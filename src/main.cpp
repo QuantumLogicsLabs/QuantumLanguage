@@ -44,6 +44,47 @@ namespace fs = std::filesystem;
 // Shared with Vm.cpp
 bool g_testMode = false;
 
+// ─── Custom Extension Guard for Multi-Language Rules ───────────────────────
+static void validateParadigmExtensions(const std::string &path, const std::string &sourceCode)
+{
+    // Extract file extension in lowercase
+    std::string ext = fs::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    // .sa is the Magic Extension: Skip validation and allow everything smoothly
+    if (ext == ".sa") {
+        return; 
+    }
+
+    // Strict Mode: Checking JavaScript Files
+    if (ext == ".js") {
+        std::vector<std::string> cppKeywords = { "int ", "float ", "cout", "printf", "scanf", "->" };
+        for (const auto &keyword : cppKeywords) {
+            if (sourceCode.find(keyword) != std::string::npos) {
+                std::cerr << "\033[31m[Syntax Error]\033[0m C/C++ architecture element '" 
+                          << keyword << "' is not supported inside a strict JavaScript (.js) module.\n";
+                std::exit(1);
+            }
+        }
+    }
+    // Strict Mode: Checking C / C++ Files
+    else if (ext == ".cpp" || ext == ".c") {
+        std::vector<std::string> jsKeywords = { "let ", "const ", "fn ", "function", ".push(", ".map(" };
+        for (const auto &keyword : jsKeywords) {
+            if (sourceCode.find(keyword) != std::string::npos) {
+                std::cerr << "\033[31m[Syntax Error]\033[0m Dynamic scripting element '" 
+                          << keyword << "' is not supported inside a native C/C++ module.\n";
+                std::exit(1);
+            }
+        }
+    }
+    // Handle unexpected/unconfigured extensions safely
+    else {
+        std::cerr << "\033[31m[Error]\033[0m Unsupported file extension: " << ext << "\n";
+        std::exit(1);
+    }
+}
+
 // ─── Executable path ──────────────────────────────────────────────────────────
 
 static std::string getExecutablePath()
@@ -169,8 +210,7 @@ static std::shared_ptr<Chunk> compileSource(const std::string &source,
     return chunk;
 }
 
-// ─── runFile — interpret a .sa file in-place (no exe created) ─────────────────
-
+// ─── runFile — interpret a file in-place (no exe created) ─────────────────
 static void runFile(const std::string &path, bool debug = false)
 {
     std::ifstream file(path);
@@ -182,6 +222,9 @@ static void runFile(const std::string &path, bool debug = false)
     }
     std::ostringstream ss;
     ss << file.rdbuf();
+    
+    // ─── HOOK VALIDATOR HERE ───
+    validateParadigmExtensions(path, ss.str());
 
     try
     {
@@ -191,7 +234,7 @@ static void runFile(const std::string &path, bool debug = false)
     catch (const ParseError &e)
     {
         std::cerr << Colors::RED << Colors::BOLD
-                  << "\n  X ParseError" << Colors::RESET
+                  << "\n   X ParseError" << Colors::RESET
                   << " in " << path << " at line " << e.line << ":" << e.col
                   << "\n    " << e.what() << "\n\n";
         std::exit(1);
@@ -199,7 +242,7 @@ static void runFile(const std::string &path, bool debug = false)
     catch (const QuantumError &e)
     {
         std::cerr << Colors::RED << Colors::BOLD
-                  << "\n  X " << e.kind << Colors::RESET;
+                  << "\n   X " << e.kind << Colors::RESET;
         if (e.line > 0)
             std::cerr << " at line " << e.line;
         std::cerr << "\n    " << e.what() << "\n\n";
@@ -784,10 +827,9 @@ static std::string findStubPath(const std::string &quantumExePath)
 // ─── bundleAndRun ─────────────────────────────────────────────────────────────
 // Compiles .sa → bytecode, appends it to a copy of quantum_stub.exe,
 // writes <name>.exe next to the .sa file, then launches it and waits.
-
 static int bundleAndRun(const std::string &path, const std::string &exePath)
 {
-    // 1. Read source
+    // 1. Read source [cite: 703]
     std::ifstream src(path);
     if (!src.is_open())
     {
@@ -799,7 +841,10 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
     std::ostringstream ss;
     ss << src.rdbuf();
 
-    // 2. Compile
+    // ─── HOOK VALIDATOR HERE ───
+    validateParadigmExtensions(path, ss.str());
+
+    // 2. Compile [cite: 714]
     std::shared_ptr<Chunk> chunk;
     try
     {
@@ -807,7 +852,7 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
     }
     catch (const ParseError &e)
     {
-        std::cout << Colors::RED << Colors::BOLD << "\n  X ParseError" << Colors::RESET
+        std::cout << Colors::RED << Colors::BOLD << "\n   X ParseError" << Colors::RESET
                   << " in " << path << " at line " << e.line << ":" << e.col
                   << "\n    " << e.what() << "\n\n";
         std::cout.flush();
@@ -819,39 +864,34 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
         std::cout.flush();
         return 1;
     }
-
-    // 3. Serialize bytecode
+    // 3. Serialize bytecode [cite: 734]
     auto payload = Serializer::serialize(chunk);
     uint32_t payloadSize = (uint32_t)payload.size();
-
-    // 4. Find quantum_stub.exe (the template runtime)
+    // 4. Find quantum_stub.exe (the template runtime) [cite: 737]
     std::string stub = findStubPath(exePath);
     if (stub.empty())
     {
         std::cout.flush();
         return 1;
     }
-
-    // 5. Determine output path: hello.sa → hello.exe
+    // 5. Determine output path: hello.sa → hello.exe [cite: 744]
     fs::path srcPath(path);
     std::string outName;
     if (srcPath.parent_path().empty())
         outName = (fs::current_path() / srcPath.stem()).string() + ".exe";
     else
         outName = (srcPath.parent_path() / srcPath.stem()).string() + ".exe";
-
-    // Safety: never overwrite quantum.exe, qrun.exe, or quantum_stub.exe
+    // Safety: never overwrite quantum.exe, qrun.exe, or quantum_stub.exe [cite: 751]
     {
         std::string stemLower = fs::path(outName).stem().string();
         std::transform(stemLower.begin(), stemLower.end(), stemLower.begin(), ::tolower);
         if (stemLower == "quantum" || stemLower == "qrun" || stemLower == "quantum_stub")
             outName = (fs::path(outName).parent_path() /
-                       (fs::path(outName).stem().string() + "_out"))
+                      (fs::path(outName).stem().string() + "_out"))
                           .string() +
                       ".exe";
     }
-
-    // 6. Copy stub → output exe
+    // 6. Copy stub → output exe [cite: 761]
     std::error_code copyErr;
     fs::copy_file(stub, outName, fs::copy_options::overwrite_existing, copyErr);
     if (copyErr)
@@ -861,8 +901,7 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
         std::cout.flush();
         return 1;
     }
-
-    // 7. Append payload: [bytes] [size: uint32 LE] [magic: "QNTM_VM!" 8 bytes]
+    // 7. Append payload: [bytes] [size: uint32 LE] [magic: "QNTM_VM!" 8 bytes] [cite: 771]
     {
         std::ofstream out(outName, std::ios::binary | std::ios::app);
         if (!out)
@@ -884,20 +923,16 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
             return 1;
         }
     }
-
     std::cout << Colors::GREEN << "[Compiled] " << Colors::RESET
               << path << "  ->  " << outName << "  (" << payloadSize << " bytes)\n";
     std::cout.flush();
-
-    // 8. Launch the produced .exe and wait for it to finish
+    // 8. Launch the produced .exe and wait for it to finish [cite: 796]
     std::cout << Colors::CYAN << "[Running]  " << Colors::RESET << outName << "\n\n";
     std::cout.flush();
-
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     std::string cmd = "\"" + outName + "\"";
-
     if (!CreateProcessA(NULL, const_cast<char *>(cmd.c_str()),
                         NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
     {

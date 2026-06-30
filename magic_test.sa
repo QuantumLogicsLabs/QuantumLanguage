@@ -1,0 +1,4 @@
+let dynamicVar = "JavaScript style";
+int nativeVar = 101;
+print(dynamicVar);
+printf("C-Style: %d\n", nativeVar);
