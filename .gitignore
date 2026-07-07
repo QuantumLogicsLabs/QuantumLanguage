@@ -17,7 +17,8 @@ method1_error.txt
 method2_error.txt
 method3_error.txt
 output.txt
-
+build_log.txt
+build_errors.txt
 # IDE files
 /.vscode
 .vscode

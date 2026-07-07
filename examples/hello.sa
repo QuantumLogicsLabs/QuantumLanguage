@@ -7,3 +7,4 @@ let name = "Q_Lang"
 let version = 1.0
 
 print("Welcome,", name, "| Quantum v" + str(version))
+

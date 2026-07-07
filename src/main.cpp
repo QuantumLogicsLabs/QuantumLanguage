@@ -26,6 +26,7 @@
 #include <cstring>
 #include <ctime>
 #include <iomanip>
+#include <cstdlib>
 
 // Windows-only — bundling and launching use Win32 API
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1030,8 +1031,88 @@ int main(int argc, char *argv[])
     }
     if (a1 == "--test")
         return runTestExamples(argc >= 3 ? argv[2] : "examples");
-    runFile(a1);
-    return 0;
+    // qrun behavior by extension
+        // qrun behavior by extension
+        if (a1.size() >= 3 && a1.substr(a1.size() - 3) == ".sa")
+        {
+            // .sa only: Quantum interpreter mode, no exe generated
+            runFile(a1);
+            return 0;
+        }
+        else if (a1.size() >= 3 && a1.substr(a1.size() - 3) == ".js")
+        {
+            // JavaScript syntax check
+            std::string checkCmd = "node --check \"" + a1 + "\"";
+            int result = system(checkCmd.c_str());
+
+            if (result != 0)
+            {
+                std::cerr << "[Quantum Error] Invalid JavaScript syntax in " << a1 << "\n";
+                return result;
+            }
+
+            // Run JavaScript
+            std::string runCmd = "node \"" + a1 + "\"";
+            return system(runCmd.c_str());
+        }
+        else if (a1.size() >= 2 && a1.substr(a1.size() - 2) == ".c")
+        {
+            // Compile C source
+            std::string out = a1.substr(0, a1.size() - 2) + ".exe";
+
+            std::string compileCmd = "gcc \"" + a1 + "\" -o \"" + out + "\"";
+            int result = system(compileCmd.c_str());
+
+            if (result != 0)
+            {
+                std::cerr << "[Quantum Error] Invalid C syntax in " << a1 << "\n";
+                return result;
+            }
+
+            // Run executable
+            std::string runCmd = "\"" + out + "\"";
+            int runResult = system(runCmd.c_str());
+
+            // Delete generated executable
+            if (std::remove(out.c_str()) != 0)
+            {
+                std::cerr << "[Warning] Failed to delete temporary executable: " << out << "\n";
+            }
+
+            return runResult;
+        }
+        else if (a1.size() >= 4 && a1.substr(a1.size() - 4) == ".cpp")
+        {
+            // Compile C++ source
+            std::string out = a1.substr(0, a1.size() - 4) + ".exe";
+
+            std::string compileCmd = "g++ \"" + a1 + "\" -o \"" + out + "\"";
+            int result = system(compileCmd.c_str());
+
+            if (result != 0)
+            {
+                std::cerr << "[Quantum Error] Invalid C++ syntax in " << a1 << "\n";
+                return result;
+            }
+
+            // Run executable
+            std::string runCmd = "\"" + out + "\"";
+            int runResult = system(runCmd.c_str());
+
+            // Delete generated executable
+            if (std::remove(out.c_str()) != 0)
+            {
+                std::cerr << "[Warning] Failed to delete temporary executable: " << out << "\n";
+            }
+
+            return runResult;
+        }
+        else
+        {
+            std::cerr << "[Error] Unsupported file type: " << a1 << "\n";
+            std::cerr << "Supported: .sa, .js, .c, .cpp\n";
+            return 1;
+        }
 #endif
 
     // ══════════════════════════════════════════════════════════════
@@ -1099,5 +1180,66 @@ int main(int argc, char *argv[])
     }
 
     // Default: compile .sa → hello.exe (using quantum_stub as template) → run
-    return bundleAndRun(arg, exePath);
+    // Default: run based on file extension
+    if (arg.size() >= 3 && arg.substr(arg.size() - 3) == ".sa")
+    {
+        // Only .sa supports Quantum multi-syntax
+        return bundleAndRun(arg, exePath);
+    }
+    else if (arg.size() >= 3 && arg.substr(arg.size() - 3) == ".js")
+    {
+        // JavaScript syntax check first
+        std::string checkCmd = "node --check \"" + arg + "\"";
+        int result = system(checkCmd.c_str());
+
+        if (result != 0)
+        {
+            std::cerr << "[Quantum Error] Invalid JavaScript syntax in " << arg << "\n";
+            return result;
+        }
+
+        // If syntax is valid, run JS
+        std::string runCmd = "node \"" + arg + "\"";
+        return system(runCmd.c_str());
+    }
+    else if (arg.size() >= 2 && arg.substr(arg.size() - 2) == ".c")
+    {
+        std::string out = arg.substr(0, arg.size() - 2) + ".exe";
+
+        // C compiler will give C syntax errors
+        std::string compileCmd = "gcc \"" + arg + "\" -o \"" + out + "\"";
+        int result = system(compileCmd.c_str());
+
+        if (result != 0)
+        {
+            std::cerr << "[Quantum Error] Invalid C syntax in " << arg << "\n";
+            return result;
+        }
+
+        std::string runCmd = "\"" + out + "\"";
+        return system(runCmd.c_str());
+    }
+    else if (arg.size() >= 4 && arg.substr(arg.size() - 4) == ".cpp")
+    {
+        std::string out = arg.substr(0, arg.size() - 4) + ".exe";
+
+        // C++ compiler will give C++ syntax errors
+        std::string compileCmd = "g++ \"" + arg + "\" -o \"" + out + "\"";
+        int result = system(compileCmd.c_str());
+
+        if (result != 0)
+        {
+            std::cerr << "[Quantum Error] Invalid C++ syntax in " << arg << "\n";
+            return result;
+        }
+
+        std::string runCmd = "\"" + out + "\"";
+        return system(runCmd.c_str());
+    }
+    else
+    {
+        std::cerr << "[Error] Unsupported file type: " << arg << "\n";
+        std::cerr << "Supported: .sa, .js, .c, .cpp\n";
+        return 1;
+    }
 }
