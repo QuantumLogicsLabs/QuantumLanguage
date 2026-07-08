@@ -72,8 +72,24 @@ static void validateParadigmExtensions(const std::string &path, const std::strin
         std::vector<std::string> jsKeywords = { "let ", "const ", "fn ", "function", ".push(", ".map(" };
         for (const auto &keyword : jsKeywords) {
             if (sourceCode.find(keyword) != std::string::npos) {
-                std::cerr << "\033[31m[Syntax Error]\033[0m Dynamic scripting element '" 
+                std::cerr << "\033[31m[Syntax Error]\033[0m Dynamic scripting element '"
                           << keyword << "' is not supported inside a native C/C++ module.\n";
+                std::exit(1);
+            }
+        }
+    }
+    // Strict Mode: Checking Python Files — reject C/C++ *and* Quantum-script syntax
+    else if (ext == ".py") {
+        std::vector<std::string> foreignKeywords = {
+            // C/C++ architecture elements
+            "int ", "float ", "cout", "printf", "scanf", "->",
+            // Quantum / JavaScript-style scripting elements
+            "let ", "const ", "fn ", "function", ".push(", ".map("
+        };
+        for (const auto &keyword : foreignKeywords) {
+            if (sourceCode.find(keyword) != std::string::npos) {
+                std::cerr << "\033[31m[Syntax Error]\033[0m Non-Python element '"
+                          << keyword << "' is not supported inside a strict Python (.py) module.\n";
                 std::exit(1);
             }
         }
@@ -1055,6 +1071,22 @@ int main(int argc, char *argv[])
             std::string runCmd = "node \"" + a1 + "\"";
             return system(runCmd.c_str());
         }
+        else if (a1.size() >= 3 && a1.substr(a1.size() - 3) == ".py")
+        {
+            // Python syntax check
+            std::string checkCmd = "python -m py_compile \"" + a1 + "\"";
+            int result = system(checkCmd.c_str());
+
+            if (result != 0)
+            {
+                std::cerr << "[Quantum Error] Invalid Python syntax in " << a1 << "\n";
+                return result;
+            }
+
+            // Run Python
+            std::string runCmd = "python \"" + a1 + "\"";
+            return system(runCmd.c_str());
+        }
         else if (a1.size() >= 2 && a1.substr(a1.size() - 2) == ".c")
         {
             // Compile C source
@@ -1110,7 +1142,7 @@ int main(int argc, char *argv[])
         else
         {
             std::cerr << "[Error] Unsupported file type: " << a1 << "\n";
-            std::cerr << "Supported: .sa, .js, .c, .cpp\n";
+            std::cerr << "Supported: .sa, .js, .py, .c, .cpp\n";
             return 1;
         }
 #endif
@@ -1202,6 +1234,21 @@ int main(int argc, char *argv[])
         std::string runCmd = "node \"" + arg + "\"";
         return system(runCmd.c_str());
     }
+    else if (arg.size() >= 3 && arg.substr(arg.size() - 3) == ".py")
+    {
+        // Python passthrough — no bundling. Validate syntax, then run via python.exe.
+        std::string checkCmd = "python -m py_compile \"" + arg + "\"";
+        int result = system(checkCmd.c_str());
+
+        if (result != 0)
+        {
+            std::cerr << "[Quantum Error] Invalid Python syntax in " << arg << "\n";
+            return result;
+        }
+
+        std::string runCmd = "python \"" + arg + "\"";
+        return system(runCmd.c_str());
+    }
     else if (arg.size() >= 2 && arg.substr(arg.size() - 2) == ".c")
     {
         std::string out = arg.substr(0, arg.size() - 2) + ".exe";
@@ -1239,7 +1286,7 @@ int main(int argc, char *argv[])
     else
     {
         std::cerr << "[Error] Unsupported file type: " << arg << "\n";
-        std::cerr << "Supported: .sa, .js, .c, .cpp\n";
+        std::cerr << "Supported: .sa, .js, .py, .c, .cpp\n";
         return 1;
     }
 }
