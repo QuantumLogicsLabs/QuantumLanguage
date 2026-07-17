@@ -1,0 +1,136 @@
+// Transitive Closure (Warshall's Algorithm) Implementation in C++
+#include <iostream>
+#include <vector>
+using namespace std;
+
+class TransitiveClosureGraph {
+private:
+    vector<vector<bool>> reachability;
+    int vertices;
+
+public:
+    TransitiveClosureGraph(int v) : vertices(v) {
+        reachability.resize(vertices, vector<bool>(vertices, false));
+    }
+
+    void addEdge(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            reachability[u][v] = true;
+        }
+    }
+
+    vector<vector<bool>> getTransitiveClosure() {
+        vector<vector<bool>> closure = reachability;
+
+        for (int k = 0; k < vertices; k++) {
+            for (int i = 0; i < vertices; i++) {
+                for (int j = 0; j < vertices; j++) {
+                    closure[i][j] = closure[i][j] || (closure[i][k] && closure[k][j]);
+                }
+            }
+        }
+
+        return closure;
+    }
+
+    vector<vector<bool>> getTransitiveClosureDFS() {
+        vector<vector<bool>> closure(vertices, vector<bool>(vertices, false));
+
+        for (int i = 0; i < vertices; i++) {
+            vector<bool> visited(vertices, false);
+            dfsUtil(i, visited);
+            for (int j = 0; j < vertices; j++) {
+                closure[i][j] = visited[j];
+            }
+        }
+
+        return closure;
+    }
+
+    void dfsUtil(int vertex, vector<bool>& visited) {
+        visited[vertex] = true;
+        for (int i = 0; i < vertices; i++) {
+            if (reachability[vertex][i] && !visited[i]) {
+                dfsUtil(i, visited);
+            }
+        }
+    }
+
+    bool isStronglyConnected() {
+        vector<vector<bool>> closure = getTransitiveClosure();
+
+        for (int i = 0; i < vertices; i++) {
+            for (int j = 0; j < vertices; j++) {
+                if (!closure[i][j]) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    vector<vector<bool>> getReachabilityMatrix() {
+        return getTransitiveClosure();
+    }
+
+    void displayMatrix(const vector<vector<bool>>& matrix, const string& title) {
+        cout << title << ":" << endl;
+        cout << "   ";
+        for (int i = 0; i < vertices; i++) {
+            cout << i << " ";
+        }
+        cout << endl;
+
+        for (int i = 0; i < vertices; i++) {
+            cout << i << ": ";
+            for (int j = 0; j < vertices; j++) {
+                cout << (matrix[i][j] ? "1" : "0") << " ";
+            }
+            cout << endl;
+        }
+    }
+
+    void displayReachability(const vector<vector<bool>>& closure) {
+        cout << "Reachability Information:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            cout << "From vertex " << i << ": ";
+            for (int j = 0; j < vertices; j++) {
+                if (closure[i][j]) {
+                    cout << j << " ";
+                }
+            }
+            cout << endl;
+        }
+    }
+
+    void display() {
+        cout << "Directed Graph:" << endl;
+        displayMatrix(reachability, "Adjacency Matrix");
+    }
+};
+
+int main() {
+    TransitiveClosureGraph g(4);
+    
+    g.addEdge(0, 1);
+    g.addEdge(0, 2);
+    g.addEdge(1, 2);
+    g.addEdge(2, 0);
+    g.addEdge(2, 3);
+    g.addEdge(3, 3);
+    
+    g.display();
+    cout << endl;
+    
+    vector<vector<bool>> closure = g.getTransitiveClosure();
+    g.displayMatrix(closure, "Transitive Closure");
+    cout << endl;
+    
+    g.displayReachability(closure);
+    cout << endl;
+    
+    cout << "Is strongly connected: " << (g.isStronglyConnected() ? "Yes" : "No") << endl;
+    
+    return 0;
+}

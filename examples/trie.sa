@@ -1,0 +1,114 @@
+// Trie (Prefix Tree) Implementation in C++
+#include <iostream>
+#include <string>
+using namespace std;
+
+struct TrieNode {
+    TrieNode* children[26];
+    bool isEndOfWord;
+    
+    TrieNode() : isEndOfWord(false) {
+        for (int i = 0; i < 26; i++) {
+            children[i] = nullptr;
+        }
+    }
+    
+    ~TrieNode() {
+        for (int i = 0; i < 26; i++) {
+            delete children[i];
+        }
+    }
+};
+
+class Trie {
+private:
+    TrieNode* root;
+
+    void displayHelper(TrieNode* node, string prefix) {
+        if (node->isEndOfWord) {
+            cout << prefix << endl;
+        }
+        
+        for (int i = 0; i < 26; i++) {
+            if (node->children[i]) {
+                displayHelper(node->children[i], prefix + char('a' + i));
+            }
+        }
+    }
+
+public:
+    Trie() {
+        root = new TrieNode();
+    }
+
+    ~Trie() {
+        delete root;
+    }
+
+    void insert(const string& word) {
+        TrieNode* current = root;
+        
+        for (char c : word) {
+            int index = c - 'a';
+            if (index < 0 || index >= 26) continue;
+            
+            if (!current->children[index]) {
+                current->children[index] = new TrieNode();
+            }
+            current = current->children[index];
+        }
+        
+        current->isEndOfWord = true;
+    }
+
+    bool search(const string& word) {
+        TrieNode* current = root;
+        
+        for (char c : word) {
+            int index = c - 'a';
+            if (index < 0 || index >= 26 || !current->children[index]) {
+                return false;
+            }
+            current = current->children[index];
+        }
+        
+        return current->isEndOfWord;
+    }
+
+    bool startsWith(const string& prefix) {
+        TrieNode* current = root;
+        
+        for (char c : prefix) {
+            int index = c - 'a';
+            if (index < 0 || index >= 26 || !current->children[index]) {
+                return false;
+            }
+            current = current->children[index];
+        }
+        
+        return true;
+    }
+
+    void display() {
+        cout << "Trie words:" << endl;
+        displayHelper(root, "");
+    }
+};
+
+int main() {
+    Trie trie;
+    trie.insert("hello");
+    trie.insert("world");
+    trie.insert("help");
+    trie.insert("helmet");
+    trie.insert("word");
+    
+    trie.display();
+    
+    cout << "Search 'hello': " << (trie.search("hello") ? "Found" : "Not Found") << endl;
+    cout << "Search 'hell': " << (trie.search("hell") ? "Found" : "Not Found") << endl;
+    cout << "StartsWith 'hel': " << (trie.startsWith("hel") ? "Yes" : "No") << endl;
+    cout << "StartsWith 'xyz': " << (trie.startsWith("xyz") ? "Yes" : "No") << endl;
+    
+    return 0;
+}

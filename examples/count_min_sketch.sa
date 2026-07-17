@@ -1,0 +1,228 @@
+// Count-Min Sketch Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <random>
+using namespace std;
+
+class CountMinSketch {
+private:
+    vector<vector<size_t>> table;
+    size_t width;
+    size_t depth;
+    vector<hash<string>> hashFunctions;
+
+    size_t hash(const string& str, size_t hashIndex) const {
+        hash<string> hasher;
+        size_t hashValue = hasher(str);
+        return (hashValue * (2654435761 + hashIndex * 12345)) % width;
+    }
+
+public:
+    CountMinSketch(size_t w, size_t d) : width(w), depth(d) {
+        table.resize(depth, vector<size_t>(width, 0));
+        hashFunctions.resize(depth);
+    }
+
+    void add(const string& item, size_t count = 1) {
+        for (size_t i = 0; i < depth; ++i) {
+            size_t index = hash(item, i);
+            table[i][index] += count;
+        }
+    }
+
+    size_t estimate(const string& item) const {
+        size_t minCount = numeric_limits<size_t>::max();
+        
+        for (size_t i = 0; i < depth; ++i) {
+            size_t index = hash(item, i);
+            minCount = min(minCount, table[i][index]);
+        }
+        
+        return minCount;
+    }
+
+    void clear() {
+        for (auto& row : table) {
+            fill(row.begin(), row.end(), 0);
+        }
+    }
+
+    double getErrorRate() const {
+        return 1.0 / width;
+    }
+
+    double getConfidence() const {
+        return 1.0 - pow(0.5, depth);
+    }
+
+    void display() const {
+        cout << "Count-Min Sketch:" << endl;
+        cout << "Width: " << width << ", Depth: " << depth << endl;
+        cout << "Error rate: " << getErrorRate() << endl;
+        cout << "Confidence: " << getConfidence() << endl;
+        
+        size_t total = 0;
+        for (const auto& row : table) {
+            for (size_t count : row) {
+                total += count;
+            }
+        }
+        cout << "Total count: " << total << endl;
+        
+        cout << "Table structure (first 10x10):" << endl;
+        for (size_t i = 0; i < min(depth, size_t(10)); ++i) {
+            cout << "Row " << i << ": ";
+            for (size_t j = 0; j < min(width, size_t(10)); ++j) {
+                cout << table[i][j] << " ";
+            }
+            if (width > 10) cout << "...";
+            cout << endl;
+        }
+    }
+
+    vector<pair<string, size_t>> getHeavyHitters(const vector<string>& items, size_t threshold) const {
+        vector<pair<string, size_t>> heavyHitters;
+        
+        for (const string& item : items) {
+            size_t count = estimate(item);
+            if (count >= threshold) {
+                heavyHitters.push_back({item, count});
+            }
+        }
+        
+        sort(heavyHitters.begin(), heavyHitters.end(), 
+             [](const pair<string, size_t>& a, const pair<string, size_t>& b) {
+                 return a.second > b.second;
+             });
+        
+        return heavyHitters;
+    }
+};
+
+class CountingBloomFilter {
+private:
+    vector<vector<size_t>> table;
+    size_t width;
+    size_t depth;
+
+    size_t hash(const string& str, size_t hashIndex) const {
+        hash<string> hasher;
+        size_t hashValue = hasher(str);
+        return (hashValue * (2654435761 + hashIndex * 12345)) % width;
+    }
+
+public:
+    CountingBloomFilter(size_t w, size_t d) : width(w), depth(d) {
+        table.resize(depth, vector<size_t>(width, 0));
+    }
+
+    void add(const string& item) {
+        for (size_t i = 0; i < depth; ++i) {
+            size_t index = hash(item, i);
+            table[i][index]++;
+        }
+    }
+
+    void remove(const string& item) {
+        for (size_t i = 0; i < depth; ++i) {
+            size_t index = hash(item, i);
+            if (table[i][index] > 0) {
+                table[i][index]--;
+            }
+        }
+    }
+
+    bool possiblyContains(const string& item) const {
+        for (size_t i = 0; i < depth; ++i) {
+            size_t index = hash(item, i);
+            if (table[i][index] == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    size_t estimateCount(const string& item) const {
+        size_t minCount = numeric_limits<size_t>::max();
+        
+        for (size_t i = 0; i < depth; ++i) {
+            size_t index = hash(item, i);
+            minCount = min(minCount, table[i][index]);
+        }
+        
+        return minCount;
+    }
+
+    void display() const {
+        cout << "Counting Bloom Filter:" << endl;
+        cout << "Width: " << width << ", Depth: " << depth << endl;
+        
+        cout << "Table structure (first 5x5):" << endl;
+        for (size_t i = 0; i < min(depth, size_t(5)); ++i) {
+            cout << "Row " << i << ": ";
+            for (size_t j = 0; j < min(width, size_t(5)); ++j) {
+                cout << table[i][j] << " ";
+            }
+            if (width > 5) cout << "...";
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    cout << "=== Count-Min Sketch ===" << endl;
+    CountMinSketch cms(1000, 5);
+    
+    vector<string> items = {"apple", "banana", "orange", "grape", "mango", "pear", "peach"};
+    vector<size_t> counts = {100, 50, 75, 25, 150, 30, 60};
+    
+    for (size_t i = 0; i < items.size(); ++i) {
+        cms.add(items[i], counts[i]);
+    }
+    
+    cms.display();
+    cout << endl;
+    
+    cout << "Count estimates:" << endl;
+    for (size_t i = 0; i < items.size(); ++i) {
+        cout << items[i] << ": Actual=" << counts[i] << ", Estimated=" << cms.estimate(items[i]) << endl;
+    }
+    
+    cms.add("apple", 50);
+    cms.add("banana", 25);
+    
+    cout << "\nAfter adding more:" << endl;
+    cout << "apple: Actual=" << counts[0] + 50 << ", Estimated=" << cms.estimate("apple") << endl;
+    cout << "banana: Actual=" << counts[1] + 25 << ", Estimated=" << cms.estimate("banana") << endl;
+    
+    auto heavyHitters = cms.getHeavyHitters(items, 50);
+    cout << "\nHeavy Hitters (threshold >= 50):" << endl;
+    for (const auto& hitter : heavyHitters) {
+        cout << hitter.first << ": " << hitter.second << endl;
+    }
+    
+    cout << "\n=== Counting Bloom Filter ===" << endl;
+    CountingBloomFilter cbf(1000, 5);
+    
+    for (const string& item : items) {
+        cbf.add(item);
+    }
+    
+    cbf.display();
+    cout << endl;
+    
+    cout << "Membership tests:" << endl;
+    for (const string& item : items) {
+        cout << item << ": " << (cbf.possiblyContains(item) ? "Possibly present" : "Definitely not present") << endl;
+        cout << "  Count estimate: " << cbf.estimateCount(item) << endl;
+    }
+    
+    cbf.remove("apple");
+    cout << "\nAfter removing 'apple':" << endl;
+    cout << "apple: " << (cbf.possiblyContains("apple") ? "Possibly present" : "Definitely not present") << endl;
+    cout << "banana: " << (cbf.possiblyContains("banana") ? "Possibly present" : "Definitely not present") << endl;
+    
+    return 0;
+}

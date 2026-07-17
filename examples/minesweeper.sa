@@ -1,0 +1,194 @@
+/*
+ * ╔══════════════════════════════════════╗
+ *      MINESWEEPER  — Console Game
+ *   Navigate with WASD, F to flag,
+ *   ENTER/Space to reveal a cell.
+ * ╚══════════════════════════════════════╝
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+  #include <conio.h>
+  #include <windows.h>
+  #define CLEAR "cls"
+  #define GETCH _getch
+#else
+  #include <unistd.h>
+  #include <termios.h>
+  #define CLEAR "clear"
+  int getch_unix(void) {
+      struct termios oldt, newt;
+      tcgetattr(STDIN_FILENO, &oldt);
+      newt = oldt;
+      newt.c_lflag &= ~(ICANON | ECHO);
+      tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+      int ch = getchar();
+      tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+      return ch;
+  }
+  #define GETCH getch_unix
+#endif
+
+#define ROWS   12
+#define COLS   20
+#define MINES  30
+
+typedef struct {
+    int mine;
+    int revealed;
+    int flagged;
+    int adj;      /* adjacent mine count */
+} Cell;
+
+Cell board[ROWS][COLS];
+int  cursor_r, cursor_c;
+int  first_click;
+int  flags_left;
+int  cells_left;   /* unrevealed non-mine cells */
+
+/* ─── init ─── */
+void count_adjacent(void) {
+    for (int r = 0; r < ROWS; r++)
+    for (int c = 0; c < COLS; c++) {
+        if (board[r][c].mine) { board[r][c].adj = -1; continue; }
+        int cnt = 0;
+        for (int dr = -1; dr <= 1; dr++)
+        for (int dc = -1; dc <= 1; dc++) {
+            int nr = r+dr, nc = c+dc;
+            if (nr>=0&&nr<ROWS&&nc>=0&&nc<COLS&&board[nr][nc].mine) cnt++;
+        }
+        board[r][c].adj = cnt;
+    }
+}
+
+void place_mines(int sr, int sc) {
+    int placed = 0;
+    while (placed < MINES) {
+        int r = rand() % ROWS, c = rand() % COLS;
+        /* don't place on or adjacent to first click */
+        if (abs(r-sr)<=1 && abs(c-sc)<=1) continue;
+        if (!board[r][c].mine) { board[r][c].mine = 1; placed++; }
+    }
+    count_adjacent();
+}
+
+void init_board(void) {
+    memset(board, 0, sizeof(board));
+    cursor_r = ROWS/2; cursor_c = COLS/2;
+    first_click = 1;
+    flags_left = MINES;
+    cells_left = ROWS * COLS - MINES;
+}
+
+/* ─── flood-fill reveal ─── */
+void reveal(int r, int c) {
+    if (r<0||r>=ROWS||c<0||c>=COLS) return;
+    if (board[r][c].revealed || board[r][c].flagged || board[r][c].mine) return;
+    board[r][c].revealed = 1;
+    cells_left--;
+    if (board[r][c].adj == 0) {
+        for (int dr=-1;dr<=1;dr++)
+        for (int dc=-1;dc<=1;dc++)
+            reveal(r+dr, c+dc);
+    }
+}
+
+/* ─── draw ─── */
+void draw(int dead, int won) {
+    system(CLEAR);
+    printf("\n  MINESWEEPER  |  Mines left: %d  |  Cells left: %d\n", flags_left, cells_left);
+    printf("  WASD=move  ENTER/Space=reveal  F=flag  Q=quit\n\n");
+
+    /* column numbers */
+    printf("    ");
+    for (int c = 0; c < COLS; c++) printf("%d", c%10);
+    printf("\n");
+
+    /* top border */
+    printf("   +");
+    for (int c = 0; c < COLS; c++) printf("-");
+    printf("+\n");
+
+    for (int r = 0; r < ROWS; r++) {
+        printf("%2d |", r);
+        for (int c = 0; c < COLS; c++) {
+            int is_cur = (r == cursor_r && c == cursor_c);
+            Cell *cell = &board[r][c];
+
+            if (dead && cell->mine) {
+                printf(is_cur ? "X" : "*");
+            } else if (cell->flagged) {
+                printf(is_cur ? "[" : "F");
+            } else if (!cell->revealed) {
+                printf(is_cur ? "#" : ".");
+            } else {
+                /* revealed */
+                if (cell->adj == 0) printf(" ");
+                else printf("%d", cell->adj);
+            }
+        }
+        printf("|\n");
+    }
+
+    printf("   +");
+    for (int c = 0; c < COLS; c++) printf("-");
+    printf("+\n");
+
+    if (dead) printf("\n  *** BOOM! You hit a mine! ***\n\n");
+    if (won)  printf("\n  *** YOU WIN! All safe cells revealed! ***\n\n");
+}
+
+/* ─── main ─── */
+int main(void) {
+    srand((unsigned)time(NULL));
+
+    printf("\n  === MINESWEEPER ===\n");
+    printf("  WASD=move | Enter/Space=reveal | F=flag | Q=quit\n");
+    printf("  Press ENTER to begin...\n");
+    getchar();
+
+    init_board();
+    int dead = 0, won = 0;
+
+    while (!dead && !won) {
+        draw(0, 0);
+
+        char c = (char)GETCH();
+        if (c=='q'||c=='Q') break;
+        if (c=='w'||c=='W') { if (cursor_r > 0)      cursor_r--; }
+        if (c=='s'||c=='S') { if (cursor_r < ROWS-1)  cursor_r++; }
+        if (c=='a'||c=='A') { if (cursor_c > 0)        cursor_c--; }
+        if (c=='d'||c=='D') { if (cursor_c < COLS-1)   cursor_c++; }
+
+        if (c=='f'||c=='F') {
+            Cell *cell = &board[cursor_r][cursor_c];
+            if (!cell->revealed) {
+                if (!cell->flagged && flags_left > 0) { cell->flagged=1; flags_left--; }
+                else if (cell->flagged) { cell->flagged=0; flags_left++; }
+            }
+        }
+
+        if (c=='\n'||c=='\r'||c==' ') {
+            Cell *cell = &board[cursor_r][cursor_c];
+            if (!cell->flagged && !cell->revealed) {
+                if (first_click) {
+                    place_mines(cursor_r, cursor_c);
+                    first_click = 0;
+                }
+                if (cell->mine) {
+                    cell->revealed = 1; dead = 1;
+                } else {
+                    reveal(cursor_r, cursor_c);
+                    if (cells_left == 0) won = 1;
+                }
+            }
+        }
+    }
+
+    draw(dead, won);
+    return 0;
+}

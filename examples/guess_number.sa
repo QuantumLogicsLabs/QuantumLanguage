@@ -1,0 +1,41 @@
+# Number Guessing Game
+# Classic guessing game with random numbers
+
+import random
+
+def guess_number_game():
+    secret_number = random.randint(1, 100)
+    attempts = 0
+    max_attempts = 7
+    
+    print("Welcome to the Number Guessing Game!")
+    print(f"I'm thinking of a number between 1 and 100")
+    print(f"You have {max_attempts} attempts to guess it")
+    
+    while attempts < max_attempts:
+        attempts += 1
+        remaining = max_attempts - attempts
+        
+        try:
+            guess = int(input(f"Attempt {attempts}/{max_attempts}. Enter your guess: "))
+        except ValueError:
+            print("Please enter a valid number")
+            continue
+        
+        if guess < secret_number:
+            print("Too low!")
+        elif guess > secret_number:
+            print("Too high!")
+        else:
+            print(f"Congratulations! You guessed it in {attempts} attempts!")
+            return
+        
+        if remaining > 0:
+            print(f"You have {remaining} attempts left")
+        else:
+            print("This is your last attempt!")
+    
+    print(f"Game over! The number was {secret_number}")
+
+# Play the game
+guess_number_game()

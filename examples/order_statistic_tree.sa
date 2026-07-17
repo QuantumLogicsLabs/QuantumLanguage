@@ -1,0 +1,197 @@
+// Order Statistic Tree Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct OSTNode {
+    int data;
+    int height;
+    int size;
+    OSTNode* left;
+    OSTNode* right;
+    
+    OSTNode(int val) : data(val), height(1), size(1), left(nullptr), right(nullptr) {}
+};
+
+class OrderStatisticTree {
+private:
+    OSTNode* root;
+
+    int height(OSTNode* node) {
+        return node ? node->height : 0;
+    }
+
+    int getSize(OSTNode* node) {
+        return node ? node->size : 0;
+    }
+
+    int getBalance(OSTNode* node) {
+        return node ? height(node->left) - height(node->right) : 0;
+    }
+
+    OSTNode* rightRotate(OSTNode* y) {
+        OSTNode* x = y->left;
+        OSTNode* T2 = x->right;
+
+        x->right = y;
+        y->left = T2;
+
+        y->height = max(height(y->left), height(y->right)) + 1;
+        x->height = max(height(x->left), height(x->right)) + 1;
+
+        y->size = getSize(y->left) + getSize(y->right) + 1;
+        x->size = getSize(x->left) + getSize(x->right) + 1;
+
+        return x;
+    }
+
+    OSTNode* leftRotate(OSTNode* x) {
+        OSTNode* y = x->right;
+        OSTNode* T2 = y->left;
+
+        y->left = x;
+        x->right = T2;
+
+        x->height = max(height(x->left), height(x->right)) + 1;
+        y->height = max(height(y->left), height(y->right)) + 1;
+
+        x->size = getSize(x->left) + getSize(x->right) + 1;
+        y->size = getSize(y->left) + getSize(y->right) + 1;
+
+        return y;
+    }
+
+    OSTNode* insert(OSTNode* node, int value) {
+        if (!node) {
+            return new OSTNode(value);
+        }
+
+        if (value < node->data) {
+            node->left = insert(node->left, value);
+        } else if (value > node->data) {
+            node->right = insert(node->right, value);
+        } else {
+            return node;
+        }
+
+        node->height = 1 + max(height(node->left), height(node->right));
+        node->size = getSize(node->left) + getSize(node->right) + 1;
+
+        int balance = getBalance(node);
+
+        if (balance > 1 && value < node->left->data) {
+            return rightRotate(node);
+        }
+
+        if (balance < -1 && value > node->right->data) {
+            return leftRotate(node);
+        }
+
+        if (balance > 1 && value > node->left->data) {
+            node->left = leftRotate(node->left);
+            return rightRotate(node);
+        }
+
+        if (balance < -1 && value < node->right->data) {
+            node->right = rightRotate(node->right);
+            return leftRotate(node);
+        }
+
+        return node;
+    }
+
+    OSTNode* kthSmallest(OSTNode* node, int k) {
+        if (!node) {
+            return nullptr;
+        }
+
+        int leftSize = getSize(node->left);
+        
+        if (k == leftSize + 1) {
+            return node;
+        } else if (k <= leftSize) {
+            return kthSmallest(node->left, k);
+        } else {
+            return kthSmallest(node->right, k - leftSize - 1);
+        }
+    }
+
+    int rank(OSTNode* node, int value) {
+        if (!node) {
+            return 0;
+        }
+
+        if (value < node->data) {
+            return rank(node->left, value);
+        } else if (value > node->data) {
+            return getSize(node->left) + 1 + rank(node->right, value);
+        } else {
+            return getSize(node->left) + 1;
+        }
+    }
+
+    void inorder(OSTNode* node) {
+        if (node) {
+            inorder(node->left);
+            cout << node->data << "(size:" << node->size << ") ";
+            inorder(node->right);
+        }
+    }
+
+    void destroyTree(OSTNode* node) {
+        if (node) {
+            destroyTree(node->left);
+            destroyTree(node->right);
+            delete node;
+        }
+    }
+
+public:
+    OrderStatisticTree() : root(nullptr) {}
+
+    ~OrderStatisticTree() {
+        destroyTree(root);
+    }
+
+    void insert(int value) {
+        root = insert(root, value);
+    }
+
+    int kthSmallest(int k) {
+        OSTNode* result = kthSmallest(root, k);
+        return result ? result->data : -1;
+    }
+
+    int rank(int value) {
+        return rank(root, value);
+    }
+
+    void display() {
+        cout << "Order Statistic Tree: ";
+        inorder(root);
+        cout << endl;
+    }
+};
+
+int main() {
+    OrderStatisticTree ost;
+    ost.insert(20);
+    ost.insert(10);
+    ost.insert(30);
+    ost.insert(5);
+    ost.insert(15);
+    ost.insert(25);
+    ost.insert(35);
+    
+    ost.display();
+    
+    cout << "1st smallest: " << ost.kthSmallest(1) << endl;
+    cout << "3rd smallest: " << ost.kthSmallest(3) << endl;
+    cout << "5th smallest: " << ost.kthSmallest(5) << endl;
+    cout << "7th smallest: " << ost.kthSmallest(7) << endl;
+    
+    cout << "Rank of 15: " << ost.rank(15) << endl;
+    cout << "Rank of 25: " << ost.rank(25) << endl;
+    cout << "Rank of 40: " << ost.rank(40) << endl;
+    
+    return 0;
+}

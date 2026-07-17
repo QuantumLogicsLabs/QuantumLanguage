@@ -1,0 +1,187 @@
+// Perfect Hashing Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+using namespace std;
+
+template<typename K>
+class PerfectHashSet {
+private:
+    vector<vector<K>> firstLevel;
+    vector<vector<bool>> secondLevel;
+    vector<vector<size_t>> secondLevelHashes;
+    size_t size;
+    hash<K> hasher;
+
+    size_t hash1(const K& key) const {
+        return hasher(key) % firstLevel.size();
+    }
+
+    size_t hash2(const K& key, size_t tableSize) const {
+        return (hasher(key) * 2654435761) % tableSize;
+    }
+
+    bool isCollisionFree(const vector<K>& keys, size_t tableSize, vector<size_t>& hashes) {
+        vector<bool> used(tableSize, false);
+        hashes.clear();
+        hashes.resize(keys.size());
+        
+        for (size_t i = 0; i < keys.size(); ++i) {
+            size_t hash = hash2(keys[i], tableSize);
+            if (used[hash]) {
+                return false;
+            }
+            used[hash] = true;
+            hashes[i] = hash;
+        }
+        return true;
+    }
+
+    void buildSecondLevel(size_t bucket) {
+        const vector<K>& keys = firstLevel[bucket];
+        if (keys.empty()) {
+            return;
+        }
+
+        if (keys.size() == 1) {
+            secondLevel[bucket].resize(1, false);
+            secondLevelHashes[bucket].resize(1);
+            size_t hash = hash2(keys[0], 1);
+            secondLevel[bucket][hash] = true;
+            secondLevelHashes[bucket][0] = hash;
+            return;
+        }
+
+        size_t tableSize = keys.size() * keys.size();
+        vector<size_t> hashes;
+        
+        while (!isCollisionFree(keys, tableSize, hashes)) {
+            tableSize++;
+        }
+
+        secondLevel[bucket].resize(tableSize, false);
+        secondLevelHashes[bucket] = hashes;
+        
+        for (size_t i = 0; i < keys.size(); ++i) {
+            secondLevel[bucket][hashes[i]] = true;
+        }
+    }
+
+public:
+    PerfectHashSet(const vector<K>& keys) : size(keys.size()) {
+        if (keys.empty()) {
+            return;
+        }
+
+        firstLevel.resize(size);
+        secondLevel.resize(size);
+        secondLevelHashes.resize(size);
+
+        for (const K& key : keys) {
+            firstLevel[hash1(key)].push_back(key);
+        }
+
+        for (size_t i = 0; i < size; ++i) {
+            buildSecondLevel(i);
+        }
+    }
+
+    bool contains(const K& key) const {
+        if (firstLevel.empty()) {
+            return false;
+        }
+
+        size_t bucket = hash1(key);
+        const vector<K>& bucketKeys = firstLevel[bucket];
+        
+        if (bucketKeys.empty()) {
+            return false;
+        }
+
+        size_t hash = hash2(key, secondLevel[bucket].size());
+        return secondLevel[bucket][hash];
+    }
+
+    bool insert(const K& key) {
+        return contains(key);
+    }
+
+    bool remove(const K& key) {
+        return false;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    size_t getTotalSize() const {
+        size_t total = firstLevel.size();
+        for (const auto& level : secondLevel) {
+            total += level.size();
+        }
+        return total;
+    }
+
+    void display() const {
+        cout << "Perfect Hash Set:" << endl;
+        cout << "Number of keys: " << size << endl;
+        cout << "First level size: " << firstLevel.size() << endl;
+        cout << "Total table size: " << getTotalSize() << endl;
+        
+        for (size_t i = 0; i < firstLevel.size(); ++i) {
+            cout << "Bucket " << i << " (" << firstLevel[i].size() << " keys): ";
+            for (const K& key : firstLevel[i]) {
+                cout << key << " ";
+            }
+            cout << endl;
+            
+            if (!secondLevel[i].empty()) {
+                cout << "  Second level (" << secondLevel[i].size() << "): ";
+                for (size_t j = 0; j < secondLevel[i].size(); ++j) {
+                    if (secondLevel[i][j]) {
+                        cout << "1 ";
+                    } else {
+                        cout << "0 ";
+                    }
+                }
+                cout << endl;
+            }
+        }
+    }
+
+    vector<K> getKeys() const {
+        vector<K> allKeys;
+        for (const auto& bucket : firstLevel) {
+            for (const K& key : bucket) {
+                allKeys.push_back(key);
+            }
+        }
+        return allKeys;
+    }
+};
+
+int main() {
+    vector<string> keys = {"apple", "banana", "orange", "grape", "mango", "pear", "peach"};
+    
+    PerfectHashSet<string> phs(keys);
+    
+    phs.display();
+    cout << endl;
+    
+    cout << "Total size: " << phs.getTotalSize() << endl;
+    cout << "Space efficiency: " << static_cast<double>(phs.getTotalSize()) / keys.size() << endl;
+    
+    cout << "\nMembership tests:" << endl;
+    for (const string& key : keys) {
+        cout << key << ": " << (phs.contains(key) ? "Present" : "Absent") << endl;
+    }
+    
+    cout << "\nNon-member tests:" << endl;
+    vector<string> nonKeys = {"cherry", "plum", "kiwi", "melon"};
+    for (const string& key : nonKeys) {
+        cout << key << ": " << (phs.contains(key) ? "Present" : "Absent") << endl;
+    }
+    
+    return 0;
+}

@@ -1,0 +1,204 @@
+// Link-Cut Tree Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct LCTNode {
+    LCTNode* parent;
+    LCTNode* left;
+    LCTNode* right;
+    int value;
+    bool isReversed;
+    
+    LCTNode(int val) : parent(nullptr), left(nullptr), right(nullptr), value(val), isReversed(false) {}
+    
+    void push() {
+        if (isReversed) {
+            swap(left, right);
+            if (left) left->isReversed = !left->isReversed;
+            if (right) right->isReversed = !right->isReversed;
+            isReversed = false;
+        }
+    }
+    
+    bool isRoot() {
+        return !parent || (parent->left != this && parent->right != this);
+    }
+};
+
+class LinkCutTree {
+private:
+    LCTNode** nodes;
+    int size;
+
+    void rotate(LCTNode* x) {
+        LCTNode* p = x->parent;
+        LCTNode* gp = p->parent;
+        
+        p->push();
+        x->push();
+        
+        if (p->left == x) {
+            p->left = x->right;
+            if (x->right) x->right->parent = p;
+            x->right = p;
+        } else {
+            p->right = x->left;
+            if (x->left) x->left->parent = p;
+            x->left = p;
+        }
+        
+        p->parent = x;
+        x->parent = gp;
+        
+        if (gp) {
+            if (gp->left == p) {
+                gp->left = x;
+            } else if (gp->right == p) {
+                gp->right = x;
+            }
+        }
+    }
+
+    void splay(LCTNode* x) {
+        while (!x->isRoot()) {
+            LCTNode* p = x->parent;
+            LCTNode* gp = p->parent;
+            
+            if (!p->isRoot()) {
+                if ((p->left == x) == (gp->left == p)) {
+                    rotate(p);
+                } else {
+                    rotate(x);
+                }
+            }
+            rotate(x);
+        }
+        x->push();
+    }
+
+    LCTNode* access(LCTNode* x) {
+        LCTNode* last = nullptr;
+        
+        for (LCTNode* y = x; y; y = y->parent) {
+            splay(y);
+            y->right = last;
+            last = y;
+        }
+        
+        splay(x);
+        return last;
+    }
+
+    void makeRoot(LCTNode* x) {
+        access(x);
+        x->isReversed = !x->isReversed;
+        x->push();
+    }
+
+    LCTNode* findRoot(LCTNode* x) {
+        access(x);
+        while (x->left) {
+            x = x->left;
+            x->push();
+        }
+        return x;
+    }
+
+    void linkHelper(LCTNode* u, LCTNode* v) {
+        makeRoot(u);
+        access(v);
+        u->parent = v;
+    }
+
+    void cutHelper(LCTNode* u, LCTNode* v) {
+        makeRoot(u);
+        access(v);
+        
+        if (v->left == u && !u->right) {
+            v->left = nullptr;
+            u->parent = nullptr;
+        }
+    }
+
+public:
+    LinkCutTree(int n) : size(n) {
+        nodes = new LCTNode*[n];
+        for (int i = 0; i < n; i++) {
+            nodes[i] = new LCTNode(i);
+        }
+    }
+
+    ~LinkCutTree() {
+        for (int i = 0; i < size; i++) {
+            delete nodes[i];
+        }
+        delete[] nodes;
+    }
+
+    void link(int u, int v) {
+        if (u >= 0 && u < size && v >= 0 && v < size) {
+            linkHelper(nodes[u], nodes[v]);
+        }
+    }
+
+    void cut(int u, int v) {
+        if (u >= 0 && u < size && v >= 0 && v < size) {
+            cutHelper(nodes[u], nodes[v]);
+        }
+    }
+
+    bool connected(int u, int v) {
+        if (u >= 0 && u < size && v >= 0 && v < size) {
+            return findRoot(nodes[u]) == findRoot(nodes[v]);
+        }
+        return false;
+    }
+
+    void display() {
+        cout << "Link-Cut Tree Structure:" << endl;
+        for (int i = 0; i < size; i++) {
+            cout << "Node " << i << ": ";
+            if (nodes[i]->parent) {
+                cout << "parent=" << nodes[i]->parent->value << " ";
+            }
+            if (nodes[i]->left) {
+                cout << "left=" << nodes[i]->left->value << " ";
+            }
+            if (nodes[i]->right) {
+                cout << "right=" << nodes[i]->right->value << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    LinkCutTree lct(6);
+    
+    cout << "Initial state:" << endl;
+    lct.display();
+    
+    lct.link(0, 1);
+    lct.link(1, 2);
+    lct.link(3, 4);
+    lct.link(4, 5);
+    
+    cout << "\nAfter linking:" << endl;
+    lct.display();
+    
+    cout << "\nConnectivity tests:" << endl;
+    cout << "0-2 connected: " << (lct.connected(0, 2) ? "Yes" : "No") << endl;
+    cout << "2-3 connected: " << (lct.connected(2, 3) ? "Yes" : "No") << endl;
+    cout << "3-5 connected: " << (lct.connected(3, 5) ? "Yes" : "No") << endl;
+    
+    lct.link(2, 3);
+    cout << "\nAfter linking 2-3:" << endl;
+    cout << "0-5 connected: " << (lct.connected(0, 5) ? "Yes" : "No") << endl;
+    
+    lct.cut(1, 2);
+    cout << "\nAfter cutting 1-2:" << endl;
+    cout << "0-5 connected: " << (lct.connected(0, 5) ? "Yes" : "No") << endl;
+    cout << "2-5 connected: " << (lct.connected(2, 5) ? "Yes" : "No") << endl;
+    
+    return 0;
+}

@@ -1,0 +1,122 @@
+// Free List Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct FreeListNode {
+    int data;
+    FreeListNode* next;
+    
+    FreeListNode(int val) : data(val), next(nullptr) {}
+};
+
+class FreeList {
+private:
+    FreeListNode* head;
+    FreeListNode* freeList;
+
+public:
+    FreeList() : head(nullptr), freeList(nullptr) {}
+
+    ~FreeList() {
+        FreeListNode* current = head;
+        while (current) {
+            FreeListNode* next = current->next;
+            delete current;
+            current = next;
+        }
+        
+        current = freeList;
+        while (current) {
+            FreeListNode* next = current->next;
+            delete current;
+            current = next;
+        }
+    }
+
+    void insert(int value) {
+        FreeListNode* newNode;
+        
+        if (freeList) {
+            newNode = freeList;
+            freeList = freeList->next;
+            newNode->data = value;
+            newNode->next = nullptr;
+        } else {
+            newNode = new FreeListNode(value);
+        }
+        
+        if (!head) {
+            head = newNode;
+        } else {
+            FreeListNode* current = head;
+            while (current->next) {
+                current = current->next;
+            }
+            current->next = newNode;
+        }
+    }
+
+    bool remove(int value) {
+        if (!head) return false;
+        
+        if (head->data == value) {
+            FreeListNode* temp = head;
+            head = head->next;
+            temp->next = freeList;
+            freeList = temp;
+            return true;
+        }
+        
+        FreeListNode* current = head;
+        while (current->next && current->next->data != value) {
+            current = current->next;
+        }
+        
+        if (current->next) {
+            FreeListNode* temp = current->next;
+            current->next = temp->next;
+            temp->next = freeList;
+            freeList = temp;
+            return true;
+        }
+        
+        return false;
+    }
+
+    void display() {
+        FreeListNode* current = head;
+        cout << "Active List: ";
+        while (current) {
+            cout << current->data << " -> ";
+            current = current->next;
+        }
+        cout << "nullptr" << endl;
+        
+        current = freeList;
+        cout << "Free List: ";
+        while (current) {
+            cout << current->data << " -> ";
+            current = current->next;
+        }
+        cout << "nullptr" << endl;
+    }
+};
+
+int main() {
+    FreeList fl;
+    fl.insert(10);
+    fl.insert(20);
+    fl.insert(30);
+    fl.insert(40);
+    fl.display();
+    
+    cout << "Removing 20..." << endl;
+    fl.remove(20);
+    fl.display();
+    
+    cout << "Removing 10..." << endl;
+    fl.remove(10);
+    fl.display();
+    
+    return 0;
+}

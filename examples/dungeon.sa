@@ -1,0 +1,336 @@
+/*
+ * ╔══════════════════════════════════════════╗
+ *     NUMBER DUNGEON  — Roguelike in C
+ *
+ *  Navigate a dungeon, fight monsters with
+ *  mental math, collect gold, find the exit!
+ *
+ *  WASD = move | Q = quit
+ *  Fight by walking into monsters.
+ *  Each fight: solve a math problem to deal
+ *  extra damage — or take full damage if wrong!
+ * ╚══════════════════════════════════════════╝
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+  #define CLEAR "cls"
+#else
+  #define CLEAR "clear"
+#endif
+
+#define ROWS  18
+#define COLS  40
+#define MAX_MONSTERS 12
+#define MAX_GOLD     10
+#define MAX_LOG       6
+
+/* ── tile types ── */
+#define T_WALL  '#'
+#define T_FLOOR '.'
+#define T_EXIT  'E'
+
+/* ── entity types ── */
+#define MON_GOBLIN  'g'
+#define MON_ORC     'O'
+#define MON_DRAGON  'D'
+#define GOLD_COIN   '$'
+
+typedef struct {
+    int r, c;
+    char type;
+    int hp, max_hp, atk;
+    int alive;
+} Entity;
+
+/* ── globals ── */
+char map[ROWS][COLS];
+Entity monsters[MAX_MONSTERS];
+int   mon_count;
+Entity gold_piles[MAX_GOLD];
+int   gold_count;
+
+int   p_r, p_c;
+int   p_hp = 20, p_max_hp = 20;
+int   p_gold = 0;
+int   floor_num = 1;
+int   game_over = 0, won = 0;
+
+char  log_lines[MAX_LOG][80];
+int   log_head = 0;
+
+/* ── logging ── */
+void log_msg(const char *msg) {
+    strncpy(log_lines[log_head % MAX_LOG], msg, 79);
+    log_lines[log_head % MAX_LOG][79] = '\0';
+    log_head++;
+}
+
+/* ── map generation (simple room + corridors) ── */
+void fill_map(void) {
+    for (int r=0;r<ROWS;r++) for (int c=0;c<COLS;c++) map[r][c]=T_WALL;
+}
+
+void carve_rect(int r1,int c1,int r2,int c2) {
+    for (int r=r1;r<=r2;r++) for(int c=c1;c<=c2;c++) map[r][c]=T_FLOOR;
+}
+
+void carve_hcorridor(int r,int c1,int c2) {
+    if (c1>c2){int t=c1;c1=c2;c2=t;}
+    for (int c=c1;c<=c2;c++) map[r][c]=T_FLOOR;
+}
+void carve_vcorridor(int c,int r1,int r2) {
+    if (r1>r2){int t=r1;r1=r2;r2=t;}
+    for (int r=r1;r<=r2;r++) map[r][c]=T_FLOOR;
+}
+
+typedef struct { int r,c,w,h; } Room;
+#define MAX_ROOMS 6
+Room rooms[MAX_ROOMS];
+int  room_count;
+
+void gen_map(void) {
+    fill_map();
+    room_count = 0;
+    int attempts = 0;
+    while (room_count < MAX_ROOMS && attempts < 200) {
+        attempts++;
+        int w = 4 + rand()%5, h = 3 + rand()%4;
+        int r = 1 + rand()%(ROWS-h-2);
+        int c = 1 + rand()%(COLS-w-2);
+        /* check overlap */
+        int ok=1;
+        for(int i=0;i<room_count;i++){
+            Room *rm=&rooms[i];
+            if (r<rm->r+rm->h+1 && r+h>rm->r-1 && c<rm->c+rm->w+1 && c+w>rm->c-1){ok=0;break;}
+        }
+        if (!ok) continue;
+        carve_rect(r, c, r+h-1, c+w-1);
+        rooms[room_count++] = (Room){r,c,w,h};
+    }
+    /* connect rooms */
+    for (int i=1;i<room_count;i++) {
+        int pr = rooms[i-1].r + rooms[i-1].h/2;
+        int pc = rooms[i-1].c + rooms[i-1].w/2;
+        int nr = rooms[i].r   + rooms[i].h/2;
+        int nc = rooms[i].c   + rooms[i].w/2;
+        carve_hcorridor(pr, pc, nc);
+        carve_vcorridor(nc, pr, nr);
+    }
+    /* place exit in last room */
+    Room *last = &rooms[room_count-1];
+    map[last->r + last->h/2][last->c + last->w/2] = T_EXIT;
+}
+
+int rand_floor(int *rout, int *cout) {
+    for (int t=0;t<1000;t++){
+        int r=rand()%ROWS, c=rand()%COLS;
+        if (map[r][c]==T_FLOOR){*rout=r;*cout=c;return 1;}
+    }
+    return 0;
+}
+
+void spawn_entities(void) {
+    mon_count  = 0;
+    gold_count = 0;
+    int num_mon  = 4 + floor_num * 2;  if (num_mon  > MAX_MONSTERS) num_mon  = MAX_MONSTERS;
+    int num_gold = 3 + floor_num;      if (num_gold > MAX_GOLD)     num_gold = MAX_GOLD;
+
+    for (int i=0;i<num_mon;i++) {
+        int r,c;
+        if (!rand_floor(&r,&c)) continue;
+        Entity *m = &monsters[mon_count++];
+        m->alive = 1;
+        m->r = r; m->c = c;
+        int roll = rand()%10;
+        if (roll < 5)       { m->type=MON_GOBLIN; m->max_hp=4+floor_num;  m->atk=2+floor_num/2; }
+        else if (roll < 8)  { m->type=MON_ORC;    m->max_hp=8+floor_num*2;m->atk=4+floor_num; }
+        else                { m->type=MON_DRAGON;  m->max_hp=14+floor_num*3;m->atk=7+floor_num*2;}
+        m->hp = m->max_hp;
+    }
+    for (int i=0;i<num_gold;i++) {
+        int r,c;
+        if (!rand_floor(&r,&c)) continue;
+        gold_piles[gold_count++] = (Entity){r,c,GOLD_COIN,1,1,0,1};
+    }
+}
+
+void init_floor(void) {
+    gen_map();
+    /* player in first room center */
+    p_r = rooms[0].r + rooms[0].h/2;
+    p_c = rooms[0].c + rooms[0].w/2;
+    spawn_entities();
+    char buf[60];
+    snprintf(buf,sizeof(buf),"-- Entered floor %d --", floor_num);
+    log_msg(buf);
+}
+
+/* ── math challenge ── */
+int math_challenge(int difficulty) {
+    int a = 2 + rand()%(4*difficulty);
+    int b = 1 + rand()%(3*difficulty);
+    int op = rand()%3;
+    int answer, correct;
+    char question[60];
+    if (op==0){ answer=a+b; snprintf(question,sizeof(question),"  %d + %d = ? ", a, b); }
+    else if(op==1){ answer=a*b; snprintf(question,sizeof(question),"  %d x %d = ? ", a, b); }
+    else { answer=a-b; snprintf(question,sizeof(question),"  %d - %d = ? ", a, b); }
+
+    printf("\n  [MATH CHALLENGE] %s", question);
+    int guess;
+    if (scanf("%d",&guess)!=1) guess=-9999;
+    /* flush */
+    int ch; while((ch=getchar())!='\n'&&ch!=EOF);
+    correct = (guess == answer);
+    if (correct) printf("  CORRECT! Deal double damage!\n");
+    else printf("  Wrong! (answer: %d) — you deal half damage!\n", answer);
+    return correct;
+}
+
+/* ── combat ── */
+void fight(Entity *m) {
+    printf("\n");
+    printf("  *** COMBAT: You vs %c (HP:%d/%d ATK:%d) ***\n",
+           m->type, m->hp, m->max_hp, m->atk);
+
+    int diff = (m->type==MON_GOBLIN)?1:(m->type==MON_ORC)?2:3;
+    int correct = math_challenge(diff);
+
+    int p_dmg = 3 + floor_num + (correct ? 3 : 0);
+    if (!correct) p_dmg = p_dmg / 2 + 1;
+    int m_dmg = m->atk - (correct ? 1 : 0);
+    if (m_dmg < 1) m_dmg = 1;
+
+    m->hp -= p_dmg;
+    p_hp  -= m_dmg;
+
+    char buf[80];
+    if (m->hp <= 0) {
+        m->alive = 0;
+        int loot = 2 + rand()%4;
+        p_gold += loot;
+        snprintf(buf,sizeof(buf),"Defeated %c! Got %d gold. You took %d dmg.", m->type, loot, m_dmg);
+    } else {
+        snprintf(buf,sizeof(buf),"Hit %c for %d dmg (HP:%d). Took %d dmg.", m->type, p_dmg, m->hp, m_dmg);
+    }
+    log_msg(buf);
+    printf("  %s\n", buf);
+    printf("  Press ENTER to continue...");
+    getchar();
+}
+
+/* ── draw ── */
+void draw(void) {
+    system(CLEAR);
+    printf("\n  NUMBER DUNGEON  |  Floor %d  |  HP: %d/%d  |  Gold: %d\n",
+           floor_num, p_hp, p_max_hp, p_gold);
+    printf("  WASD=move | Walk into monsters to fight | Q=quit\n\n");
+
+    /* build display */
+    char display[ROWS][COLS+1];
+    for (int r=0;r<ROWS;r++){memcpy(display[r],map[r],COLS);display[r][COLS]='\0';}
+
+    for (int i=0;i<gold_count;i++)
+        if (gold_piles[i].alive)
+            display[gold_piles[i].r][gold_piles[i].c] = GOLD_COIN;
+    for (int i=0;i<mon_count;i++)
+        if (monsters[i].alive)
+            display[monsters[i].r][monsters[i].c] = monsters[i].type;
+    display[p_r][p_c] = '@';
+
+    for (int r=0;r<ROWS;r++) printf("  %s\n", display[r]);
+
+    printf("\n  Legend: @ you  g goblin  O orc  D dragon  $ gold  E exit  # wall\n\n");
+    printf("  -- Messages --\n");
+    int start = log_head - MAX_LOG;
+    if (start < 0) start = 0;
+    for (int i=start; i<log_head; i++)
+        printf("  > %s\n", log_lines[i%MAX_LOG]);
+    printf("\n");
+}
+
+/* ── move ── */
+void try_move(int dr, int dc) {
+    int nr = p_r + dr, nc = p_c + dc;
+    if (nr<0||nr>=ROWS||nc<0||nc>=COLS) return;
+    if (map[nr][nc]==T_WALL) return;
+
+    /* check monsters */
+    for (int i=0;i<mon_count;i++) {
+        if (monsters[i].alive && monsters[i].r==nr && monsters[i].c==nc) {
+            fight(&monsters[i]);
+            if (p_hp <= 0) { game_over = 1; }
+            return;
+        }
+    }
+    /* pick up gold */
+    for (int i=0;i<gold_count;i++) {
+        if (gold_piles[i].alive && gold_piles[i].r==nr && gold_piles[i].c==nc) {
+            int amt = 5 + rand()%10;
+            p_gold += amt;
+            gold_piles[i].alive = 0;
+            char buf[60];
+            snprintf(buf,sizeof(buf),"Picked up %d gold! Total: %d", amt, p_gold);
+            log_msg(buf);
+        }
+    }
+    /* move */
+    p_r = nr; p_c = nc;
+
+    /* check exit */
+    if (map[nr][nc]==T_EXIT) {
+        floor_num++;
+        if (floor_num > 5) { won = 1; return; }
+        /* heal a bit between floors */
+        p_hp += 5; if (p_hp > p_max_hp) p_max_hp += 3, p_hp = p_max_hp;
+        init_floor();
+    }
+}
+
+/* ── main ── */
+int main(void) {
+    srand((unsigned)time(NULL));
+
+    printf("\n  ╔══════════════════════════════════╗\n");
+    printf("  ║      NUMBER DUNGEON v1.0         ║\n");
+    printf("  ║  A math-powered roguelike in C   ║\n");
+    printf("  ╚══════════════════════════════════╝\n\n");
+    printf("  Survive 5 floors of monster-filled dungeons!\n");
+    printf("  When you fight, solve a math problem fast.\n");
+    printf("  Correct = BONUS damage. Wrong = PENALTY!\n\n");
+    printf("  Press ENTER to begin...\n");
+    getchar();
+
+    memset(log_lines, 0, sizeof(log_lines));
+    init_floor();
+
+    while (!game_over && !won) {
+        draw();
+        char c = getchar();
+        /* flush rest of line */
+        if (c != '\n') { int ch; while((ch=getchar())!='\n'&&ch!=EOF); }
+        if (c=='q'||c=='Q') break;
+        if (c=='w'||c=='W') try_move(-1, 0);
+        if (c=='s'||c=='S') try_move(+1, 0);
+        if (c=='a'||c=='A') try_move( 0,-1);
+        if (c=='d'||c=='D') try_move( 0,+1);
+    }
+
+    system(CLEAR);
+    if (won) {
+        printf("\n  *** YOU ESCAPED THE DUNGEON! ***\n");
+        printf("  Floors cleared: 5  |  Final gold: %d\n\n", p_gold);
+    } else if (game_over) {
+        printf("\n  *** YOU DIED on floor %d ***\n", floor_num);
+        printf("  Gold collected: %d\n\n", p_gold);
+    } else {
+        printf("\n  You fled the dungeon with %d gold.\n\n", p_gold);
+    }
+    return 0;
+}

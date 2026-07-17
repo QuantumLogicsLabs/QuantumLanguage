@@ -1,0 +1,352 @@
+// Persistent Hash Table Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+#include <memory>
+#include <functional>
+using namespace std;
+
+template<typename K, typename V>
+class PersistentHashTable {
+private:
+    struct Node {
+        K key;
+        V value;
+        shared_ptr<Node> next;
+        
+        Node(const K& k, const V& v, shared_ptr<Node> n = nullptr) 
+            : key(k), value(v), next(n) {}
+    };
+
+    struct Bucket {
+        shared_ptr<Node> head;
+        size_t size;
+        
+        Bucket() : head(nullptr), size(0) {}
+        Bucket(shared_ptr<Node> h, size_t s) : head(h), size(s) {}
+    };
+
+    vector<shared_ptr<Bucket>> buckets;
+    size_t capacity;
+    size_t size;
+    hash<K> hasher;
+
+    size_t hashFunction(const K& key) const {
+        return hasher(key) % capacity;
+    }
+
+    shared_ptr<Bucket> createBucketWithEntry(shared_ptr<Bucket> oldBucket, 
+                                              const K& key, const V& value, bool update) {
+        shared_ptr<Node> newHead = oldBucket->head;
+        bool found = false;
+        
+        // Check if key already exists
+        shared_ptr<Node> current = newHead;
+        while (current) {
+            if (current->key == key) {
+                found = true;
+                break;
+            }
+            current = current->next;
+        }
+        
+        if (found) {
+            if (!update) {
+                return oldBucket; // Don't update existing entry
+            }
+            
+            // Update existing entry
+            shared_ptr<Node> newHeadCopy = nullptr;
+            current = oldBucket->head;
+            
+            while (current) {
+                if (current->key == key) {
+                    newHeadCopy = make_shared<Node>(key, value, current->next);
+                } else {
+                    newHeadCopy = make_shared<Node>(current->key, current->value, newHeadCopy);
+                }
+                current = current->next;
+            }
+            
+            return make_shared<Bucket>(newHeadCopy, oldBucket->size);
+        } else {
+            // Add new entry
+            shared_ptr<Node> newEntry = make_shared<Node>(key, value, newHead);
+            return make_shared<Bucket>(newEntry, oldBucket->size + 1);
+        }
+    }
+
+    shared_ptr<Bucket> createBucketWithoutEntry(shared_ptr<Bucket> oldBucket, const K& key) {
+        shared_ptr<Node> newHead = nullptr;
+        shared_ptr<Node> current = oldBucket->head;
+        bool found = false;
+        
+        while (current) {
+            if (current->key != key) {
+                newHead = make_shared<Node>(current->key, current->value, newHead);
+            } else {
+                found = true;
+            }
+            current = current->next;
+        }
+        
+        return make_shared<Bucket>(newHead, found ? oldBucket->size - 1 : oldBucket->size);
+    }
+
+    shared_ptr<vector<shared_ptr<Bucket>>> rehash(shared_ptr<vector<shared_ptr<Bucket>>> oldBuckets, 
+                                                     size_t newCapacity) {
+        auto newBuckets = make_shared<vector<shared_ptr<Bucket>>>();
+        newBuckets->resize(newCapacity);
+        
+        for (size_t i = 0; i < newCapacity; ++i) {
+            (*newBuckets)[i] = make_shared<Bucket>();
+        }
+        
+        for (size_t i = 0; i < oldBuckets->size(); ++i) {
+            shared_ptr<Node> current = (*oldBuckets)[i]->head;
+            
+            while (current) {
+                size_t newIndex = hasher(current->key) % newCapacity;
+                (*newBuckets)[newIndex] = createBucketWithEntry((*newBuckets)[newIndex], 
+                                                               current->key, current->value, false);
+                current = current->next;
+            }
+        }
+        
+        return newBuckets;
+    }
+
+public:
+    PersistentHashTable(size_t initialCapacity = 16) : capacity(initialCapacity), size(0) {
+        buckets = make_shared<vector<shared_ptr<Bucket>>>();
+        buckets->resize(capacity);
+        
+        for (size_t i = 0; i < capacity; ++i) {
+            (*buckets)[i] = make_shared<Bucket>();
+        }
+    }
+
+    PersistentHashTable(shared_ptr<vector<shared_ptr<Bucket>>> b, size_t s, size_t c) 
+        : buckets(b), size(s), capacity(c) {}
+
+    PersistentHashTable insert(const K& key, const V& value) const {
+        size_t index = hashFunction(key);
+        
+        // Check if we need to rehash
+        if (static_cast<double>(size + 1) / capacity > 0.75) {
+            size_t newCapacity = capacity * 2;
+            auto newBuckets = rehash(buckets, newCapacity);
+            index = hasher(key) % newCapacity;
+            
+            (*newBuckets)[index] = createBucketWithEntry((*newBuckets)[index], key, value, false);
+            
+            return PersistentHashTable(newBuckets, size + 1, newCapacity);
+        }
+        
+        auto newBuckets = make_shared<vector<shared_ptr<Bucket>>>(*buckets);
+        (*newBuckets)[index] = createBucketWithEntry((*newBuckets)[index], key, value, false);
+        
+        // Check if key already existed
+        shared_ptr<Node> current = (*buckets)[index]->head;
+        bool keyExists = false;
+        while (current) {
+            if (current->key == key) {
+                keyExists = true;
+                break;
+            }
+            current = current->next;
+        }
+        
+        return PersistentHashTable(newBuckets, keyExists ? size : size + 1, capacity);
+    }
+
+    PersistentHashTable remove(const K& key) const {
+        size_t index = hashFunction(key);
+        
+        auto newBuckets = make_shared<vector<shared_ptr<Bucket>>>(*buckets);
+        (*newBuckets)[index] = createBucketWithoutEntry((*newBuckets)[index], key);
+        
+        // Check if key existed
+        shared_ptr<Node> current = (*buckets)[index]->head;
+        bool keyExists = false;
+        while (current) {
+            if (current->key == key) {
+                keyExists = true;
+                break;
+            }
+            current = current->next;
+        }
+        
+        return PersistentHashTable(newBuckets, keyExists ? size - 1 : size, capacity);
+    }
+
+    V* find(const K& key) const {
+        size_t index = hashFunction(key);
+        shared_ptr<Node> current = (*buckets)[index]->head;
+        
+        while (current) {
+            if (current->key == key) {
+                return &current->value;
+            }
+            current = current->next;
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) const {
+        return find(key) != nullptr;
+    }
+
+    size_t getSize() const { return size; }
+    size_t getCapacity() const { return capacity; }
+
+    vector<pair<K, V>> getAll() const {
+        vector<pair<K, V>> result;
+        
+        for (size_t i = 0; i < capacity; ++i) {
+            shared_ptr<Node> current = (*buckets)[i]->head;
+            while (current) {
+                result.emplace_back(current->key, current->value);
+                current = current->next;
+            }
+        }
+        
+        return result;
+    }
+
+    void display() const {
+        cout << "Persistent Hash Table:" << endl;
+        cout << "Size: " << size << ", Capacity: " << capacity << endl;
+        
+        for (size_t i = 0; i < capacity; ++i) {
+            shared_ptr<Node> current = (*buckets)[i]->head;
+            if (current) {
+                cout << "Bucket " << i << ": ";
+                while (current) {
+                    cout << "[" << current->key << ": " << current->value << "] ";
+                    current = current->next;
+                }
+                cout << endl;
+            }
+        }
+    }
+
+    // Version history support
+    class Version {
+    private:
+        PersistentHashTable hashTable;
+        string description;
+
+    public:
+        Version(const PersistentHashTable& ht, const string& desc) 
+            : hashTable(ht), description(desc) {}
+
+        const PersistentHashTable& getHashTable() const { return hashTable; }
+        const string& getDescription() const { return description; }
+    };
+
+    // Create a new version with a description
+    Version createVersion(const string& description) const {
+        return Version(*this, description);
+    }
+};
+
+// Version history manager
+template<typename K, typename V>
+class HashTableVersionManager {
+private:
+    vector<typename PersistentHashTable<K, V>::Version> versions;
+
+public:
+    void addVersion(const PersistentHashTable<K, V>& hashTable, const string& description) {
+        versions.emplace_back(hashTable, description);
+    }
+
+    const PersistentHashTable<K, V>& getVersion(size_t index) const {
+        return versions[index].getHashTable();
+    }
+
+    const string& getVersionDescription(size_t index) const {
+        return versions[index].getDescription();
+    }
+
+    size_t getVersionCount() const {
+        return versions.size();
+    }
+
+    void displayVersionHistory() const {
+        cout << "Version History:" << endl;
+        for (size_t i = 0; i < versions.size(); ++i) {
+            cout << "Version " << i << ": " << versions[i].getDescription() 
+                 << " (Size: " << versions[i].getHashTable().getSize() << ")" << endl;
+        }
+    }
+};
+
+int main() {
+    cout << "=== Persistent Hash Table ===" << endl;
+    PersistentHashTable<string, int> pht;
+    
+    HashTableVersionManager<string, int> versionManager;
+    
+    // Initial version
+    pht = pht.insert("apple", 5);
+    pht = pht.insert("banana", 3);
+    pht = pht.insert("orange", 7);
+    
+    versionManager.addVersion(pht, "Initial state");
+    
+    cout << "Initial state:" << endl;
+    pht.display();
+    cout << endl;
+    
+    // Version 1
+    pht = pht.insert("grape", 2);
+    pht = pht.insert("mango", 4);
+    
+    versionManager.addVersion(pht, "Added grape and mango");
+    
+    cout << "After adding grape and mango:" << endl;
+    pht.display();
+    cout << endl;
+    
+    // Version 2
+    pht = pht.remove("banana");
+    pht = pht.insert("peach", 6);
+    
+    versionManager.addVersion(pht, "Removed banana, added peach");
+    
+    cout << "After removing banana and adding peach:" << endl;
+    pht.display();
+    cout << endl;
+    
+    // Version 3
+    pht = pht.insert("apple", 10); // Update existing
+    
+    versionManager.addVersion(pht, "Updated apple value");
+    
+    cout << "After updating apple:" << endl;
+    pht.display();
+    cout << endl;
+    
+    // Display version history
+    versionManager.displayVersionHistory();
+    cout << endl;
+    
+    // Demonstrate immutability
+    cout << "=== Immutability Demo ===" << endl;
+    auto version1 = versionManager.getVersion(1);
+    auto version2 = versionManager.getVersion(2);
+    
+    cout << "Version 1 contains apple: " << (version1.contains("apple") ? "Yes" : "No") << endl;
+    cout << "Version 1 apple value: " << *(version1.find("apple")) << endl;
+    
+    cout << "Version 2 contains banana: " << (version2.contains("banana") ? "Yes" : "No") << endl;
+    cout << "Version 2 contains peach: " << (version2.contains("peach") ? "Yes" : "No") << endl;
+    
+    // Show that original version is unchanged
+    cout << "Original version still has size: " << pht.getSize() << endl;
+    
+    return 0;
+}

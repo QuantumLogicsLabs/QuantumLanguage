@@ -1,0 +1,234 @@
+// Bloom Filter Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+#include <functional>
+using namespace std;
+
+class BloomFilter {
+private:
+    vector<bool> bitArray;
+    size_t size;
+    size_t hashCount;
+    vector<hash<string>> hashFunctions;
+
+    size_t hash1(const string& str) const {
+        hash<string> hasher;
+        return hasher(str) % size;
+    }
+
+    size_t hash2(const string& str) const {
+        hash<string> hasher;
+        return (hasher(str) * 2654435761) % size;
+    }
+
+    size_t hash3(const string& str) const {
+        hash<string> hasher;
+        return (hasher(str) * 1607) % size;
+    }
+
+public:
+    BloomFilter(size_t bitArraySize, size_t numHashes) : size(bitArraySize), hashCount(numHashes) {
+        bitArray.resize(size, false);
+        hashFunctions.resize(hashCount);
+    }
+
+    void add(const string& item) {
+        vector<size_t> indices = getHashIndices(item);
+        for (size_t index : indices) {
+            bitArray[index] = true;
+        }
+    }
+
+    bool possiblyContains(const string& item) const {
+        vector<size_t> indices = getHashIndices(item);
+        for (size_t index : indices) {
+            if (!bitArray[index]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void clear() {
+        fill(bitArray.begin(), bitArray.end(), false);
+    }
+
+    double getFalsePositiveRate(size_t expectedItems) const {
+        double exp = -static_cast<double>(hashCount * expectedItems) / size;
+        return pow(1 - exp(exp), hashCount);
+    }
+
+    size_t getBitCount() const {
+        size_t count = 0;
+        for (bool bit : bitArray) {
+            if (bit) count++;
+        }
+        return count;
+    }
+
+    double getLoadFactor() const {
+        return static_cast<double>(getBitCount()) / size;
+    }
+
+    void display() const {
+        cout << "Bloom Filter:" << endl;
+        cout << "Bit array size: " << size << endl;
+        cout << "Hash functions: " << hashCount << endl;
+        cout << "Bits set: " << getBitCount() << "/" << size << endl;
+        cout << "Load factor: " << getLoadFactor() << endl;
+        
+        cout << "Bit array: ";
+        for (size_t i = 0; i < min(size, size_t(64)); ++i) {
+            cout << (bitArray[i] ? "1" : "0");
+        }
+        if (size > 64) {
+            cout << "...";
+        }
+        cout << endl;
+    }
+
+private:
+    vector<size_t> getHashIndices(const string& item) const {
+        vector<size_t> indices;
+        indices.reserve(hashCount);
+        
+        size_t h1 = hash1(item);
+        size_t h2 = hash2(item);
+        
+        for (size_t i = 0; i < hashCount; ++i) {
+            indices.push_back((h1 + i * h2) % size);
+        }
+        
+        return indices;
+    }
+};
+
+class CountingBloomFilter {
+private:
+    vector<unsigned char> counterArray;
+    size_t size;
+    size_t hashCount;
+
+    size_t hash1(const string& str) const {
+        hash<string> hasher;
+        return hasher(str) % size;
+    }
+
+    size_t hash2(const string& str) const {
+        hash<string> hasher;
+        return (hasher(str) * 2654435761) % size;
+    }
+
+    vector<size_t> getHashIndices(const string& item) const {
+        vector<size_t> indices;
+        indices.reserve(hashCount);
+        
+        size_t h1 = hash1(item);
+        size_t h2 = hash2(item);
+        
+        for (size_t i = 0; i < hashCount; ++i) {
+            indices.push_back((h1 + i * h2) % size);
+        }
+        
+        return indices;
+    }
+
+public:
+    CountingBloomFilter(size_t bitArraySize, size_t numHashes) : size(bitArraySize), hashCount(numHashes) {
+        counterArray.resize(size, 0);
+    }
+
+    void add(const string& item) {
+        vector<size_t> indices = getHashIndices(item);
+        for (size_t index : indices) {
+            if (counterArray[index] < 255) {
+                counterArray[index]++;
+            }
+        }
+    }
+
+    void remove(const string& item) {
+        vector<size_t> indices = getHashIndices(item);
+        for (size_t index : indices) {
+            if (counterArray[index] > 0) {
+                counterArray[index]--;
+            }
+        }
+    }
+
+    bool possiblyContains(const string& item) const {
+        vector<size_t> indices = getHashIndices(item);
+        for (size_t index : indices) {
+            if (counterArray[index] == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void display() const {
+        cout << "Counting Bloom Filter:" << endl;
+        cout << "Counter array size: " << size << endl;
+        cout << "Hash functions: " << hashCount << endl;
+        
+        size_t nonZeroCount = 0;
+        for (unsigned char count : counterArray) {
+            if (count > 0) nonZeroCount++;
+        }
+        cout << "Non-zero counters: " << nonZeroCount << "/" << size << endl;
+        
+        cout << "Counter array: ";
+        for (size_t i = 0; i < min(size, size_t(32)); ++i) {
+            cout << static_cast<int>(counterArray[i]) << " ";
+        }
+        if (size > 32) {
+            cout << "...";
+        }
+        cout << endl;
+    }
+};
+
+int main() {
+    cout << "=== Standard Bloom Filter ===" << endl;
+    BloomFilter bf(1000, 3);
+    
+    vector<string> words = {"apple", "banana", "orange", "grape", "mango", "pear", "peach"};
+    
+    for (const string& word : words) {
+        bf.add(word);
+    }
+    
+    bf.display();
+    cout << endl;
+    
+    cout << "Membership tests:" << endl;
+    for (const string& word : words) {
+        cout << word << ": " << (bf.possiblyContains(word) ? "Possibly present" : "Definitely not present") << endl;
+    }
+    
+    vector<string> testWords = {"cherry", "plum", "kiwi", "apple", "banana"};
+    for (const string& word : testWords) {
+        cout << word << ": " << (bf.possiblyContains(word) ? "Possibly present" : "Definitely not present") << endl;
+    }
+    
+    cout << "\nEstimated false positive rate for 10 items: " << bf.getFalsePositiveRate(10) << endl;
+    cout << "Estimated false positive rate for 100 items: " << bf.getFalsePositiveRate(100) << endl;
+    
+    cout << "\n=== Counting Bloom Filter ===" << endl;
+    CountingBloomFilter cbf(1000, 3);
+    
+    for (const string& word : words) {
+        cbf.add(word);
+    }
+    
+    cbf.display();
+    cout << endl;
+    
+    cout << "Before removal - Contains 'apple': " << (cbf.possiblyContains("apple") ? "Yes" : "No") << endl;
+    cbf.remove("apple");
+    cout << "After removal - Contains 'apple': " << (cbf.possiblyContains("apple") ? "Yes" : "No") << endl;
+    cout << "Contains 'banana': " << (cbf.possiblyContains("banana") ? "Yes" : "No") << endl;
+    
+    return 0;
+}

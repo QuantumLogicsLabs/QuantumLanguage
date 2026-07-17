@@ -1,0 +1,251 @@
+// HyperLogLog Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <algorithm>
+using namespace std;
+
+class HyperLogLog {
+private:
+    vector<uint8_t> registers;
+    size_t numRegisters;
+    double alpha;
+    hash<string> hasher;
+
+    uint32_t hashFunction(const string& str) const {
+        return hasher(str);
+    }
+
+    uint32_t getBits(uint32_t value, int start, int length) const {
+        uint32_t mask = (1 << length) - 1;
+        return (value >> start) & mask;
+    }
+
+    uint8_t countLeadingZeros(uint32_t value) const {
+        if (value == 0) return 32;
+        
+        uint8_t count = 0;
+        while ((value & 0x80000000) == 0 && count < 32) {
+            count++;
+            value <<= 1;
+        }
+        return count;
+    }
+
+    double getAlpha() const {
+        if (numRegisters == 16) return 0.673;
+        if (numRegisters == 32) return 0.697;
+        if (numRegisters == 64) return 0.709;
+        return 0.7213 / (1 + 1.079 / numRegisters);
+    }
+
+public:
+    HyperLogLog(size_t precision = 14) : numRegisters(1 << precision) {
+        registers.resize(numRegisters, 0);
+        alpha = getAlpha();
+    }
+
+    void add(const string& item) {
+        uint32_t hashValue = hashFunction(item);
+        
+        size_t registerIndex = getBits(hashValue, 32 - log2(numRegisters), log2(numRegisters));
+        uint32_t remainingBits = getBits(hashValue, 0, 32 - log2(numRegisters)) | (1 << (32 - log2(numRegisters)));
+        
+        uint8_t leadingZeros = countLeadingZeros(remainingBits);
+        registers[registerIndex] = max(registers[registerIndex], leadingZeros);
+    }
+
+    double estimate() const {
+        double sum = 0.0;
+        for (uint8_t register : registers) {
+            sum += pow(2.0, -static_cast<double>(register));
+        }
+        
+        double estimate = alpha * numRegisters * numRegisters / sum;
+        
+        if (estimate <= 2.5 * numRegisters) {
+            size_t zeroCount = 0;
+            for (uint8_t register : registers) {
+                if (register == 0) zeroCount++;
+            }
+            
+            if (zeroCount != 0) {
+                estimate = numRegisters * log(static_cast<double>(numRegisters) / zeroCount);
+            }
+        } else if (estimate > pow(2.0, 32) / 30.0) {
+            estimate = -pow(2.0, 32) * log(1.0 - estimate / pow(2.0, 32));
+        }
+        
+        return estimate;
+    }
+
+    void merge(const HyperLogLog& other) {
+        if (numRegisters != other.numRegisters) {
+            throw runtime_error("Cannot merge HyperLogLog instances with different precision");
+        }
+        
+        for (size_t i = 0; i < numRegisters; ++i) {
+            registers[i] = max(registers[i], other.registers[i]);
+        }
+    }
+
+    void clear() {
+        fill(registers.begin(), registers.end(), 0);
+    }
+
+    size_t getRegisterCount() const {
+        return numRegisters;
+    }
+
+    size_t getPrecision() const {
+        return log2(numRegisters);
+    }
+
+    double getRelativeError() const {
+        return 1.04 / sqrt(numRegisters);
+    }
+
+    void display() const {
+        cout << "HyperLogLog:" << endl;
+        cout << "Precision: " << getPrecision() << " bits" << endl;
+        cout << "Registers: " << numRegisters << endl;
+        cout << "Relative error: ±" << (getRelativeError() * 100) << "%" << endl;
+        cout << "Current estimate: " << estimate() << endl;
+        
+        cout << "Register distribution (first 16): ";
+        for (size_t i = 0; i < min(numRegisters, size_t(16)); ++i) {
+            cout << static_cast<int>(registers[i]) << " ";
+        }
+        if (numRegisters > 16) cout << "...";
+        cout << endl;
+        
+        size_t zeroCount = 0;
+        for (uint8_t register : registers) {
+            if (register == 0) zeroCount++;
+        }
+        cout << "Zero registers: " << zeroCount << "/" << numRegisters << endl;
+    }
+
+    vector<uint8_t> getRegisters() const {
+        return registers;
+    }
+};
+
+class MinHash {
+private:
+    vector<uint32_t> minHashes;
+    size_t numHashes;
+    vector<hash<string>> hashFunctions;
+
+public:
+    MinHash(size_t numHashFunctions) : numHashes(numHashes) {
+        minHashes.resize(numHashes, numeric_limits<uint32_t>::max());
+        hashFunctions.resize(numHashes);
+    }
+
+    void add(const string& item) {
+        for (size_t i = 0; i < numHashes; ++i) {
+            uint32_t hashValue = hashFunctions[i](item);
+            minHashes[i] = min(minHashes[i], hashValue);
+        }
+    }
+
+    double estimateJaccard(const MinHash& other) const {
+        if (numHashes != other.numHashes) {
+            throw runtime_error("Cannot compare MinHash instances with different number of hash functions");
+        }
+        
+        size_t matches = 0;
+        for (size_t i = 0; i < numHashes; ++i) {
+            if (minHashes[i] == other.minHashes[i]) {
+                matches++;
+            }
+        }
+        
+        return static_cast<double>(matches) / numHashes;
+    }
+
+    void merge(const MinHash& other) {
+        if (numHashes != other.numHashes) {
+            throw runtime_error("Cannot merge MinHash instances with different number of hash functions");
+        }
+        
+        for (size_t i = 0; i < numHashes; ++i) {
+            minHashes[i] = min(minHashes[i], other.minHashes[i]);
+        }
+    }
+
+    void clear() {
+        fill(minHashes.begin(), minHashes.end(), numeric_limits<uint32_t>::max());
+    }
+
+    void display() const {
+        cout << "MinHash:" << endl;
+        cout << "Hash functions: " << numHashes << endl;
+        cout << "Min hash values (first 10): ";
+        for (size_t i = 0; i < min(numHashes, size_t(10)); ++i) {
+            cout << minHashes[i] << " ";
+        }
+        if (numHashes > 10) cout << "...";
+        cout << endl;
+    }
+};
+
+int main() {
+    cout << "=== HyperLogLog ===" << endl;
+    HyperLogLog hll(10);
+    
+    vector<string> items;
+    for (int i = 0; i < 1000; ++i) {
+        items.push_back("item_" + to_string(i));
+    }
+    
+    for (const string& item : items) {
+        hll.add(item);
+    }
+    
+    hll.display();
+    cout << endl;
+    
+    cout << "Actual count: " << items.size() << endl;
+    cout << "Estimated count: " << hll.estimate() << endl;
+    cout << "Absolute error: " << abs(hll.estimate() - items.size()) << endl;
+    cout << "Relative error: " << (abs(hll.estimate() - items.size()) / items.size() * 100) << "%" << endl;
+    
+    HyperLogLog hll2(10);
+    for (int i = 500; i < 1500; ++i) {
+        hll2.add("item_" + to_string(i));
+    }
+    
+    cout << "\nSecond HLL estimate: " << hll2.estimate() << endl;
+    
+    hll.merge(hll2);
+    cout << "After merge: " << hll.estimate() << endl;
+    
+    cout << "\n=== MinHash ===" << endl;
+    MinHash mh1(100), mh2(100);
+    
+    vector<string> set1 = {"apple", "banana", "orange", "grape", "mango"};
+    vector<string> set2 = {"banana", "orange", "grape", "pear", "peach"};
+    
+    for (const string& item : set1) {
+        mh1.add(item);
+    }
+    
+    for (const string& item : set2) {
+        mh2.add(item);
+    }
+    
+    mh1.display();
+    mh2.display();
+    
+    double actualJaccard = 3.0 / 7.0; // 3 common elements out of 7 total unique elements
+    double estimatedJaccard = mh1.estimateJaccard(mh2);
+    
+    cout << "Actual Jaccard similarity: " << actualJaccard << endl;
+    cout << "Estimated Jaccard similarity: " << estimatedJaccard << endl;
+    cout << "Error: " << abs(actualJaccard - estimatedJaccard) << endl;
+    
+    return 0;
+}

@@ -1,0 +1,85 @@
+// Block Array Implementation in C++
+#include <iostream>
+using namespace std;
+
+class BlockArray {
+private:
+    static const int BLOCK_SIZE = 4;
+    int** blocks;
+    int totalBlocks;
+    int size;
+
+    void addBlock() {
+        int** newBlocks = new int*[totalBlocks + 1];
+        for (int i = 0; i < totalBlocks; i++) {
+            newBlocks[i] = blocks[i];
+        }
+        newBlocks[totalBlocks] = new int[BLOCK_SIZE];
+        delete[] blocks;
+        blocks = newBlocks;
+        totalBlocks++;
+    }
+
+public:
+    BlockArray() : totalBlocks(0), size(0) {
+        blocks = new int*[0];
+    }
+
+    ~BlockArray() {
+        for (int i = 0; i < totalBlocks; i++) {
+            delete[] blocks[i];
+        }
+        delete[] blocks;
+    }
+
+    void push_back(int value) {
+        if (size / BLOCK_SIZE >= totalBlocks) {
+            addBlock();
+        }
+        
+        int blockIndex = size / BLOCK_SIZE;
+        int elementIndex = size % BLOCK_SIZE;
+        blocks[blockIndex][elementIndex] = value;
+        size++;
+    }
+
+    int& operator[](int index) {
+        if (index < 0 || index >= size) {
+            static int dummy = 0;
+            return dummy;
+        }
+        
+        int blockIndex = index / BLOCK_SIZE;
+        int elementIndex = index % BLOCK_SIZE;
+        return blocks[blockIndex][elementIndex];
+    }
+
+    int getSize() {
+        return size;
+    }
+
+    void display() {
+        cout << "Block Array (size=" << size << ", blocks=" << totalBlocks << "): ";
+        for (int i = 0; i < size; i++) {
+            cout << (*this)[i] << " ";
+        }
+        cout << endl;
+    }
+};
+
+int main() {
+    BlockArray ba;
+    ba.push_back(10);
+    ba.push_back(20);
+    ba.push_back(30);
+    ba.push_back(40);
+    ba.push_back(50);
+    ba.push_back(60);
+    ba.display();
+    
+    cout << "Element at index 4: " << ba[4] << endl;
+    ba[4] = 100;
+    ba.display();
+    
+    return 0;
+}

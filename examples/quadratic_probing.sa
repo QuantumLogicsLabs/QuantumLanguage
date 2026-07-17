@@ -1,0 +1,285 @@
+// Quadratic Probing Hash Table Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+using namespace std;
+
+enum class EntryType { EMPTY, OCCUPIED, DELETED };
+
+template<typename K, typename V>
+class QuadraticProbingHashTable {
+private:
+    struct Entry {
+        K key;
+        V value;
+        EntryType type;
+        
+        Entry() : type(EntryType::EMPTY) {}
+        Entry(const K& k, const V& v) : key(k), value(v), type(EntryType::OCCUPIED) {}
+    };
+
+    vector<Entry> table;
+    size_t capacity;
+    size_t size;
+
+    size_t hashFunction(const K& key) const {
+        hash<K> hasher;
+        return hasher(key) % capacity;
+    }
+
+    size_t probeFunction(size_t index, size_t attempt) const {
+        return (index + attempt * attempt) % capacity;
+    }
+
+    void rehash() {
+        vector<Entry> oldTable = table;
+        size_t oldCapacity = capacity;
+        
+        capacity *= 2;
+        table.clear();
+        table.resize(capacity);
+        size = 0;
+        
+        for (size_t i = 0; i < oldCapacity; ++i) {
+            if (oldTable[i].type == EntryType::OCCUPIED) {
+                insert(oldTable[i].key, oldTable[i].value);
+            }
+        }
+    }
+
+public:
+    QuadraticProbingHashTable(size_t initialCapacity = 16) : capacity(initialCapacity), size(0) {
+        table.resize(capacity);
+    }
+
+    bool insert(const K& key, const V& value) {
+        if (static_cast<double>(size) / capacity > 0.7) {
+            rehash();
+        }
+        
+        size_t index = hashFunction(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(index, attempt);
+            
+            if (table[current].type == EntryType::EMPTY || table[current].type == EntryType::DELETED) {
+                table[current] = Entry(key, value);
+                size++;
+                return true;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                table[current].value = value;
+                return true;
+            }
+            
+            attempt++;
+        }
+        
+        return false;
+    }
+
+    bool remove(const K& key) {
+        size_t index = hashFunction(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(index, attempt);
+            
+            if (table[current].type == EntryType::EMPTY) {
+                return false;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                table[current].type = EntryType::DELETED;
+                size--;
+                return true;
+            }
+            
+            attempt++;
+        }
+        
+        return false;
+    }
+
+    V* find(const K& key) {
+        size_t index = hashFunction(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(index, attempt);
+            
+            if (table[current].type == EntryType::EMPTY) {
+                return nullptr;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                return &table[current].value;
+            }
+            
+            attempt++;
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) const {
+        size_t index = hashFunction(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(index, attempt);
+            
+            if (table[current].type == EntryType::EMPTY) {
+                return false;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                return true;
+            }
+            
+            attempt++;
+        }
+        
+        return false;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    size_t getCapacity() const {
+        return capacity;
+    }
+
+    bool isEmpty() const {
+        return size == 0;
+    }
+
+    double getLoadFactor() const {
+        return static_cast<double>(size) / capacity;
+    }
+
+    void clear() {
+        for (auto& entry : table) {
+            entry.type = EntryType::EMPTY;
+        }
+        size = 0;
+    }
+
+    void display() const {
+        cout << "Quadratic Probing Hash Table:" << endl;
+        cout << "Size: " << size << ", Capacity: " << capacity << ", Load Factor: " << getLoadFactor() << endl;
+        cout << "Index\tKey\tValue\tStatus" << endl;
+        
+        for (size_t i = 0; i < capacity; ++i) {
+            cout << i << "\t";
+            if (table[i].type == EntryType::OCCUPIED) {
+                cout << table[i].key << "\t" << table[i].value << "\tOCCUPIED";
+            } else if (table[i].type == EntryType::DELETED) {
+                cout << "-\t-\tDELETED";
+            } else {
+                cout << "-\t-\tEMPTY";
+            }
+            cout << endl;
+        }
+    }
+
+    vector<K> getKeys() const {
+        vector<K> keys;
+        for (const auto& entry : table) {
+            if (entry.type == EntryType::OCCUPIED) {
+                keys.push_back(entry.key);
+            }
+        }
+        return keys;
+    }
+
+    vector<V> getValues() const {
+        vector<V> values;
+        for (const auto& entry : table) {
+            if (entry.type == EntryType::OCCUPIED) {
+                values.push_back(entry.value);
+            }
+        }
+        return values;
+    }
+
+    size_t getProbeCount(const K& key) const {
+        size_t index = hashFunction(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(index, attempt);
+            
+            if (table[current].type == EntryType::EMPTY) {
+                return attempt + 1;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                return attempt + 1;
+            }
+            
+            attempt++;
+        }
+        
+        return attempt + 1;
+    }
+
+    double getAverageProbeCount() const {
+        if (size == 0) return 0.0;
+        
+        vector<K> keys = getKeys();
+        size_t totalProbes = 0;
+        
+        for (const K& key : keys) {
+            totalProbes += getProbeCount(key);
+        }
+        
+        return static_cast<double>(totalProbes) / size;
+    }
+};
+
+int main() {
+    QuadraticProbingHashTable<string, int> qpht;
+    
+    qpht.insert("apple", 5);
+    qpht.insert("banana", 3);
+    qpht.insert("orange", 7);
+    qpht.insert("grape", 2);
+    qpht.insert("mango", 4);
+    
+    qpht.display();
+    cout << endl;
+    
+    cout << "Size: " << qpht.getSize() << endl;
+    cout << "Capacity: " << qpht.getCapacity() << endl;
+    cout << "Load Factor: " << qpht.getLoadFactor() << endl;
+    cout << "Average Probe Count: " << qpht.getAverageProbeCount() << endl;
+    cout << "Contains 'banana': " << (qpht.contains("banana") ? "Yes" : "No") << endl;
+    
+    int* value = qpht.find("orange");
+    if (value) {
+        cout << "Value of 'orange': " << *value << endl;
+    }
+    
+    qpht.remove("grape");
+    cout << "\nAfter removing 'grape':" << endl;
+    qpht.display();
+    
+    qpht.insert("pear", 6);
+    qpht.insert("peach", 1);
+    qpht.insert("plum", 8);
+    
+    cout << "\nAfter inserting more elements:" << endl;
+    qpht.display();
+    
+    cout << "\nProbe counts:" << endl;
+    vector<string> keys = qpht.getKeys();
+    for (const string& key : keys) {
+        cout << key << ": " << qpht.getProbeCount(key) << " probes" << endl;
+    }
+    
+    return 0;
+}

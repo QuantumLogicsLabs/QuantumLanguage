@@ -1,0 +1,253 @@
+// Robin Hood Hashing Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+using namespace std;
+
+template<typename K, typename V>
+class RobinHoodHashTable {
+private:
+    struct Entry {
+        K key;
+        V value;
+        int distance;
+        bool occupied;
+        
+        Entry() : distance(0), occupied(false) {}
+        Entry(const K& k, const V& v, int d) : key(k), value(v), distance(d), occupied(true) {}
+    };
+
+    vector<Entry> table;
+    size_t capacity;
+    size_t size;
+
+    size_t hashFunction(const K& key) const {
+        hash<K> hasher;
+        return hasher(key) % capacity;
+    }
+
+    void rehash() {
+        vector<Entry> oldTable = table;
+        size_t oldCapacity = capacity;
+        
+        capacity *= 2;
+        table.clear();
+        table.resize(capacity);
+        size = 0;
+        
+        for (size_t i = 0; i < oldCapacity; ++i) {
+            if (oldTable[i].occupied) {
+                insert(oldTable[i].key, oldTable[i].value);
+            }
+        }
+    }
+
+public:
+    RobinHoodHashTable(size_t initialCapacity = 16) : capacity(initialCapacity), size(0) {
+        table.resize(capacity);
+    }
+
+    bool insert(const K& key, const V& value) {
+        if (static_cast<double>(size) / capacity > 0.8) {
+            rehash();
+        }
+        
+        Entry newEntry(key, value, 0);
+        size_t index = hashFunction(key);
+        
+        while (true) {
+            if (!table[index].occupied) {
+                table[index] = newEntry;
+                size++;
+                return true;
+            }
+            
+            if (table[index].key == key) {
+                table[index].value = value;
+                return true;
+            }
+            
+            if (newEntry.distance > table[index].distance) {
+                swap(newEntry, table[index]);
+            }
+            
+            newEntry.distance++;
+            index = (index + 1) % capacity;
+        }
+    }
+
+    bool remove(const K& key) {
+        size_t index = hashFunction(key);
+        size_t startIndex = index;
+        
+        while (table[index].occupied) {
+            if (table[index].key == key) {
+                table[index].occupied = false;
+                size--;
+                
+                index = (index + 1) % capacity;
+                while (table[index].occupied && table[index].distance > 0) {
+                    size_t prevIndex = (index - 1 + capacity) % capacity;
+                    table[prevIndex] = table[index];
+                    table[prevIndex].distance--;
+                    table[index].occupied = false;
+                    index = (index + 1) % capacity;
+                }
+                
+                return true;
+            }
+            
+            index = (index + 1) % capacity;
+            if (index == startIndex) {
+                break;
+            }
+        }
+        
+        return false;
+    }
+
+    V* find(const K& key) {
+        size_t index = hashFunction(key);
+        size_t startIndex = index;
+        
+        while (table[index].occupied) {
+            if (table[index].key == key) {
+                return &table[index].value;
+            }
+            
+            index = (index + 1) % capacity;
+            if (index == startIndex) {
+                break;
+            }
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) const {
+        size_t index = hashFunction(key);
+        size_t startIndex = index;
+        
+        while (table[index].occupied) {
+            if (table[index].key == key) {
+                return true;
+            }
+            
+            index = (index + 1) % capacity;
+            if (index == startIndex) {
+                break;
+            }
+        }
+        
+        return false;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    size_t getCapacity() const {
+        return capacity;
+    }
+
+    double getLoadFactor() const {
+        return static_cast<double>(size) / capacity;
+    }
+
+    void display() const {
+        cout << "Robin Hood Hashing Table:" << endl;
+        cout << "Size: " << size << ", Capacity: " << capacity << ", Load Factor: " << getLoadFactor() << endl;
+        cout << "Index\tKey\tValue\tDistance" << endl;
+        
+        for (size_t i = 0; i < capacity; ++i) {
+            cout << i << "\t";
+            if (table[i].occupied) {
+                cout << table[i].key << "\t" << table[i].value << "\t" << table[i].distance;
+            } else {
+                cout << "-\t-\t-";
+            }
+            cout << endl;
+        }
+    }
+
+    vector<K> getKeys() const {
+        vector<K> keys;
+        for (const auto& entry : table) {
+            if (entry.occupied) {
+                keys.push_back(entry.key);
+            }
+        }
+        return keys;
+    }
+
+    vector<V> getValues() const {
+        vector<V> values;
+        for (const auto& entry : table) {
+            if (entry.occupied) {
+                values.push_back(entry.value);
+            }
+        }
+        return values;
+    }
+
+    double getAverageDistance() const {
+        if (size == 0) return 0.0;
+        
+        size_t totalDistance = 0;
+        for (const auto& entry : table) {
+            if (entry.occupied) {
+                totalDistance += entry.distance;
+            }
+        }
+        
+        return static_cast<double>(totalDistance) / size;
+    }
+
+    size_t getMaxDistance() const {
+        size_t maxDist = 0;
+        for (const auto& entry : table) {
+            if (entry.occupied) {
+                maxDist = max(maxDist, static_cast<size_t>(entry.distance));
+            }
+        }
+        return maxDist;
+    }
+};
+
+int main() {
+    RobinHoodHashTable<string, int> rhht;
+    
+    rhht.insert("apple", 5);
+    rhht.insert("banana", 3);
+    rhht.insert("orange", 7);
+    rhht.insert("grape", 2);
+    rhht.insert("mango", 4);
+    
+    rhht.display();
+    cout << endl;
+    
+    cout << "Size: " << rhht.getSize() << endl;
+    cout << "Capacity: " << rhht.getCapacity() << endl;
+    cout << "Load Factor: " << rhht.getLoadFactor() << endl;
+    cout << "Average Distance: " << rhht.getAverageDistance() << endl;
+    cout << "Max Distance: " << rhht.getMaxDistance() << endl;
+    cout << "Contains 'banana': " << (rhht.contains("banana") ? "Yes" : "No") << endl;
+    
+    int* value = rhht.find("orange");
+    if (value) {
+        cout << "Value of 'orange': " << *value << endl;
+    }
+    
+    rhht.remove("grape");
+    cout << "\nAfter removing 'grape':" << endl;
+    rhht.display();
+    
+    rhht.insert("pear", 6);
+    rhht.insert("peach", 1);
+    rhht.insert("plum", 8);
+    
+    cout << "\nAfter inserting more elements:" << endl;
+    rhht.display();
+    
+    return 0;
+}

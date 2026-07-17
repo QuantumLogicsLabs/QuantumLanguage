@@ -1,0 +1,262 @@
+// Consistent Hashing Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+#include <map>
+#include <algorithm>
+#include <functional>
+using namespace std;
+
+class ConsistentHashRing {
+private:
+    map<size_t, string> ring;
+    hash<string> hasher;
+    vector<string> nodes;
+    int virtualNodes;
+
+    size_t hashNode(const string& node, int replica) const {
+        return hasher(node + "_" + to_string(replica));
+    }
+
+public:
+    ConsistentHashRing(int virtualNodeCount = 150) : virtualNodes(virtualNodeCount) {}
+
+    void addNode(const string& node) {
+        nodes.push_back(node);
+        for (int i = 0; i < virtualNodes; ++i) {
+            size_t hash = hashNode(node, i);
+            ring[hash] = node;
+        }
+    }
+
+    void removeNode(const string& node) {
+        for (int i = 0; i < virtualNodes; ++i) {
+            size_t hash = hashNode(node, i);
+            ring.erase(hash);
+        }
+        
+        nodes.erase(remove(nodes.begin(), nodes.end(), node), nodes.end());
+    }
+
+    string getNode(const string& key) const {
+        if (ring.empty()) {
+            return "";
+        }
+
+        size_t hash = hasher(key);
+        auto it = ring.lower_bound(hash);
+        
+        if (it == ring.end()) {
+            it = ring.begin();
+        }
+        
+        return it->second;
+    }
+
+    vector<string> getNodes() const {
+        return nodes;
+    }
+
+    size_t getNodeCount() const {
+        return nodes.size();
+    }
+
+    map<string, size_t> getDistribution(const vector<string>& keys) const {
+        map<string, size_t> distribution;
+        
+        for (const string& node : nodes) {
+            distribution[node] = 0;
+        }
+        
+        for (const string& key : keys) {
+            string node = getNode(key);
+            distribution[node]++;
+        }
+        
+        return distribution;
+    }
+
+    void display() const {
+        cout << "Consistent Hash Ring:" << endl;
+        cout << "Physical nodes: " << nodes.size() << endl;
+        cout << "Virtual nodes per physical node: " << virtualNodes << endl;
+        cout << "Total virtual nodes: " << ring.size() << endl;
+        
+        cout << "Physical nodes: ";
+        for (const string& node : nodes) {
+            cout << node << " ";
+        }
+        cout << endl;
+        
+        cout << "Ring structure (first 20 virtual nodes):" << endl;
+        int count = 0;
+        for (const auto& pair : ring) {
+            cout << "Hash: " << pair.first << " -> Node: " << pair.second << endl;
+            count++;
+            if (count >= 20) break;
+        }
+        if (ring.size() > 20) {
+            cout << "... (" << (ring.size() - 20) << " more)" << endl;
+        }
+    }
+
+    void displayDistribution(const vector<string>& keys) const {
+        auto distribution = getDistribution(keys);
+        
+        cout << "Key Distribution:" << endl;
+        size_t totalKeys = keys.size();
+        size_t idealKeys = totalKeys / nodes.size();
+        
+        for (const string& node : nodes) {
+            size_t count = distribution[node];
+            double percentage = static_cast<double>(count) / totalKeys * 100;
+            double deviation = static_cast<double>(abs(count - idealKeys)) / idealKeys * 100;
+            
+            cout << node << ": " << count << " keys (" << percentage << "%, deviation: " << deviation << "%)" << endl;
+        }
+    }
+
+    double getLoadBalanceScore(const vector<string>& keys) const {
+        auto distribution = getDistribution(keys);
+        
+        if (nodes.empty()) return 0.0;
+        
+        size_t totalKeys = keys.size();
+        double idealLoad = static_cast<double>(totalKeys) / nodes.size();
+        double variance = 0.0;
+        
+        for (const string& node : nodes) {
+            double load = distribution[node];
+            double diff = load - idealLoad;
+            variance += diff * diff;
+        }
+        
+        variance /= nodes.size();
+        return sqrt(variance) / idealLoad;
+    }
+};
+
+class KetamaConsistentHash {
+private:
+    map<uint32_t, string> continuum;
+    vector<string> nodes;
+    hash<string> hasher;
+    int pointsPerNode;
+
+    uint32_t ketamaHash(const string& key) const {
+        uint32_t hash = 0;
+        for (char c : key) {
+            hash = hash * 31 + c;
+        }
+        return hash;
+    }
+
+public:
+    KetamaConsistentHash(int pointsPerNode = 160) : pointsPerNode(pointsPerNode) {}
+
+    void addNode(const string& node) {
+        nodes.push_back(node);
+        for (int i = 0; i < pointsPerNode; ++i) {
+            uint32_t hash = ketamaHash(node + "_" + to_string(i));
+            continuum[hash] = node;
+        }
+    }
+
+    void removeNode(const string& node) {
+        for (int i = 0; i < pointsPerNode; ++i) {
+            uint32_t hash = ketamaHash(node + "_" + to_string(i));
+            continuum.erase(hash);
+        }
+        
+        nodes.erase(remove(nodes.begin(), nodes.end(), node), nodes.end());
+    }
+
+    string getNode(const string& key) const {
+        if (continuum.empty()) {
+            return "";
+        }
+
+        uint32_t hash = ketamaHash(key);
+        auto it = continuum.lower_bound(hash);
+        
+        if (it == continuum.end()) {
+            it = continuum.begin();
+        }
+        
+        return it->second;
+    }
+
+    void display() const {
+        cout << "Ketama Consistent Hash:" << endl;
+        cout << "Nodes: " << nodes.size() << endl;
+        cout << "Points per node: " << pointsPerNode << endl;
+        cout << "Total points: " << continuum.size() << endl;
+        
+        cout << "Nodes: ";
+        for (const string& node : nodes) {
+            cout << node << " ";
+        }
+        cout << endl;
+    }
+};
+
+int main() {
+    cout << "=== Basic Consistent Hashing ===" << endl;
+    ConsistentHashRing chr;
+    
+    vector<string> servers = {"server1", "server2", "server3", "server4"};
+    for (const string& server : servers) {
+        chr.addNode(server);
+    }
+    
+    chr.display();
+    cout << endl;
+    
+    vector<string> keys;
+    for (int i = 0; i < 10000; ++i) {
+        keys.push_back("key_" + to_string(i));
+    }
+    
+    chr.displayDistribution(keys);
+    cout << "Load balance score (lower is better): " << chr.getLoadBalanceScore(keys) << endl;
+    cout << endl;
+    
+    cout << "Key routing examples:" << endl;
+    for (int i = 0; i < 10; ++i) {
+        string key = "test_key_" + to_string(i);
+        string node = chr.getNode(key);
+        cout << key << " -> " << node << endl;
+    }
+    cout << endl;
+    
+    cout << "Adding server5..." << endl;
+    chr.addNode("server5");
+    chr.displayDistribution(keys);
+    cout << "Load balance score: " << chr.getLoadBalanceScore(keys) << endl;
+    cout << endl;
+    
+    cout << "Removing server2..." << endl;
+    chr.removeNode("server2");
+    chr.displayDistribution(keys);
+    cout << "Load balance score: " << chr.getLoadBalanceScore(keys) << endl;
+    cout << endl;
+    
+    cout << "=== Ketama Consistent Hashing ===" << endl;
+    KetamaConsistentHash kch;
+    
+    for (const string& server : {"cache1", "cache2", "cache3"}) {
+        kch.addNode(server);
+    }
+    
+    kch.display();
+    cout << endl;
+    
+    cout << "Key routing with Ketama:" << endl;
+    for (int i = 0; i < 10; ++i) {
+        string key = "user_session_" + to_string(i);
+        string node = kch.getNode(key);
+        cout << key << " -> " << node << endl;
+    }
+    
+    return 0;
+}

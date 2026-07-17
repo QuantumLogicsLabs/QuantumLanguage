@@ -1,0 +1,126 @@
+// Skip List Implementation in C++
+#include <iostream>
+#include <cstdlib>
+#include <ctime>
+using namespace std;
+
+struct SkipNode {
+    int data;
+    SkipNode** forward;
+    
+    SkipNode(int level, int value) : data(value) {
+        forward = new SkipNode*[level + 1];
+        for (int i = 0; i <= level; i++) {
+            forward[i] = nullptr;
+        }
+    }
+    
+    ~SkipNode() {
+        delete[] forward;
+    }
+};
+
+class SkipList {
+private:
+    static const int MAX_LEVEL = 16;
+    SkipNode* header;
+    int level;
+
+    int randomLevel() {
+        int lvl = 0;
+        while (rand() % 2 == 0 && lvl < MAX_LEVEL) {
+            lvl++;
+        }
+        return lvl;
+    }
+
+public:
+    SkipList() {
+        srand(time(nullptr));
+        level = 0;
+        header = new SkipNode(MAX_LEVEL, -1);
+    }
+
+    ~SkipList() {
+        SkipNode* current = header->forward[0];
+        while (current) {
+            SkipNode* next = current->forward[0];
+            delete current;
+            current = next;
+        }
+        delete header;
+    }
+
+    void insert(int value) {
+        SkipNode* update[MAX_LEVEL + 1];
+        SkipNode* current = header;
+
+        for (int i = level; i >= 0; i--) {
+            while (current->forward[i] && current->forward[i]->data < value) {
+                current = current->forward[i];
+            }
+            update[i] = current;
+        }
+
+        current = current->forward[0];
+
+        if (!current || current->data != value) {
+            int newLevel = randomLevel();
+            
+            if (newLevel > level) {
+                for (int i = level + 1; i <= newLevel; i++) {
+                    update[i] = header;
+                }
+                level = newLevel;
+            }
+
+            SkipNode* newNode = new SkipNode(newLevel, value);
+            
+            for (int i = 0; i <= newLevel; i++) {
+                newNode->forward[i] = update[i]->forward[i];
+                update[i]->forward[i] = newNode;
+            }
+        }
+    }
+
+    bool search(int value) {
+        SkipNode* current = header;
+        
+        for (int i = level; i >= 0; i--) {
+            while (current->forward[i] && current->forward[i]->data < value) {
+                current = current->forward[i];
+            }
+        }
+        
+        current = current->forward[0];
+        return current && current->data == value;
+    }
+
+    void display() {
+        cout << "Skip List:" << endl;
+        for (int i = 0; i <= level; i++) {
+            SkipNode* node = header->forward[i];
+            cout << "Level " << i << ": ";
+            while (node) {
+                cout << node->data << " ";
+                node = node->forward[i];
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    SkipList sl;
+    sl.insert(10);
+    sl.insert(20);
+    sl.insert(30);
+    sl.insert(15);
+    sl.insert(25);
+    sl.display();
+    
+    cout << "Search 15: " << (sl.search(15) ? "Found" : "Not Found") << endl;
+    cout << "Search 35: " << (sl.search(35) ? "Found" : "Not Found") << endl;
+    
+    return 0;
+}

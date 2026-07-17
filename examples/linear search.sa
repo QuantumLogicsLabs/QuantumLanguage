@@ -1,0 +1,196 @@
+# linear_search.sa - Linear Search Algorithm Implementation
+# C-style linear search implementation in Quantum Language
+
+function linear_search(arr, target) {
+    let n = len(arr);
+    
+    for (let i = 0; i < n; i++) {
+        if (arr[i] == target) {
+            return i;  # Return index of found element
+        }
+    }
+    
+    return -1;  # Return -1 if not found
+}
+
+# Test the linear search implementation
+let test_array = [2, 3, 4, 10, 40];
+print("Test array:", test_array);
+
+let target1 = 10;
+let result1 = linear_search(test_array, target1);
+print("Searching for", target1, "- Index:", result1);
+
+let target2 = 5;
+let result2 = linear_search(test_array, target2);
+print("Searching for", target2, "- Index:", result2);
+
+# Search with different data types
+let string_array = ["apple", "banana", "cherry", "date"];
+print("String array:", string_array);
+
+let string_target = "cherry";
+let string_result = linear_search(string_array, string_target);
+print("Searching for", string_target, "- Index:", string_result);
+
+# Search in array with duplicates
+let duplicates_array = [1, 2, 3, 2, 4, 2, 5];
+print("Array with duplicates:", duplicates_array);
+
+let duplicate_target = 2;
+let duplicate_result = linear_search(duplicates_array, duplicate_target);
+print("First occurrence of", duplicate_target, "- Index:", duplicate_result);
+
+# Enhanced linear search that returns all occurrences
+function linear_search_all(arr, target) {
+    let n = len(arr);
+    let occurrences = [];
+    
+    for (let i = 0; i < n; i++) {
+        if (arr[i] == target) {
+            occurrences.push(i);
+        }
+    }
+    
+    return occurrences;
+}
+
+let all_occurrences = linear_search_all(duplicates_array, duplicate_target);
+print("All occurrences of", duplicate_target, ":", all_occurrences);
+
+# Linear search with custom comparison function
+function linear_search_custom(arr, target, compare_func) {
+    let n = len(arr);
+    
+    for (let i = 0; i < n; i++) {
+        if (compare_func(arr[i], target)) {
+            return i;
+        }
+    }
+    
+    return -1;
+}
+
+# Search for numbers greater than a threshold
+let numbers = [10, 25, 5, 30, 15, 40, 20];
+print("Numbers array:", numbers);
+
+let threshold = 20;
+let greater_than_result = linear_search_custom(numbers, threshold, (x, t) => x > t);
+print("First number > 20 - Index:", greater_than_result, "Value:", numbers[greater_than_result]);
+
+# Search for strings containing a substring
+let words = ["hello", "world", "programming", "quantum", "computer"];
+print("Words array:", words);
+
+let substring = "pro";
+let contains_result = linear_search_custom(words, substring, (word, sub) => word.contains(sub));
+print("First word containing", substring, "- Index:", contains_result, "Value:", words[contains_result]);
+
+# Search in array of objects
+let students = [
+    {"name": "Alice", "age": 20, "grade": "A"},
+    {"name": "Bob", "age": 22, "grade": "B"},
+    {"name": "Charlie", "age": 21, "grade": "A"},
+    {"name": "Diana", "age": 19, "grade": "C"}
+];
+
+print("Students array:");
+for (let student in students) {
+    print("  ", student.name, "- Age:", student.age, "- Grade:", student.grade);
+}
+
+# Search for student by name
+function find_student_by_name(students, name) {
+    for (let i = 0; i < len(students); i++) {
+        if (students[i].name == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+let student_name = "Charlie";
+let student_index = find_student_by_name(students, student_name);
+if (student_index != -1) {
+    print("Found", student_name, "at index", student_index);
+    print("Details:", students[student_index]);
+} else {
+    print(student_name, "not found");
+}
+
+# Search for students with specific grade
+function find_students_by_grade(students, grade) {
+    let result = [];
+    for (let i = 0; i < len(students); i++) {
+        if (students[i].grade == grade) {
+            result.push(students[i]);
+        }
+    }
+    return result;
+}
+
+let grade_a_students = find_students_by_grade(students, "A");
+print("Students with grade A:");
+for (let student in grade_a_students) {
+    print("  ", student.name);
+}
+
+# Performance comparison with different array sizes
+function performance_test() {
+    print("\nPerformance Test:");
+    
+    for (let size = 100; size <= 1000; size += 100) {
+        # Create array with random numbers
+        let test_arr = [];
+        for (let i = 0; i < size; i++) {
+            test_arr.push(randint(0, 1000));
+        }
+        
+        # Search for a random target
+        let target = randint(0, 1000);
+        
+        let start_time = time();
+        let result = linear_search(test_arr, target);
+        let end_time = time();
+        
+        print("Array size:", size, "Search time:", (end_time - start_time), "seconds");
+    }
+}
+
+performance_test();
+
+# Count comparisons during search
+function linear_search_with_stats(arr, target) {
+    let n = len(arr);
+    let comparisons = 0;
+    
+    for (let i = 0; i < n; i++) {
+        comparisons++;
+        if (arr[i] == target) {
+            return {"index": i, "comparisons": comparisons, "found": true};
+        }
+    }
+    
+    return {"index": -1, "comparisons": comparisons, "found": false};
+}
+
+let stats = linear_search_with_stats([2, 3, 4, 10, 40], 10);
+print("Search for 10 - Found:", stats.found, "Index:", stats.index, "Comparisons:", stats.comparisons);
+
+let stats_not_found = linear_search_with_stats([2, 3, 4, 10, 40], 5);
+print("Search for 5 - Found:", stats_not_found.found, "Comparisons:", stats_not_found.comparisons);
+
+# Best case, worst case, and average case analysis
+print("\nCase Analysis:");
+let best_case_array = [1, 2, 3, 4, 5];
+let worst_case_array = [1, 2, 3, 4, 5];
+let avg_case_array = [3, 1, 4, 2, 5];
+
+let best_case = linear_search_with_stats(best_case_array, 1);
+let worst_case = linear_search_with_stats(worst_case_array, 5);
+let avg_case = linear_search_with_stats(avg_case_array, 2);
+
+print("Best case (first element):", best_case.comparisons, "comparisons");
+print("Worst case (last element):", worst_case.comparisons, "comparisons");
+print("Average case (middle element):", avg_case.comparisons, "comparisons");

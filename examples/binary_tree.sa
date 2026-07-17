@@ -1,0 +1,115 @@
+// Binary Tree Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct TreeNode {
+    int data;
+    TreeNode* left;
+    TreeNode* right;
+    
+    TreeNode(int val) : data(val), left(nullptr), right(nullptr) {}
+};
+
+class BinaryTree {
+private:
+    TreeNode* root;
+
+    void inorder(TreeNode* node) {
+        if (node) {
+            inorder(node->left);
+            cout << node->data << " ";
+            inorder(node->right);
+        }
+    }
+
+    void preorder(TreeNode* node) {
+        if (node) {
+            cout << node->data << " ";
+            preorder(node->left);
+            preorder(node->right);
+        }
+    }
+
+    void postorder(TreeNode* node) {
+        if (node) {
+            postorder(node->left);
+            postorder(node->right);
+            cout << node->data << " ";
+        }
+    }
+
+    void destroyTree(TreeNode* node) {
+        if (node) {
+            destroyTree(node->left);
+            destroyTree(node->right);
+            delete node;
+        }
+    }
+
+public:
+    BinaryTree() : root(nullptr) {}
+
+    ~BinaryTree() {
+        destroyTree(root);
+    }
+
+    void insert(int value) {
+        TreeNode* newNode = new TreeNode(value);
+        if (!root) {
+            root = newNode;
+            return;
+        }
+
+        TreeNode* current = root;
+        while (true) {
+            if (value < current->data) {
+                if (!current->left) {
+                    current->left = newNode;
+                    break;
+                }
+                current = current->left;
+            } else {
+                if (!current->right) {
+                    current->right = newNode;
+                    break;
+                }
+                current = current->right;
+            }
+        }
+    }
+
+    void displayInorder() {
+        cout << "Inorder: ";
+        inorder(root);
+        cout << endl;
+    }
+
+    void displayPreorder() {
+        cout << "Preorder: ";
+        preorder(root);
+        cout << endl;
+    }
+
+    void displayPostorder() {
+        cout << "Postorder: ";
+        postorder(root);
+        cout << endl;
+    }
+};
+
+int main() {
+    BinaryTree bt;
+    bt.insert(50);
+    bt.insert(30);
+    bt.insert(70);
+    bt.insert(20);
+    bt.insert(40);
+    bt.insert(60);
+    bt.insert(80);
+    
+    bt.displayInorder();
+    bt.displayPreorder();
+    bt.displayPostorder();
+    
+    return 0;
+}

@@ -1,0 +1,138 @@
+// Strongly Connected Components (Kosaraju's Algorithm) Implementation in C++
+#include <iostream>
+#include <vector>
+#include <stack>
+#include <list>
+using namespace std;
+
+class StronglyConnectedGraph {
+private:
+    vector<list<int>> adjList;
+    vector<list<int>> reverseAdjList;
+    int vertices;
+
+    void fillOrder(int vertex, vector<bool>& visited, stack<int>& stack) {
+        visited[vertex] = true;
+
+        for (int neighbor : adjList[vertex]) {
+            if (!visited[neighbor]) {
+                fillOrder(neighbor, visited, stack);
+            }
+        }
+
+        stack.push(vertex);
+    }
+
+    void dfs(int vertex, vector<bool>& visited, vector<int>& component) {
+        visited[vertex] = true;
+        component.push_back(vertex);
+
+        for (int neighbor : reverseAdjList[vertex]) {
+            if (!visited[neighbor]) {
+                dfs(neighbor, visited, component);
+            }
+        }
+    }
+
+public:
+    StronglyConnectedGraph(int v) : vertices(v) {
+        adjList.resize(vertices);
+        reverseAdjList.resize(vertices);
+    }
+
+    void addEdge(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            adjList[u].push_back(v);
+            reverseAdjList[v].push_back(u);
+        }
+    }
+
+    vector<vector<int>> getStronglyConnectedComponents() {
+        vector<bool> visited(vertices, false);
+        stack<int> stack;
+
+        for (int i = 0; i < vertices; i++) {
+            if (!visited[i]) {
+                fillOrder(i, visited, stack);
+            }
+        }
+
+        fill(visited.begin(), visited.end(), false);
+        vector<vector<int>> sccs;
+
+        while (!stack.empty()) {
+            int vertex = stack.top();
+            stack.pop();
+
+            if (!visited[vertex]) {
+                vector<int> component;
+                dfs(vertex, visited, component);
+                sccs.push_back(component);
+            }
+        }
+
+        return sccs;
+    }
+
+    bool isStronglyConnected() {
+        vector<vector<int>> sccs = getStronglyConnectedComponents();
+        return sccs.size() == 1;
+    }
+
+    void displaySCCs(const vector<vector<int>>& sccs) {
+        cout << "Strongly Connected Components:" << endl;
+        for (int i = 0; i < sccs.size(); i++) {
+            cout << "Component " << i + 1 << ": ";
+            for (int vertex : sccs[i]) {
+                cout << vertex << " ";
+            }
+            cout << endl;
+        }
+    }
+
+    void display() {
+        cout << "Directed Graph:" << endl;
+        cout << "Forward edges:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            cout << i << ": ";
+            for (int neighbor : adjList[i]) {
+                cout << neighbor << " ";
+            }
+            cout << endl;
+        }
+        
+        cout << "\nReverse edges:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            cout << i << ": ";
+            for (int neighbor : reverseAdjList[i]) {
+                cout << neighbor << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    StronglyConnectedGraph g(8);
+    
+    g.addEdge(0, 1);
+    g.addEdge(1, 2);
+    g.addEdge(2, 0);
+    g.addEdge(2, 3);
+    g.addEdge(3, 4);
+    g.addEdge(4, 5);
+    g.addEdge(5, 3);
+    g.addEdge(6, 5);
+    g.addEdge(6, 7);
+    g.addEdge(7, 6);
+    
+    g.display();
+    cout << endl;
+    
+    vector<vector<int>> sccs = g.getStronglyConnectedComponents();
+    g.displaySCCs(sccs);
+    
+    cout << "\nIs strongly connected: " << (g.isStronglyConnected() ? "Yes" : "No") << endl;
+    
+    return 0;
+}

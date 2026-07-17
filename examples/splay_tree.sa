@@ -1,0 +1,178 @@
+// Splay Tree Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct SplayNode {
+    int data;
+    SplayNode* left;
+    SplayNode* right;
+    
+    SplayNode(int val) : data(val), left(nullptr), right(nullptr) {}
+};
+
+class SplayTree {
+private:
+    SplayNode* root;
+
+    SplayNode* rightRotate(SplayNode* x) {
+        SplayNode* y = x->left;
+        x->left = y->right;
+        y->right = x;
+        return y;
+    }
+
+    SplayNode* leftRotate(SplayNode* x) {
+        SplayNode* y = x->right;
+        x->right = y->left;
+        y->left = x;
+        return y;
+    }
+
+    SplayNode* splay(SplayNode* root, int key) {
+        if (!root || root->data == key) {
+            return root;
+        }
+        
+        if (root->data > key) {
+            if (!root->left) return root;
+            
+            if (root->left->data > key) {
+                root->left->left = splay(root->left->left, key);
+                root = rightRotate(root);
+            } else if (root->left->data < key) {
+                root->left->right = splay(root->left->right, key);
+                if (root->left->right) {
+                    root->left = leftRotate(root->left);
+                }
+            }
+            
+            return root->left ? rightRotate(root) : root;
+        } else {
+            if (!root->right) return root;
+            
+            if (root->right->data > key) {
+                root->right->left = splay(root->right->left, key);
+                if (root->right->left) {
+                    root->right = rightRotate(root->right);
+                }
+            } else if (root->right->data < key) {
+                root->right->right = splay(root->right->right, key);
+                root = leftRotate(root);
+            }
+            
+            return root->right ? leftRotate(root) : root;
+        }
+    }
+
+    SplayNode* insert(SplayNode* root, int key) {
+        if (!root) {
+            return new SplayNode(key);
+        }
+        
+        root = splay(root, key);
+        
+        if (root->data == key) {
+            return root;
+        }
+        
+        SplayNode* newNode = new SplayNode(key);
+        
+        if (root->data > key) {
+            newNode->right = root;
+            newNode->left = root->left;
+            root->left = nullptr;
+        } else {
+            newNode->left = root;
+            newNode->right = root->right;
+            root->right = nullptr;
+        }
+        
+        return newNode;
+    }
+
+    SplayNode* remove(SplayNode* root, int key) {
+        if (!root) return nullptr;
+        
+        root = splay(root, key);
+        
+        if (root->data != key) {
+            return root;
+        }
+        
+        SplayNode* temp;
+        if (!root->left) {
+            temp = root->right;
+        } else {
+            temp = root->left;
+            temp = splay(temp, key);
+            temp->right = root->right;
+        }
+        
+        delete root;
+        return temp;
+    }
+
+    void inorder(SplayNode* node) {
+        if (node) {
+            inorder(node->left);
+            cout << node->data << " ";
+            inorder(node->right);
+        }
+    }
+
+    void destroyTree(SplayNode* node) {
+        if (node) {
+            destroyTree(node->left);
+            destroyTree(node->right);
+            delete node;
+        }
+    }
+
+public:
+    SplayTree() : root(nullptr) {}
+
+    ~SplayTree() {
+        destroyTree(root);
+    }
+
+    void insert(int key) {
+        root = insert(root, key);
+    }
+
+    void remove(int key) {
+        root = remove(root, key);
+    }
+
+    bool search(int key) {
+        root = splay(root, key);
+        return root && root->data == key;
+    }
+
+    void display() {
+        cout << "Splay Tree: ";
+        inorder(root);
+        cout << endl;
+    }
+};
+
+int main() {
+    SplayTree st;
+    st.insert(100);
+    st.insert(50);
+    st.insert(200);
+    st.insert(25);
+    st.insert(75);
+    st.insert(150);
+    st.insert(250);
+    
+    st.display();
+    
+    cout << "Search 75: " << (st.search(75) ? "Found" : "Not Found") << endl;
+    cout << "Search 300: " << (st.search(300) ? "Found" : "Not Found") << endl;
+    
+    st.remove(50);
+    cout << "After removing 50: ";
+    st.display();
+    
+    return 0;
+}

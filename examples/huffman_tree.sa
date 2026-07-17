@@ -1,0 +1,137 @@
+// Huffman Tree Implementation in C++
+#include <iostream>
+#include <queue>
+#include <unordered_map>
+using namespace std;
+
+struct HuffmanNode {
+    char data;
+    int frequency;
+    HuffmanNode* left;
+    HuffmanNode* right;
+    
+    HuffmanNode(char d, int freq) : data(d), frequency(freq), left(nullptr), right(nullptr) {}
+    
+    HuffmanNode(int freq) : data('$'), frequency(freq), left(nullptr), right(nullptr) {}
+};
+
+struct Compare {
+    bool operator()(HuffmanNode* a, HuffmanNode* b) {
+        return a->frequency > b->frequency;
+    }
+};
+
+class HuffmanTree {
+private:
+    HuffmanNode* root;
+    unordered_map<char, string> codes;
+
+    void generateCodes(HuffmanNode* node, string code) {
+        if (!node) return;
+        
+        if (node->data != '$') {
+            codes[node->data] = code;
+            return;
+        }
+        
+        generateCodes(node->left, code + "0");
+        generateCodes(node->right, code + "1");
+    }
+
+    void destroyTree(HuffmanNode* node) {
+        if (node) {
+            destroyTree(node->left);
+            destroyTree(node->right);
+            delete node;
+        }
+    }
+
+public:
+    HuffmanTree() : root(nullptr) {}
+
+    ~HuffmanTree() {
+        destroyTree(root);
+    }
+
+    void buildTree(const unordered_map<char, int>& frequencies) {
+        priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> minHeap;
+        
+        for (auto pair : frequencies) {
+            minHeap.push(new HuffmanNode(pair.first, pair.second));
+        }
+        
+        while (minHeap.size() > 1) {
+            HuffmanNode* left = minHeap.top();
+            minHeap.pop();
+            
+            HuffmanNode* right = minHeap.top();
+            minHeap.pop();
+            
+            HuffmanNode* internal = new HuffmanNode(left->frequency + right->frequency);
+            internal->left = left;
+            internal->right = right;
+            
+            minHeap.push(internal);
+        }
+        
+        root = minHeap.top();
+        generateCodes(root, "");
+    }
+
+    string encode(const string& text) {
+        string encoded;
+        for (char c : text) {
+            encoded += codes[c];
+        }
+        return encoded;
+    }
+
+    string decode(const string& encoded) {
+        string decoded;
+        HuffmanNode* current = root;
+        
+        for (char bit : encoded) {
+            if (bit == '0') {
+                current = current->left;
+            } else {
+                current = current->right;
+            }
+            
+            if (current->data != '$') {
+                decoded += current->data;
+                current = root;
+            }
+        }
+        
+        return decoded;
+    }
+
+    void displayCodes() {
+        cout << "Huffman Codes:" << endl;
+        for (auto pair : codes) {
+            cout << pair.first << ": " << pair.second << endl;
+        }
+    }
+};
+
+int main() {
+    string text = "hello world";
+    unordered_map<char, int> frequencies;
+    
+    for (char c : text) {
+        frequencies[c]++;
+    }
+    
+    HuffmanTree ht;
+    ht.buildTree(frequencies);
+    ht.displayCodes();
+    
+    string encoded = ht.encode(text);
+    cout << "Original: " << text << endl;
+    cout << "Encoded: " << encoded << endl;
+    
+    string decoded = ht.decode(encoded);
+    cout << "Decoded: " << decoded << endl;
+    
+    return 0;
+}

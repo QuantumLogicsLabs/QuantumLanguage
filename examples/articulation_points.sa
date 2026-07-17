@@ -1,0 +1,185 @@
+// Articulation Points (Cut Vertices) Implementation in C++
+#include <iostream>
+#include <vector>
+#include <list>
+#include <algorithm>
+using namespace std;
+
+class ArticulationPointsGraph {
+private:
+    vector<list<int>> adjList;
+    int vertices;
+    int time;
+
+    void findArticulationPointsUtil(int u, vector<bool>& visited, vector<int>& discovery,
+                                   vector<int>& low, vector<int>& parent, vector<bool>& ap) {
+        int children = 0;
+        visited[u] = true;
+        discovery[u] = low[u] = ++time;
+
+        for (int v : adjList[u]) {
+            if (!visited[v]) {
+                children++;
+                parent[v] = u;
+                findArticulationPointsUtil(v, visited, discovery, low, parent, ap);
+
+                low[u] = min(low[u], low[v]);
+
+                if (parent[u] == -1 && children > 1) {
+                    ap[u] = true;
+                }
+
+                if (parent[u] != -1 && low[v] >= discovery[u]) {
+                    ap[u] = true;
+                }
+            } else if (v != parent[u]) {
+                low[u] = min(low[u], discovery[v]);
+            }
+        }
+    }
+
+    void findBridgesUtil(int u, vector<bool>& visited, vector<int>& discovery,
+                        vector<int>& low, vector<int>& parent, vector<pair<int, int>>& bridges) {
+        visited[u] = true;
+        discovery[u] = low[u] = ++time;
+
+        for (int v : adjList[u]) {
+            if (!visited[v]) {
+                parent[v] = u;
+                findBridgesUtil(v, visited, discovery, low, parent, bridges);
+
+                low[u] = min(low[u], low[v]);
+
+                if (low[v] > discovery[u]) {
+                    bridges.push_back({min(u, v), max(u, v)});
+                }
+            } else if (v != parent[u]) {
+                low[u] = min(low[u], discovery[v]);
+            }
+        }
+    }
+
+public:
+    ArticulationPointsGraph(int v) : vertices(v), time(0) {
+        adjList.resize(vertices);
+    }
+
+    void addEdge(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            adjList[u].push_back(v);
+            adjList[v].push_back(u);
+        }
+    }
+
+    vector<int> getArticulationPoints() {
+        vector<bool> visited(vertices, false);
+        vector<int> discovery(vertices, -1);
+        vector<int> low(vertices, -1);
+        vector<int> parent(vertices, -1);
+        vector<bool> ap(vertices, false);
+
+        for (int i = 0; i < vertices; i++) {
+            if (!visited[i]) {
+                findArticulationPointsUtil(i, visited, discovery, low, parent, ap);
+            }
+        }
+
+        vector<int> articulationPoints;
+        for (int i = 0; i < vertices; i++) {
+            if (ap[i]) {
+                articulationPoints.push_back(i);
+            }
+        }
+
+        return articulationPoints;
+    }
+
+    vector<pair<int, int>> getBridges() {
+        vector<bool> visited(vertices, false);
+        vector<int> discovery(vertices, -1);
+        vector<int> low(vertices, -1);
+        vector<int> parent(vertices, -1);
+        vector<pair<int, int>> bridges;
+        time = 0;
+
+        for (int i = 0; i < vertices; i++) {
+            if (!visited[i]) {
+                findBridgesUtil(i, visited, discovery, low, parent, bridges);
+            }
+        }
+
+        sort(bridges.begin(), bridges.end());
+        return bridges;
+    }
+
+    bool isBiconnected() {
+        return getArticulationPoints().empty() && getBridges().empty();
+    }
+
+    void displayArticulationPoints(const vector<int>& ap) {
+        cout << "Articulation Points: ";
+        if (ap.empty()) {
+            cout << "None" << endl;
+        } else {
+            for (int i = 0; i < ap.size(); i++) {
+                cout << ap[i];
+                if (i < ap.size() - 1) {
+                    cout << ", ";
+                }
+            }
+            cout << endl;
+        }
+    }
+
+    void displayBridges(const vector<pair<int, int>>& bridges) {
+        cout << "Bridges: ";
+        if (bridges.empty()) {
+            cout << "None" << endl;
+        } else {
+            for (int i = 0; i < bridges.size(); i++) {
+                cout << "(" << bridges[i].first << "," << bridges[i].second << ")";
+                if (i < bridges.size() - 1) {
+                    cout << ", ";
+                }
+            }
+            cout << endl;
+        }
+    }
+
+    void display() {
+        cout << "Graph:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            cout << i << ": ";
+            for (int neighbor : adjList[i]) {
+                cout << neighbor << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    ArticulationPointsGraph g(7);
+    
+    g.addEdge(0, 1);
+    g.addEdge(0, 2);
+    g.addEdge(1, 2);
+    g.addEdge(1, 3);
+    g.addEdge(1, 4);
+    g.addEdge(1, 6);
+    g.addEdge(3, 5);
+    g.addEdge(4, 5);
+    
+    g.display();
+    cout << endl;
+    
+    vector<int> articulationPoints = g.getArticulationPoints();
+    g.displayArticulationPoints(articulationPoints);
+    
+    vector<pair<int, int>> bridges = g.getBridges();
+    g.displayBridges(bridges);
+    
+    cout << "Is biconnected: " << (g.isBiconnected() ? "Yes" : "No") << endl;
+    
+    return 0;
+}

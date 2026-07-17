@@ -1,0 +1,46 @@
+// Simple File Reader
+function readTextFile(file) {
+  const reader = new FileReader();
+  
+  reader.onload = function(e) {
+    console.log('File content:', e.target.result);
+  };
+  
+  reader.onerror = function() {
+    console.error('Error reading file');
+  };
+  
+  reader.readAsText(file);
+}
+
+function readImageFile(file) {
+  const reader = new FileReader();
+  
+  reader.onload = function(e) {
+    const img = document.createElement('img');
+    img.src = e.target.result;
+    document.body.appendChild(img);
+  };
+  
+  reader.readAsDataURL(file);
+}
+
+function setupFileInput() {
+  const fileInput = document.getElementById('fileInput');
+  
+  fileInput.addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    if (file) {
+      if (file.type.startsWith('image/')) {
+        readImageFile(file);
+      } else {
+        readTextFile(file);
+      }
+    }
+  });
+}
+
+// Usage
+setupFileInput();
+
+console.log('File reader ready!');

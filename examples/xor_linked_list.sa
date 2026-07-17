@@ -1,0 +1,92 @@
+// XOR Linked List Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct XORNode {
+    int data;
+    XORNode* both;
+    
+    XORNode(int val) : data(val), both(nullptr) {}
+};
+
+class XORLinkedList {
+private:
+    XORNode* head;
+    
+    XORNode* XOR(XORNode* a, XORNode* b) {
+        return (XORNode*)((uintptr_t)a ^ (uintptr_t)b);
+    }
+
+public:
+    XORLinkedList() : head(nullptr) {}
+
+    ~XORLinkedList() {
+        XORNode* current = head;
+        XORNode* prev = nullptr;
+        XORNode* next;
+        
+        while (current) {
+            next = XOR(prev, current->both);
+            delete current;
+            prev = current;
+            current = next;
+        }
+    }
+
+    void insert(int value) {
+        XORNode* newNode = new XORNode(value);
+        newNode->both = XOR(head, nullptr);
+        
+        if (head) {
+            XORNode* next = XOR(nullptr, head->both);
+            head->both = XOR(newNode, next);
+        }
+        
+        head = newNode;
+    }
+
+    void display() {
+        XORNode* current = head;
+        XORNode* prev = nullptr;
+        XORNode* next;
+        
+        cout << "XOR Linked List: ";
+        while (current) {
+            cout << current->data << " ";
+            next = XOR(prev, current->both);
+            prev = current;
+            current = next;
+        }
+        cout << endl;
+    }
+
+    bool search(int value) {
+        XORNode* current = head;
+        XORNode* prev = nullptr;
+        XORNode* next;
+        
+        while (current) {
+            if (current->data == value) {
+                return true;
+            }
+            next = XOR(prev, current->both);
+            prev = current;
+            current = next;
+        }
+        return false;
+    }
+};
+
+int main() {
+    XORLinkedList xll;
+    xll.insert(10);
+    xll.insert(20);
+    xll.insert(30);
+    xll.insert(40);
+    xll.display();
+    
+    cout << "Search 20: " << (xll.search(20) ? "Found" : "Not Found") << endl;
+    cout << "Search 50: " << (xll.search(50) ? "Found" : "Not Found") << endl;
+    
+    return 0;
+}

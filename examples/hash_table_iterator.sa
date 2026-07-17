@@ -1,0 +1,368 @@
+// Hash Table with Iterator Implementation in C++
+#include <iostream>
+#include <vector>
+#include <list>
+#include <iterator>
+#include <string>
+using namespace std;
+
+template<typename K, typename V>
+class IterableHashTable {
+private:
+    struct Entry {
+        K key;
+        V value;
+        
+        Entry(const K& k, const V& v) : key(k), value(v) {}
+    };
+
+    vector<list<Entry>> table;
+    size_t capacity;
+    size_t size;
+
+    size_t hashFunction(const K& key) const {
+        hash<K> hasher;
+        return hasher(key) % capacity;
+    }
+
+    void rehash() {
+        vector<list<Entry>> oldTable = table;
+        size_t oldCapacity = capacity;
+        
+        capacity *= 2;
+        table.clear();
+        table.resize(capacity);
+        size = 0;
+        
+        for (size_t i = 0; i < oldCapacity; ++i) {
+            for (const Entry& entry : oldTable[i]) {
+                insert(entry.key, entry.value);
+            }
+        }
+    }
+
+public:
+    IterableHashTable(size_t initialCapacity = 16) : capacity(initialCapacity), size(0) {
+        table.resize(capacity);
+    }
+
+    void insert(const K& key, const V& value) {
+        if (static_cast<double>(size) / capacity > 0.75) {
+            rehash();
+        }
+        
+        size_t index = hashFunction(key);
+        
+        for (Entry& entry : table[index]) {
+            if (entry.key == key) {
+                entry.value = value;
+                return;
+            }
+        }
+        
+        table[index].emplace_back(key, value);
+        size++;
+    }
+
+    bool remove(const K& key) {
+        size_t index = hashFunction(key);
+        
+        for (auto it = table[index].begin(); it != table[index].end(); ++it) {
+            if (it->key == key) {
+                table[index].erase(it);
+                size--;
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    V* find(const K& key) {
+        size_t index = hashFunction(key);
+        
+        for (Entry& entry : table[index]) {
+            if (entry.key == key) {
+                return &entry.value;
+            }
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) const {
+        size_t index = hashFunction(key);
+        
+        for (const Entry& entry : table[index]) {
+            if (entry.key == key) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    size_t getSize() const { return size; }
+    size_t getCapacity() const { return capacity; }
+
+    // Iterator implementation
+    class Iterator {
+    private:
+        vector<list<Entry>>* table;
+        size_t bucketIndex;
+        typename list<Entry>::iterator listIt;
+        bool atEnd;
+
+        void advanceToNextValid() {
+            while (bucketIndex < table->size()) {
+                if (listIt != (*table)[bucketIndex].end()) {
+                    break;
+                }
+                bucketIndex++;
+                if (bucketIndex < table->size()) {
+                    listIt = (*table)[bucketIndex].begin();
+                }
+            }
+            
+            if (bucketIndex >= table->size()) {
+                atEnd = true;
+            }
+        }
+
+    public:
+        Iterator(vector<list<Entry>>* t, bool end = false) 
+            : table(t), bucketIndex(0), atEnd(end) {
+            if (!end && !table->empty()) {
+                listIt = (*table)[0].begin();
+                advanceToNextValid();
+            } else {
+                atEnd = true;
+            }
+        }
+
+        Iterator& operator++() {
+            if (atEnd) return *this;
+            
+            ++listIt;
+            advanceToNextValid();
+            return *this;
+        }
+
+        Iterator operator++(int) {
+            Iterator temp = *this;
+            ++(*this);
+            return temp;
+        }
+
+        Entry& operator*() {
+            return *listIt;
+        }
+
+        Entry* operator->() {
+            return &(*listIt);
+        }
+
+        bool operator==(const Iterator& other) const {
+            return atEnd == other.atEnd && 
+                   (atEnd || (bucketIndex == other.bucketIndex && listIt == other.listIt));
+        }
+
+        bool operator!=(const Iterator& other) const {
+            return !(*this == other);
+        }
+    };
+
+    Iterator begin() {
+        return Iterator(&table);
+    }
+
+    Iterator end() {
+        return Iterator(&table, true);
+    }
+
+    // Const iterator
+    class ConstIterator {
+    private:
+        const vector<list<Entry>>* table;
+        size_t bucketIndex;
+        typename list<Entry>::const_iterator listIt;
+        bool atEnd;
+
+        void advanceToNextValid() {
+            while (bucketIndex < table->size()) {
+                if (listIt != (*table)[bucketIndex].end()) {
+                    break;
+                }
+                bucketIndex++;
+                if (bucketIndex < table->size()) {
+                    listIt = (*table)[bucketIndex].begin();
+                }
+            }
+            
+            if (bucketIndex >= table->size()) {
+                atEnd = true;
+            }
+        }
+
+    public:
+        ConstIterator(const vector<list<Entry>>* t, bool end = false) 
+            : table(t), bucketIndex(0), atEnd(end) {
+            if (!end && !table->empty()) {
+                listIt = (*table)[0].begin();
+                advanceToNextValid();
+            } else {
+                atEnd = true;
+            }
+        }
+
+        ConstIterator& operator++() {
+            if (atEnd) return *this;
+            
+            ++listIt;
+            advanceToNextValid();
+            return *this;
+        }
+
+        ConstIterator operator++(int) {
+            ConstIterator temp = *this;
+            ++(*this);
+            return temp;
+        }
+
+        const Entry& operator*() const {
+            return *listIt;
+        }
+
+        const Entry* operator->() const {
+            return &(*listIt);
+        }
+
+        bool operator==(const ConstIterator& other) const {
+            return atEnd == other.atEnd && 
+                   (atEnd || (bucketIndex == other.bucketIndex && listIt == other.listIt));
+        }
+
+        bool operator!=(const ConstIterator& other) const {
+            return !(*this == other);
+        }
+    };
+
+    ConstIterator begin() const {
+        return ConstIterator(&table);
+    }
+
+    ConstIterator end() const {
+        return ConstIterator(&table, true);
+    }
+
+    ConstIterator cbegin() const {
+        return begin();
+    }
+
+    ConstIterator cend() const {
+        return end();
+    }
+
+    void display() const {
+        cout << "Iterable Hash Table:" << endl;
+        cout << "Size: " << size << ", Capacity: " << capacity << endl;
+        cout << "Contents:" << endl;
+        
+        for (const auto& entry : *this) {
+            cout << "[" << entry.key << ": " << entry.value << "] ";
+        }
+        cout << endl;
+    }
+
+    vector<K> getKeys() const {
+        vector<K> keys;
+        for (const auto& entry : *this) {
+            keys.push_back(entry.key);
+        }
+        return keys;
+    }
+
+    vector<V> getValues() const {
+        vector<V> values;
+        for (const auto& entry : *this) {
+            values.push_back(entry.value);
+        }
+        return values;
+    }
+};
+
+// Range-based for loop support example
+template<typename K, typename V>
+void printHashTable(const IterableHashTable<K, V>& ht) {
+    cout << "Printing using range-based for loop:" << endl;
+    for (const auto& entry : ht) {
+        cout << entry.key << " -> " << entry.value << endl;
+    }
+}
+
+// STL algorithm compatibility example
+template<typename K, typename V>
+V findMaxValue(const IterableHashTable<K, V>& ht) {
+    if (ht.getSize() == 0) {
+        return V{};
+    }
+    
+    auto maxIt = max_element(ht.begin(), ht.end(), 
+        [](const auto& a, const auto& b) {
+            return a.value < b.value;
+        });
+    
+    return maxIt->value;
+}
+
+int main() {
+    IterableHashTable<string, int> iht;
+    
+    iht.insert("apple", 5);
+    iht.insert("banana", 3);
+    iht.insert("orange", 7);
+    iht.insert("grape", 2);
+    iht.insert("mango", 4);
+    
+    iht.display();
+    cout << endl;
+    
+    cout << "=== Iterator Demo ===" << endl;
+    cout << "Using iterator:" << endl;
+    for (auto it = iht.begin(); it != iht.end(); ++it) {
+        cout << it->key << " -> " << it->value << endl;
+    }
+    
+    cout << "\nUsing const iterator:" << endl;
+    for (auto it = iht.cbegin(); it != iht.cend(); ++it) {
+        cout << it->key << " -> " << it->value << endl;
+    }
+    
+    cout << "\n=== Range-based for loop ===" << endl;
+    printHashTable(iht);
+    
+    cout << "\n=== STL Algorithm Compatibility ===" << endl;
+    cout << "Max value: " << findMaxValue(iht) << endl;
+    
+    cout << "Count of entries with value > 3: " << 
+        count_if(iht.begin(), iht.end(), 
+                [](const auto& entry) { return entry.value > 3; }) << endl;
+    
+    cout << "All entries (using for_each):" << endl;
+    for_each(iht.begin(), iht.end(), 
+            [](const auto& entry) { 
+                cout << entry.key << ":" << entry.value << " "; 
+            });
+    cout << endl;
+    
+    cout << "\n=== Find and Modify ===" << endl;
+    auto it = find_if(iht.begin(), iht.end(), 
+                    [](const auto& entry) { return entry.key == "banana"; });
+    
+    if (it != iht.end()) {
+        cout << "Found banana with value: " << it->value << endl;
+        // Note: Can't modify through const_iterator, but could through regular iterator
+    }
+    
+    return 0;
+}

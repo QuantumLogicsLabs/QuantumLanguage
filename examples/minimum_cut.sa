@@ -1,0 +1,157 @@
+// Minimum Cut (Stoer-Wagner Algorithm) Implementation in C++
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <climits>
+using namespace std;
+
+class MinimumCutGraph {
+private:
+    vector<vector<int>> weight;
+    int vertices;
+
+    pair<int, vector<vector<int>>> minimumCutPhase(vector<int>& vertices) {
+        vector<bool> inA(vertices.size(), false);
+        vector<int> addedWeight(vertices.size(), 0);
+        vector<int> previous;
+
+        while (previous.size() < vertices.size()) {
+            int maxWeight = -1;
+            int selected = -1;
+
+            for (int i = 0; i < vertices.size(); i++) {
+                if (!inA[vertices[i]] && addedWeight[vertices[i]] > maxWeight) {
+                    maxWeight = addedWeight[vertices[i]];
+                    selected = vertices[i];
+                }
+            }
+
+            if (selected == -1) break;
+
+            previous.push_back(selected);
+            inA[selected] = true;
+
+            for (int i = 0; i < vertices.size(); i++) {
+                if (!inA[vertices[i]]) {
+                    addedWeight[vertices[i]] += weight[selected][vertices[i]];
+                }
+            }
+        }
+
+        int s = previous[previous.size() - 2];
+        int t = previous[previous.size() - 1];
+        int cutWeight = 0;
+
+        for (int i = 0; i < vertices.size(); i++) {
+            cutWeight += weight[t][vertices[i]];
+        }
+
+        vector<vector<int>> partition(2);
+        for (int i = 0; i < vertices.size(); i++) {
+            if (i != t) {
+                partition[0].push_back(vertices[i]);
+            } else {
+                partition[1].push_back(vertices[i]);
+            }
+        }
+
+        for (int i = 0; i < vertices.size(); i++) {
+            weight[s][vertices[i]] += weight[t][vertices[i]];
+            weight[vertices[i]][s] = weight[s][vertices[i]];
+        }
+
+        return {cutWeight, partition};
+    }
+
+public:
+    MinimumCutGraph(int v) : vertices(v) {
+        weight.resize(vertices, vector<int>(vertices, 0));
+    }
+
+    void addEdge(int u, int v, int w) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            weight[u][v] += w;
+            weight[v][u] += w;
+        }
+    }
+
+    pair<int, vector<vector<int>>> getMinimumCut() {
+        vector<int> currentVertices;
+        for (int i = 0; i < vertices; i++) {
+            currentVertices.push_back(i);
+        }
+
+        int minCutWeight = INT_MAX;
+        vector<vector<int>> bestPartition;
+
+        while (currentVertices.size() > 1) {
+            auto result = minimumCutPhase(currentVertices);
+            int cutWeight = result.first;
+            vector<vector<int>> partition = result.second;
+
+            if (cutWeight < minCutWeight) {
+                minCutWeight = cutWeight;
+                bestPartition = partition;
+            }
+
+            currentVertices.erase(remove(currentVertices.begin(), currentVertices.end(), result.second[1][0]), currentVertices.end());
+        }
+
+        return {minCutWeight, bestPartition};
+    }
+
+    void displayPartition(const vector<vector<int>>& partition) {
+        cout << "Partition:" << endl;
+        cout << "Set A: ";
+        for (int vertex : partition[0]) {
+            cout << vertex << " ";
+        }
+        cout << endl;
+
+        cout << "Set B: ";
+        for (int vertex : partition[1]) {
+            cout << vertex << " ";
+        }
+        cout << endl;
+    }
+
+    void display() {
+        cout << "Weight Matrix:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            for (int j = 0; j < vertices; j++) {
+                cout << weight[i][j] << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    MinimumCutGraph g(8);
+    
+    g.addEdge(0, 1, 1);
+    g.addEdge(0, 2, 1);
+    g.addEdge(0, 3, 1);
+    g.addEdge(1, 2, 1);
+    g.addEdge(1, 3, 1);
+    g.addEdge(2, 3, 1);
+    g.addEdge(4, 5, 1);
+    g.addEdge(4, 6, 1);
+    g.addEdge(4, 7, 1);
+    g.addEdge(5, 6, 1);
+    g.addEdge(5, 7, 1);
+    g.addEdge(6, 7, 1);
+    g.addEdge(3, 4, 1);
+    
+    g.display();
+    cout << endl;
+    
+    auto result = g.getMinimumCut();
+    int minCutWeight = result.first;
+    vector<vector<int>> partition = result.second;
+    
+    cout << "Minimum Cut Weight: " << minCutWeight << endl;
+    g.displayPartition(partition);
+    
+    return 0;
+}

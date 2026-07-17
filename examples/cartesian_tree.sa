@@ -1,0 +1,102 @@
+// Cartesian Tree Implementation in C++
+#include <iostream>
+#include <vector>
+#include <stack>
+using namespace std;
+
+struct CartesianNode {
+    int data;
+    int index;
+    CartesianNode* left;
+    CartesianNode* right;
+    
+    CartesianNode(int val, int idx) : data(val), index(idx), left(nullptr), right(nullptr) {}
+};
+
+class CartesianTree {
+private:
+    CartesianNode* root;
+
+    CartesianNode* buildTree(const vector<int>& arr) {
+        stack<CartesianNode*> st;
+        CartesianNode* node = nullptr;
+        
+        for (int i = 0; i < arr.size(); i++) {
+            node = new CartesianNode(arr[i], i);
+            CartesianNode* last = nullptr;
+            
+            while (!st.empty() && st.top()->data < node->data) {
+                last = st.top();
+                st.pop();
+            }
+            
+            if (!st.empty()) {
+                st.top()->right = node;
+            }
+            
+            if (last) {
+                node->left = last;
+            }
+            
+            st.push(node);
+        }
+        
+        while (!st.empty()) {
+            node = st.top();
+            st.pop();
+        }
+        
+        return node;
+    }
+
+    void inorder(CartesianNode* node) {
+        if (node) {
+            inorder(node->left);
+            cout << node->data << "(idx:" << node->index << ") ";
+            inorder(node->right);
+        }
+    }
+
+    void destroyTree(CartesianNode* node) {
+        if (node) {
+            destroyTree(node->left);
+            destroyTree(node->right);
+            delete node;
+        }
+    }
+
+public:
+    CartesianTree() : root(nullptr) {}
+
+    CartesianTree(const vector<int>& arr) {
+        root = buildTree(arr);
+    }
+
+    ~CartesianTree() {
+        destroyTree(root);
+    }
+
+    void build(const vector<int>& arr) {
+        destroyTree(root);
+        root = buildTree(arr);
+    }
+
+    void display() {
+        cout << "Cartesian Tree: ";
+        inorder(root);
+        cout << endl;
+    }
+};
+
+int main() {
+    vector<int> arr = {3, 2, 6, 1, 9, 4, 5, 8, 7};
+    CartesianTree ct(arr);
+    
+    ct.display();
+    
+    vector<int> arr2 = {5, 10, 40, 30, 28};
+    CartesianTree ct2(arr2);
+    ct2.display();
+    
+    return 0;
+}

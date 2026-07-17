@@ -1,0 +1,133 @@
+// Interval Tree Implementation in C++
+#include <iostream>
+#include <algorithm>
+using namespace std;
+
+struct Interval {
+    int low, high;
+    
+    Interval(int l, int h) : low(l), high(h) {}
+};
+
+class IntervalNode {
+public:
+    Interval interval;
+    int max;
+    IntervalNode* left;
+    IntervalNode* right;
+    
+    IntervalNode(Interval i) : interval(i), max(i.high), left(nullptr), right(nullptr) {}
+    
+    ~IntervalNode() {
+        delete left;
+        delete right;
+    }
+};
+
+class IntervalTree {
+private:
+    IntervalNode* root;
+
+    int getMax(IntervalNode* node) {
+        return node ? node->max : 0;
+    }
+
+    IntervalNode* insert(IntervalNode* node, Interval interval) {
+        if (!node) {
+            return new IntervalNode(interval);
+        }
+        
+        int l = node->interval.low;
+        
+        if (interval.low < l) {
+            node->left = insert(node->left, interval);
+        } else {
+            node->right = insert(node->right, interval);
+        }
+        
+        node->max = max(node->interval.high, 
+                      max(getMax(node->left), getMax(node->right)));
+        
+        return node;
+    }
+
+    bool doOverlap(Interval i1, Interval i2) {
+        return i1.low <= i2.high && i2.low <= i1.high;
+    }
+
+    Interval* overlapSearch(IntervalNode* node, Interval interval) {
+        if (!node) {
+            return nullptr;
+        }
+        
+        if (doOverlap(node->interval, interval)) {
+            return &node->interval;
+        }
+        
+        if (node->left && node->left->max >= interval.low) {
+            return overlapSearch(node->left, interval);
+        }
+        
+        return overlapSearch(node->right, interval);
+    }
+
+    void inorder(IntervalNode* node) {
+        if (node) {
+            inorder(node->left);
+            cout << "[" << node->interval.low << "," << node->interval.high 
+                 << "] max=" << node->max << " ";
+            inorder(node->right);
+        }
+    }
+
+public:
+    IntervalTree() : root(nullptr) {}
+
+    ~IntervalTree() {
+        delete root;
+    }
+
+    void insert(Interval interval) {
+        root = insert(root, interval);
+    }
+
+    Interval* search(Interval interval) {
+        return overlapSearch(root, interval);
+    }
+
+    void display() {
+        cout << "Interval Tree: ";
+        inorder(root);
+        cout << endl;
+    }
+};
+
+int main() {
+    IntervalTree it;
+    
+    it.insert(Interval(15, 20));
+    it.insert(Interval(10, 30));
+    it.insert(Interval(17, 19));
+    it.insert(Interval(5, 20));
+    it.insert(Interval(12, 15));
+    it.insert(Interval(30, 40));
+    
+    it.display();
+    
+    Interval search1(6, 7);
+    Interval search2(14, 16);
+    Interval search3(21, 23);
+    
+    Interval* result;
+    
+    result = it.search(search1);
+    cout << "Search [6,7]: " << (result ? "Found [" + to_string(result->low) + "," + to_string(result->high) + "]" : "Not Found") << endl;
+    
+    result = it.search(search2);
+    cout << "Search [14,16]: " << (result ? "Found [" + to_string(result->low) + "," + to_string(result->high) + "]" : "Not Found") << endl;
+    
+    result = it.search(search3);
+    cout << "Search [21,23]: " << (result ? "Found [" + to_string(result->low) + "," + to_string(result->high) + "]" : "Not Found") << endl;
+    
+    return 0;
+}

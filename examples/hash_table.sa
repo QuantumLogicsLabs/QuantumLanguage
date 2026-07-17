@@ -1,0 +1,156 @@
+// Hash Table Implementation in C++
+#include <iostream>
+#include <vector>
+#include <list>
+#include <string>
+using namespace std;
+
+template<typename K, typename V>
+class HashTable {
+private:
+    static const int TABLE_SIZE = 10;
+    vector<list<pair<K, V>>> table;
+
+    int hashFunction(const K& key) {
+        hash<K> hasher;
+        return hasher(key) % TABLE_SIZE;
+    }
+
+public:
+    HashTable() {
+        table.resize(TABLE_SIZE);
+    }
+
+    void insert(const K& key, const V& value) {
+        int index = hashFunction(key);
+        
+        for (auto& pair : table[index]) {
+            if (pair.first == key) {
+                pair.second = value;
+                return;
+            }
+        }
+        
+        table[index].push_back({key, value});
+    }
+
+    bool remove(const K& key) {
+        int index = hashFunction(key);
+        
+        for (auto it = table[index].begin(); it != table[index].end(); ++it) {
+            if (it->first == key) {
+                table[index].erase(it);
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    V* find(const K& key) {
+        int index = hashFunction(key);
+        
+        for (auto& pair : table[index]) {
+            if (pair.first == key) {
+                return &pair.second;
+            }
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) {
+        return find(key) != nullptr;
+    }
+
+    void display() {
+        cout << "Hash Table:" << endl;
+        for (int i = 0; i < TABLE_SIZE; i++) {
+            cout << "Bucket " << i << ": ";
+            for (auto& pair : table[i]) {
+                cout << "[" << pair.first << ": " << pair.second << "] ";
+            }
+            cout << endl;
+        }
+    }
+
+    int size() {
+        int count = 0;
+        for (int i = 0; i < TABLE_SIZE; i++) {
+            count += table[i].size();
+        }
+        return count;
+    }
+
+    bool isEmpty() {
+        return size() == 0;
+    }
+
+    void clear() {
+        for (int i = 0; i < TABLE_SIZE; i++) {
+            table[i].clear();
+        }
+    }
+
+    vector<K> getKeys() {
+        vector<K> keys;
+        for (int i = 0; i < TABLE_SIZE; i++) {
+            for (auto& pair : table[i]) {
+                keys.push_back(pair.first);
+            }
+        }
+        return keys;
+    }
+
+    vector<V> getValues() {
+        vector<V> values;
+        for (int i = 0; i < TABLE_SIZE; i++) {
+            for (auto& pair : table[i]) {
+                values.push_back(pair.second);
+            }
+        }
+        return values;
+    }
+};
+
+int main() {
+    HashTable<string, int> ht;
+    
+    ht.insert("apple", 5);
+    ht.insert("banana", 3);
+    ht.insert("orange", 7);
+    ht.insert("grape", 2);
+    ht.insert("mango", 4);
+    
+    ht.display();
+    cout << endl;
+    
+    cout << "Size: " << ht.size() << endl;
+    cout << "Contains 'apple': " << (ht.contains("apple") ? "Yes" : "No") << endl;
+    cout << "Contains 'pear': " << (ht.contains("pear") ? "Yes" : "No") << endl;
+    
+    int* value = ht.find("banana");
+    if (value) {
+        cout << "Value of 'banana': " << *value << endl;
+    }
+    
+    ht.remove("orange");
+    cout << "\nAfter removing 'orange':" << endl;
+    ht.display();
+    
+    cout << "\nKeys: ";
+    vector<string> keys = ht.getKeys();
+    for (const string& key : keys) {
+        cout << key << " ";
+    }
+    cout << endl;
+    
+    cout << "Values: ";
+    vector<int> values = ht.getValues();
+    for (int val : values) {
+        cout << val << " ";
+    }
+    cout << endl;
+    
+    return 0;
+}

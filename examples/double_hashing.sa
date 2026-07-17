@@ -1,0 +1,242 @@
+// Double Hashing Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+using namespace std;
+
+enum class EntryType { EMPTY, OCCUPIED, DELETED };
+
+template<typename K, typename V>
+class DoubleHashTable {
+private:
+    struct Entry {
+        K key;
+        V value;
+        EntryType type;
+        
+        Entry() : type(EntryType::EMPTY) {}
+        Entry(const K& k, const V& v) : key(k), value(v), type(EntryType::OCCUPIED) {}
+    };
+
+    vector<Entry> table;
+    size_t capacity;
+    size_t size;
+
+    size_t hash1(const K& key) const {
+        hash<K> hasher;
+        return hasher(key) % capacity;
+    }
+
+    size_t hash2(const K& key) const {
+        hash<K> hasher;
+        size_t hash = hasher(key);
+        return 1 + (hash % (capacity - 1));
+    }
+
+    size_t probeFunction(size_t h1, size_t h2, size_t attempt) const {
+        return (h1 + attempt * h2) % capacity;
+    }
+
+    void rehash() {
+        vector<Entry> oldTable = table;
+        size_t oldCapacity = capacity;
+        
+        capacity *= 2;
+        table.clear();
+        table.resize(capacity);
+        size = 0;
+        
+        for (size_t i = 0; i < oldCapacity; ++i) {
+            if (oldTable[i].type == EntryType::OCCUPIED) {
+                insert(oldTable[i].key, oldTable[i].value);
+            }
+        }
+    }
+
+public:
+    DoubleHashTable(size_t initialCapacity = 16) : capacity(initialCapacity), size(0) {
+        table.resize(capacity);
+    }
+
+    bool insert(const K& key, const V& value) {
+        if (static_cast<double>(size) / capacity > 0.7) {
+            rehash();
+        }
+        
+        size_t h1 = hash1(key);
+        size_t h2 = hash2(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(h1, h2, attempt);
+            
+            if (table[current].type == EntryType::EMPTY || table[current].type == EntryType::DELETED) {
+                table[current] = Entry(key, value);
+                size++;
+                return true;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                table[current].value = value;
+                return true;
+            }
+            
+            attempt++;
+        }
+        
+        return false;
+    }
+
+    bool remove(const K& key) {
+        size_t h1 = hash1(key);
+        size_t h2 = hash2(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(h1, h2, attempt);
+            
+            if (table[current].type == EntryType::EMPTY) {
+                return false;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                table[current].type = EntryType::DELETED;
+                size--;
+                return true;
+            }
+            
+            attempt++;
+        }
+        
+        return false;
+    }
+
+    V* find(const K& key) {
+        size_t h1 = hash1(key);
+        size_t h2 = hash2(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(h1, h2, attempt);
+            
+            if (table[current].type == EntryType::EMPTY) {
+                return nullptr;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                return &table[current].value;
+            }
+            
+            attempt++;
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) const {
+        size_t h1 = hash1(key);
+        size_t h2 = hash2(key);
+        size_t attempt = 0;
+        
+        while (attempt < capacity) {
+            size_t current = probeFunction(h1, h2, attempt);
+            
+            if (table[current].type == EntryType::EMPTY) {
+                return false;
+            }
+            
+            if (table[current].type == EntryType::OCCUPIED && table[current].key == key) {
+                return true;
+            }
+            
+            attempt++;
+        }
+        
+        return false;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    size_t getCapacity() const {
+        return capacity;
+    }
+
+    double getLoadFactor() const {
+        return static_cast<double>(size) / capacity;
+    }
+
+    void display() const {
+        cout << "Double Hashing Table:" << endl;
+        cout << "Size: " << size << ", Capacity: " << capacity << ", Load Factor: " << getLoadFactor() << endl;
+        cout << "Index\tKey\tValue\tStatus" << endl;
+        
+        for (size_t i = 0; i < capacity; ++i) {
+            cout << i << "\t";
+            if (table[i].type == EntryType::OCCUPIED) {
+                cout << table[i].key << "\t" << table[i].value << "\tOCCUPIED";
+            } else if (table[i].type == EntryType::DELETED) {
+                cout << "-\t-\tDELETED";
+            } else {
+                cout << "-\t-\tEMPTY";
+            }
+            cout << endl;
+        }
+    }
+
+    vector<K> getKeys() const {
+        vector<K> keys;
+        for (const auto& entry : table) {
+            if (entry.type == EntryType::OCCUPIED) {
+                keys.push_back(entry.key);
+            }
+        }
+        return keys;
+    }
+
+    vector<V> getValues() const {
+        vector<V> values;
+        for (const auto& entry : table) {
+            if (entry.type == EntryType::OCCUPIED) {
+                values.push_back(entry.value);
+            }
+        }
+        return values;
+    }
+};
+
+int main() {
+    DoubleHashTable<string, int> dht;
+    
+    dht.insert("apple", 5);
+    dht.insert("banana", 3);
+    dht.insert("orange", 7);
+    dht.insert("grape", 2);
+    dht.insert("mango", 4);
+    
+    dht.display();
+    cout << endl;
+    
+    cout << "Size: " << dht.getSize() << endl;
+    cout << "Capacity: " << dht.getCapacity() << endl;
+    cout << "Load Factor: " << dht.getLoadFactor() << endl;
+    cout << "Contains 'banana': " << (dht.contains("banana") ? "Yes" : "No") << endl;
+    
+    int* value = dht.find("orange");
+    if (value) {
+        cout << "Value of 'orange': " << *value << endl;
+    }
+    
+    dht.remove("grape");
+    cout << "\nAfter removing 'grape':" << endl;
+    dht.display();
+    
+    dht.insert("pear", 6);
+    dht.insert("peach", 1);
+    
+    cout << "\nAfter inserting more elements:" << endl;
+    dht.display();
+    
+    return 0;
+}

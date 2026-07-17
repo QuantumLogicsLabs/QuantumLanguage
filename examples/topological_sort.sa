@@ -1,0 +1,175 @@
+// Topological Sort Implementation in C++
+#include <iostream>
+#include <vector>
+#include <stack>
+#include <queue>
+#include <list>
+using namespace std;
+
+class TopologicalSortGraph {
+private:
+    vector<list<int>> adjList;
+    int vertices;
+
+    void dfsHelper(int vertex, vector<bool>& visited, stack<int>& result) {
+        visited[vertex] = true;
+
+        for (int neighbor : adjList[vertex]) {
+            if (!visited[neighbor]) {
+                dfsHelper(neighbor, visited, result);
+            }
+        }
+
+        result.push(vertex);
+    }
+
+public:
+    TopologicalSortGraph(int v) : vertices(v) {
+        adjList.resize(vertices);
+    }
+
+    void addEdge(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            adjList[u].push_back(v);
+        }
+    }
+
+    vector<int> topologicalSortDFS() {
+        vector<bool> visited(vertices, false);
+        stack<int> result;
+
+        for (int i = 0; i < vertices; i++) {
+            if (!visited[i]) {
+                dfsHelper(i, visited, result);
+            }
+        }
+
+        vector<int> sorted;
+        while (!result.empty()) {
+            sorted.push_back(result.top());
+            result.pop();
+        }
+
+        return sorted;
+    }
+
+    vector<int> topologicalSortKahn() {
+        vector<int> inDegree(vertices, 0);
+
+        for (int i = 0; i < vertices; i++) {
+            for (int neighbor : adjList[i]) {
+                inDegree[neighbor]++;
+            }
+        }
+
+        queue<int> q;
+        for (int i = 0; i < vertices; i++) {
+            if (inDegree[i] == 0) {
+                q.push(i);
+            }
+        }
+
+        vector<int> result;
+        while (!q.empty()) {
+            int u = q.front();
+            q.pop();
+            result.push_back(u);
+
+            for (int neighbor : adjList[u]) {
+                inDegree[neighbor]--;
+                if (inDegree[neighbor] == 0) {
+                    q.push(neighbor);
+                }
+            }
+        }
+
+        if (result.size() != vertices) {
+            return {};
+        }
+
+        return result;
+    }
+
+    bool hasCycle() {
+        vector<int> inDegree(vertices, 0);
+
+        for (int i = 0; i < vertices; i++) {
+            for (int neighbor : adjList[i]) {
+                inDegree[neighbor]++;
+            }
+        }
+
+        queue<int> q;
+        for (int i = 0; i < vertices; i++) {
+            if (inDegree[i] == 0) {
+                q.push(i);
+            }
+        }
+
+        int count = 0;
+        while (!q.empty()) {
+            int u = q.front();
+            q.pop();
+            count++;
+
+            for (int neighbor : adjList[u]) {
+                inDegree[neighbor]--;
+                if (inDegree[neighbor] == 0) {
+                    q.push(neighbor);
+                }
+            }
+        }
+
+        return count != vertices;
+    }
+
+    void displayTopologicalOrder(const vector<int>& order, const string& method) {
+        cout << "Topological Order (" << method << "): ";
+        if (order.empty()) {
+            cout << "Graph has a cycle!" << endl;
+        } else {
+            for (int i = 0; i < order.size(); i++) {
+                cout << order[i];
+                if (i < order.size() - 1) {
+                    cout << " -> ";
+                }
+            }
+            cout << endl;
+        }
+    }
+
+    void display() {
+        cout << "Directed Acyclic Graph:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            cout << i << ": ";
+            for (int neighbor : adjList[i]) {
+                cout << neighbor << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    TopologicalSortGraph g(6);
+    
+    g.addEdge(5, 2);
+    g.addEdge(5, 0);
+    g.addEdge(4, 0);
+    g.addEdge(4, 1);
+    g.addEdge(2, 3);
+    g.addEdge(3, 1);
+    
+    g.display();
+    cout << endl;
+    
+    vector<int> dfsOrder = g.topologicalSortDFS();
+    g.displayTopologicalOrder(dfsOrder, "DFS");
+    
+    vector<int> kahnOrder = g.topologicalSortKahn();
+    g.displayTopologicalOrder(kahnOrder, "Kahn's Algorithm");
+    
+    cout << "Has cycle: " << (g.hasCycle() ? "Yes" : "No") << endl;
+    
+    return 0;
+}

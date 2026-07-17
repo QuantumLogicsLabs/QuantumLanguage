@@ -1,0 +1,98 @@
+// Chunked Array Implementation in C++
+#include <iostream>
+using namespace std;
+
+class ChunkedArray {
+private:
+    static const int CHUNK_SIZE = 8;
+    int** chunks;
+    int totalChunks;
+    int size;
+
+    void addChunk() {
+        int** newChunks = new int*[totalChunks + 1];
+        for (int i = 0; i < totalChunks; i++) {
+            newChunks[i] = chunks[i];
+        }
+        newChunks[totalChunks] = new int[CHUNK_SIZE];
+        delete[] chunks;
+        chunks = newChunks;
+        totalChunks++;
+    }
+
+public:
+    ChunkedArray() : totalChunks(0), size(0) {
+        chunks = new int*[0];
+    }
+
+    ~ChunkedArray() {
+        for (int i = 0; i < totalChunks; i++) {
+            delete[] chunks[i];
+        }
+        delete[] chunks;
+    }
+
+    void push_back(int value) {
+        if (size / CHUNK_SIZE >= totalChunks) {
+            addChunk();
+        }
+        
+        int chunkIndex = size / CHUNK_SIZE;
+        int elementIndex = size % CHUNK_SIZE;
+        chunks[chunkIndex][elementIndex] = value;
+        size++;
+    }
+
+    int& operator[](int index) {
+        if (index < 0 || index >= size) {
+            static int dummy = 0;
+            return dummy;
+        }
+        
+        int chunkIndex = index / CHUNK_SIZE;
+        int elementIndex = index % CHUNK_SIZE;
+        return chunks[chunkIndex][elementIndex];
+    }
+
+    int getSize() {
+        return size;
+    }
+
+    int getChunkCount() {
+        return totalChunks;
+    }
+
+    void display() {
+        cout << "Chunked Array (size=" << size << ", chunks=" << totalChunks << "): ";
+        for (int i = 0; i < size; i++) {
+            cout << (*this)[i] << " ";
+        }
+        cout << endl;
+    }
+
+    void displayChunks() {
+        cout << "Chunks:" << endl;
+        for (int i = 0; i < totalChunks; i++) {
+            cout << "Chunk " << i << ": ";
+            for (int j = 0; j < CHUNK_SIZE && i * CHUNK_SIZE + j < size; j++) {
+                cout << chunks[i][j] << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    ChunkedArray ca;
+    for (int i = 1; i <= 20; i++) {
+        ca.push_back(i * 10);
+    }
+    ca.display();
+    ca.displayChunks();
+    
+    cout << "Element at index 12: " << ca[12] << endl;
+    ca[12] = 999;
+    ca.display();
+    
+    return 0;
+}

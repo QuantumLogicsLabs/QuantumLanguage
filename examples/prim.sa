@@ -1,0 +1,123 @@
+// Prim's Algorithm for Minimum Spanning Tree Implementation in C++
+#include <iostream>
+#include <vector>
+#include <queue>
+#include <climits>
+using namespace std;
+
+struct Edge {
+    int destination;
+    int weight;
+    
+    Edge(int dest, int w) : destination(dest), weight(w) {}
+};
+
+class PrimGraph {
+private:
+    vector<vector<Edge>> adjList;
+    int vertices;
+
+public:
+    PrimGraph(int v) : vertices(v) {
+        adjList.resize(vertices);
+    }
+
+    void addEdge(int u, int v, int weight) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            adjList[u].push_back(Edge(v, weight));
+            adjList[v].push_back(Edge(u, weight));
+        }
+    }
+
+    vector<pair<pair<int, int>, int>> primMST() {
+        vector<pair<pair<int, int>, int>> mst;
+        vector<bool> visited(vertices, false);
+        vector<int> key(vertices, INT_MAX);
+        vector<int> parent(vertices, -1);
+
+        priority_queue<pair<int, int>, vector<pair<int, int>>, greater<pair<int, int>>> pq;
+
+        key[0] = 0;
+        pq.push({0, 0});
+
+        while (!pq.empty()) {
+            int u = pq.top().second;
+            pq.pop();
+
+            if (visited[u]) {
+                continue;
+            }
+
+            visited[u] = true;
+
+            for (const Edge& edge : adjList[u]) {
+                int v = edge.destination;
+                int weight = edge.weight;
+
+                if (!visited[v] && weight < key[v]) {
+                    key[v] = weight;
+                    parent[v] = u;
+                    pq.push({key[v], v});
+                }
+            }
+        }
+
+        for (int i = 1; i < vertices; i++) {
+            if (parent[i] != -1) {
+                mst.push_back({{parent[i], i}, key[i]});
+            }
+        }
+
+        return mst;
+    }
+
+    int getTotalWeight(const vector<pair<pair<int, int>, int>>& mst) {
+        int totalWeight = 0;
+        for (const auto& edge : mst) {
+            totalWeight += edge.second;
+        }
+        return totalWeight;
+    }
+
+    void displayMST(const vector<pair<pair<int, int>, int>>& mst) {
+        cout << "Minimum Spanning Tree (Prim's Algorithm):" << endl;
+        cout << "Edge\t\tWeight" << endl;
+        for (const auto& edge : mst) {
+            cout << edge.first.first << " - " << edge.first.second << "\t\t" << edge.second << endl;
+        }
+        cout << "Total weight: " << getTotalWeight(mst) << endl;
+    }
+
+    void display() {
+        cout << "Graph:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            cout << i << ": ";
+            for (const Edge& edge : adjList[i]) {
+                cout << edge.destination << "(w:" << edge.weight << ") ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    PrimGraph g(6);
+    
+    g.addEdge(0, 1, 4);
+    g.addEdge(0, 2, 4);
+    g.addEdge(1, 2, 2);
+    g.addEdge(1, 3, 6);
+    g.addEdge(2, 3, 3);
+    g.addEdge(2, 4, 5);
+    g.addEdge(3, 4, 2);
+    g.addEdge(3, 5, 4);
+    g.addEdge(4, 5, 3);
+    
+    g.display();
+    cout << endl;
+    
+    vector<pair<pair<int, int>, int>> mst = g.primMST();
+    g.displayMST(mst);
+    
+    return 0;
+}

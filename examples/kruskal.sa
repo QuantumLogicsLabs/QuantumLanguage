@@ -1,0 +1,145 @@
+// Kruskal's Algorithm for Minimum Spanning Tree Implementation in C++
+#include <iostream>
+#include <vector>
+#include <algorithm>
+using namespace std;
+
+struct Edge {
+    int source;
+    int destination;
+    int weight;
+    
+    Edge(int src, int dest, int w) : source(src), destination(dest), weight(w) {}
+    
+    bool operator<(const Edge& other) const {
+        return weight < other.weight;
+    }
+};
+
+class UnionFind {
+private:
+    vector<int> parent;
+    vector<int> rank;
+
+public:
+    UnionFind(int n) {
+        parent.resize(n);
+        rank.resize(n, 0);
+        for (int i = 0; i < n; i++) {
+            parent[i] = i;
+        }
+    }
+
+    int find(int i) {
+        if (parent[i] != i) {
+            parent[i] = find(parent[i]);
+        }
+        return parent[i];
+    }
+
+    void unite(int i, int j) {
+        int rootI = find(i);
+        int rootJ = find(j);
+        
+        if (rootI != rootJ) {
+            if (rank[rootI] < rank[rootJ]) {
+                parent[rootI] = rootJ;
+            } else if (rank[rootI] > rank[rootJ]) {
+                parent[rootJ] = rootI;
+            } else {
+                parent[rootJ] = rootI;
+                rank[rootI]++;
+            }
+        }
+    }
+};
+
+class KruskalGraph {
+private:
+    vector<Edge> edges;
+    int vertices;
+
+public:
+    KruskalGraph(int v) : vertices(v) {}
+
+    void addEdge(int u, int v, int weight) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            edges.push_back(Edge(u, v, weight));
+        }
+    }
+
+    vector<Edge> kruskalMST() {
+        vector<Edge> mst;
+        sort(edges.begin(), edges.end());
+        UnionFind uf(vertices);
+
+        for (const Edge& edge : edges) {
+            int rootSource = uf.find(edge.source);
+            int rootDest = uf.find(edge.destination);
+
+            if (rootSource != rootDest) {
+                mst.push_back(edge);
+                uf.unite(rootSource, rootDest);
+
+                if (mst.size() == vertices - 1) {
+                    break;
+                }
+            }
+        }
+
+        return mst;
+    }
+
+    int getTotalWeight(const vector<Edge>& mst) {
+        int totalWeight = 0;
+        for (const Edge& edge : mst) {
+            totalWeight += edge.weight;
+        }
+        return totalWeight;
+    }
+
+    void displayMST(const vector<Edge>& mst) {
+        cout << "Minimum Spanning Tree (Kruskal's Algorithm):" << endl;
+        cout << "Edge\t\tWeight" << endl;
+        for (const Edge& edge : mst) {
+            cout << edge.source << " - " << edge.destination << "\t\t" << edge.weight << endl;
+        }
+        cout << "Total weight: " << getTotalWeight(mst) << endl;
+    }
+
+    void display() {
+        cout << "Graph edges:" << endl;
+        cout << "Edge\t\tWeight" << endl;
+        for (const Edge& edge : edges) {
+            cout << edge.source << " - " << edge.destination << "\t\t" << edge.weight << endl;
+        }
+    }
+};
+
+int main() {
+    KruskalGraph g(6);
+    
+    g.addEdge(0, 1, 4);
+    g.addEdge(0, 2, 4);
+    g.addEdge(1, 2, 2);
+    g.addEdge(1, 0, 4);
+    g.addEdge(2, 0, 4);
+    g.addEdge(2, 1, 2);
+    g.addEdge(2, 3, 3);
+    g.addEdge(2, 5, 2);
+    g.addEdge(2, 4, 4);
+    g.addEdge(3, 2, 3);
+    g.addEdge(3, 4, 3);
+    g.addEdge(4, 2, 4);
+    g.addEdge(4, 3, 3);
+    g.addEdge(5, 2, 2);
+    g.addEdge(5, 4, 3);
+    
+    g.display();
+    cout << endl;
+    
+    vector<Edge> mst = g.kruskalMST();
+    g.displayMST(mst);
+    
+    return 0;
+}

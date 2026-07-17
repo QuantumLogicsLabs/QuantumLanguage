@@ -1,0 +1,93 @@
+// Doubly Linked List Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct Node {
+    int data;
+    Node* prev;
+    Node* next;
+    
+    Node(int val) : data(val), prev(nullptr), next(nullptr) {}
+};
+
+class DoublyLinkedList {
+private:
+    Node* head;
+
+public:
+    DoublyLinkedList() : head(nullptr) {}
+
+    ~DoublyLinkedList() {
+        Node* current = head;
+        while (current) {
+            Node* next = current->next;
+            delete current;
+            current = next;
+        }
+    }
+
+    void insertFront(int value) {
+        Node* newNode = new Node(value);
+        if (!head) {
+            head = newNode;
+        } else {
+            newNode->next = head;
+            head->prev = newNode;
+            head = newNode;
+        }
+    }
+
+    void insertBack(int value) {
+        Node* newNode = new Node(value);
+        if (!head) {
+            head = newNode;
+        } else {
+            Node* current = head;
+            while (current->next) {
+                current = current->next;
+            }
+            current->next = newNode;
+            newNode->prev = current;
+        }
+    }
+
+    void displayForward() {
+        Node* current = head;
+        cout << "Forward: ";
+        while (current) {
+            cout << current->data << " <-> ";
+            current = current->next;
+        }
+        cout << "nullptr" << endl;
+    }
+
+    void displayBackward() {
+        if (!head) {
+            cout << "Backward: nullptr" << endl;
+            return;
+        }
+        
+        Node* current = head;
+        while (current->next) {
+            current = current->next;
+        }
+        
+        cout << "Backward: ";
+        while (current) {
+            cout << current->data << " <-> ";
+            current = current->prev;
+        }
+        cout << "nullptr" << endl;
+    }
+};
+
+int main() {
+    DoublyLinkedList dll;
+    dll.insertBack(10);
+    dll.insertBack(20);
+    dll.insertBack(30);
+    dll.insertFront(5);
+    dll.displayForward();
+    dll.displayBackward();
+    return 0;
+}

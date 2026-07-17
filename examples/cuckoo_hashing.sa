@@ -1,0 +1,276 @@
+// Cuckoo Hashing Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+#include <random>
+using namespace std;
+
+template<typename K, typename V>
+class CuckooHashTable {
+private:
+    struct Entry {
+        K key;
+        V value;
+        bool occupied;
+        
+        Entry() : occupied(false) {}
+        Entry(const K& k, const V& v) : key(k), value(v), occupied(true) {}
+    };
+
+    vector<Entry> table1, table2;
+    size_t capacity;
+    size_t size;
+    const size_t MAX_RETRIES = 100;
+    mt19937 rng;
+
+    size_t hash1(const K& key) const {
+        hash<K> hasher;
+        return hasher(key) % capacity;
+    }
+
+    size_t hash2(const K& key) const {
+        hash<K> hasher;
+        return (hasher(key) * 2654435761) % capacity;
+    }
+
+    void rehash() {
+        vector<pair<K, V>> elements;
+        
+        for (const auto& entry : table1) {
+            if (entry.occupied) {
+                elements.push_back({entry.key, entry.value});
+            }
+        }
+        
+        for (const auto& entry : table2) {
+            if (entry.occupied) {
+                elements.push_back({entry.key, entry.value});
+            }
+        }
+        
+        capacity *= 2;
+        table1.clear();
+        table2.clear();
+        table1.resize(capacity);
+        table2.resize(capacity);
+        size = 0;
+        
+        for (const auto& element : elements) {
+            insert(element.first, element.second);
+        }
+    }
+
+    bool insertHelper(const K& key, const V& value, int retries) {
+        if (retries > MAX_RETRIES) {
+            rehash();
+            return insertHelper(key, value, 0);
+        }
+        
+        size_t index1 = hash1(key);
+        
+        if (!table1[index1].occupied) {
+            table1[index1] = Entry(key, value);
+            size++;
+            return true;
+        }
+        
+        if (table1[index1].key == key) {
+            table1[index1].value = value;
+            return true;
+        }
+        
+        K displacedKey = table1[index1].key;
+        V displacedValue = table1[index1].value;
+        table1[index1] = Entry(key, value);
+        
+        return insertHelper2(displacedKey, displacedValue, retries + 1);
+    }
+
+    bool insertHelper2(const K& key, const V& value, int retries) {
+        size_t index2 = hash2(key);
+        
+        if (!table2[index2].occupied) {
+            table2[index2] = Entry(key, value);
+            return true;
+        }
+        
+        if (table2[index2].key == key) {
+            table2[index2].value = value;
+            return true;
+        }
+        
+        K displacedKey = table2[index2].key;
+        V displacedValue = table2[index2].value;
+        table2[index2] = Entry(key, value);
+        
+        return insertHelper(displacedKey, displacedValue, retries + 1);
+    }
+
+public:
+    CuckooHashTable(size_t initialCapacity = 16) : capacity(initialCapacity), size(0), rng(random_device{}()) {
+        table1.resize(capacity);
+        table2.resize(capacity);
+    }
+
+    bool insert(const K& key, const V& value) {
+        if (static_cast<double>(size) / capacity > 0.45) {
+            rehash();
+        }
+        
+        return insertHelper(key, value, 0);
+    }
+
+    bool remove(const K& key) {
+        size_t index1 = hash1(key);
+        if (table1[index1].occupied && table1[index1].key == key) {
+            table1[index1].occupied = false;
+            size--;
+            return true;
+        }
+        
+        size_t index2 = hash2(key);
+        if (table2[index2].occupied && table2[index2].key == key) {
+            table2[index2].occupied = false;
+            size--;
+            return true;
+        }
+        
+        return false;
+    }
+
+    V* find(const K& key) {
+        size_t index1 = hash1(key);
+        if (table1[index1].occupied && table1[index1].key == key) {
+            return &table1[index1].value;
+        }
+        
+        size_t index2 = hash2(key);
+        if (table2[index2].occupied && table2[index2].key == key) {
+            return &table2[index2].value;
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) const {
+        size_t index1 = hash1(key);
+        if (table1[index1].occupied && table1[index1].key == key) {
+            return true;
+        }
+        
+        size_t index2 = hash2(key);
+        if (table2[index2].occupied && table2[index2].key == key) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    size_t getCapacity() const {
+        return capacity;
+    }
+
+    double getLoadFactor() const {
+        return static_cast<double>(size) / (2 * capacity);
+    }
+
+    void display() const {
+        cout << "Cuckoo Hashing Table:" << endl;
+        cout << "Size: " << size << ", Capacity: " << capacity << ", Load Factor: " << getLoadFactor() << endl;
+        
+        cout << "Table 1:" << endl;
+        cout << "Index\tKey\tValue" << endl;
+        for (size_t i = 0; i < capacity; ++i) {
+            cout << i << "\t";
+            if (table1[i].occupied) {
+                cout << table1[i].key << "\t" << table1[i].value;
+            } else {
+                cout << "-\t-";
+            }
+            cout << endl;
+        }
+        
+        cout << "\nTable 2:" << endl;
+        cout << "Index\tKey\tValue" << endl;
+        for (size_t i = 0; i < capacity; ++i) {
+            cout << i << "\t";
+            if (table2[i].occupied) {
+                cout << table2[i].key << "\t" << table2[i].value;
+            } else {
+                cout << "-\t-";
+            }
+            cout << endl;
+        }
+    }
+
+    vector<K> getKeys() const {
+        vector<K> keys;
+        for (const auto& entry : table1) {
+            if (entry.occupied) {
+                keys.push_back(entry.key);
+            }
+        }
+        for (const auto& entry : table2) {
+            if (entry.occupied) {
+                keys.push_back(entry.key);
+            }
+        }
+        return keys;
+    }
+
+    vector<V> getValues() const {
+        vector<V> values;
+        for (const auto& entry : table1) {
+            if (entry.occupied) {
+                values.push_back(entry.value);
+            }
+        }
+        for (const auto& entry : table2) {
+            if (entry.occupied) {
+                values.push_back(entry.value);
+            }
+        }
+        return values;
+    }
+};
+
+int main() {
+    CuckooHashTable<string, int> cht;
+    
+    cht.insert("apple", 5);
+    cht.insert("banana", 3);
+    cht.insert("orange", 7);
+    cht.insert("grape", 2);
+    cht.insert("mango", 4);
+    
+    cht.display();
+    cout << endl;
+    
+    cout << "Size: " << cht.getSize() << endl;
+    cout << "Capacity: " << cht.getCapacity() << endl;
+    cout << "Load Factor: " << cht.getLoadFactor() << endl;
+    cout << "Contains 'banana': " << (cht.contains("banana") ? "Yes" : "No") << endl;
+    
+    int* value = cht.find("orange");
+    if (value) {
+        cout << "Value of 'orange': " << *value << endl;
+    }
+    
+    cht.remove("grape");
+    cout << "\nAfter removing 'grape':" << endl;
+    cht.display();
+    
+    cht.insert("pear", 6);
+    cht.insert("peach", 1);
+    cht.insert("plum", 8);
+    cht.insert("cherry", 9);
+    
+    cout << "\nAfter inserting more elements:" << endl;
+    cht.display();
+    
+    return 0;
+}

@@ -1,0 +1,101 @@
+// Unrolled Linked List Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct UnrolledNode {
+    static const int MAX_ELEMENTS = 4;
+    int elements[MAX_ELEMENTS];
+    int count;
+    UnrolledNode* next;
+    
+    UnrolledNode() : count(0), next(nullptr) {}
+    
+    ~UnrolledNode() {
+        delete next;
+    }
+};
+
+class UnrolledLinkedList {
+private:
+    UnrolledNode* head;
+
+public:
+    UnrolledLinkedList() : head(nullptr) {}
+
+    ~UnrolledLinkedList() {
+        delete head;
+    }
+
+    void insert(int value) {
+        if (!head) {
+            head = new UnrolledNode();
+            head->elements[head->count++] = value;
+            return;
+        }
+
+        UnrolledNode* current = head;
+        while (current->next) {
+            current = current->next;
+        }
+
+        if (current->count < current->MAX_ELEMENTS) {
+            current->elements[current->count++] = value;
+        } else {
+            UnrolledNode* newNode = new UnrolledNode();
+            current->next = newNode;
+            
+            int mid = current->count / 2;
+            for (int i = mid; i < current->count; i++) {
+                newNode->elements[newNode->count++] = current->elements[i];
+            }
+            current->count = mid;
+            
+            if (value < newNode->elements[0]) {
+                current->elements[current->count++] = value;
+            } else {
+                newNode->elements[newNode->count++] = value;
+            }
+        }
+    }
+
+    void display() {
+        UnrolledNode* current = head;
+        int nodeNum = 0;
+        while (current) {
+            cout << "Node " << nodeNum++ << ": ";
+            for (int i = 0; i < current->count; i++) {
+                cout << current->elements[i] << " ";
+            }
+            cout << endl;
+            current = current->next;
+        }
+    }
+
+    bool search(int value) {
+        UnrolledNode* current = head;
+        while (current) {
+            for (int i = 0; i < current->count; i++) {
+                if (current->elements[i] == value) {
+                    return true;
+                }
+            }
+            current = current->next;
+        }
+        return false;
+    }
+};
+
+int main() {
+    UnrolledLinkedList ull;
+    for (int i = 10; i <= 50; i += 10) {
+        ull.insert(i);
+    }
+    ull.insert(25);
+    ull.insert(35);
+    ull.display();
+    
+    cout << "Search 25: " << (ull.search(25) ? "Found" : "Not Found") << endl;
+    cout << "Search 99: " << (ull.search(99) ? "Found" : "Not Found") << endl;
+    
+    return 0;
+}

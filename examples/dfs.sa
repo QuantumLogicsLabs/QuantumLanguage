@@ -1,0 +1,220 @@
+// Depth-First Search (DFS) Implementation in C++
+#include <iostream>
+#include <vector>
+#include <stack>
+#include <list>
+using namespace std;
+
+class DFSGraph {
+private:
+    vector<list<int>> adjList;
+    int vertices;
+
+public:
+    DFSGraph(int v) : vertices(v) {
+        adjList.resize(vertices);
+    }
+
+    void addEdge(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            adjList[u].push_back(v);
+            adjList[v].push_back(u);
+        }
+    }
+
+    vector<int> dfsRecursive(int startVertex) {
+        vector<int> visited(vertices, false);
+        vector<int> traversal;
+        dfsHelper(startVertex, visited, traversal);
+        return traversal;
+    }
+
+    void dfsHelper(int vertex, vector<int>& visited, vector<int>& traversal) {
+        if (vertex >= 0 && vertex < vertices && !visited[vertex]) {
+            visited[vertex] = true;
+            traversal.push_back(vertex);
+
+            for (int neighbor : adjList[vertex]) {
+                if (!visited[neighbor]) {
+                    dfsHelper(neighbor, visited, traversal);
+                }
+            }
+        }
+    }
+
+    vector<int> dfsIterative(int startVertex) {
+        vector<int> visited(vertices, false);
+        vector<int> traversal;
+        stack<int> s;
+
+        if (startVertex >= 0 && startVertex < vertices) {
+            s.push(startVertex);
+
+            while (!s.empty()) {
+                int current = s.top();
+                s.pop();
+
+                if (!visited[current]) {
+                    visited[current] = true;
+                    traversal.push_back(current);
+
+                    for (int neighbor : adjList[current]) {
+                        if (!visited[neighbor]) {
+                            s.push(neighbor);
+                        }
+                    }
+                }
+            }
+        }
+
+        return traversal;
+    }
+
+    vector<int> dfsAll() {
+        vector<int> visited(vertices, false);
+        vector<int> traversal;
+
+        for (int i = 0; i < vertices; i++) {
+            if (!visited[i]) {
+                dfsHelper(i, visited, traversal);
+            }
+        }
+
+        return traversal;
+    }
+
+    bool hasCycle() {
+        vector<int> visited(vertices, false);
+        vector<int> recStack(vertices, false);
+
+        for (int i = 0; i < vertices; i++) {
+            if (!visited[i]) {
+                if (hasCycleHelper(i, visited, recStack)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    bool hasCycleHelper(int vertex, vector<int>& visited, vector<int>& recStack) {
+        if (!visited[vertex]) {
+            visited[vertex] = true;
+            recStack[vertex] = true;
+
+            for (int neighbor : adjList[vertex]) {
+                if (!visited[neighbor] && hasCycleHelper(neighbor, visited, recStack)) {
+                    return true;
+                } else if (recStack[neighbor]) {
+                    return true;
+                }
+            }
+        }
+
+        recStack[vertex] = false;
+        return false;
+    }
+
+    vector<vector<int>> connectedComponents() {
+        vector<int> visited(vertices, false);
+        vector<vector<int>> components;
+
+        for (int i = 0; i < vertices; i++) {
+            if (!visited[i]) {
+                vector<int> component;
+                dfsHelper(i, visited, component);
+                components.push_back(component);
+            }
+        }
+
+        return components;
+    }
+
+    void topologicalSortHelper(int vertex, vector<int>& visited, vector<int>& result) {
+        visited[vertex] = true;
+
+        for (int neighbor : adjList[vertex]) {
+            if (!visited[neighbor]) {
+                topologicalSortHelper(neighbor, visited, result);
+            }
+        }
+
+        result.push_back(vertex);
+    }
+
+    vector<int> topologicalSort() {
+        vector<int> visited(vertices, false);
+        vector<int> result;
+
+        for (int i = 0; i < vertices; i++) {
+            if (!visited[i]) {
+                topologicalSortHelper(i, visited, result);
+            }
+        }
+
+        reverse(result.begin(), result.end());
+        return result;
+    }
+
+    void display() {
+        cout << "Graph:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            cout << i << ": ";
+            for (int neighbor : adjList[i]) {
+                cout << neighbor << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    DFSGraph g(8);
+    
+    g.addEdge(0, 1);
+    g.addEdge(0, 2);
+    g.addEdge(1, 3);
+    g.addEdge(1, 4);
+    g.addEdge(2, 5);
+    g.addEdge(2, 6);
+    g.addEdge(3, 7);
+    g.addEdge(4, 7);
+    g.addEdge(5, 7);
+    
+    g.display();
+    cout << endl;
+    
+    cout << "DFS (Recursive) from vertex 0: ";
+    vector<int> dfsRecursive = g.dfsRecursive(0);
+    for (int vertex : dfsRecursive) {
+        cout << vertex << " ";
+    }
+    cout << endl;
+    
+    cout << "DFS (Iterative) from vertex 0: ";
+    vector<int> dfsIterative = g.dfsIterative(0);
+    for (int vertex : dfsIterative) {
+        cout << vertex << " ";
+    }
+    cout << endl;
+    
+    cout << "DFS from all vertices: ";
+    vector<int> dfsAll = g.dfsAll();
+    for (int vertex : dfsAll) {
+        cout << vertex << " ";
+    }
+    cout << endl;
+    
+    cout << "\nConnected components:" << endl;
+    vector<vector<int>> components = g.connectedComponents();
+    for (int i = 0; i < components.size(); i++) {
+        cout << "Component " << i + 1 << ": ";
+        for (int vertex : components[i]) {
+            cout << vertex << " ";
+        }
+        cout << endl;
+    }
+    
+    return 0;
+}

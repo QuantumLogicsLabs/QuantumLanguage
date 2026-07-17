@@ -1,0 +1,242 @@
+// Hash Set Implementation in C++
+#include <iostream>
+#include <vector>
+#include <list>
+#include <functional>
+using namespace std;
+
+template<typename T>
+class HashSet {
+private:
+    vector<list<T>> buckets;
+    size_t numBuckets;
+    size_t size;
+
+    size_t hashKey(const T& key) const {
+        hash<T> hasher;
+        return hasher(key) % numBuckets;
+    }
+
+    void rehash() {
+        vector<list<T>> oldBuckets = buckets;
+        size_t oldNumBuckets = numBuckets;
+        
+        numBuckets *= 2;
+        buckets.clear();
+        buckets.resize(numBuckets);
+        size = 0;
+        
+        for (const auto& bucket : oldBuckets) {
+            for (const T& element : bucket) {
+                insert(element);
+            }
+        }
+    }
+
+public:
+    HashSet(size_t initialSize = 16) : numBuckets(initialSize), size(0) {
+        buckets.resize(numBuckets);
+    }
+
+    bool insert(const T& element) {
+        if (static_cast<double>(size) / numBuckets > 0.75) {
+            rehash();
+        }
+        
+        size_t index = hashKey(element);
+        
+        for (const T& existing : buckets[index]) {
+            if (existing == element) {
+                return false;
+            }
+        }
+        
+        buckets[index].push_back(element);
+        size++;
+        return true;
+    }
+
+    bool remove(const T& element) {
+        size_t index = hashKey(element);
+        
+        for (auto it = buckets[index].begin(); it != buckets[index].end(); ++it) {
+            if (*it == element) {
+                buckets[index].erase(it);
+                size--;
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    bool contains(const T& element) const {
+        size_t index = hashKey(element);
+        
+        for (const T& existing : buckets[index]) {
+            if (existing == element) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    bool isEmpty() const {
+        return size == 0;
+    }
+
+    void clear() {
+        for (auto& bucket : buckets) {
+            bucket.clear();
+        }
+        size = 0;
+    }
+
+    double getLoadFactor() const {
+        return static_cast<double>(size) / numBuckets;
+    }
+
+    HashSet unionWith(const HashSet& other) const {
+        HashSet result;
+        
+        for (const auto& bucket : buckets) {
+            for (const T& element : bucket) {
+                result.insert(element);
+            }
+        }
+        
+        for (const auto& bucket : other.buckets) {
+            for (const T& element : bucket) {
+                result.insert(element);
+            }
+        }
+        
+        return result;
+    }
+
+    HashSet intersectWith(const HashSet& other) const {
+        HashSet result;
+        
+        for (const auto& bucket : buckets) {
+            for (const T& element : bucket) {
+                if (other.contains(element)) {
+                    result.insert(element);
+                }
+            }
+        }
+        
+        return result;
+    }
+
+    HashSet differenceWith(const HashSet& other) const {
+        HashSet result;
+        
+        for (const auto& bucket : buckets) {
+            for (const T& element : bucket) {
+                if (!other.contains(element)) {
+                    result.insert(element);
+                }
+            }
+        }
+        
+        return result;
+    }
+
+    bool isSubsetOf(const HashSet& other) const {
+        for (const auto& bucket : buckets) {
+            for (const T& element : bucket) {
+                if (!other.contains(element)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void display() const {
+        cout << "HashSet (Size: " << size << ", Buckets: " << numBuckets 
+             << ", Load Factor: " << getLoadFactor() << ")" << endl;
+        
+        for (size_t i = 0; i < numBuckets; ++i) {
+            if (!buckets[i].empty()) {
+                cout << "Bucket " << i << ": ";
+                for (const T& element : buckets[i]) {
+                    cout << element << " ";
+                }
+                cout << endl;
+            }
+        }
+    }
+
+    vector<T> getElements() const {
+        vector<T> elements;
+        for (const auto& bucket : buckets) {
+            for (const T& element : bucket) {
+                elements.push_back(element);
+            }
+        }
+        return elements;
+    }
+};
+
+int main() {
+    HashSet<int> hs;
+    
+    hs.insert(10);
+    hs.insert(20);
+    hs.insert(30);
+    hs.insert(40);
+    hs.insert(50);
+    
+    hs.display();
+    cout << endl;
+    
+    cout << "Size: " << hs.getSize() << endl;
+    cout << "Load Factor: " << hs.getLoadFactor() << endl;
+    cout << "Contains 30: " << (hs.contains(30) ? "Yes" : "No") << endl;
+    cout << "Contains 60: " << (hs.contains(60) ? "Yes" : "No") << endl;
+    
+    cout << "\nInserting duplicate 20: " << (hs.insert(20) ? "Success" : "Already exists") << endl;
+    
+    hs.remove(30);
+    cout << "\nAfter removing 30:" << endl;
+    hs.display();
+    
+    HashSet<int> hs2;
+    hs2.insert(40);
+    hs2.insert(50);
+    hs2.insert(60);
+    hs2.insert(70);
+    
+    cout << "\nSet Operations:" << endl;
+    HashSet<int> unionSet = hs.unionWith(hs2);
+    cout << "Union: ";
+    vector<int> unionElements = unionSet.getElements();
+    for (int elem : unionElements) {
+        cout << elem << " ";
+    }
+    cout << endl;
+    
+    HashSet<int> intersectSet = hs.intersectWith(hs2);
+    cout << "Intersection: ";
+    vector<int> intersectElements = intersectSet.getElements();
+    for (int elem : intersectElements) {
+        cout << elem << " ";
+    }
+    cout << endl;
+    
+    HashSet<int> diffSet = hs.differenceWith(hs2);
+    cout << "Difference: ";
+    vector<int> diffElements = diffSet.getElements();
+    for (int elem : diffElements) {
+        cout << elem << " ";
+    }
+    cout << endl;
+    
+    return 0;
+}

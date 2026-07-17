@@ -1,0 +1,94 @@
+// Rope Implementation in C++
+#include <iostream>
+#include <string>
+using namespace std;
+
+struct RopeNode {
+    string data;
+    int length;
+    RopeNode* left;
+    RopeNode* right;
+    
+    RopeNode(const string& str) : data(str), length(str.length()), left(nullptr), right(nullptr) {}
+    
+    RopeNode(RopeNode* l, RopeNode* r) : data(""), length(0), left(l), right(r) {
+        if (left) length += left->length;
+        if (right) length += right->length;
+    }
+    
+    ~RopeNode() {
+        delete left;
+        delete right;
+    }
+};
+
+class Rope {
+private:
+    RopeNode* root;
+
+    char getChar(RopeNode* node, int index) {
+        if (!node) return '\0';
+        
+        if (node->left) {
+            if (index < node->left->length) {
+                return getChar(node->left, index);
+            }
+            index -= node->left->length;
+        }
+        
+        if (node->right && index >= node->data.length()) {
+            return getChar(node->right, index - node->data.length());
+        }
+        
+        if (index < node->data.length()) {
+            return node->data[index];
+        }
+        
+        return '\0';
+    }
+
+public:
+    Rope() : root(nullptr) {}
+    
+    Rope(const string& str) {
+        root = new RopeNode(str);
+    }
+    
+    ~Rope() {
+        delete root;
+    }
+
+    char operator[](int index) {
+        return getChar(root, index);
+    }
+
+    int length() {
+        return root ? root->length : 0;
+    }
+
+    string toString() {
+        string result;
+        for (int i = 0; i < length(); i++) {
+            result += (*this)[i];
+        }
+        return result;
+    }
+
+    void display() {
+        cout << "Rope: \"" << toString() << "\" (length=" << length() << ")" << endl;
+    }
+};
+
+int main() {
+    Rope rope1("Hello");
+    Rope rope2(" World");
+    Rope rope3("!");
+    
+    rope1.display();
+    rope2.display();
+    rope3.display();
+    
+    cout << "Character at index 4: " << rope1[4] << endl;
+    
+    return 0;
+}

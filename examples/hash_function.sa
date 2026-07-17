@@ -1,0 +1,328 @@
+// Various Hash Function Implementations in C++
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <cstdint>
+using namespace std;
+
+class HashFunctions {
+private:
+    static const uint32_t FNV_PRIME = 16777619;
+    static const uint32_t FNV_OFFSET_BASIS = 2166136261;
+    static const uint64_t FNV_PRIME64 = 1099511628211ULL;
+    static const uint64_t FNV_OFFSET_BASIS64 = 14695981039346656037ULL;
+
+public:
+    // Simple hash functions
+    static uint32_t simpleHash(const string& str) {
+        uint32_t hash = 0;
+        for (char c : str) {
+            hash += c;
+        }
+        return hash;
+    }
+
+    static uint32_t polynomialHash(const string& str) {
+        uint32_t hash = 0;
+        const uint32_t prime = 31;
+        
+        for (char c : str) {
+            hash = hash * prime + c;
+        }
+        return hash;
+    }
+
+    // DJB2 hash
+    static uint32_t djb2Hash(const string& str) {
+        uint32_t hash = 5381;
+        
+        for (char c : str) {
+            hash = ((hash << 5) + hash) + c;
+        }
+        return hash;
+    }
+
+    // SDBM hash
+    static uint32_t sdbmHash(const string& str) {
+        uint32_t hash = 0;
+        
+        for (char c : str) {
+            hash = c + (hash << 6) + (hash << 16) - hash;
+        }
+        return hash;
+    }
+
+    // FNV-1a hash (32-bit)
+    static uint32_t fnv1aHash32(const string& str) {
+        uint32_t hash = FNV_OFFSET_BASIS;
+        
+        for (char c : str) {
+            hash ^= c;
+            hash *= FNV_PRIME;
+        }
+        return hash;
+    }
+
+    // FNV-1a hash (64-bit)
+    static uint64_t fnv1aHash64(const string& str) {
+        uint64_t hash = FNV_OFFSET_BASIS64;
+        
+        for (char c : str) {
+            hash ^= c;
+            hash *= FNV_PRIME64;
+        }
+        return hash;
+    }
+
+    // MurmurHash3 (32-bit)
+    static uint32_t murmur3Hash32(const string& str, uint32_t seed = 0) {
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(str.c_str());
+        size_t len = str.length();
+        const uint32_t c1 = 0xcc9e2d51;
+        const uint32_t c2 = 0x1b873593;
+        const uint32_t r1 = 15;
+        const uint32_t r2 = 13;
+        const uint32_t m = 5;
+        const uint32_t n = 0xe6546b64;
+        
+        uint32_t h1 = seed;
+        const int nblocks = len / 4;
+        
+        const uint32_t* blocks = reinterpret_cast<const uint32_t*>(data + nblocks * 4);
+        
+        for (int i = -nblocks; i; i++) {
+            uint32_t k1 = blocks[i];
+            
+            k1 *= c1;
+            k1 = (k1 << r1) | (k1 >> (32 - r1));
+            k1 *= c2;
+            
+            h1 ^= k1;
+            h1 = (h1 << r2) | (h1 >> (32 - r2));
+            h1 = h1 * m + n;
+        }
+        
+        const uint8_t* tail = data + nblocks * 4;
+        uint32_t k1 = 0;
+        
+        switch (len & 3) {
+            case 3: k1 ^= tail[2] << 16;
+            case 2: k1 ^= tail[1] << 8;
+            case 1: k1 ^= tail[0];
+                k1 *= c1;
+                k1 = (k1 << r1) | (k1 >> (32 - r1));
+                k1 *= c2;
+                h1 ^= k1;
+        }
+        
+        h1 ^= len;
+        h1 ^= h1 >> 16;
+        h1 *= 0x85ebca6b;
+        h1 ^= h1 >> 13;
+        h1 *= 0xc2b2ae35;
+        h1 ^= h1 >> 16;
+        
+        return h1;
+    }
+
+    // Jenkins hash
+    static uint32_t jenkinsHash(const string& str) {
+        uint32_t hash = 0;
+        
+        for (char c : str) {
+            hash += c;
+            hash += (hash << 10);
+            hash ^= (hash >> 6);
+        }
+        
+        hash += (hash << 3);
+        hash ^= (hash >> 11);
+        hash += (hash << 15);
+        
+        return hash;
+    }
+
+    // Pearson hash
+    static uint8_t pearsonHash(const string& str) {
+        static const uint8_t T[256] = {
+            // Pearson lookup table (simplified)
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+            // ... (truncated for brevity)
+        };
+        
+        uint8_t hash = 0;
+        for (char c : str) {
+            hash = T[hash ^ static_cast<uint8_t>(c)];
+        }
+        return hash;
+    }
+
+    // Rolling hash (Rabin-Karp)
+    static class RollingHash {
+    private:
+        uint32_t hash;
+        uint32_t base;
+        uint32_t mod;
+        uint32_t basePower;
+        size_t windowSize;
+
+    public:
+        RollingHash(size_t windowSize, uint32_t base = 256, uint32_t mod = 1000000007)
+            : hash(0), base(base), mod(mod), windowSize(windowSize) {
+            basePower = 1;
+            for (size_t i = 0; i < windowSize - 1; ++i) {
+                basePower = (basePower * base) % mod;
+            }
+        }
+
+        void init(const string& str) {
+            hash = 0;
+            for (size_t i = 0; i < windowSize && i < str.length(); ++i) {
+                hash = (hash * base + str[i]) % mod;
+            }
+        }
+
+        void roll(char oldChar, char newChar) {
+            hash = (hash - oldChar * basePower) % mod;
+            hash = (hash * base + newChar) % mod;
+            if (hash < 0) hash += mod;
+        }
+
+        uint32_t getHash() const { return hash; }
+    };
+
+    // Universal hash family
+    static class UniversalHash {
+    private:
+        uint32_t a, b;
+        uint32_t p;
+        uint32_t m;
+
+    public:
+        UniversalHash(uint32_t tableSize, uint32_t prime = 4294967291U) 
+            : p(prime), m(tableSize) {
+            a = rand() % (p - 1) + 1;
+            b = rand() % p;
+        }
+
+        uint32_t hash(const string& str) const {
+            uint32_t hash = 0;
+            for (char c : str) {
+                hash = (hash * 31 + c) % p;
+            }
+            return ((a * hash + b) % p) % m;
+        }
+    };
+
+    // Cryptographic hash simulation (simplified)
+    static uint64_t cryptoHash(const string& str) {
+        uint64_t hash = 0xdeadbeefcafebabeULL;
+        
+        for (size_t i = 0; i < str.length(); ++i) {
+            hash ^= (static_cast<uint64_t>(str[i]) << (i % 8 * 8));
+            hash += hash << 13;
+            hash ^= hash >> 7;
+            hash += hash << 3;
+            hash ^= hash >> 17;
+            hash += hash << 5;
+        }
+        
+        return hash;
+    }
+};
+
+class HashAnalyzer {
+public:
+    static void analyzeDistribution(const vector<uint32_t>& hashes, size_t bucketCount) {
+        vector<size_t> buckets(bucketCount, 0);
+        
+        for (uint32_t hash : hashes) {
+            buckets[hash % bucketCount]++;
+        }
+        
+        double mean = static_cast<double>(hashes.size()) / bucketCount;
+        double variance = 0.0;
+        
+        for (size_t count : buckets) {
+            double diff = count - mean;
+            variance += diff * diff;
+        }
+        variance /= bucketCount;
+        
+        double stdDev = sqrt(variance);
+        double cv = (stdDev / mean) * 100; // Coefficient of variation
+        
+        cout << "Bucket count: " << bucketCount << endl;
+        cout << "Mean items per bucket: " << mean << endl;
+        cout << "Standard deviation: " << stdDev << endl;
+        cout << "Coefficient of variation: " << cv << "%" << endl;
+        cout << "Ideal CV (Poisson): " << (100.0 / sqrt(mean)) << "%" << endl;
+        
+        size_t minCount = *min_element(buckets.begin(), buckets.end());
+        size_t maxCount = *max_element(buckets.begin(), buckets.end());
+        cout << "Min bucket size: " << minCount << endl;
+        cout << "Max bucket size: " << maxCount << endl;
+        cout << "Max/Min ratio: " << static_cast<double>(maxCount) / minCount << endl;
+    }
+};
+
+int main() {
+    vector<string> testData = {
+        "apple", "banana", "orange", "grape", "mango",
+        "pear", "peach", "plum", "cherry", "kiwi",
+        "watermelon", "strawberry", "blueberry", "raspberry", "blackberry"
+    };
+    
+    cout << "=== Hash Function Comparison ===" << endl;
+    
+    vector<pair<string, function<uint32_t(const string&)>>> hashFunctions = {
+        {"Simple", HashFunctions::simpleHash},
+        {"Polynomial", HashFunctions::polynomialHash},
+        {"DJB2", HashFunctions::djb2Hash},
+        {"SDBM", HashFunctions::sdbmHash},
+        {"FNV-1a", HashFunctions::fnv1aHash32},
+        {"Murmur3", HashFunctions::murmur3Hash32},
+        {"Jenkins", HashFunctions::jenkinsHash}
+    };
+    
+    for (const auto& pair : hashFunctions) {
+        cout << "\n" << pair.first << " Hash:" << endl;
+        vector<uint32_t> hashes;
+        
+        for (const string& str : testData) {
+            uint32_t hash = pair.second(str);
+            hashes.push_back(hash);
+            cout << str << " -> " << hash << endl;
+        }
+        
+        HashAnalyzer::analyzeDistribution(hashes, 10);
+    }
+    
+    cout << "\n=== 64-bit Hashes ===" << endl;
+    for (const string& str : testData) {
+        uint64_t hash64 = HashFunctions::fnv1aHash64(str);
+        uint64_t cryptoHash = HashFunctions::cryptoHash(str);
+        cout << str << " -> FNV-1a64: " << hash64 << ", Crypto: " << cryptoHash << endl;
+    }
+    
+    cout << "\n=== Rolling Hash Demo ===" << endl;
+    string text = "abcdefghijklmnopqrstuvwxyz";
+    HashFunctions::RollingHash rollingHash(5);
+    rollingHash.init(text.substr(0, 5));
+    cout << "Initial hash: " << rollingHash.getHash() << endl;
+    
+    for (size_t i = 5; i < text.length(); ++i) {
+        rollingHash.roll(text[i - 5], text[i]);
+        cout << "Window " << i-4 << "-" << i << ": " << rollingHash.getHash() << endl;
+    }
+    
+    cout << "\n=== Universal Hash Demo ===" << endl;
+    HashFunctions::UniversalHash universalHash(100);
+    for (const string& str : testData) {
+        cout << str << " -> " << universalHash.hash(str) << endl;
+    }
+    
+    return 0;
+}

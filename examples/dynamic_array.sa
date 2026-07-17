@@ -1,0 +1,91 @@
+// Dynamic Array Implementation in C++
+#include <iostream>
+using namespace std;
+
+class DynamicArray {
+private:
+    int* data;
+    int size;
+    int capacity;
+
+    void resize() {
+        int newCapacity = capacity * 2;
+        int* newData = new int[newCapacity];
+        
+        for (int i = 0; i < size; i++) {
+            newData[i] = data[i];
+        }
+        
+        delete[] data;
+        data = newData;
+        capacity = newCapacity;
+    }
+
+public:
+    DynamicArray() : size(0), capacity(4) {
+        data = new int[capacity];
+    }
+
+    ~DynamicArray() {
+        delete[] data;
+    }
+
+    void insert(int index, int value) {
+        if (index < 0 || index > size) {
+            return;
+        }
+        
+        if (size >= capacity) {
+            resize();
+        }
+        
+        for (int i = size; i > index; i--) {
+            data[i] = data[i - 1];
+        }
+        
+        data[index] = value;
+        size++;
+    }
+
+    void remove(int index) {
+        if (index < 0 || index >= size) {
+            return;
+        }
+        
+        for (int i = index; i < size - 1; i++) {
+            data[i] = data[i + 1];
+        }
+        
+        size--;
+    }
+
+    int& operator[](int index) {
+        return data[index];
+    }
+
+    int getSize() {
+        return size;
+    }
+
+    void display() {
+        cout << "Dynamic Array (size=" << size << ", capacity=" << capacity << "): ";
+        for (int i = 0; i < size; i++) {
+            cout << data[i] << " ";
+        }
+        cout << endl;
+    }
+};
+
+int main() {
+    DynamicArray arr;
+    arr.insert(0, 10);
+    arr.insert(1, 20);
+    arr.insert(2, 30);
+    arr.insert(1, 15);
+    arr.display();
+    
+    arr.remove(2);
+    arr.display();
+    
+    return 0;
+}

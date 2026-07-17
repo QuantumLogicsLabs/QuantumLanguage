@@ -1,0 +1,107 @@
+// Heap Implementation in C++
+#include <iostream>
+#include <vector>
+#include <algorithm>
+using namespace std;
+
+class Heap {
+private:
+    vector<int> heap;
+
+    void heapifyUp(int index) {
+        while (index > 0) {
+            int parent = (index - 1) / 2;
+            if (heap[parent] <= heap[index]) {
+                break;
+            }
+            swap(heap[parent], heap[index]);
+            index = parent;
+        }
+    }
+
+    void heapifyDown(int index) {
+        int n = heap.size();
+        while (true) {
+            int left = 2 * index + 1;
+            int right = 2 * index + 2;
+            int smallest = index;
+            
+            if (left < n && heap[left] < heap[smallest]) {
+                smallest = left;
+            }
+            if (right < n && heap[right] < heap[smallest]) {
+                smallest = right;
+            }
+            
+            if (smallest == index) {
+                break;
+            }
+            
+            swap(heap[index], heap[smallest]);
+            index = smallest;
+        }
+    }
+
+public:
+    void insert(int value) {
+        heap.push_back(value);
+        heapifyUp(heap.size() - 1);
+    }
+
+    int extractMin() {
+        if (heap.empty()) {
+            throw runtime_error("Heap is empty");
+        }
+        
+        int min = heap[0];
+        heap[0] = heap.back();
+        heap.pop_back();
+        heapifyDown(0);
+        return min;
+    }
+
+    int getMin() {
+        if (heap.empty()) {
+            throw runtime_error("Heap is empty");
+        }
+        return heap[0];
+    }
+
+    bool isEmpty() {
+        return heap.empty();
+    }
+
+    int getSize() {
+        return heap.size();
+    }
+
+    void display() {
+        cout << "Heap: ";
+        for (int val : heap) {
+            cout << val << " ";
+        }
+        cout << endl;
+    }
+};
+
+int main() {
+    Heap heap;
+    heap.insert(10);
+    heap.insert(20);
+    heap.insert(5);
+    heap.insert(30);
+    heap.insert(15);
+    heap.insert(25);
+    
+    heap.display();
+    
+    cout << "Minimum element: " << heap.getMin() << endl;
+    
+    cout << "Extracting minimums: ";
+    while (!heap.isEmpty()) {
+        cout << heap.extractMin() << " ";
+    }
+    cout << endl;
+    
+    return 0;
+}

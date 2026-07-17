@@ -1,0 +1,89 @@
+// Self-Adjusting List Implementation in C++
+#include <iostream>
+using namespace std;
+
+struct SelfAdjustingNode {
+    int data;
+    SelfAdjustingNode* next;
+    
+    SelfAdjustingNode(int val) : data(val), next(nullptr) {}
+};
+
+class SelfAdjustingList {
+private:
+    SelfAdjustingNode* head;
+
+public:
+    SelfAdjustingList() : head(nullptr) {}
+
+    ~SelfAdjustingList() {
+        SelfAdjustingNode* current = head;
+        while (current) {
+            SelfAdjustingNode* next = current->next;
+            delete current;
+            current = next;
+        }
+    }
+
+    void insert(int value) {
+        SelfAdjustingNode* newNode = new SelfAdjustingNode(value);
+        if (!head) {
+            head = newNode;
+        } else {
+            SelfAdjustingNode* current = head;
+            while (current->next) {
+                current = current->next;
+            }
+            current->next = newNode;
+        }
+    }
+
+    bool search(int value) {
+        SelfAdjustingNode* current = head;
+        SelfAdjustingNode* prev = nullptr;
+        
+        while (current) {
+            if (current->data == value) {
+                if (prev) {
+                    prev->next = current->next;
+                    current->next = head;
+                    head = current;
+                }
+                return true;
+            }
+            prev = current;
+            current = current->next;
+        }
+        return false;
+    }
+
+    void display() {
+        SelfAdjustingNode* current = head;
+        cout << "Self-Adjusting List: ";
+        while (current) {
+            cout << current->data << " -> ";
+            current = current->next;
+        }
+        cout << "nullptr" << endl;
+    }
+};
+
+int main() {
+    SelfAdjustingList sal;
+    sal.insert(10);
+    sal.insert(20);
+    sal.insert(30);
+    sal.insert(40);
+    sal.insert(50);
+    sal.display();
+    
+    cout << "Searching for 30..." << endl;
+    sal.search(30);
+    sal.display();
+    
+    cout << "Searching for 40..." << endl;
+    sal.search(40);
+    sal.display();
+    
+    return 0;
+}

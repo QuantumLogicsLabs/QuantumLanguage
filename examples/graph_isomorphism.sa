@@ -1,0 +1,191 @@
+// Graph Isomorphism Implementation in C++
+#include <iostream>
+#include <vector>
+#include <list>
+#include <algorithm>
+#include <map>
+using namespace std;
+
+struct Graph {
+    int vertices;
+    vector<list<int>> adjList;
+    
+    Graph(int v) : vertices(v) {
+        adjList.resize(v);
+    }
+    
+    void addEdge(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            adjList[u].push_back(v);
+            adjList[v].push_back(u);
+        }
+    }
+    
+    vector<int> getDegreeSequence() {
+        vector<int> degrees(vertices);
+        for (int i = 0; i < vertices; i++) {
+            degrees[i] = adjList[i].size();
+        }
+        sort(degrees.rbegin(), degrees.rend());
+        return degrees;
+    }
+    
+    vector<int> getSortedNeighbors(int vertex) {
+        vector<int> neighbors;
+        for (int neighbor : adjList[vertex]) {
+            neighbors.push_back(neighbor);
+        }
+        sort(neighbors.begin(), neighbors.end());
+        return neighbors;
+    }
+};
+
+class GraphIsomorphism {
+private:
+    Graph* g1;
+    Graph* g2;
+
+    bool areDegreeSequencesEqual() {
+        vector<int> deg1 = g1->getDegreeSequence();
+        vector<int> deg2 = g2->getDegreeSequence();
+        return deg1 == deg2;
+    }
+
+    bool isomorphismUtil(vector<int>& mapping, vector<bool>& used) {
+        if (mapping.size() == g1->vertices) {
+            return verifyIsomorphism(mapping);
+        }
+
+        int currentVertex = mapping.size();
+        vector<int> candidates;
+
+        for (int v = 0; v < g2->vertices; v++) {
+            if (!used[v] && g1->adjList[currentVertex].size() == g2->adjList[v].size()) {
+                candidates.push_back(v);
+            }
+        }
+
+        for (int candidate : candidates) {
+            bool valid = true;
+            
+            for (int i = 0; i < currentVertex; i++) {
+                int mappedVertex = mapping[i];
+                bool edgeInG1 = find(g1->adjList[currentVertex].begin(), 
+                                   g1->adjList[currentVertex].end(), i) != g1->adjList[currentVertex].end();
+                bool edgeInG2 = find(g2->adjList[candidate].begin(), 
+                                   g2->adjList[candidate].end(), mappedVertex) != g2->adjList[candidate].end();
+                
+                if (edgeInG1 != edgeInG2) {
+                    valid = false;
+                    break;
+                }
+            }
+
+            if (valid) {
+                mapping.push_back(candidate);
+                used[candidate] = true;
+
+                if (isomorphismUtil(mapping, used)) {
+                    return true;
+                }
+
+                mapping.pop_back();
+                used[candidate] = false;
+            }
+        }
+
+        return false;
+    }
+
+    bool verifyIsomorphism(const vector<int>& mapping) {
+        for (int i = 0; i < g1->vertices; i++) {
+            for (int j = 0; j < g1->vertices; j++) {
+                bool edgeInG1 = find(g1->adjList[i].begin(), 
+                                   g1->adjList[i].end(), j) != g1->adjList[i].end();
+                bool edgeInG2 = find(g2->adjList[mapping[i]].begin(), 
+                                   g2->adjList[mapping[i]].end(), mapping[j]) != g2->adjList[mapping[i]].end();
+                
+                if (edgeInG1 != edgeInG2) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+public:
+    GraphIsomorphism(Graph* graph1, Graph* graph2) : g1(graph1), g2(graph2) {}
+
+    vector<int> findIsomorphism() {
+        if (g1->vertices != g2->vertices || !areDegreeSequencesEqual()) {
+            return {};
+        }
+
+        vector<int> mapping;
+        vector<bool> used(g2->vertices, false);
+
+        if (isomorphismUtil(mapping, used)) {
+            return mapping;
+        }
+
+        return {};
+    }
+
+    bool areIsomorphic() {
+        return !findIsomorphism().empty();
+    }
+
+    void displayMapping(const vector<int>& mapping) {
+        cout << "Vertex Mapping (G1 -> G2):" << endl;
+        for (int i = 0; i < mapping.size(); i++) {
+            cout << i << " -> " << mapping[i] << endl;
+        }
+    }
+
+    void displayGraphs() {
+        cout << "Graph 1:" << endl;
+        for (int i = 0; i < g1->vertices; i++) {
+            cout << i << ": ";
+            for (int neighbor : g1->adjList[i]) {
+                cout << neighbor << " ";
+            }
+            cout << endl;
+        }
+
+        cout << "\nGraph 2:" << endl;
+        for (int i = 0; i < g2->vertices; i++) {
+            cout << i << ": ";
+            for (int neighbor : g2->adjList[i]) {
+                cout << neighbor << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    Graph g1(4);
+    g1.addEdge(0, 1);
+    g1.addEdge(0, 2);
+    g1.addEdge(1, 2);
+    g1.addEdge(2, 3);
+    
+    Graph g2(4);
+    g2.addEdge(0, 3);
+    g2.addEdge(1, 3);
+    g2.addEdge(1, 2);
+    g2.addEdge(2, 3);
+    
+    GraphIsomorphism gi(&g1, &g2);
+    gi.displayGraphs();
+    cout << endl;
+    
+    cout << "Are isomorphic: " << (gi.areIsomorphic() ? "Yes" : "No") << endl;
+    
+    vector<int> mapping = gi.findIsomorphism();
+    if (!mapping.empty()) {
+        gi.displayMapping(mapping);
+    }
+    
+    return 0;
+}

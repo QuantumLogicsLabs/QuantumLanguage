@@ -1,0 +1,172 @@
+// Treap (Tree + Heap) Implementation in C++
+#include <iostream>
+#include <cstdlib>
+#include <ctime>
+using namespace std;
+
+struct TreapNode {
+    int data;
+    int priority;
+    TreapNode* left;
+    TreapNode* right;
+    
+    TreapNode(int val) : data(val), priority(rand()), left(nullptr), right(nullptr) {}
+};
+
+class Treap {
+private:
+    TreapNode* root;
+
+    TreapNode* rotateRight(TreapNode* y) {
+        TreapNode* x = y->left;
+        TreapNode* T2 = x->right;
+        
+        x->right = y;
+        y->left = T2;
+        
+        return x;
+    }
+
+    TreapNode* rotateLeft(TreapNode* x) {
+        TreapNode* y = x->right;
+        TreapNode* T2 = y->left;
+        
+        y->left = x;
+        x->right = T2;
+        
+        return y;
+    }
+
+    TreapNode* insert(TreapNode* node, int data) {
+        if (!node) {
+            return new TreapNode(data);
+        }
+        
+        if (data < node->data) {
+            node->left = insert(node->left, data);
+            
+            if (node->left->priority > node->priority) {
+                node = rotateRight(node);
+            }
+        } else {
+            node->right = insert(node->right, data);
+            
+            if (node->right->priority > node->priority) {
+                node = rotateLeft(node);
+            }
+        }
+        
+        return node;
+    }
+
+    TreapNode* remove(TreapNode* node, int data) {
+        if (!node) {
+            return nullptr;
+        }
+        
+        if (data < node->data) {
+            node->left = remove(node->left, data);
+        } else if (data > node->data) {
+            node->right = remove(node->right, data);
+        } else {
+            if (!node->left) {
+                TreapNode* temp = node->right;
+                delete node;
+                return temp;
+            } else if (!node->right) {
+                TreapNode* temp = node->left;
+                delete node;
+                return temp;
+            }
+            
+            if (node->left->priority > node->right->priority) {
+                node = rotateRight(node);
+                node->right = remove(node->right, data);
+            } else {
+                node = rotateLeft(node);
+                node->left = remove(node->left, data);
+            }
+        }
+        
+        return node;
+    }
+
+    bool search(TreapNode* node, int data) {
+        if (!node) {
+            return false;
+        }
+        
+        if (node->data == data) {
+            return true;
+        } else if (data < node->data) {
+            return search(node->left, data);
+        } else {
+            return search(node->right, data);
+        }
+    }
+
+    void inorder(TreapNode* node) {
+        if (node) {
+            inorder(node->left);
+            cout << node->data << "(p:" << node->priority << ") ";
+            inorder(node->right);
+        }
+    }
+
+    void destroyTree(TreapNode* node) {
+        if (node) {
+            destroyTree(node->left);
+            destroyTree(node->right);
+            delete node;
+        }
+    }
+
+public:
+    Treap() : root(nullptr) {
+        srand(time(nullptr));
+    }
+
+    ~Treap() {
+        destroyTree(root);
+    }
+
+    void insert(int data) {
+        root = insert(root, data);
+    }
+
+    void remove(int data) {
+        root = remove(root, data);
+    }
+
+    bool search(int data) {
+        return search(root, data);
+    }
+
+    void display() {
+        cout << "Treap: ";
+        inorder(root);
+        cout << endl;
+    }
+};
+
+int main() {
+    Treap treap;
+    treap.insert(50);
+    treap.insert(30);
+    treap.insert(70);
+    treap.insert(20);
+    treap.insert(40);
+    treap.insert(60);
+    treap.insert(80);
+    
+    treap.display();
+    
+    cout << "Search 40: " << (treap.search(40) ? "Found" : "Not Found") << endl;
+    cout << "Search 90: " << (treap.search(90) ? "Found" : "Not Found") << endl;
+    
+    treap.remove(30);
+    cout << "After removing 30: ";
+    treap.display();
+    
+    return 0;
+}

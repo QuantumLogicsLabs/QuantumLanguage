@@ -1,0 +1,229 @@
+// Universal Hashing Implementation in C++
+#include <iostream>
+#include <vector>
+#include <string>
+#include <random>
+using namespace std;
+
+template<typename K>
+class UniversalHashFamily {
+private:
+    vector<vector<pair<K, size_t>>> table;
+    size_t capacity;
+    size_t size;
+    mt19937 rng;
+    uniform_int_distribution<size_t> dist;
+    hash<K> baseHasher;
+
+    size_t universalHash(const K& key) const {
+        size_t hashValue = baseHasher(key);
+        return (hashValue * 2654435761 + 12345) % capacity;
+    }
+
+    void rehash() {
+        vector<pair<K, size_t>> elements;
+        
+        for (const auto& bucket : table) {
+            for (const auto& element : bucket) {
+                elements.push_back(element);
+            }
+        }
+        
+        capacity *= 2;
+        table.clear();
+        table.resize(capacity);
+        size = 0;
+        
+        for (const auto& element : elements) {
+            insert(element.first, element.second);
+        }
+    }
+
+public:
+    UniversalHashFamily(size_t initialCapacity = 16) : capacity(initialCapacity), size(0), rng(random_device{}()), dist(0, numeric_limits<size_t>::max()) {
+        table.resize(capacity);
+    }
+
+    bool insert(const K& key, size_t value) {
+        if (static_cast<double>(size) / capacity > 0.75) {
+            rehash();
+        }
+        
+        size_t index = universalHash(key);
+        
+        for (auto& element : table[index]) {
+            if (element.first == key) {
+                element.second = value;
+                return true;
+            }
+        }
+        
+        table[index].push_back({key, value});
+        size++;
+        return true;
+    }
+
+    bool remove(const K& key) {
+        size_t index = universalHash(key);
+        
+        for (auto it = table[index].begin(); it != table[index].end(); ++it) {
+            if (it->first == key) {
+                table[index].erase(it);
+                size--;
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    size_t* find(const K& key) {
+        size_t index = universalHash(key);
+        
+        for (auto& element : table[index]) {
+            if (element.first == key) {
+                return &element.second;
+            }
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) const {
+        size_t index = universalHash(key);
+        
+        for (const auto& element : table[index]) {
+            if (element.first == key) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    size_t getCapacity() const {
+        return capacity;
+    }
+
+    double getLoadFactor() const {
+        return static_cast<double>(size) / capacity;
+    }
+
+    void display() const {
+        cout << "Universal Hashing Table:" << endl;
+        cout << "Size: " << size << ", Capacity: " << capacity << ", Load Factor: " << getLoadFactor() << endl;
+        cout << "Index\tKeys" << endl;
+        
+        for (size_t i = 0; i < capacity; ++i) {
+            cout << i << "\t";
+            if (!table[i].empty()) {
+                for (const auto& element : table[i]) {
+                    cout << "[" << element.first << ":" << element.second << "] ";
+                }
+            } else {
+                cout << "Empty";
+            }
+            cout << endl;
+        }
+    }
+
+    vector<K> getKeys() const {
+        vector<K> keys;
+        for (const auto& bucket : table) {
+            for (const auto& element : bucket) {
+                keys.push_back(element.first);
+            }
+        }
+        return keys;
+    }
+
+    vector<size_t> getValues() const {
+        vector<size_t> values;
+        for (const auto& bucket : table) {
+            for (const auto& element : bucket) {
+                values.push_back(element.second);
+            }
+        }
+        return values;
+    }
+
+    double getAverageBucketSize() const {
+        if (capacity == 0) return 0.0;
+        return static_cast<double>(size) / capacity;
+    }
+
+    size_t getMaxBucketSize() const {
+        size_t maxSize = 0;
+        for (const auto& bucket : table) {
+            maxSize = max(maxSize, bucket.size());
+        }
+        return maxSize;
+    }
+
+    size_t getEmptyBuckets() const {
+        size_t empty = 0;
+        for (const auto& bucket : table) {
+            if (bucket.empty()) {
+                empty++;
+            }
+        }
+        return empty;
+    }
+
+    void analyzeDistribution() const {
+        cout << "Hash Distribution Analysis:" << endl;
+        cout << "Average bucket size: " << getAverageBucketSize() << endl;
+        cout << "Max bucket size: " << getMaxBucketSize() << endl;
+        cout << "Empty buckets: " << getEmptyBuckets() << "/" << capacity << endl;
+        cout << "Non-empty buckets: " << (capacity - getEmptyBuckets()) << "/" << capacity << endl;
+        
+        vector<size_t> bucketSizes;
+        for (const auto& bucket : table) {
+            bucketSizes.push_back(bucket.size());
+        }
+        
+        sort(bucketSizes.begin(), bucketSizes.end());
+        cout << "Median bucket size: " << bucketSizes[bucketSizes.size() / 2] << endl;
+    }
+};
+
+int main() {
+    UniversalHashFamily<string> uhf;
+    
+    uhf.insert("apple", 5);
+    uhf.insert("banana", 3);
+    uhf.insert("orange", 7);
+    uhf.insert("grape", 2);
+    uhf.insert("mango", 4);
+    uhf.insert("pear", 6);
+    uhf.insert("peach", 1);
+    uhf.insert("plum", 8);
+    uhf.insert("cherry", 9);
+    uhf.insert("kiwi", 10);
+    
+    uhf.display();
+    cout << endl;
+    
+    uhf.analyzeDistribution();
+    cout << endl;
+    
+    cout << "Size: " << uhf.getSize() << endl;
+    cout << "Capacity: " << uhf.getCapacity() << endl;
+    cout << "Load Factor: " << uhf.getLoadFactor() << endl;
+    cout << "Contains 'banana': " << (uhf.contains("banana") ? "Yes" : "No") << endl;
+    
+    size_t* value = uhf.find("orange");
+    if (value) {
+        cout << "Value of 'orange': " << *value << endl;
+    }
+    
+    uhf.remove("grape");
+    cout << "\nAfter removing 'grape':" << endl;
+    uhf.display();
+    
+    return 0;
+}

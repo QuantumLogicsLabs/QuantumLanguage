@@ -1,0 +1,136 @@
+// Adjacency Matrix Graph Implementation in C++
+#include <iostream>
+#include <vector>
+using namespace std;
+
+class AdjacencyMatrixGraph {
+private:
+    vector<vector<int>> matrix;
+    int vertices;
+    bool isDirected;
+
+public:
+    AdjacencyMatrixGraph(int v, bool directed = false) : vertices(v), isDirected(directed) {
+        matrix.resize(vertices, vector<int>(vertices, 0));
+    }
+
+    void addEdge(int u, int v, int weight = 1) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            matrix[u][v] = weight;
+            if (!isDirected) {
+                matrix[v][u] = weight;
+            }
+        }
+    }
+
+    void removeEdge(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            matrix[u][v] = 0;
+            if (!isDirected) {
+                matrix[v][u] = 0;
+            }
+        }
+    }
+
+    bool hasEdge(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            return matrix[u][v] != 0;
+        }
+        return false;
+    }
+
+    int getEdgeWeight(int u, int v) {
+        if (u >= 0 && u < vertices && v >= 0 && v < vertices) {
+            return matrix[u][v];
+        }
+        return 0;
+    }
+
+    vector<int> getNeighbors(int u) {
+        vector<int> neighbors;
+        if (u >= 0 && u < vertices) {
+            for (int v = 0; v < vertices; v++) {
+                if (matrix[u][v] != 0) {
+                    neighbors.push_back(v);
+                }
+            }
+        }
+        return neighbors;
+    }
+
+    int getDegree(int u) {
+        if (u >= 0 && u < vertices) {
+            int degree = 0;
+            for (int v = 0; v < vertices; v++) {
+                if (matrix[u][v] != 0) {
+                    degree++;
+                }
+            }
+            if (!isDirected) {
+                return degree;
+            } else {
+                int inDegree = 0;
+                for (int v = 0; v < vertices; v++) {
+                    if (matrix[v][u] != 0) {
+                        inDegree++;
+                    }
+                }
+                return degree + inDegree;
+            }
+        }
+        return 0;
+    }
+
+    void display() {
+        cout << "Adjacency Matrix (" << (isDirected ? "Directed" : "Undirected") << "):" << endl;
+        cout << "   ";
+        for (int i = 0; i < vertices; i++) {
+            cout << i << " ";
+        }
+        cout << endl;
+        
+        for (int i = 0; i < vertices; i++) {
+            cout << i << ": ";
+            for (int j = 0; j < vertices; j++) {
+                cout << matrix[i][j] << " ";
+            }
+            cout << endl;
+        }
+    }
+
+    void displayNeighbors() {
+        cout << "Neighbors:" << endl;
+        for (int i = 0; i < vertices; i++) {
+            vector<int> neighbors = getNeighbors(i);
+            cout << i << ": ";
+            for (int neighbor : neighbors) {
+                cout << neighbor << " ";
+            }
+            cout << endl;
+        }
+    }
+};
+
+int main() {
+    AdjacencyMatrixGraph g(5);
+    
+    g.addEdge(0, 1);
+    g.addEdge(0, 4);
+    g.addEdge(1, 2);
+    g.addEdge(1, 3);
+    g.addEdge(1, 4);
+    g.addEdge(2, 3);
+    g.addEdge(3, 4);
+    
+    g.display();
+    cout << endl;
+    g.displayNeighbors();
+    
+    cout << "\nEdge information:" << endl;
+    cout << "Has edge 1-3: " << (g.hasEdge(1, 3) ? "Yes" : "No") << endl;
+    cout << "Has edge 0-2: " << (g.hasEdge(0, 2) ? "Yes" : "No") << endl;
+    cout << "Degree of vertex 1: " << g.getDegree(1) << endl;
+    cout << "Degree of vertex 4: " << g.getDegree(4) << endl;
+    
+    return 0;
+}

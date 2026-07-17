@@ -1,0 +1,156 @@
+// Rope String Implementation in C++
+#include <iostream>
+#include <string>
+using namespace std;
+
+struct RopeNode {
+    string data;
+    int length;
+    RopeNode* left;
+    RopeNode* right;
+    
+    RopeNode(const string& str) : data(str), length(str.length()), left(nullptr), right(nullptr) {}
+    
+    RopeNode(RopeNode* l, RopeNode* r) : data(""), length(0), left(l), right(r) {
+        if (left) length += left->length;
+        if (right) length += right->length;
+    }
+    
+    ~RopeNode() {
+        delete left;
+        delete right;
+    }
+};
+
+class RopeString {
+private:
+    RopeNode* root;
+
+    char getChar(RopeNode* node, int index) {
+        if (!node) return '\0';
+        
+        if (node->left) {
+            if (index < node->left->length) {
+                return getChar(node->left, index);
+            }
+            index -= node->left->length;
+        }
+        
+        if (node->right && index >= node->data.length()) {
+            return getChar(node->right, index - node->data.length());
+        }
+        
+        if (index < node->data.length()) {
+            return node->data[index];
+        }
+        
+        return '\0';
+    }
+
+    RopeNode* concat(RopeNode* left, RopeNode* right) {
+        return new RopeNode(left, right);
+    }
+
+    pair<RopeNode*, RopeNode*> split(RopeNode* node, int index) {
+        if (!node) {
+            return {nullptr, nullptr};
+        }
+        
+        if (node->left && index <= node->left->length) {
+            auto splitResult = split(node->left, index);
+            node->left = splitResult.second;
+            node->length = (node->left ? node->left->length : 0) + node->data.length() + 
+                          (node->right ? node->right->length : 0);
+            return {splitResult.first, node};
+        }
+        
+        if (node->left && index > node->left->length + node->data.length()) {
+            auto splitResult = split(node->right, index - node->left->length - node->data.length());
+            node->right = splitResult.first;
+            node->length = (node->left ? node->left->length : 0) + node->data.length() + 
+                          (node->right ? node->right->length : 0);
+            return {node, splitResult.second};
+        }
+        
+        string leftPart = node->data.substr(0, index - (node->left ? node->left->length : 0));
+        string rightPart = node->data.substr(index - (node->left ? node->left->length : 0));
+        
+        RopeNode* leftNode = new RopeNode(leftPart);
+        leftNode->left = node->left;
+        leftNode->length = (leftNode->left ? leftNode->left->length : 0) + leftPart.length();
+        
+        RopeNode* rightNode = new RopeNode(rightPart);
+        rightNode->right = node->right;
+        rightNode->length = rightPart.length() + (rightNode->right ? rightNode->right->length : 0);
+        
+        node->left = node->right = nullptr;
+        delete node;
+        
+        return {leftNode, rightNode};
+    }
+
+public:
+    RopeString() : root(nullptr) {}
+    
+    RopeString(const string& str) {
+        root = new RopeNode(str);
+    }
+    
+    RopeString(RopeNode* node) : root(node) {}
+    
+    ~RopeString() {
+        delete root;
+    }
+
+    char operator[](int index) {
+        return getChar(root, index);
+    }
+
+    int length() {
+        return root ? root->length : 0;
+    }
+
+    RopeString concat(const RopeString& other) {
+        return RopeString(concat(root, other.root));
+    }
+
+    pair<RopeString, RopeString> split(int index) {
+        auto splitResult = split(root, index);
+        return {RopeString(splitResult.first), RopeString(splitResult.second)};
+    }
+
+    string toString() {
+        string result;
+        for (int i = 0; i < length(); i++) {
+            result += (*this)[i];
+        }
+        return result;
+    }
+
+    void display() {
+        cout << "Rope String: \"" << toString() << "\" (length=" << length() << ")" << endl;
+    }
+};
+
+int main() {
+    RopeString rope1("Hello");
+    RopeString rope2(" World");
+    RopeString rope3("!");
+    
+    rope1.display();
+    rope2.display();
+    rope3.display();
+    
+    RopeString combined = rope1.concat(rope2).concat(rope3);
+    combined.display();
+    
+    cout << "Character at index 4: " << combined[4] << endl;
+    cout << "Character at index 7: " << combined[7] << endl;
+    
+    auto splitResult = combined.split(5);
+    cout << "Split at index 5:" << endl;
+    splitResult.first.display();
+    splitResult.second.display();
+    
+    return 0;
+}

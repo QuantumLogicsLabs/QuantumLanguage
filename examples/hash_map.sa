@@ -1,0 +1,211 @@
+// Hash Map Implementation in C++
+#include <iostream>
+#include <vector>
+#include <list>
+#include <functional>
+using namespace std;
+
+template<typename K, typename V>
+class HashMap {
+private:
+    struct Entry {
+        K key;
+        V value;
+        
+        Entry(const K& k, const V& v) : key(k), value(v) {}
+    };
+
+    vector<list<Entry>> buckets;
+    size_t numBuckets;
+    size_t size;
+
+    size_t hashKey(const K& key) const {
+        hash<K> hasher;
+        return hasher(key) % numBuckets;
+    }
+
+    void rehash() {
+        vector<list<Entry>> oldBuckets = buckets;
+        size_t oldNumBuckets = numBuckets;
+        
+        numBuckets *= 2;
+        buckets.clear();
+        buckets.resize(numBuckets);
+        size = 0;
+        
+        for (const auto& bucket : oldBuckets) {
+            for (const auto& entry : bucket) {
+                insert(entry.key, entry.value);
+            }
+        }
+    }
+
+public:
+    HashMap(size_t initialSize = 16) : numBuckets(initialSize), size(0) {
+        buckets.resize(numBuckets);
+    }
+
+    void insert(const K& key, const V& value) {
+        if (static_cast<double>(size) / numBuckets > 0.75) {
+            rehash();
+        }
+        
+        size_t index = hashKey(key);
+        
+        for (auto& entry : buckets[index]) {
+            if (entry.key == key) {
+                entry.value = value;
+                return;
+            }
+        }
+        
+        buckets[index].emplace_back(key, value);
+        size++;
+    }
+
+    bool remove(const K& key) {
+        size_t index = hashKey(key);
+        
+        for (auto it = buckets[index].begin(); it != buckets[index].end(); ++it) {
+            if (it->key == key) {
+                buckets[index].erase(it);
+                size--;
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    V* get(const K& key) {
+        size_t index = hashKey(key);
+        
+        for (auto& entry : buckets[index]) {
+            if (entry.key == key) {
+                return &entry.value;
+            }
+        }
+        
+        return nullptr;
+    }
+
+    const V* get(const K& key) const {
+        size_t index = hashKey(key);
+        
+        for (const auto& entry : buckets[index]) {
+            if (entry.key == key) {
+                return &entry.value;
+            }
+        }
+        
+        return nullptr;
+    }
+
+    bool contains(const K& key) const {
+        return get(key) != nullptr;
+    }
+
+    V& operator[](const K& key) {
+        V* value = get(key);
+        if (value) {
+            return *value;
+        }
+        
+        insert(key, V{});
+        return *get(key);
+    }
+
+    size_t getSize() const {
+        return size;
+    }
+
+    bool isEmpty() const {
+        return size == 0;
+    }
+
+    void clear() {
+        for (auto& bucket : buckets) {
+            bucket.clear();
+        }
+        size = 0;
+    }
+
+    double getLoadFactor() const {
+        return static_cast<double>(size) / numBuckets;
+    }
+
+    void display() const {
+        cout << "HashMap (Size: " << size << ", Buckets: " << numBuckets 
+             << ", Load Factor: " << getLoadFactor() << ")" << endl;
+        
+        for (size_t i = 0; i < numBuckets; ++i) {
+            if (!buckets[i].empty()) {
+                cout << "Bucket " << i << ": ";
+                for (const auto& entry : buckets[i]) {
+                    cout << "[" << entry.key << ": " << entry.value << "] ";
+                }
+                cout << endl;
+            }
+        }
+    }
+
+    vector<K> getKeys() const {
+        vector<K> keys;
+        for (const auto& bucket : buckets) {
+            for (const auto& entry : bucket) {
+                keys.push_back(entry.key);
+            }
+        }
+        return keys;
+    }
+
+    vector<V> getValues() const {
+        vector<V> values;
+        for (const auto& bucket : buckets) {
+            for (const auto& entry : bucket) {
+                values.push_back(entry.value);
+            }
+        }
+        return values;
+    }
+};
+
+int main() {
+    HashMap<string, int> hm;
+    
+    hm["one"] = 1;
+    hm["two"] = 2;
+    hm["three"] = 3;
+    hm["four"] = 4;
+    hm["five"] = 5;
+    
+    hm.display();
+    cout << endl;
+    
+    cout << "Size: " << hm.getSize() << endl;
+    cout << "Load Factor: " << hm.getLoadFactor() << endl;
+    cout << "Contains 'three': " << (hm.contains("three") ? "Yes" : "No") << endl;
+    
+    hm["two"] = 20;
+    cout << "Updated value of 'two': " << hm["two"] << endl;
+    
+    hm.remove("four");
+    cout << "\nAfter removing 'four':" << endl;
+    hm.display();
+    
+    cout << "\nKeys: ";
+    vector<string> keys = hm.getKeys();
+    for (const string& key : keys) {
+        cout << key << " ";
+    }
+    cout << endl;
+    
+    cout << "Values: ";
+    vector<int> values = hm.getValues();
+    for (int val : values) {
+        cout << val << " ";
+    }
+    cout << endl;
+    
+    return 0;
+}
