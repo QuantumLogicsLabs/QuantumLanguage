@@ -56,13 +56,13 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
         }
         return QuantumValue(r);
     }
-    if (m == "toUpperCase" || m == "upper")
+    if (m == "toUpperCase" || m == "upper" || m == "upcase")
     {
         std::string r = str;
         std::transform(r.begin(), r.end(), r.begin(), ::toupper);
         return QuantumValue(r);
     }
-    if (m == "toLowerCase" || m == "lower")
+    if (m == "toLowerCase" || m == "lower" || m == "downcase")
     {
         std::string r = str;
         std::transform(r.begin(), r.end(), r.begin(), ::tolower);
@@ -76,6 +76,55 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
         while (!r.empty() && std::isspace((unsigned char)r.back()))
             r.pop_back();
         return QuantumValue(r);
+    }
+    // Ruby String#chomp — strips one trailing line ending only (not all whitespace).
+    if (m == "chomp")
+    {
+        std::string r = str;
+        if (!r.empty() && r.back() == '\n')
+            r.pop_back();
+        if (!r.empty() && r.back() == '\r')
+            r.pop_back();
+        return QuantumValue(r);
+    }
+    // Ruby String#reverse
+    if (m == "reverse")
+        return QuantumValue(std::string(str.rbegin(), str.rend()));
+    // Ruby String#to_i / #to_f / #to_s — parse a leading numeric prefix.
+    if (m == "to_i")
+    {
+        try
+        {
+            return QuantumValue((double)std::stoll(str));
+        }
+        catch (...)
+        {
+            return QuantumValue(0.0);
+        }
+    }
+    if (m == "to_f")
+    {
+        try
+        {
+            return QuantumValue(std::stod(str));
+        }
+        catch (...)
+        {
+            return QuantumValue(0.0);
+        }
+    }
+    if (m == "to_s")
+        return QuantumValue(str);
+    // Ruby Exception#message — the raised value here is a plain
+    // "TypeName: description" string; strip the leading type-name prefix
+    // so e.message reads like Ruby's message text.
+    if (m == "message")
+    {
+        std::smatch mm;
+        static const std::regex prefixRe("^[A-Za-z_][A-Za-z0-9_]*: (.*)$");
+        if (std::regex_match(str, mm, prefixRe))
+            return QuantumValue(mm[1].str());
+        return QuantumValue(str);
     }
     if (m == "startsWith" || m == "startswith")
     {
@@ -184,6 +233,47 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
         }
         return QuantumValue(s);
     }
+    // Ruby String#gsub / #sub — replace all/first matches. The pattern arg
+    // follows the same "/regex/flags" convention already used by split/test;
+    // a plain string argument falls back to literal substring replacement.
+    if (m == "gsub" || m == "sub")
+    {
+        if (args.size() < 2)
+            return QuantumValue(str);
+        std::string pat = args[0].toString(), to = args[1].toString();
+        bool global = (m == "gsub");
+        if (pat.size() >= 2 && pat.front() == '/' && pat.find_last_of('/') > 0)
+        {
+            size_t lastSlash = pat.find_last_of('/');
+            std::string pattern = pat.substr(1, lastSlash - 1);
+            std::string flags = pat.substr(lastSlash + 1);
+            std::regex::flag_type regexFlags = std::regex::ECMAScript;
+            if (flags.find('i') != std::string::npos)
+                regexFlags |= std::regex::icase;
+            try
+            {
+                std::regex re(pattern, regexFlags);
+                return QuantumValue(std::regex_replace(str, re, to,
+                    global ? std::regex_constants::format_default
+                           : std::regex_constants::format_first_only));
+            }
+            catch (const std::regex_error &)
+            {
+                return QuantumValue(str);
+            }
+        }
+        // Literal substring replacement
+        std::string s = str;
+        size_t p = 0;
+        while ((p = s.find(pat, p)) != std::string::npos)
+        {
+            s = s.substr(0, p) + to + s.substr(p + pat.size());
+            p += to.size();
+            if (!global)
+                break;
+        }
+        return QuantumValue(s);
+    }
     if (m == "substring" || m == "substr")
     {
         int start = args.empty() ? 0 : (int)args[0].asNumber();
@@ -231,7 +321,7 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
             r += str;
         return QuantumValue(r);
     }
-    if (m == "padStart")
+    if (m == "padStart" || m == "rjust")
     {
         int n = args.empty() ? 0 : (int)args[0].asNumber();
         std::string p = args.size() > 1 ? args[1].toString() : " ";
@@ -240,7 +330,7 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
             r = p + r;
         return QuantumValue(r.substr(r.size() - std::max((size_t)n, str.size())));
     }
-    if (m == "padEnd")
+    if (m == "padEnd" || m == "ljust")
     {
         int n = args.empty() ? 0 : (int)args[0].asNumber();
         std::string p = args.size() > 1 ? args[1].toString() : " ";

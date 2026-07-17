@@ -232,9 +232,15 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
         arr->clear();
         return QuantumValue();
     }
-    if (m == "copy")
+    if (m == "copy" || m == "dup" || m == "clone")
     {
         return QuantumValue(std::make_shared<Array>(*arr));
+    }
+    if (m == "take")
+    {
+        int n = args.empty() ? 0 : (int)args[0].asNumber();
+        n = std::max(0, std::min(n, (int)arr->size()));
+        return QuantumValue(std::make_shared<Array>(arr->begin(), arr->begin() + n));
     }
     if (m == "extend")
     {
@@ -285,7 +291,7 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
             result->push_back(callFn(fn, {(*arr)[i], QuantumValue((double)i)}));
         return QuantumValue(result);
     }
-    if (m == "filter")
+    if (m == "filter" || m == "select")
     {
         if (args.empty())
             throw RuntimeError("filter() requires a callback");
@@ -327,7 +333,7 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
             acc = callFn(fn, {acc, (*arr)[i], QuantumValue((double)i)});
         return acc;
     }
-    if (m == "forEach")
+    if (m == "forEach" || m == "each")
     {
         if (args.empty())
             throw RuntimeError("forEach() requires a callback");
@@ -346,7 +352,7 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
                 return v;
         return QuantumValue();
     }
-    if (m == "every")
+    if (m == "every" || m == "all")
     {
         if (args.empty())
             throw RuntimeError("every() requires a callback");
@@ -356,7 +362,7 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
                 return QuantumValue(false);
         return QuantumValue(true);
     }
-    if (m == "some")
+    if (m == "some" || m == "any")
     {
         if (args.empty())
             throw RuntimeError("some() requires a callback");
@@ -365,6 +371,16 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
             if (callFn(fn, {v}).isTruthy())
                 return QuantumValue(true);
         return QuantumValue(false);
+    }
+    if (m == "none")
+    {
+        if (args.empty())
+            throw RuntimeError("none() requires a callback");
+        QuantumValue fn = args[0];
+        for (auto &v : *arr)
+            if (callFn(fn, {v}).isTruthy())
+                return QuantumValue(false);
+        return QuantumValue(true);
     }
 
     throw TypeError("Array has no method '" + m + "'");
