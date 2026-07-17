@@ -496,6 +496,8 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
 {
     if (obj.isNumber())
     {
+        if (method == "zero")
+            return QuantumValue(obj.asNumber() == 0.0);
         if (method == "toFixed")
         {
             int places = args.empty() ? 0 : static_cast<int>(args[0].asNumber());

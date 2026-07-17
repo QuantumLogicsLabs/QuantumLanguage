@@ -9,7 +9,7 @@
 #include "Lexer.h"
 #include "Parser.h"
 #include "Compiler.h"
-#include "VM.h"
+#include "Vm.h"
 #include "Disassembler.h"
 #include "TypeChecker.h"
 #include "Error.h"
@@ -27,17 +27,50 @@
 #include <ctime>
 #include <iomanip>
 #include <cstdlib>
+#include <regex>
+#include <functional>
+#include <map>
+#include <set>
 
 // Windows-only — bundling and launching use Win32 API
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+// Platform-specific headers
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+    #define NOMINMAX
+    #endif
+    #include <windows.h>
+#else
+    #include <unistd.h>
+    #include <limits.h>
+    #include <cstdlib>
+    #include <sys/wait.h>
 #endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 #include <setjmp.h>
 #include <signal.h>
+
+// Executable file extension: ".exe" on Windows, nothing elsewhere.
+#ifdef _WIN32
+    static const char *EXE_EXT = ".exe";
+#else
+    static const char *EXE_EXT = "";
+#endif
+
+// Quote a program path for system().  On POSIX the shell searches $PATH
+// only -- never the current directory -- so a bare name like "hello" is
+// not found even when ./hello exists.  Prefix "./" when there is no slash.
+static std::string shellExec(const std::string &p)
+{
+#ifdef _WIN32
+    return "\"" + p + "\"";
+#else
+    if (p.find('/') == std::string::npos)
+        return "\"./" + p + "\"";
+    return "\"" + p + "\"";
+#endif
+}
 
 namespace fs = std::filesystem;
 
@@ -48,9 +81,17 @@ bool g_testMode = false;
 
 static std::string getExecutablePath()
 {
+#ifdef _WIN32
     char buffer[MAX_PATH];
     GetModuleFileNameA(NULL, buffer, MAX_PATH);
     return std::string(buffer);
+#else
+    char buffer[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buffer, PATH_MAX - 1);
+    if (n == -1) return std::string();
+    buffer[n] = '\0';
+    return std::string(buffer);
+#endif
 }
 
 // ─── Embedded bytecode ────────────────────────────────────────────────────────
@@ -453,8 +494,12 @@ struct TestResult
 
 static void redirectStdinToNull()
 {
+#ifdef _WIN32
     FILE *n = nullptr;
     freopen_s(&n, "NUL", "r", stdin);
+#else
+    if (!freopen("/dev/null", "r", stdin)) { /* ignore */ }
+#endif
 }
 
 static bool isInputDriven(const std::string &m)
@@ -581,9 +626,11 @@ static TestResult testFile(const std::string &path)
     res.source = ss.str();
 
     // ── Lex + parse ──────────────────────────────────────────────────────────
+    // Dialect-translate first (.rb/.c/.cpp) — parsing the raw source here would
+    // reject valid Ruby/C/C++ files before the real (dialect-aware) run below.
     try
     {
-        Lexer l(res.source);
+        Lexer l(applyDialect(res.source, path));
         auto tok = l.tokenize();
         Parser p(std::move(tok));
         auto ast = p.parse();
@@ -687,7 +734,11 @@ static void openProgressiveReport(const std::string &dir, int totalFiles)
         std::time_t t = std::time(nullptr);
         char buf[64];
         struct tm tm_i;
+#ifdef _WIN32
         localtime_s(&tm_i, &t);
+#else
+        localtime_r(&t, &tm_i);
+#endif
         std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_i);
         g_reportStream << buf;
     }
@@ -953,10 +1004,10 @@ static std::string findStubPath(const std::string &quantumExePath)
     fs::path base = fs::path(quantumExePath).parent_path();
 
     std::vector<fs::path> candidates = {
-        base / "quantum_stub.exe",
-        base / "build" / "quantum_stub.exe",
-        base / "build" / "Release" / "quantum_stub.exe",
-        base / "build" / "Debug" / "quantum_stub.exe",
+        base / (std::string("quantum_stub") + EXE_EXT),
+        base / "build" / (std::string("quantum_stub") + EXE_EXT),
+        base / "build" / "Release" / (std::string("quantum_stub") + EXE_EXT),
+        base / "build" / "Debug" / (std::string("quantum_stub") + EXE_EXT),
     };
 
     for (auto &p : candidates)
@@ -967,10 +1018,14 @@ static std::string findStubPath(const std::string &quantumExePath)
 
     // Nothing found — tell the user exactly where we looked
     std::cout << Colors::RED << "[Error] " << Colors::RESET
-              << "quantum_stub.exe not found. Searched:\n";
+              << "quantum_stub" << EXE_EXT << " not found. Searched:\n";
     for (auto &p : candidates)
         std::cout << "  " << p.string() << "\n";
+#ifdef _WIN32
     std::cout << "Run build.bat to rebuild all three binaries.\n";
+#else
+    std::cout << "Rebuild with: cmake --build .\n";
+#endif
     return "";
 }
 
@@ -1030,9 +1085,9 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
     fs::path srcPath(path);
     std::string outName;
     if (srcPath.parent_path().empty())
-        outName = (fs::current_path() / srcPath.stem()).string() + ".exe";
+        outName = (fs::current_path() / srcPath.stem()).string() + EXE_EXT;
     else
-        outName = (srcPath.parent_path() / srcPath.stem()).string() + ".exe";
+        outName = (srcPath.parent_path() / srcPath.stem()).string() + EXE_EXT;
 
     // Safety: never overwrite quantum.exe, qrun.exe, or quantum_stub.exe
     {
@@ -1042,7 +1097,7 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
             outName = (fs::path(outName).parent_path() /
                        (fs::path(outName).stem().string() + "_out"))
                           .string() +
-                      ".exe";
+                      EXE_EXT;
     }
 
     // 6. Copy stub → output exe
@@ -1087,6 +1142,7 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
     std::cout << Colors::CYAN << "[Running]  " << Colors::RESET << outName << "\n\n";
     std::cout.flush();
 
+#ifdef _WIN32
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -1107,14 +1163,30 @@ static int bundleAndRun(const std::string &path, const std::string &exePath)
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return (int)exitCode;
+#else
+    std::string cmd = shellExec(outName);
+    int rc = std::system(cmd.c_str());
+    if (rc == -1)
+    {
+        std::cout << Colors::RED << "[Error] " << Colors::RESET
+                  << "Could not launch " << outName << "\n";
+        std::cout.flush();
+        return 1;
+    }
+    if (WIFEXITED(rc))
+        return WEXITSTATUS(rc);
+    return 1;
+#endif
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char *argv[])
 {
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+#endif
 
     std::string exePath = getExecutablePath();
 

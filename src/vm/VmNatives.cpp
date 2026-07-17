@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <cstring>
 
 extern bool g_testMode;
 
@@ -2033,6 +2034,184 @@ void VM::registerNatives()
         std::ostringstream buffer;
         buffer << in.rdbuf();
         return QuantumValue(buffer.str()); });
+
+    reg("gets", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (g_testMode) return defaultTestInputValue(args, true);
+        if (!args.empty()) std::cout << args[0].toString();
+        std::string line;
+        std::getline(std::cin, line);
+        return QuantumValue(line); });
+
+    // ── Ruby-style File module (open/foreach/delete/exist) ────────────────
+    {
+        auto invoke = [this](QuantumValue fn, std::vector<QuantumValue> fnArgs) -> QuantumValue
+        {
+            if (fn.isNative())
+                return fn.asNative()->fn(fnArgs);
+            if (fn.isFunction())
+            {
+                push(fn);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(fn.asFunction(), static_cast<int>(fnArgs.size()), 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            if (fn.isBoundMethod())
+            {
+                auto bm = fn.asBoundMethod();
+                push(fn);
+                push(bm->self);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(bm->method, static_cast<int>(fnArgs.size()) + 1, 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            return QuantumValue();
+        };
+
+        auto fileModule = std::make_shared<Dict>();
+
+        auto openFn = std::make_shared<QuantumNative>();
+        openFn->name = "File.open";
+        openFn->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty())
+                throw RuntimeError("File.open requires a path");
+            std::string path = args[0].toString();
+            std::string mode = args.size() > 1 && !args[1].isFunction() && !args[1].isNative()
+                                    ? args[1].toString()
+                                    : "r";
+            QuantumValue callback;
+            for (auto &a : args)
+                if (a.isFunction() || a.isNative() || a.isBoundMethod())
+                    callback = a;
+
+            auto stream = std::make_shared<std::fstream>();
+            std::ios_base::openmode om = std::ios::in;
+            if (mode == "w")
+                om = std::ios::out | std::ios::trunc;
+            else if (mode == "a")
+                om = std::ios::out | std::ios::app;
+            else if (mode == "r+" || mode == "w+")
+                om = std::ios::in | std::ios::out;
+            stream->open(path, om);
+            if (!stream->is_open())
+                throw RuntimeError("File.open: cannot open '" + path + "'");
+
+            auto fileObj = std::make_shared<Dict>();
+
+            auto putsFn = std::make_shared<QuantumNative>();
+            putsFn->fn = [stream](std::vector<QuantumValue> a) -> QuantumValue
+            {
+                for (auto &v : a)
+                {
+                    std::string s = v.toString();
+                    *stream << s;
+                    if (s.empty() || s.back() != '\n')
+                        *stream << "\n";
+                }
+                if (a.empty())
+                    *stream << "\n";
+                return QuantumValue();
+            };
+            (*fileObj)["puts"] = QuantumValue(putsFn);
+
+            auto writeFn = std::make_shared<QuantumNative>();
+            writeFn->fn = [stream](std::vector<QuantumValue> a) -> QuantumValue
+            {
+                for (auto &v : a)
+                    *stream << v.toString();
+                return QuantumValue();
+            };
+            (*fileObj)["write"] = QuantumValue(writeFn);
+
+            auto closeFn = std::make_shared<QuantumNative>();
+            closeFn->fn = [stream](std::vector<QuantumValue>) -> QuantumValue
+            {
+                stream->close();
+                return QuantumValue();
+            };
+            (*fileObj)["close"] = QuantumValue(closeFn);
+
+            QuantumValue fileVal(fileObj);
+            if (!callback.isNil())
+            {
+                QuantumValue result = invoke(callback, {fileVal});
+                stream->close();
+                return result;
+            }
+            return fileVal;
+        };
+        (*fileModule)["open"] = QuantumValue(openFn);
+
+        auto foreachFn = std::make_shared<QuantumNative>();
+        foreachFn->name = "File.foreach";
+        foreachFn->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty())
+                throw RuntimeError("File.foreach requires a path");
+            std::ifstream in(args[0].toString());
+            if (!in)
+                throw RuntimeError("File.foreach: cannot open '" + args[0].toString() + "'");
+            QuantumValue callback = args.size() > 1 ? args[1] : QuantumValue();
+            std::string line;
+            while (std::getline(in, line))
+                if (!callback.isNil())
+                    invoke(callback, {QuantumValue(line)});
+            return QuantumValue();
+        };
+        (*fileModule)["foreach"] = QuantumValue(foreachFn);
+
+        auto deleteFn = std::make_shared<QuantumNative>();
+        deleteFn->name = "File.delete";
+        deleteFn->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty())
+                return QuantumValue(false);
+            return QuantumValue(std::remove(args[0].toString().c_str()) == 0);
+        };
+        (*fileModule)["delete"] = QuantumValue(deleteFn);
+
+        auto existFn = std::make_shared<QuantumNative>();
+        existFn->name = "File.exist";
+        existFn->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty())
+                return QuantumValue(false);
+            std::ifstream in(args[0].toString());
+            return QuantumValue(in.good());
+        };
+        (*fileModule)["exist"] = QuantumValue(existFn);
+
+        globals->define("File", QuantumValue(fileModule));
+    }
+
+    // ── Ruby-style Time module ─────────────────────────────────────────────
+    {
+        auto timeModule = std::make_shared<Dict>();
+        auto nowFn = std::make_shared<QuantumNative>();
+        nowFn->name = "Time.now";
+        nowFn->fn = [](std::vector<QuantumValue>) -> QuantumValue
+        {
+            std::time_t now = std::time(nullptr);
+            std::tm tmValue{};
+#ifdef _WIN32
+            localtime_s(&tmValue, &now);
+#else
+            tmValue = *std::localtime(&now);
+#endif
+            char buf[64];
+            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %z", &tmValue);
+            return QuantumValue(std::string(buf));
+        };
+        (*timeModule)["now"] = QuantumValue(nowFn);
+        globals->define("Time", QuantumValue(timeModule));
+    }
 
     // ── console object (JavaScript compatibility) ─────────────────────────
     // console.log, console.error, console.warn, console.info
