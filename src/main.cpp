@@ -223,121 +223,1327 @@ static bool startsWith(const std::string &value, const std::string &prefix)
            value.compare(0, prefix.size(), prefix) == 0;
 }
 
+// ─── Ruby dialect support ──────────────────────────────────────────────────
 // Ruby-style syntax is translated into the brace-based common syntax already
 // accepted by the Quantum lexer/parser. This intentionally implements a Ruby
 // subset; it does not embed or invoke the official Ruby interpreter.
 //
-// Supported normalizations include:
-//   puts expression       -> print(expression)
-//   print expression      -> print(expression)
-//   # comment             -> // comment
-//   if/elsif/else/end     -> brace-based conditionals
-//   unless condition      -> if (!(condition))
-//   while/until/end       -> brace-based loops
-//   def name(args)/end    -> function name(args) { ... }
-static std::string applyRubyDialect(const std::string &source)
+// This is a multi-pass source-to-source transpiler (not a single regex pass):
+//   1. Modules are flattened: `module M ... end` bodies are captured and
+//      spliced in wherever a class does `include M`.
+//   2. A quick symbol-table scan collects every class's ivar (`@x`) and
+//      method names so bare self-references inside string interpolation
+//      (`"#{name}"` inside a method whose class has an ivar/method `name`)
+//      can be qualified to `self.name` / `self.name()`.
+//   3. The main line-by-line pass rewrites control flow, blocks
+//      (`do |x| ... end` / `{ |x| ... }` -> `fn(x) { ... }`), ranges
+//      (`(a..b)` -> `range(a, b+1)`), multiple assignment (via temporaries,
+//      since Quantum's native unpack assignment only supports plain
+//      identifier targets), `case/when`, classes/`initialize`/`@ivar`,
+//      `<<` array push, string interpolation, and Ruby's `?`/`!` method-name
+//      suffixes (stripped, since Quantum identifiers don't allow them).
+//   4. A tail-position pass inserts `return` before the final expression of
+//      each method/block body, mirroring Ruby's implicit-return semantics.
+
+// Index just past the string literal starting at s[pos] (s[pos] must be a
+// quote character: ' " or the backtick used by Quantum template literals).
+static size_t rbSkipString(const std::string &s, size_t pos)
 {
-    std::istringstream input(source);
-    std::ostringstream output;
-    std::string line;
-
-    while (std::getline(input, line))
+    char quote = s[pos];
+    size_t i = pos + 1;
+    while (i < s.size() && s[i] != quote)
     {
-        size_t first = line.find_first_not_of(" \t");
-        if (first == std::string::npos)
-        {
-            output << "\n";
-            continue;
-        }
+        if (s[i] == '\\' && i + 1 < s.size())
+            i += 2;
+        else
+            i++;
+    }
+    return i < s.size() ? i + 1 : i;
+}
 
-        std::string indentation = line.substr(0, first);
-        std::string code = trimCopy(line.substr(first));
+static bool rbIsQuote(char c) { return c == '"' || c == '\'' || c == '`'; }
+static bool rbIsIdentStart(char c) { return std::isalpha((unsigned char)c) || c == '_'; }
+static bool rbIsIdentChar(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
 
-        // Full-line Ruby comments. Inline # comments are left unchanged so a
-        // # inside a string or interpolation-like text is never corrupted.
-        if (!code.empty() && code[0] == '#')
+// Find `needle` at bracket-depth 0, outside string literals.
+static size_t rbFindTopLevel(const std::string &s, const std::string &needle, size_t from = 0)
+{
+    int depth = 0;
+    for (size_t i = from; i < s.size();)
+    {
+        char c = s[i];
+        if (rbIsQuote(c))
         {
-            output << indentation << "//" << code.substr(1) << "\n";
+            i = rbSkipString(s, i);
             continue;
         }
+        // Check the needle BEFORE adjusting depth for this character: this
+        // matters when the needle itself is a bracket char (e.g. "{"), since
+        // otherwise it would only ever match one level too deep.
+        if (depth <= 0 && s.compare(i, needle.size(), needle) == 0)
+            return i;
+        if (c == '(' || c == '[' || c == '{')
+        {
+            depth++;
+            i++;
+            continue;
+        }
+        if (c == ')' || c == ']' || c == '}')
+        {
+            depth--;
+            i++;
+            continue;
+        }
+        i++;
+    }
+    return std::string::npos;
+}
 
-        // puts(...) and puts expression
-        if (startsWith(code, "puts("))
+// Index of the character matching the bracket at s[openPos].
+static size_t rbMatchBracket(const std::string &s, size_t openPos)
+{
+    int depth = 0;
+    for (size_t i = openPos; i < s.size();)
+    {
+        char c = s[i];
+        if (rbIsQuote(c))
         {
-            output << indentation << "print" << code.substr(4) << "\n";
+            i = rbSkipString(s, i);
             continue;
         }
-        if (startsWith(code, "puts "))
+        if (c == '(' || c == '[' || c == '{')
         {
-            output << indentation << "print(" << trimCopy(code.substr(5)) << ")\n";
+            depth++;
+            i++;
             continue;
         }
+        if (c == ')' || c == ']' || c == '}')
+        {
+            depth--;
+            if (depth == 0)
+                return i;
+            i++;
+            continue;
+        }
+        i++;
+    }
+    return std::string::npos;
+}
 
-        // Ruby print expression (print(...) already matches the common syntax).
-        if (startsWith(code, "print "))
+// Split on `sep` at bracket-depth 0, outside string literals. Trims pieces.
+static std::vector<std::string> rbSplitTopLevel(const std::string &s, char sep)
+{
+    std::vector<std::string> parts;
+    int depth = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < s.size();)
+    {
+        char c = s[i];
+        if (rbIsQuote(c))
         {
-            output << indentation << "print(" << trimCopy(code.substr(6)) << ")\n";
+            i = rbSkipString(s, i);
             continue;
         }
+        if (c == '(' || c == '[' || c == '{')
+        {
+            depth++;
+            i++;
+            continue;
+        }
+        if (c == ')' || c == ']' || c == '}')
+        {
+            depth--;
+            i++;
+            continue;
+        }
+        if (depth == 0 && c == sep)
+        {
+            parts.push_back(s.substr(start, i - start));
+            i++;
+            start = i;
+            continue;
+        }
+        i++;
+    }
+    parts.push_back(s.substr(start));
+    for (auto &p : parts)
+        p = trimCopy(p);
+    return parts;
+}
 
-        if (startsWith(code, "elsif "))
+// Find a bare top-level '=' (assignment), skipping ==, !=, <=, >=, +=, -=,
+// *=, /=, %=, &=, |=, ^=. Returns npos if none.
+static size_t rbFindTopLevelAssign(const std::string &s)
+{
+    int depth = 0;
+    for (size_t i = 0; i < s.size();)
+    {
+        char c = s[i];
+        if (rbIsQuote(c))
         {
-            output << indentation << "} else if ("
-                   << trimCopy(code.substr(6)) << ") {\n";
+            i = rbSkipString(s, i);
             continue;
         }
-        if (code == "else")
+        if (c == '(' || c == '[' || c == '{')
         {
-            output << indentation << "} else {\n";
+            depth++;
+            i++;
             continue;
         }
-        if (code == "end")
+        if (c == ')' || c == ']' || c == '}')
         {
-            output << indentation << "}\n";
+            depth--;
+            i++;
             continue;
         }
+        if (depth == 0 && c == '=')
+        {
+            char prev = i > 0 ? s[i - 1] : '\0';
+            char next = i + 1 < s.size() ? s[i + 1] : '\0';
+            if (next != '=' && prev != '=' && prev != '!' && prev != '<' && prev != '>' &&
+                prev != '+' && prev != '-' && prev != '*' && prev != '/' && prev != '%' &&
+                prev != '&' && prev != '|' && prev != '^')
+                return i;
+        }
+        i++;
+    }
+    return std::string::npos;
+}
 
-        if (startsWith(code, "unless "))
-        {
-            output << indentation << "if (!("
-                   << trimCopy(code.substr(7)) << ")) {\n";
-            continue;
-        }
-        if (startsWith(code, "if "))
-        {
-            output << indentation << "if ("
-                   << trimCopy(code.substr(3)) << ") {\n";
-            continue;
-        }
+// Known zero-argument Ruby-style method names that our examples call without
+// parens (idiomatic Ruby). Quantum requires explicit call parens, so these
+// get "()" appended when used bare (e.g. `str.reverse` -> `str.reverse()`).
+// In mixed (.sa) mode the collision-prone names — ones that commonly appear
+// as plain instance FIELDS in existing Python/C++-style .sa classes
+// (`self.size = 0`, `block.length`, `Date.now`) — are excluded, because
+// auto-parenizing a field read breaks it ("No method 'size' on HashTable").
+static const std::set<std::string> &rbZeroArgMethods(bool strict)
+{
+    static const std::set<std::string> strictNames = {
+        "reverse", "chomp", "downcase", "upcase", "dup", "clone", "sort",
+        "strip", "trim", "to_i", "to_f", "to_s", "zero", "chars", "length",
+        "size", "now", "message"};
+    static const std::set<std::string> mixedNames = {
+        "reverse", "chomp", "downcase", "upcase", "dup", "clone",
+        "to_i", "to_f", "to_s", "chars"};
+    return strict ? strictNames : mixedNames;
+}
 
-        if (startsWith(code, "until "))
-        {
-            output << indentation << "while (!("
-                   << trimCopy(code.substr(6)) << ")) {\n";
-            continue;
-        }
-        if (startsWith(code, "while "))
-        {
-            output << indentation << "while ("
-                   << trimCopy(code.substr(6)) << ") {\n";
-            continue;
-        }
+// Symbol table (per Ruby file): every ivar / method name seen anywhere.
+// Deliberately global (not per-class) — our target scripts have at most one
+// small class family per file, so a whole-file union is simple and safe.
+struct RubySymbolTable
+{
+    std::set<std::string> fields;
+    std::set<std::string> methods;
+};
 
-        if (startsWith(code, "def "))
-        {
-            std::string signature = trimCopy(code.substr(4));
-            output << indentation << "function " << signature << " {\n";
-            continue;
-        }
+static const RubySymbolTable &rbEmptySymbolTable()
+{
+    static RubySymbolTable t;
+    return t;
+}
 
-        // Common Ruby literals mapped to the Quantum common representation.
-        if (code == "nil")
-            code = "null";
-
-        output << indentation << code << "\n";
+// Combined token-level normalization pass, applied to plain code text
+// (never string-literal contents, which are always skipped intact):
+//   - `@ivar`               -> `self.ivar`
+//   - `identifier?` / `!`   -> `identifier`   (Ruby predicate/bang suffix)
+//   - bare zero-arg method calls (`.reverse`, `.chomp`, user-defined
+//     methods from `st`, ...) get `()`
+//   - bare `gets` (not already followed by `(`) -> `gets()`
+static std::string rbNormalizeAtoms(const std::string &s,
+                                    const RubySymbolTable &st = rbEmptySymbolTable(),
+                                    bool strict = true)
+{
+    // Whole-line decorator invocations (`@property`, `@abstractmethod`,
+    // `@name.setter`, `@app.route("/x")`) are legitimate, existing Python-
+    // style .sa syntax — never rewrite `@ident` to `self.ident` for these.
+    // Only applies in mixed mode: strict Ruby has no decorators, and the
+    // interpolation pipeline passes bare `@ivar` snippets through here.
+    if (!strict)
+    {
+        static const std::regex decoratorRe("^@[A-Za-z_][A-Za-z0-9_.]*(\\(.*\\))?$");
+        if (std::regex_match(trimCopy(s), decoratorRe))
+            return s;
     }
 
-    return output.str();
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (size_t i = 0; i < s.size();)
+    {
+        char c = s[i];
+        if (rbIsQuote(c))
+        {
+            size_t end = rbSkipString(s, i);
+            out += s.substr(i, end - i);
+            i = end;
+            continue;
+        }
+        if (c == '@' && i + 1 < s.size() && rbIsIdentStart(s[i + 1]))
+        {
+            size_t j = i + 1;
+            while (j < s.size() && rbIsIdentChar(s[j]))
+                j++;
+            out += "self.";
+            out += s.substr(i + 1, j - i - 1);
+            i = j;
+            continue;
+        }
+        if (rbIsIdentStart(c))
+        {
+            size_t j = i + 1;
+            while (j < s.size() && rbIsIdentChar(s[j]))
+                j++;
+            std::string ident = s.substr(i, j - i);
+            bool hadDotBefore = !out.empty() && out.back() == '.';
+            bool suffixStripped = false;
+            if (j < s.size() && (s[j] == '?' || s[j] == '!'))
+            {
+                j++;
+                suffixStripped = true;
+            }
+            bool followedByParen = (j < s.size() && s[j] == '(');
+            // "input" is a plain, common Ruby variable name but a reserved
+            // statement keyword/native function in Quantum (the scanf/cin
+            // -style input statement, and the native input() call already
+            // used across many existing .sa scripts) — only rename the bare,
+            // paren-less variable-reference form to avoid a parse collision;
+            // leave input(...) calls and function definitions untouched.
+            if (ident == "input" && !followedByParen)
+                ident = "__rb_input";
+            out += ident;
+            if (!followedByParen && ident == "gets" && !hadDotBefore)
+                out += "()";
+            // User-defined method names (st.methods) are only auto-parenized
+            // in strict mode: in mixed .sa files the symbol table also picks
+            // up Python-style `def` methods, and parenizing a bare
+            // `obj.method` there would turn a bound-method reference into a
+            // call — a silent behavior change.
+            else if (!followedByParen && hadDotBefore &&
+                     (suffixStripped || rbZeroArgMethods(strict).count(ident) ||
+                      (strict && st.methods.count(ident))))
+                out += "()";
+            i = j;
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    return out;
+}
+
+// True only when `code` carries no existing-style markers: no top-level '{'
+// anywhere (already brace-style — whether self-closed on one line, like
+// `if found { break }`, or opening a multi-line block) and no trailing ':'
+// (Python-colon-style). Used to gate Ruby-only block-opener conversions in
+// mixed (.sa) mode so already-valid Python/brace/C-style constructs are left
+// completely untouched — only unambiguously bare Ruby syntax gets converted.
+static bool rbUnambiguous(const std::string &code)
+{
+    if (!code.empty() && code.back() == ':')
+        return false;
+    return rbFindTopLevel(code, "{") == std::string::npos;
+}
+
+// True when the line contains a C-style comment marker (`//`, `/*`, `*/`)
+// outside string literals. Mixed (.sa) mode leaves such lines completely
+// untouched — comment prose ("Check if key already exists") would otherwise
+// match Ruby patterns like the modifier-if and get mangled.
+static bool rbHasCStyleComment(const std::string &s)
+{
+    for (size_t i = 0; i + 1 < s.size();)
+    {
+        char c = s[i];
+        if (rbIsQuote(c))
+        {
+            i = rbSkipString(s, i);
+            continue;
+        }
+        if (c == '/' && (s[i + 1] == '/' || s[i + 1] == '*'))
+            return true;
+        if (c == '*' && s[i + 1] == '/')
+            return true;
+        i++;
+    }
+    return false;
+}
+
+// True when the line opens a /* block comment it does not close.
+static bool rbOpensBlockComment(const std::string &s)
+{
+    size_t open = s.rfind("/*");
+    if (open == std::string::npos)
+        return false;
+    return s.find("*/", open + 2) == std::string::npos;
+}
+
+// Rough opener detection used only by the forward `end`-scan below.
+static bool rbLineIsRubyOpener(const std::string &code)
+{
+    if (!rbUnambiguous(code))
+        return false;
+    if (startsWith(code, "if ") || startsWith(code, "unless ") ||
+        startsWith(code, "while ") || startsWith(code, "until ") ||
+        startsWith(code, "def ") || startsWith(code, "class ") ||
+        startsWith(code, "case ") || startsWith(code, "module ") ||
+        code == "loop" || code == "loop do" || code == "begin")
+        return true;
+    static const std::regex doRe("\\bdo(\\s*\\|[^|]*\\|)?\\s*$");
+    return std::regex_search(code, doRe);
+}
+
+// The decisive mixed-mode signal: a genuine Ruby block in a .sa file is
+// always terminated by a bare `end` line. Scanning forward with depth
+// tracking distinguishes a Ruby opener from the look-alikes that plain
+// text can't otherwise separate — C's one-line `while (*s) writeChar(*s++);`,
+// a C-style `while (cond)` whose `{` sits on the next line, or Quantum's
+// single-line `if x > 0 print("x")` — none of which are followed by a
+// matching `end`.
+static bool rbHasMatchingEnd(const std::vector<std::string> &lines, size_t openerIdx)
+{
+    int depth = 1;
+    for (size_t i = openerIdx + 1; i < lines.size(); i++)
+    {
+        std::string t = trimCopy(lines[i]);
+        if (t == "end")
+        {
+            if (--depth == 0)
+                return true;
+        }
+        else if (rbLineIsRubyOpener(t))
+            depth++;
+    }
+    return false;
+}
+
+static bool rbLooksLikeReturnable(const std::string &line)
+{
+    std::string t = trimCopy(line);
+    if (t.empty() || t == "}" || t.front() == '}')
+        return false;
+    static const std::vector<std::string> skip = {
+        "return", "raise", "break", "continue", "if (", "if(", "while (",
+        "while(", "for (", "for(", "//", "function ", "fn(", "class "};
+    for (auto &p : skip)
+        if (startsWith(t, p))
+            return false;
+    if (t.back() == '{')
+        return false;
+    if (rbFindTopLevelAssign(t) != std::string::npos)
+        return false;
+    return true;
+}
+
+static void rbCollectSymbols(const std::vector<std::string> &lines, RubySymbolTable &st)
+{
+    static const std::regex ivarRe("@([A-Za-z_][A-Za-z0-9_]*)");
+    static const std::regex defRe("^\\s*def\\s+([A-Za-z_][A-Za-z0-9_]*[?!]?)");
+    for (auto &line : lines)
+    {
+        for (auto it = std::sregex_iterator(line.begin(), line.end(), ivarRe);
+             it != std::sregex_iterator(); ++it)
+            st.fields.insert((*it)[1].str());
+        std::smatch m;
+        if (std::regex_search(line, m, defRe))
+        {
+            std::string name = m[1].str();
+            if (!name.empty() && (name.back() == '?' || name.back() == '!'))
+                name.pop_back();
+            if (name != "initialize")
+                st.methods.insert(name);
+        }
+    }
+}
+
+// Qualifies bare identifiers that are known class fields/methods with
+// `self.` (fields) or `self.name()` (zero-arg methods), and rewrites the
+// common `X.class.name` idiom to `classname(X)`. Scoped to a single
+// expression snippet (interpolation content or an inline block body) —
+// never touches string-literal contents inside that snippet.
+static std::string rbQualifySelf(const std::string &expr, const RubySymbolTable &st)
+{
+    static const std::regex classNameRe("\\b([A-Za-z_][A-Za-z0-9_]*)\\.class\\.name\\b");
+    std::string s = std::regex_replace(expr, classNameRe, "classname($1)");
+
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (size_t i = 0; i < s.size();)
+    {
+        char c = s[i];
+        if (rbIsQuote(c))
+        {
+            size_t end = rbSkipString(s, i);
+            out += s.substr(i, end - i);
+            i = end;
+            continue;
+        }
+        if (rbIsIdentStart(c))
+        {
+            size_t j = i + 1;
+            while (j < s.size() && rbIsIdentChar(s[j]))
+                j++;
+            std::string ident = s.substr(i, j - i);
+            // Look past an optional `?`/`!` suffix (still present at this
+            // stage — rbNormalizeAtoms strips it later) so `palindrome?(x)`
+            // is correctly seen as already-parenthesized, not a bare ref.
+            size_t afterSuffix = j;
+            if (afterSuffix < s.size() && (s[afterSuffix] == '?' || s[afterSuffix] == '!'))
+                afterSuffix++;
+            bool hadDotBefore = !out.empty() && out.back() == '.';
+            bool followedByParen = (afterSuffix < s.size() && s[afterSuffix] == '(');
+            if (!hadDotBefore && !followedByParen && st.fields.count(ident))
+                out += "self." + ident;
+            else if (!hadDotBefore && !followedByParen && st.methods.count(ident))
+                out += "self." + ident + "()";
+            else
+                out += ident;
+            i = j;
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    return out;
+}
+
+// Converts every double-quoted string in `line` that contains `#{...}` into
+// a Quantum backtick template literal (`text${expr}text`), applying
+// self-qualification to each embedded expression. Strings without `#{` and
+// single-quoted strings are left untouched.
+static std::string rbConvertInterpolation(const std::string &line, const RubySymbolTable &st)
+{
+    std::string out;
+    size_t i = 0;
+    while (i < line.size())
+    {
+        char c = line[i];
+        if (c == '"')
+        {
+            size_t end = rbSkipString(line, i);
+            std::string raw = line.substr(i, end - i); // includes quotes
+            if (raw.find("#{") == std::string::npos)
+            {
+                out += raw;
+                i = end;
+                continue;
+            }
+            // Rebuild as a backtick template: #{expr} -> ${qualified(expr)}
+            std::string inner = raw.substr(1, raw.size() >= 2 ? raw.size() - 2 : 0);
+            std::string rebuilt = "`";
+            size_t p = 0;
+            while (p < inner.size())
+            {
+                size_t hashBrace = inner.find("#{", p);
+                if (hashBrace == std::string::npos)
+                {
+                    rebuilt += inner.substr(p);
+                    break;
+                }
+                rebuilt += inner.substr(p, hashBrace - p);
+                size_t exprStart = hashBrace + 2;
+                int depth = 1;
+                size_t q = exprStart;
+                while (q < inner.size() && depth > 0)
+                {
+                    if (inner[q] == '{')
+                        depth++;
+                    else if (inner[q] == '}')
+                    {
+                        depth--;
+                        if (depth == 0)
+                            break;
+                    }
+                    q++;
+                }
+                std::string exprText = inner.substr(exprStart, q - exprStart);
+                // Normalize first so `@ivar` becomes `self.ivar` before the
+                // qualify pass (qualifying first would produce `@self.ivar`).
+                rebuilt += "${" + rbQualifySelf(rbNormalizeAtoms(trimCopy(exprText), st), st) + "}";
+                p = (q < inner.size()) ? q + 1 : inner.size();
+            }
+            rebuilt += "`";
+            out += rebuilt;
+            i = end;
+            continue;
+        }
+        if (c == '\'' || c == '`')
+        {
+            size_t end = rbSkipString(line, i);
+            out += line.substr(i, end - i);
+            i = end;
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    return out;
+}
+
+// Converts a standalone parenthesized Ruby range `(A..B)` / `(A...B)` used
+// as a method-call receiver into `range(A, B+1)` / `range(A, B)`. Only
+// matches parens NOT preceded by an identifier char (so `foo(1..5)`, a
+// normal call whose argument happens to be a range, is left alone).
+static std::string rbConvertRangesOnce(const std::string &line, bool &changed)
+{
+    changed = false;
+    for (size_t i = 0; i < line.size(); i++)
+    {
+        if (line[i] != '(')
+            continue;
+        if (i > 0 && rbIsIdentChar(line[i - 1]))
+            continue;
+        size_t close = rbMatchBracket(line, i);
+        if (close == std::string::npos)
+            continue;
+        std::string content = line.substr(i + 1, close - i - 1);
+        if (rbSplitTopLevel(content, ',').size() != 1)
+            continue;
+        size_t dotdot = rbFindTopLevel(content, "..");
+        if (dotdot == std::string::npos)
+            continue;
+        bool exclusive = dotdot + 2 < content.size() && content[dotdot + 2] == '.';
+        std::string left = trimCopy(content.substr(0, dotdot));
+        std::string right = trimCopy(content.substr(dotdot + (exclusive ? 3 : 2)));
+        // Inclusive upper bound: "i <= right" as an exclusive bound is
+        // floor(right)+1, not right+1 — right may be a non-integer
+        // expression (e.g. Math.sqrt(n)), and right+1 would wrongly admit
+        // one extra integer whenever right isn't a whole number.
+        std::string replacement = exclusive
+            ? ("range(" + left + ", " + right + ")")
+            : ("range(" + left + ", floor(" + right + ")+1)");
+        changed = true;
+        return line.substr(0, i) + replacement + line.substr(close + 1);
+    }
+    return line;
+}
+
+static std::string rbConvertRanges(std::string line)
+{
+    for (int guard = 0; guard < 8; guard++)
+    {
+        bool changed = false;
+        line = rbConvertRangesOnce(line, changed);
+        if (!changed)
+            break;
+    }
+    // Ruby's `ClassName.new(args)` constructor call -> Quantum's `ClassName(args)`.
+    static const std::regex newCallRe("\\b([A-Za-z_][A-Za-z0-9_]*)\\.new\\(");
+    line = std::regex_replace(line, newCallRe, "$1(");
+    return line;
+}
+
+// Ruby's `arr << expr` append idiom, recognized only when it is the entire
+// statement (avoids misfiring on a genuine bitwise left-shift expression).
+static bool rbTryPushAppend(const std::string &code, std::string &outResult)
+{
+    size_t pos = rbFindTopLevel(code, "<<");
+    if (pos == std::string::npos)
+        return false;
+    // `x <<= 1` is a compound shift-assign, never a push.
+    if (pos + 2 < code.size() && code[pos + 2] == '=')
+        return false;
+    std::string lhs = trimCopy(code.substr(0, pos));
+    std::string rhs = trimCopy(code.substr(pos + 2));
+    if (lhs.empty() || rhs.empty())
+        return false;
+    // C++ stream insertion (`cout << x << endl`) is valid existing .sa
+    // syntax — never a Ruby array push. Chained `<<` in the rhs is the
+    // giveaway (Ruby pushes here are single), as is a stream lhs.
+    if (lhs == "cout" || lhs == "cerr" || lhs == "clog")
+        return false;
+    if (rbFindTopLevel(rhs, "<<") != std::string::npos)
+        return false;
+    static const std::regex lvalRe("^[A-Za-z_][A-Za-z0-9_]*(\\[[^\\]]*\\])?$");
+    if (!std::regex_match(lhs, lvalRe))
+        return false;
+    outResult = lhs + ".push(" + rhs + ")";
+    return true;
+}
+
+// Ruby's `raise ClassName, "message"` comma form -> `raise ClassName("message")`.
+static std::string rbConvertRaiseComma(const std::string &code)
+{
+    if (!startsWith(code, "raise "))
+        return code;
+    std::string rest = code.substr(6);
+    size_t comma = rbFindTopLevel(rest, ",");
+    if (comma == std::string::npos)
+        return code;
+    std::string ident = trimCopy(rest.substr(0, comma));
+    static const std::regex identRe("^[A-Za-z_][A-Za-z0-9_]*$");
+    if (!std::regex_match(ident, identRe))
+        return code;
+    std::string msg = trimCopy(rest.substr(comma + 1));
+    return "raise " + ident + "(" + msg + ")";
+}
+
+// Ruby's bare `.split` (no args, whitespace-run splitting) -> a trimmed
+// regex split, since Quantum's split() with an empty separator splits into
+// individual characters instead.
+static std::string rbConvertBareSplit(const std::string &code)
+{
+    static const std::regex bareSplitRe("\\.split(?:\\(\\s*\\))?(?!\\()");
+    std::smatch m;
+    std::string s = code;
+    std::string result;
+    size_t last = 0;
+    auto begin = std::sregex_iterator(s.begin(), s.end(), bareSplitRe);
+    auto end = std::sregex_iterator();
+    for (auto it = begin; it != end; ++it)
+    {
+        // The trailing (?!\() guards against `.split(pattern)` — a real
+        // argument means the optional empty-parens group can't consume it,
+        // so the lookahead fails and this call is left untouched.
+        result += s.substr(last, it->position() - last);
+        result += ".trim().split(" + std::string(R"("/\\s+/")") + ")";
+        last = it->position() + it->length();
+    }
+    result += s.substr(last);
+    return result;
+}
+
+struct RubyBlockCall
+{
+    std::string prefix; // receiver+method(+args) before the block
+    std::string params;
+    std::string body;   // only for single-line `{ ... }` form
+    std::string suffix; // text after the block (rare)
+};
+
+// Detects a trailing single-line `{ |params| body }` Ruby block attached to
+// a call. Ruby hashes are not in scope for this dialect, so any top-level
+// `{` on a statement line is treated as a block.
+// True only when `prefix` (the text immediately before a `{`) genuinely
+// ends in a call to a known block-accepting Ruby method (or is the bare
+// `loop` keyword). This is what distinguishes a real Ruby block —
+// `arr.each { |x| ... }`, `(2..n).none? { ... }` — from a `{` that belongs
+// to something else entirely: a dict/hash literal (`x = {"a": 1}`), a
+// brace-style if/else continuation (`} else if (...) {`), or a bare
+// single-line brace-complete statement (`if found { break }`). Without
+// this check every one of those non-Ruby cases would be misread as a block.
+static bool rbPrefixEndsWithBlockMethod(const std::string &prefix)
+{
+    static const std::regex blockMethodRe(
+        "(^loop$)|(\\.(each|each_with_index|map|select|filter|reduce|none|any|"
+        "all|every|some|times|sort_by|reject|find|detect)[?!]?(\\([^()]*\\))?$)");
+    return std::regex_search(prefix, blockMethodRe);
+}
+
+static bool rbTryInlineBraceBlock(const std::string &code, RubyBlockCall &out)
+{
+    if (!code.empty() && code[0] == '}')
+        return false; // continuation of an earlier brace construct, not a fresh block
+    size_t open = rbFindTopLevel(code, "{");
+    if (open == std::string::npos)
+        return false;
+    size_t close = rbMatchBracket(code, open);
+    if (close == std::string::npos)
+        return false;
+    out.prefix = trimCopy(code.substr(0, open));
+    if (out.prefix.empty() || !rbPrefixEndsWithBlockMethod(out.prefix))
+        return false;
+    std::string content = trimCopy(code.substr(open + 1, close - open - 1));
+    out.suffix = trimCopy(code.substr(close + 1));
+    if (!content.empty() && content[0] == '|')
+    {
+        size_t p2 = content.find('|', 1);
+        if (p2 != std::string::npos)
+        {
+            out.params = trimCopy(content.substr(1, p2 - 1));
+            out.body = trimCopy(content.substr(p2 + 1));
+            return true;
+        }
+    }
+    out.params = "";
+    out.body = content;
+    return true;
+}
+
+// Detects a trailing multi-line `do |params|` (or bare `do`) block opener.
+static bool rbTryTrailingDoOpener(const std::string &code, std::string &prefix, std::string &params)
+{
+    static const std::regex doRe("^(.*?)\\bdo(?:\\s*\\|([^|]*)\\|)?\\s*$");
+    std::smatch m;
+    if (!std::regex_match(code, m, doRe))
+        return false;
+    prefix = trimCopy(m[1].str());
+    params = trimCopy(m[2].str());
+    return true;
+}
+
+// Builds the call-opening text for a Ruby block: appends the closure as an
+// extra call argument, e.g. "arr.each" + "x" -> "arr.each(fn(x) {" and
+// "arr.reduce(0)" + "acc,x" -> "arr.reduce(0, fn(acc,x) {".
+static std::string rbBuildBlockOpenText(const std::string &prefix, const std::string &params)
+{
+    if (!prefix.empty() && prefix.back() == ')')
+    {
+        std::string base = prefix.substr(0, prefix.size() - 1);
+        bool emptyArgs = !base.empty() && base.back() == '(';
+        return base + (emptyArgs ? "" : ", ") + "fn(" + params + ") {";
+    }
+    return prefix + "(fn(" + params + ") {";
+}
+
+// ── Block-stack frame kinds for the main transform pass ───────────────────
+enum class RBFrameKind { Other, Def, ClosureDo, Branch, Loop };
+enum class RBTailKind { None, Statement, Chain };
+
+struct RBTailInfo
+{
+    RBTailKind kind = RBTailKind::None;
+    int stmtIndex = -1;
+    int chainGroup = -1;
+};
+
+struct RBFrame
+{
+    RBFrameKind kind = RBFrameKind::Other;
+    int chainGroupId = -1;
+    RBTailInfo last;
+};
+
+// Extracts `module Name ... end` blocks from `lines`, storing their raw body
+// text keyed by module name, and removes them from the line list (replaced
+// with blanks to preserve line numbers). Any `include Name` line still
+// present afterward is expanded to the stored module body in-place.
+static std::vector<std::string> rbFlattenModules(std::vector<std::string> lines)
+{
+    static const std::regex moduleRe("^module\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$");
+    static const std::regex includeRe("^include\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$");
+
+    auto isOpener = [](const std::string &t) -> bool
+    {
+        if (startsWith(t, "module ") || startsWith(t, "class ") || startsWith(t, "def ") ||
+            t == "begin" || startsWith(t, "if ") || startsWith(t, "unless ") ||
+            startsWith(t, "while ") || startsWith(t, "until ") || startsWith(t, "case "))
+            return true;
+        static const std::regex doRe("\\bdo(\\s*\\|[^|]*\\|)?\\s*$");
+        return std::regex_search(t, doRe);
+    };
+
+    std::map<std::string, std::vector<std::string>> modules;
+
+    for (size_t i = 0; i < lines.size(); i++)
+    {
+        std::string t = trimCopy(lines[i]);
+        std::smatch m;
+        if (!std::regex_match(t, m, moduleRe))
+            continue;
+        std::string name = m[1].str();
+        int depth = 1;
+        size_t j = i + 1;
+        std::vector<std::string> body;
+        while (j < lines.size() && depth > 0)
+        {
+            std::string tj = trimCopy(lines[j]);
+            if (tj == "end")
+            {
+                depth--;
+                if (depth == 0)
+                    break;
+            }
+            else if (isOpener(tj))
+                depth++;
+            body.push_back(lines[j]);
+            j++;
+        }
+        modules[name] = body;
+        for (size_t k = i; k <= j && k < lines.size(); k++)
+            lines[k] = "";
+    }
+
+    std::vector<std::string> result;
+    for (auto &line : lines)
+    {
+        std::smatch m;
+        std::string t = trimCopy(line);
+        if (std::regex_match(t, m, includeRe) && modules.count(m[1].str()))
+            for (auto &bl : modules[m[1].str()])
+                result.push_back(bl);
+        else
+            result.push_back(line);
+    }
+    return result;
+}
+
+// Expands Ruby multiple assignment (`a, b = b, a`, `arr[i], arr[j] = arr[j],
+// arr[i]`, `a, op, b = x, y, z`) into temporary-variable assignments.
+// Quantum's native unpack-assignment only recognizes plain identifier
+// targets and doesn't reliably support this idiom, so we sidestep it
+// entirely rather than depend on it.
+static bool rbTryMultiAssign(const std::string &code, std::vector<std::string> &outLines)
+{
+    size_t eq = rbFindTopLevelAssign(code);
+    if (eq == std::string::npos)
+        return false;
+    std::string lhs = trimCopy(code.substr(0, eq));
+    std::string rhs = trimCopy(code.substr(eq + 1));
+    auto targets = rbSplitTopLevel(lhs, ',');
+    auto values = rbSplitTopLevel(rhs, ',');
+    if (targets.size() < 2 || targets.size() != values.size())
+        return false;
+    static const std::regex targetRe("^[A-Za-z_][A-Za-z0-9_]*(\\[[^\\]]*\\]|\\.[A-Za-z_][A-Za-z0-9_]*)*$");
+    for (auto &t : targets)
+        if (!std::regex_match(t, targetRe))
+            return false;
+
+    static int counter = 0;
+    std::string tag = "__ma" + std::to_string(counter++) + "_";
+    for (size_t k = 0; k < values.size(); k++)
+        outLines.push_back(tag + std::to_string(k) + " = " + values[k]);
+    for (size_t k = 0; k < targets.size(); k++)
+        outLines.push_back(targets[k] + " = " + tag + std::to_string(k));
+    return true;
+}
+
+// `strict` = true for pure `.rb` files: every recognized Ruby construct
+// converts unconditionally, since the whole file is Ruby.
+// `strict` = false for `.sa` files, where Ruby is one of several accepted
+// styles in the same file: block-openers only convert when `rbUnambiguous`
+// confirms the line isn't already valid Python-colon or brace style.
+static std::string applyRubyDialect(const std::string &source, bool strict)
+{
+    // Split into raw lines up front (module flattening needs random access).
+    std::vector<std::string> rawLines;
+    {
+        std::istringstream input(source);
+        std::string line;
+        while (std::getline(input, line))
+            rawLines.push_back(line);
+    }
+    rawLines = rbFlattenModules(std::move(rawLines));
+
+    RubySymbolTable symbols;
+    rbCollectSymbols(rawLines, symbols);
+
+    std::vector<std::string> outLines;
+    std::vector<RBFrame> stack;
+    stack.push_back(RBFrame{}); // file-scope sentinel, never resolved
+    std::map<int, std::vector<RBTailInfo>> branchGroups;
+    int nextChainGroup = 0;
+    std::map<size_t, std::string> caseSubjects;    // stack-depth -> subject, before first `when`
+    std::map<int, std::string> caseSubjectByGroup; // chainGroupId -> subject, after first `when`
+
+    auto markStatement = [&](int idx)
+    {
+        if (!stack.empty())
+            stack.back().last = RBTailInfo{RBTailKind::Statement, idx, -1};
+    };
+    auto emit = [&](const std::string &indentation, const std::string &code, bool trackAsStatement)
+    {
+        outLines.push_back(indentation + code);
+        if (trackAsStatement)
+            markStatement((int)outLines.size() - 1);
+    };
+
+    std::function<void(const RBTailInfo &)> resolveTail = [&](const RBTailInfo &info)
+    {
+        if (info.kind == RBTailKind::Statement)
+        {
+            std::string &ln = outLines[info.stmtIndex];
+            // `case/when ... then EXPR` (and modifier-if) share their line
+            // with an opener, e.g. `if (cond) { a + b` — target the
+            // statement text after the last "{ ", not the whole line.
+            size_t braceSpace = ln.rfind("{ ");
+            size_t stmtStart = (braceSpace != std::string::npos)
+                                    ? braceSpace + 2
+                                    : ln.find_first_not_of(" \t");
+            if (stmtStart == std::string::npos)
+                stmtStart = ln.size();
+            if (rbLooksLikeReturnable(ln.substr(stmtStart)))
+                ln.insert(stmtStart, "return ");
+        }
+        else if (info.kind == RBTailKind::Chain)
+        {
+            for (auto &b : branchGroups[info.chainGroup])
+                resolveTail(b);
+        }
+    };
+
+    // Transforms a single "leaf" statement fragment: raise-comma, puts/print,
+    // inline blocks, `<<` push, interpolation, bare-split, atom normalization.
+    std::function<std::string(const std::string &)> transformCore =
+        [&](const std::string &codeIn) -> std::string
+    {
+        std::string code = codeIn;
+
+        if (startsWith(code, "attr_reader") || startsWith(code, "attr_accessor") ||
+            startsWith(code, "attr_writer"))
+            return ""; // direct field access already works; no getter needed
+
+        code = rbConvertRaiseComma(code);
+
+        if (startsWith(code, "puts("))
+            code = "print" + code.substr(4);
+        else if (startsWith(code, "puts "))
+            code = "print(" + trimCopy(code.substr(5)) + ")";
+        else if (startsWith(code, "print "))
+            code = "print(" + trimCopy(code.substr(6)) + ")";
+        else
+        {
+            // Ruby also allows paren-less calls on a receiver, e.g.
+            // `file.puts "text"` — wrap the argument in parens.
+            static const std::regex dotPutsRe("^(.+\\.puts)\\s+([^(].*)$");
+            std::smatch m;
+            if (std::regex_match(code, m, dotPutsRe))
+                code = m[1].str() + "(" + m[2].str() + ")";
+        }
+
+        RubyBlockCall block;
+        if (rbTryInlineBraceBlock(code, block))
+        {
+            std::string prefix = rbNormalizeAtoms(rbConvertRanges(block.prefix), symbols, strict);
+            std::string body = transformCore(block.body);
+            if (rbLooksLikeReturnable(body))
+                body = "return " + body;
+            std::string opened = rbBuildBlockOpenText(prefix, block.params);
+            code = opened + " " + body + " })" + block.suffix;
+        }
+
+        std::string pushed;
+        if (rbTryPushAppend(code, pushed))
+            code = pushed;
+
+        code = rbConvertBareSplit(code);
+        code = rbConvertRanges(code);
+        code = rbConvertInterpolation(code, symbols);
+        code = rbNormalizeAtoms(code, symbols, strict);
+        if (code == "nil")
+            code = "null";
+        return code;
+    };
+
+    bool inBlockComment = false;
+    for (size_t li = 0; li < rawLines.size(); li++)
+    {
+        const std::string &rawLine = rawLines[li];
+        size_t first = rawLine.find_first_not_of(" \t");
+        if (first == std::string::npos)
+        {
+            outLines.push_back("");
+            continue;
+        }
+        std::string indentation = rawLine.substr(0, first);
+        std::string code = trimCopy(rawLine.substr(first));
+
+        // Mixed (.sa) mode: pass comment-bearing lines through verbatim.
+        // Comment prose routinely contains words like "if"/"unless" that
+        // would otherwise trip the Ruby line patterns below. (Strict .rb
+        // files use # comments, handled separately underneath.)
+        if (!strict)
+        {
+            if (inBlockComment)
+            {
+                if (code.find("*/") != std::string::npos)
+                    inBlockComment = false;
+                outLines.push_back(rawLine);
+                continue;
+            }
+            if (rbHasCStyleComment(code))
+            {
+                if (rbOpensBlockComment(code))
+                    inBlockComment = true;
+                outLines.push_back(rawLine);
+                continue;
+            }
+        }
+
+        if (!code.empty() && code[0] == '#')
+        {
+            outLines.push_back(indentation + "//" + code.substr(1));
+            continue;
+        }
+
+        // ── Multiple assignment (whole-statement only) ──────────────────
+        {
+            std::vector<std::string> expanded;
+            if (rbTryMultiAssign(code, expanded))
+            {
+                for (size_t k = 0; k < expanded.size(); k++)
+                {
+                    std::string ln = rbConvertInterpolation(rbConvertRanges(expanded[k]), symbols);
+                    ln = rbNormalizeAtoms(ln, symbols, strict);
+                    emit(indentation, ln, k + 1 == expanded.size());
+                }
+                continue;
+            }
+        }
+
+        // ── Modifier if/unless (trailing, never at line-start) ──────────
+        {
+            static const std::regex modIfRe("^(.*\\S)\\s+(if|unless)\\s+(.+)$");
+            std::smatch m;
+            if (!startsWith(code, "if ") && !startsWith(code, "unless ") &&
+                // A Ruby modifier-if line is a plain brace-less statement;
+                // anything containing a top-level `{`, starting with `}`
+                // (e.g. `} else if cond {` continuations), or containing
+                // `else if` (C/JS chaining) is native syntax — skip it.
+                rbUnambiguous(code) && code[0] != '}' &&
+                rbFindTopLevel(code, "else if ") == std::string::npos &&
+                std::regex_match(code, m, modIfRe) &&
+                rbFindTopLevel(code, " " + m[2].str() + " ") != std::string::npos &&
+                // Python inline ternary (`x = a if cond else b`) also matches
+                // this shape — its giveaway is a top-level ` else `, which a
+                // Ruby modifier-if never has. Leave it to the native parser.
+                rbFindTopLevel(m[3].str(), " else ") == std::string::npos)
+            {
+                std::string stmt = transformCore(trimCopy(m[1].str()));
+                std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(m[3].str())), symbols), symbols, strict);
+                std::string wrappedCond = m[2].str() == "unless" ? "!(" + cond + ")" : cond;
+                if (!stmt.empty())
+                {
+                    emit(indentation, "if (" + wrappedCond + ") { " + stmt + " }", true);
+                }
+                continue;
+            }
+        }
+
+        // elsif/else/end only transform when the innermost open frame is one
+        // Ruby-mode itself pushed (stack beyond the file-scope sentinel) —
+        // otherwise the line belongs to native syntax and falls through.
+        if (startsWith(code, "elsif ") && stack.size() > 1 &&
+            stack.back().kind == RBFrameKind::Branch)
+        {
+            branchGroups[stack.back().chainGroupId].push_back(stack.back().last);
+            int gid = stack.back().chainGroupId;
+            stack.pop_back();
+            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6))), symbols), symbols, strict);
+            outLines.push_back(indentation + "} else if (" + cond + ") {");
+            stack.push_back(RBFrame{RBFrameKind::Branch, gid, RBTailInfo{}});
+            continue;
+        }
+        if (code == "else" && stack.size() > 1 &&
+            stack.back().kind == RBFrameKind::Branch)
+        {
+            branchGroups[stack.back().chainGroupId].push_back(stack.back().last);
+            int gid = stack.back().chainGroupId;
+            stack.pop_back();
+            outLines.push_back(indentation + "} else {");
+            stack.push_back(RBFrame{RBFrameKind::Branch, gid, RBTailInfo{}});
+            continue;
+        }
+        if (code == "end" && stack.size() > 1)
+        {
+            {
+                RBFrame top = stack.back();
+                stack.pop_back();
+                if (top.kind == RBFrameKind::Branch)
+                {
+                    branchGroups[top.chainGroupId].push_back(top.last);
+                    outLines.push_back(indentation + "}");
+                    if (!stack.empty())
+                        stack.back().last = RBTailInfo{RBTailKind::Chain, -1, top.chainGroupId};
+                }
+                else if (top.kind == RBFrameKind::ClosureDo)
+                {
+                    outLines.push_back(indentation + "})");
+                    resolveTail(top.last);
+                    if (!stack.empty())
+                        stack.back().last = RBTailInfo{};
+                }
+                else if (top.kind == RBFrameKind::Def)
+                {
+                    outLines.push_back(indentation + "}");
+                    resolveTail(top.last);
+                    if (!stack.empty())
+                        stack.back().last = RBTailInfo{};
+                }
+                else
+                {
+                    outLines.push_back(indentation + "}");
+                    if (!stack.empty())
+                        stack.back().last = RBTailInfo{};
+                }
+            }
+            continue;
+        }
+
+        if (startsWith(code, "unless ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(7))), symbols), symbols, strict);
+            outLines.push_back(indentation + "if (!(" + cond + ")) {");
+            stack.push_back(RBFrame{RBFrameKind::Branch, nextChainGroup++, RBTailInfo{}});
+            continue;
+        }
+        if (startsWith(code, "if ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(3))), symbols), symbols, strict);
+            outLines.push_back(indentation + "if (" + cond + ") {");
+            stack.push_back(RBFrame{RBFrameKind::Branch, nextChainGroup++, RBTailInfo{}});
+            continue;
+        }
+        if (startsWith(code, "until ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6))), symbols), symbols, strict);
+            outLines.push_back(indentation + "while (!(" + cond + ")) {");
+            stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
+            continue;
+        }
+        if (startsWith(code, "while ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            std::string cond = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(6))), symbols), symbols, strict);
+            outLines.push_back(indentation + "while (" + cond + ") {");
+            stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
+            continue;
+        }
+        if ((code == "loop" || code == "loop do") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            outLines.push_back(indentation + "while (true) {");
+            stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
+            continue;
+        }
+        if (startsWith(code, "begin") && trimCopy(code) == "begin" && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            outLines.push_back(indentation + "try {");
+            stack.push_back(RBFrame{RBFrameKind::Other, -1, RBTailInfo{}});
+            continue;
+        }
+        // rescue/ensure only continue a begin-block that Ruby-mode itself
+        // opened (stack beyond the file-scope sentinel).
+        if (stack.size() > 1)
+        {
+            static const std::regex rescueRe("^rescue(\\s+[A-Za-z_][A-Za-z0-9_:]*)?\\s*(=>\\s*(\\w+))?\\s*$");
+            std::smatch m;
+            if (std::regex_match(code, m, rescueRe))
+            {
+                std::string var = m[3].matched ? m[3].str() : "e";
+                stack.pop_back();
+                outLines.push_back(indentation + "} catch (" + var + ") {");
+                stack.push_back(RBFrame{RBFrameKind::Other, -1, RBTailInfo{}});
+                continue;
+            }
+        }
+        if (code == "ensure" && stack.size() > 1)
+        {
+            stack.pop_back();
+            outLines.push_back(indentation + "} finally {");
+            stack.push_back(RBFrame{RBFrameKind::Other, -1, RBTailInfo{}});
+            continue;
+        }
+
+        if (startsWith(code, "case ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            std::string subject = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(code.substr(5))), symbols), symbols, strict);
+            // Stash the subject via a marker frame; the first `when` opens
+            // the actual branch. We reuse Other with chainGroupId encoding
+            // deferred via a side map keyed by stack depth.
+            outLines.push_back("");
+            RBFrame f{RBFrameKind::Other, -2, RBTailInfo{}};
+            caseSubjects[stack.size()] = subject;
+            stack.push_back(f);
+            continue;
+        }
+        {
+            static const std::regex whenRe("^when\\s+(.+?)(\\s+then\\s+(.+))?$");
+            std::smatch m;
+            if (std::regex_match(code, m, whenRe) && stack.size() > 1 &&
+                (stack.back().chainGroupId == -2 || stack.back().kind == RBFrameKind::Branch))
+            {
+                bool isFirst = stack.back().chainGroupId == -2;
+                std::string subject = isFirst ? caseSubjects[stack.size() - 1] : "";
+                int gid;
+                if (isFirst)
+                {
+                    stack.pop_back();
+                    gid = nextChainGroup++;
+                }
+                else
+                {
+                    branchGroups[stack.back().chainGroupId].push_back(stack.back().last);
+                    gid = stack.back().chainGroupId;
+                    stack.pop_back();
+                }
+                std::string valuesText = rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(m[1].str()), symbols), symbols, strict);
+                auto values = rbSplitTopLevel(valuesText, ',');
+                std::string subj = isFirst ? subject : caseSubjectByGroup[gid];
+                caseSubjectByGroup[gid] = subj;
+                std::string cond;
+                for (size_t k = 0; k < values.size(); k++)
+                {
+                    if (k)
+                        cond += " || ";
+                    cond += "(" + subj + " == " + values[k] + ")";
+                }
+                std::string opener = (isFirst ? "if (" : "} else if (") + cond + ") {";
+                if (m[3].matched)
+                {
+                    std::string stmt = transformCore(trimCopy(m[3].str()));
+                    outLines.push_back(indentation + opener + " " + stmt);
+                    stack.push_back(RBFrame{RBFrameKind::Branch, gid, RBTailInfo{RBTailKind::Statement, (int)outLines.size() - 1, -1}});
+                }
+                else
+                {
+                    outLines.push_back(indentation + opener);
+                    stack.push_back(RBFrame{RBFrameKind::Branch, gid, RBTailInfo{}});
+                }
+                continue;
+            }
+        }
+
+        if (startsWith(code, "class ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            std::string rest = trimCopy(code.substr(6));
+            static const std::regex classRe("^([A-Za-z_][A-Za-z0-9_]*)\\s*(<\\s*([A-Za-z_][A-Za-z0-9_]*))?\\s*$");
+            std::smatch m;
+            std::string header;
+            if (std::regex_match(rest, m, classRe))
+                header = m[3].matched ? ("class " + m[1].str() + " extends " + m[3].str())
+                                       : ("class " + m[1].str());
+            else
+                header = "class " + rest;
+            outLines.push_back(indentation + header + " {");
+            stack.push_back(RBFrame{RBFrameKind::Other, -1, RBTailInfo{}});
+            continue;
+        }
+        {
+            // Only the exact Ruby `include ModuleName` marker is dropped
+            // (already spliced by rbFlattenModules); anything else that
+            // happens to start with "include " falls through untouched.
+            static const std::regex includeMarkerRe("^include\\s+[A-Za-z_][A-Za-z0-9_]*$");
+            if (std::regex_match(code, includeMarkerRe))
+                continue;
+        }
+
+        if (startsWith(code, "def ") && (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            std::string signature = trimCopy(code.substr(4));
+            static const std::regex initRe("^initialize(\\s*\\(.*)?$");
+            signature = std::regex_replace(signature, initRe, "init$1");
+            signature = rbNormalizeAtoms(signature, symbols, strict);
+            if (signature.find('(') == std::string::npos)
+                signature += "()"; // Ruby allows parameter-less `def name`
+            outLines.push_back(indentation + "function " + signature + " {");
+            stack.push_back(RBFrame{RBFrameKind::Def, -1, RBTailInfo{}});
+            continue;
+        }
+
+        std::string prefix, params;
+        if (rbTryTrailingDoOpener(code, prefix, params) && !prefix.empty() &&
+            (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li))))
+        {
+            std::string convertedPrefix = rbNormalizeAtoms(rbConvertRanges(prefix), symbols, strict);
+            outLines.push_back(indentation + rbBuildBlockOpenText(convertedPrefix, params));
+            stack.push_back(RBFrame{RBFrameKind::ClosureDo, -1, RBTailInfo{}});
+            continue;
+        }
+
+        std::string finalCode = transformCore(code);
+        if (finalCode.empty())
+        {
+            outLines.push_back("");
+            continue;
+        }
+        emit(indentation, finalCode, true);
+    }
+
+    std::string result;
+    for (auto &l : outLines)
+    {
+        result += l;
+        result += "\n";
+    }
+    return result;
 }
 
 // C/C++ programs only define main() — append a call so the program executes
@@ -348,7 +1554,11 @@ static std::string applyDialect(std::string source, const std::string &path)
     std::string ext = fileExtLower(path);
 
     if (ext == ".rb")
-        source = applyRubyDialect(source);
+        source = applyRubyDialect(source, /*strict=*/true);
+    else if (ext == ".sa")
+        source = applyRubyDialect(source, /*strict=*/false);
+    if ((ext == ".rb" || ext == ".sa") && std::getenv("QUANTUM_DEBUG_RUBY"))
+        std::cerr << "----- translated -----\n" << source << "----- end -----\n";
 
     // A newline after a chaining/stream operator is whitespace in C++-style
     // source. The shared parser previously treated it as the end of the
@@ -801,16 +2011,43 @@ static TestResult testFile(const std::string &path)
     return res;
 }
 
+// Lists one directory level, then recurses into its subdirectories
+// separately (rather than using a single fs::recursive_directory_iterator).
+// This matters because a nested checkout's .git/ directory (long hashed
+// object paths, reparse points) can throw a filesystem_error that isn't a
+// plain permission-denied — recursive_directory_iterator has no way to skip
+// just that one subtree, so the error silently aborts every sibling
+// directory that would have been visited afterward in the same lazy walk.
+// Gathering this level's subdirectories up front and recursing into each
+// independently means a failure in one subtree only loses that subtree.
+static void collectTestFilesRecursive(const fs::path &dir, std::vector<fs::path> &out)
+{
+    std::vector<fs::path> subdirs;
+    try
+    {
+        for (auto &e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied))
+        {
+            if (e.is_directory())
+                subdirs.push_back(e.path());
+            else if (e.is_regular_file() && hasSupportedExt(e.path().string()))
+                out.push_back(e.path());
+        }
+    }
+    catch (const fs::filesystem_error &)
+    {
+        return; // this subtree is unreadable — skip it, siblings are unaffected
+    }
+    for (auto &sub : subdirs)
+        collectTestFilesRecursive(sub, out);
+}
+
 static void collectTestFiles(const fs::path &dir, std::vector<fs::path> &out)
 {
     // Any file type the compiler runs natively is testable:
     // .sa .js .py .rb .c .cpp — all share the same multi-syntax pipeline.
     if (!fs::exists(dir) || !fs::is_directory(dir))
         return;
-    for (auto &e : fs::recursive_directory_iterator(
-             dir, fs::directory_options::skip_permission_denied))
-        if (e.is_regular_file() && hasSupportedExt(e.path().string()))
-            out.push_back(e.path());
+    collectTestFilesRecursive(dir, out);
 }
 
 // ── Write test_results.txt ────────────────────────────────────────────────────

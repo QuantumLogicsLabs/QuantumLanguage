@@ -2037,7 +2037,9 @@ void VM::registerNatives()
 
     reg("gets", [](std::vector<QuantumValue> args) -> QuantumValue
         {
-        if (g_testMode) return defaultTestInputValue(args, true);
+        // Ruby's gets always returns a string (unlike cin-style prompt-less
+        // reads), so use the non-format-aware default (matches "input" below).
+        if (g_testMode) return defaultTestInputValue(args, false);
         if (!args.empty()) std::cout << args[0].toString();
         std::string line;
         std::getline(std::cin, line);
