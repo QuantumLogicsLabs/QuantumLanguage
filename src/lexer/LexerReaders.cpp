@@ -225,7 +225,7 @@ Token Lexer::readIdentifierOrKeyword()
                 {
                     char ch = current();
                     // Track string literals inside the expression to avoid false colon matches
-                    if (!inDoubleQ && ch == '\'\'' && !inFormat)
+                    if (!inDoubleQ && ch == '\'' && !inFormat)
                         inSingleQ = !inSingleQ;
                     else if (!inSingleQ && ch == '"' && !inFormat)
                         inDoubleQ = !inDoubleQ;
@@ -330,4 +330,3 @@ Token Lexer::readIdentifierOrKeyword()
 
     return Token(type, id, startLine, startCol);
 }
-
