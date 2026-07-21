@@ -1,6 +1,0 @@
-let a=96;
-if(a<=69){
-    print("Value is Less than or equal to 69.");
-}else{
-    print("Value is greater than 69.");
-}

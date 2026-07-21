@@ -1,6 +1,0 @@
-print("Why did the scarecrow win an award?");
-print("Because he was outstanding in his field!");
-
-let a = 10;
-let b = 20;
-print(a + b);
