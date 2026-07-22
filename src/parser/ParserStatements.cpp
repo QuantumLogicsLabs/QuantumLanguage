@@ -205,11 +205,90 @@ ASTNodePtr Parser::parseStatement()
     {
         consume();
         ASTNodePtr val;
-        if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) && !atEnd())
+        // As with `return`, a bare re-raise can be closed by its enclosing
+        // block on the same line: `rescue => e { raise }`.
+        if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) &&
+            !check(TokenType::RBRACE) && !atEnd())
             val = parseExpr();
         while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
             consume();
         return std::make_unique<ASTNode>(RaiseStmt{std::move(val)}, ln);
+    }
+    case TokenType::WITH:
+    {
+        // Python `with EXPR as NAME:` (optionally comma-separated) desugars to:
+        //     NAME = EXPR
+        //     try { <body> } finally { NAME.close() }
+        // Quantum has no context-manager protocol, so cleanup is a hardcoded
+        // .close() — correct for file objects (open()), which is the case that
+        // exists. Bindings without `as` still run the body; nothing to close.
+        consume(); // eat 'with'
+
+        struct Item { std::string name; ASTNodePtr expr; };
+        std::vector<Item> items;
+
+        while (true)
+        {
+            ASTNodePtr expr = parseExpr();
+            std::string name;
+            if (check(TokenType::AS))
+            {
+                consume();
+                if (check(TokenType::IDENTIFIER))
+                    name = consume().value;
+            }
+            items.push_back({std::move(name), std::move(expr)});
+            if (check(TokenType::COMMA)) { consume(); continue; }
+            break;
+        }
+
+        match(TokenType::COLON);
+        skipNewlines();
+        auto body = parseBlock();
+
+        // Build the finally block: NAME.close() for each named item (reverse order)
+        BlockStmt finallyBlock;
+        for (auto it = items.rbegin(); it != items.rend(); ++it)
+        {
+            if (it->name.empty()) continue;
+            auto target = std::make_unique<ASTNode>(Identifier{it->name}, ln);
+            auto member = std::make_unique<ASTNode>(
+                MemberExpr{std::move(target), "close"}, ln);
+            CallExpr call;
+            call.callee = std::move(member);
+            auto callNode = std::make_unique<ASTNode>(std::move(call), ln);
+            finallyBlock.statements.push_back(
+                std::make_unique<ASTNode>(ExprStmt{std::move(callNode)}, ln));
+        }
+
+        // Assemble: [ NAME = EXPR ; ... ; try { body } finally { closes } ]
+        BlockStmt outer;
+        for (auto &item : items)
+        {
+            if (item.name.empty())
+            {
+                // No binding — just evaluate the expression for its effect
+                outer.statements.push_back(
+                    std::make_unique<ASTNode>(ExprStmt{std::move(item.expr)}, ln));
+                continue;
+            }
+            auto lhs = std::make_unique<ASTNode>(Identifier{item.name}, ln);
+            AssignExpr assign;
+            assign.op = "=";
+            assign.target = std::move(lhs);
+            assign.value = std::move(item.expr);
+            auto assignNode = std::make_unique<ASTNode>(std::move(assign), ln);
+            outer.statements.push_back(
+                std::make_unique<ASTNode>(ExprStmt{std::move(assignNode)}, ln));
+        }
+
+        TryStmt ts;
+        ts.body = std::move(body);
+        if (!finallyBlock.statements.empty())
+            ts.finallyBody = std::make_unique<ASTNode>(std::move(finallyBlock), ln);
+        outer.statements.push_back(std::make_unique<ASTNode>(std::move(ts), ln));
+
+        return std::make_unique<ASTNode>(std::move(outer), ln);
     }
     case TokenType::TRY:
     {
@@ -2391,7 +2470,11 @@ ASTNodePtr Parser::parseReturnStmt()
 {
     int ln = current().line;
     ASTNodePtr val;
-    if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) && !atEnd())
+    // A value-less `return` can also be closed by the end of its enclosing
+    // block on the same line — `if (x) { return }` — not just by a newline
+    // or semicolon.
+    if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) &&
+        !check(TokenType::RBRACE) && !atEnd())
     {
         val = parseExpr();
         // Tuple return: return a, b  or  return a, b, c
@@ -2547,6 +2630,8 @@ ASTNodePtr Parser::parseCoutStmt()
         if (!check(TokenType::LSHIFT))
             break;
         consume(); // eat <<
+
+        skipNewlines();
 
         // "endl" triggers a newline (no value pushed)
         if (check(TokenType::IDENTIFIER) && current().value == "endl")

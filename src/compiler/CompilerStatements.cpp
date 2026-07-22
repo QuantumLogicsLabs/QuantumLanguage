@@ -145,7 +145,11 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
         auto fnChunk = compileFunction(fd.name, methodParams, methodRefs, fd.defaultArgs, fd.body.get(), method->line);
         auto closureTpl = std::make_shared<Closure>(fnChunk);
         emit(Op::LOAD_CONST, addConst(QuantumValue(closureTpl)), method->line);
-        emit(Op::MAKE_FUNCTION, 0, method->line);
+        // A method body may itself contain a nested closure capturing the
+        // method's locals as upvalues (e.g. `arr.each(fn(x){ ...local... })`);
+        // that only works if the method is created with MAKE_CLOSURE so its
+        // upvalue cells exist. Plain methods keep the cheaper MAKE_FUNCTION.
+        emit(fnChunk->upvalueCount > 0 ? Op::MAKE_CLOSURE : Op::MAKE_FUNCTION, 0, method->line);
         emit(Op::BIND_METHOD, addStr(fd.name), method->line);
     }
 

@@ -496,6 +496,56 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
 {
     if (obj.isNumber())
     {
+        if (method == "zero")
+            return QuantumValue(obj.asNumber() == 0.0);
+        if (method == "even")
+            return QuantumValue(std::fmod(obj.asNumber(), 2.0) == 0.0);
+        if (method == "odd")
+            return QuantumValue(std::fmod(obj.asNumber(), 2.0) != 0.0);
+        if (method == "positive")
+            return QuantumValue(obj.asNumber() > 0.0);
+        if (method == "negative")
+            return QuantumValue(obj.asNumber() < 0.0);
+        if (method == "abs")
+            return QuantumValue(std::fabs(obj.asNumber()));
+        if (method == "to_i" || method == "floor")
+            return QuantumValue(std::floor(obj.asNumber()));
+        if (method == "ceil")
+            return QuantumValue(std::ceil(obj.asNumber()));
+        if (method == "round")
+            return QuantumValue(std::round(obj.asNumber()));
+        if (method == "to_f")
+            return QuantumValue(obj.asNumber());
+        if (method == "to_s")
+            return QuantumValue(obj.toString());
+        // Ruby Integer#times / #upto — iterate by delegating to the array
+        // higher-order dispatch, which already handles every callable kind.
+        if (method == "times" || method == "upto" || method == "downto")
+        {
+            auto range = std::make_shared<Array>();
+            if (method == "times")
+                for (int i = 0; i < (int)obj.asNumber(); ++i)
+                    range->push_back(QuantumValue((double)i));
+            else if (method == "upto")
+            {
+                int stop = args.empty() ? (int)obj.asNumber() : (int)args[0].asNumber();
+                for (int i = (int)obj.asNumber(); i <= stop; ++i)
+                    range->push_back(QuantumValue((double)i));
+            }
+            else
+            {
+                int stop = args.empty() ? 0 : (int)args[0].asNumber();
+                for (int i = (int)obj.asNumber(); i >= stop; --i)
+                    range->push_back(QuantumValue((double)i));
+            }
+            std::vector<QuantumValue> cbArgs;
+            for (auto &a : args)
+                if (a.isFunction() || a.isNative() || a.isBoundMethod())
+                    cbArgs.push_back(a);
+            if (cbArgs.empty())
+                return QuantumValue(range);
+            return callArrayMethod(range, "each", cbArgs);
+        }
         if (method == "toFixed")
         {
             int places = args.empty() ? 0 : static_cast<int>(args[0].asNumber());

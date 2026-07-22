@@ -33,6 +33,7 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords = {
     {"catch", TokenType::EXCEPT}, // JS alias
     {"finally", TokenType::FINALLY},
     {"as", TokenType::AS}, // JS alias
+    {"with", TokenType::WITH},
     {"print", TokenType::PRINT},
     {"printf", TokenType::PRINT},
     {"input", TokenType::INPUT},

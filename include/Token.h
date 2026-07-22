@@ -38,6 +38,7 @@ enum class TokenType
     EXCEPT,
     FINALLY,
     AS,
+    WITH,
     PRINT,
     INPUT,
     COUT, // cout

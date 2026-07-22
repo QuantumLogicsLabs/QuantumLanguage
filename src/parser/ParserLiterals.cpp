@@ -1036,7 +1036,7 @@ std::vector<std::string> Parser::parseParamList(std::vector<bool> *outIsRef, std
 
         // Detect whether this param is a pointer (*) or reference (&)
         bool isRef = false;
-        while (check(TokenType::BIT_AND) || check(TokenType::STAR))
+        while (check(TokenType::BIT_AND) || check(TokenType::STAR) || check(TokenType::POWER))
         {
             if (check(TokenType::BIT_AND))
                 isRef = true; // & = pass-by-reference

@@ -237,6 +237,25 @@ void VM::runFrame(size_t stopDepth)
         case Op::BIT_OR:
         case Op::BIT_XOR:
         case Op::LSHIFT:
+        {
+            QuantumValue R = pop(), L = pop();
+            // C++ stream insertion: fileObj << value → write to the file.
+            // A file object is a Dict carrying a "write" native. If L is one,
+            // write R's text and push L back so f << a << b chains.
+            if (L.isDict())
+            {
+                auto d = L.asDict();
+                auto it = d->find("write");
+                if (it != d->end() && it->second.isNative())
+                {
+                    it->second.asNative()->fn({ R });
+                    push(L);
+                    break;
+                }
+            }
+            push(execBinary(instr.op, L, R, line));
+            break;
+        }
         case Op::RSHIFT:
         case Op::EQ:
         case Op::NEQ:
@@ -633,6 +652,19 @@ void VM::runFrame(size_t stopDepth)
                 }
                 if (found)
                     break;
+
+                // 3. Unknown name on an instance -> nil, matching Ruby's
+                // (and Python's) "unset attribute reads as nil" semantics.
+                // Falling through to the builtin-method wrapper below would
+                // instead yield a truthy native object for a plain field
+                // read — which silently turns `while (node)` style loops
+                // over an unset link (`node.next_node`) into infinite
+                // loops. That wrapper can only ever throw for an instance
+                // anyway (callBuiltinMethod has no instance branch beyond
+                // methods/fields already checked here), so nil is strictly
+                // more useful as well as more correct.
+                push(QuantumValue());
+                break;
             }
 
             if (obj.isClass())
@@ -1022,6 +1054,12 @@ void VM::runFrame(size_t stopDepth)
         case Op::ARROW:
         {
             // ptr->member: handled by compileArrow as DEREF + GET_MEMBER
+            QuantumValue val = pop();
+            if (val.isPointer()){
+                push(val.asPointer()->deref());
+            }else{
+                push(val);
+            }
             break;
         }
 

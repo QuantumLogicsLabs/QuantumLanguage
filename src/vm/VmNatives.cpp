@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <cstring>
 
 extern bool g_testMode;
 
@@ -1471,11 +1472,48 @@ void VM::registerNatives()
             };
             (*setObj)["add"] = QuantumValue(addNative);
             (*setObj)["has"] = QuantumValue(hasNative);
+            // Ruby spellings for the same operations (`set << x`
+            // transpiles to push; `include?`/`member?` for membership).
+            (*setObj)["push"] = QuantumValue(addNative);
+            (*setObj)["include"] = QuantumValue(hasNative);
+            (*setObj)["member"] = QuantumValue(hasNative);
+            (*setObj)["contains"] = QuantumValue(hasNative);
+            auto deleteNative = std::make_shared<QuantumNative>();
+            deleteNative->name = "Set.delete";
+            deleteNative->fn = [setObj, values, ordered](std::vector<QuantumValue> callArgs) -> QuantumValue
+            {
+                if (!callArgs.empty())
+                {
+                    std::string key = callArgs[0].toString();
+                    if (values->erase(key))
+                        for (auto it = ordered->begin(); it != ordered->end(); ++it)
+                            if (it->toString() == key)
+                            {
+                                ordered->erase(it);
+                                break;
+                            }
+                }
+                (*setObj)["size"] = QuantumValue((double)values->size());
+                return QuantumValue(setObj);
+            };
+            (*setObj)["delete"] = QuantumValue(deleteNative);
+            auto toArrayNative = std::make_shared<QuantumNative>();
+            toArrayNative->name = "Set.to_a";
+            toArrayNative->fn = [ordered](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(std::make_shared<Array>(*ordered)); };
+            (*setObj)["to_a"] = QuantumValue(toArrayNative);
+            auto emptyNative = std::make_shared<QuantumNative>();
+            emptyNative->name = "Set.empty";
+            emptyNative->fn = [values](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(values->empty()); };
+            (*setObj)["empty"] = QuantumValue(emptyNative);
             (*setObj)["size"] = QuantumValue((double)values->size());
             (*setObj)["values"] = QuantumValue(ordered);
             return QuantumValue(setObj);
         };
         (*setDict)["__new__"] = QuantumValue(setNew);
+        // Ruby constructs it as `Set.new(...)` rather than `new Set(...)`.
+        (*setDict)["new"] = QuantumValue(setNew);
         globals->define("Set", QuantumValue(setDict));
     }
 
@@ -2033,6 +2071,774 @@ void VM::registerNatives()
         std::ostringstream buffer;
         buffer << in.rdbuf();
         return QuantumValue(buffer.str()); });
+
+    reg("gets", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        // Ruby's gets always returns a string (unlike cin-style prompt-less
+        // reads), so use the non-format-aware default (matches "input" below).
+        if (g_testMode) return defaultTestInputValue(args, false);
+        if (!args.empty()) std::cout << args[0].toString();
+        std::string line;
+        std::getline(std::cin, line);
+        return QuantumValue(line); });
+
+    // ── Ruby concurrency primitives ───────────────────────────────────────
+    // The VM is single-threaded (one value stack, one frame stack), so
+    // running user closures on real OS threads would corrupt it. These
+    // instead give *deterministic deferred execution*: a Thread body runs
+    // to completion at join (or value) time. Programs still produce their
+    // full, correct output — only the interleaving is fixed rather than
+    // scheduler-dependent. Mutex/ConditionVariable therefore have nothing
+    // to protect against and reduce to running the block / no-ops, and the
+    // queues are ordinary FIFOs that never block.
+    {
+        auto invoke = [this](QuantumValue fn, std::vector<QuantumValue> fnArgs) -> QuantumValue
+        {
+            if (fn.isNative())
+                return fn.asNative()->fn(fnArgs);
+            if (fn.isFunction())
+            {
+                push(fn);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(fn.asFunction(), static_cast<int>(fnArgs.size()), 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            if (fn.isBoundMethod())
+            {
+                auto bm = fn.asBoundMethod();
+                push(fn);
+                push(bm->self);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(bm->method, static_cast<int>(fnArgs.size()) + 1, 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            return QuantumValue();
+        };
+
+        // Thread.new { body } — body is stored, then run at join/value time.
+        auto makeThread = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            QuantumValue body;
+            for (auto &a : args)
+                if (a.isFunction() || a.isNative() || a.isBoundMethod())
+                    body = a;
+
+            auto thread = std::make_shared<Dict>();
+            auto done = std::make_shared<bool>(false);
+            auto result = std::make_shared<QuantumValue>();
+
+            auto runOnce = [invoke, body, done, result]()
+            {
+                if (*done)
+                    return;
+                *done = true;
+                if (!body.isNil())
+                    *result = invoke(body, {});
+            };
+
+            auto joinFn = std::make_shared<QuantumNative>();
+            joinFn->name = "Thread.join";
+            joinFn->fn = [runOnce, thread](std::vector<QuantumValue>) -> QuantumValue
+            {
+                runOnce();
+                return QuantumValue(thread);
+            };
+            (*thread)["join"] = QuantumValue(joinFn);
+
+            auto valueFn = std::make_shared<QuantumNative>();
+            valueFn->name = "Thread.value";
+            valueFn->fn = [runOnce, result](std::vector<QuantumValue>) -> QuantumValue
+            {
+                runOnce();
+                return *result;
+            };
+            (*thread)["value"] = QuantumValue(valueFn);
+
+            auto aliveFn = std::make_shared<QuantumNative>();
+            aliveFn->name = "Thread.alive";
+            aliveFn->fn = [done](std::vector<QuantumValue>) -> QuantumValue
+            {
+                return QuantumValue(!*done);
+            };
+            (*thread)["alive"] = QuantumValue(aliveFn);
+            (*thread)["kill"] = QuantumValue(joinFn);
+            return QuantumValue(thread);
+        };
+
+        auto threadModule = std::make_shared<Dict>();
+        auto threadNew = std::make_shared<QuantumNative>();
+        threadNew->name = "Thread.new";
+        threadNew->fn = makeThread;
+        (*threadModule)["new"] = QuantumValue(threadNew);
+        (*threadModule)["start"] = QuantumValue(threadNew);
+        globals->define("Thread", QuantumValue(threadModule));
+
+        // Mutex#synchronize just runs the block; lock/unlock are no-ops.
+        auto makeMutex = [invoke](std::vector<QuantumValue>) -> QuantumValue
+        {
+            auto mutex = std::make_shared<Dict>();
+            auto syncFn = std::make_shared<QuantumNative>();
+            syncFn->name = "Mutex.synchronize";
+            syncFn->fn = [invoke](std::vector<QuantumValue> a) -> QuantumValue
+            {
+                for (auto &v : a)
+                    if (v.isFunction() || v.isNative() || v.isBoundMethod())
+                        return invoke(v, {});
+                return QuantumValue();
+            };
+            (*mutex)["synchronize"] = QuantumValue(syncFn);
+            auto noop = std::make_shared<QuantumNative>();
+            noop->name = "Mutex.noop";
+            noop->fn = [](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(true); };
+            (*mutex)["lock"] = QuantumValue(noop);
+            (*mutex)["unlock"] = QuantumValue(noop);
+            (*mutex)["try_lock"] = QuantumValue(noop);
+            (*mutex)["owned"] = QuantumValue(noop);
+            return QuantumValue(mutex);
+        };
+        {
+            auto mutexModule = std::make_shared<Dict>();
+            auto mutexNew = std::make_shared<QuantumNative>();
+            mutexNew->name = "Mutex.new";
+            mutexNew->fn = makeMutex;
+            (*mutexModule)["new"] = QuantumValue(mutexNew);
+            globals->define("Mutex", QuantumValue(mutexModule));
+        }
+
+        // ConditionVariable: with deferred threads there is never anything
+        // to wait for, so wait/signal/broadcast are no-ops.
+        {
+            auto condModule = std::make_shared<Dict>();
+            auto condNew = std::make_shared<QuantumNative>();
+            condNew->name = "ConditionVariable.new";
+            condNew->fn = [](std::vector<QuantumValue>) -> QuantumValue
+            {
+                auto cv = std::make_shared<Dict>();
+                auto noop = std::make_shared<QuantumNative>();
+                noop->name = "ConditionVariable.noop";
+                noop->fn = [](std::vector<QuantumValue>) -> QuantumValue
+                { return QuantumValue(); };
+                (*cv)["wait"] = QuantumValue(noop);
+                (*cv)["signal"] = QuantumValue(noop);
+                (*cv)["broadcast"] = QuantumValue(noop);
+                return QuantumValue(cv);
+            };
+            (*condModule)["new"] = QuantumValue(condNew);
+            globals->define("ConditionVariable", QuantumValue(condModule));
+        }
+
+        // Queue / SizedQueue: a plain FIFO. Never blocks — a bound, if
+        // given, is ignored, since a deferred-thread producer would
+        // otherwise deadlock against a consumer that hasn't run yet.
+        {
+            auto makeQueue = [](std::vector<QuantumValue>) -> QuantumValue
+            {
+                auto items = std::make_shared<Array>();
+                auto q = std::make_shared<Dict>();
+
+                auto pushFn = std::make_shared<QuantumNative>();
+                pushFn->name = "Queue.push";
+                pushFn->fn = [items](std::vector<QuantumValue> a) -> QuantumValue
+                {
+                    for (auto &v : a)
+                        items->push_back(v);
+                    return QuantumValue((double)items->size());
+                };
+                (*q)["push"] = QuantumValue(pushFn);
+                (*q)["enq"] = QuantumValue(pushFn);
+                (*q)["<<"] = QuantumValue(pushFn);
+
+                auto popFn = std::make_shared<QuantumNative>();
+                popFn->name = "Queue.pop";
+                popFn->fn = [items](std::vector<QuantumValue>) -> QuantumValue
+                {
+                    if (items->empty())
+                        return QuantumValue();
+                    QuantumValue v = items->front();
+                    items->erase(items->begin());
+                    return v;
+                };
+                (*q)["pop"] = QuantumValue(popFn);
+                (*q)["deq"] = QuantumValue(popFn);
+                (*q)["shift"] = QuantumValue(popFn);
+
+                auto sizeFn = std::make_shared<QuantumNative>();
+                sizeFn->name = "Queue.size";
+                sizeFn->fn = [items](std::vector<QuantumValue>) -> QuantumValue
+                { return QuantumValue((double)items->size()); };
+                (*q)["size"] = QuantumValue(sizeFn);
+                (*q)["length"] = QuantumValue(sizeFn);
+
+                auto emptyFn = std::make_shared<QuantumNative>();
+                emptyFn->name = "Queue.empty";
+                emptyFn->fn = [items](std::vector<QuantumValue>) -> QuantumValue
+                { return QuantumValue(items->empty()); };
+                (*q)["empty"] = QuantumValue(emptyFn);
+
+                auto closeFn = std::make_shared<QuantumNative>();
+                closeFn->name = "Queue.close";
+                closeFn->fn = [](std::vector<QuantumValue>) -> QuantumValue
+                { return QuantumValue(); };
+                (*q)["close"] = QuantumValue(closeFn);
+                return QuantumValue(q);
+            };
+            for (const char *qname : {"Queue", "SizedQueue"})
+            {
+                auto qModule = std::make_shared<Dict>();
+                auto qNew = std::make_shared<QuantumNative>();
+                qNew->name = std::string(qname) + ".new";
+                qNew->fn = makeQueue;
+                (*qModule)["new"] = QuantumValue(qNew);
+                globals->define(qname, QuantumValue(qModule));
+            }
+        }
+
+        // Ractor: like Thread, but the body takes the passed-in value as
+        // its argument and the result is collected with `take`.
+        {
+            auto ractorModule = std::make_shared<Dict>();
+            auto ractorNew = std::make_shared<QuantumNative>();
+            ractorNew->name = "Ractor.new";
+            ractorNew->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+            {
+                QuantumValue body;
+                std::vector<QuantumValue> payload;
+                for (auto &a : args)
+                {
+                    if (a.isFunction() || a.isNative() || a.isBoundMethod())
+                        body = a;
+                    else
+                        payload.push_back(a);
+                }
+                auto ractor = std::make_shared<Dict>();
+                auto done = std::make_shared<bool>(false);
+                auto result = std::make_shared<QuantumValue>();
+                auto runOnce = [invoke, body, payload, done, result]()
+                {
+                    if (*done)
+                        return;
+                    *done = true;
+                    if (!body.isNil())
+                        *result = invoke(body, payload);
+                };
+                auto takeFn = std::make_shared<QuantumNative>();
+                takeFn->name = "Ractor.take";
+                takeFn->fn = [runOnce, result](std::vector<QuantumValue>) -> QuantumValue
+                {
+                    runOnce();
+                    return *result;
+                };
+                (*ractor)["take"] = QuantumValue(takeFn);
+                (*ractor)["value"] = QuantumValue(takeFn);
+                (*ractor)["join"] = QuantumValue(takeFn);
+                return QuantumValue(ractor);
+            };
+            (*ractorModule)["new"] = QuantumValue(ractorNew);
+            globals->define("Ractor", QuantumValue(ractorModule));
+        }
+
+        // Fiber: cooperative coroutines. Without a real coroutine stack the
+        // faithful subset is "run the body on first resume"; Fiber.yield is
+        // a no-op, so a fiber body runs straight through instead of
+        // suspending. alive? reports false once it has run.
+        {
+            auto fiberModule = std::make_shared<Dict>();
+            auto fiberNew = std::make_shared<QuantumNative>();
+            fiberNew->name = "Fiber.new";
+            fiberNew->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+            {
+                QuantumValue body;
+                for (auto &a : args)
+                    if (a.isFunction() || a.isNative() || a.isBoundMethod())
+                        body = a;
+                auto fiber = std::make_shared<Dict>();
+                auto done = std::make_shared<bool>(false);
+                auto resumeFn = std::make_shared<QuantumNative>();
+                resumeFn->name = "Fiber.resume";
+                resumeFn->fn = [invoke, body, done](std::vector<QuantumValue> a) -> QuantumValue
+                {
+                    if (*done)
+                        return QuantumValue();
+                    *done = true;
+                    if (body.isNil())
+                        return QuantumValue();
+                    return invoke(body, a);
+                };
+                (*fiber)["resume"] = QuantumValue(resumeFn);
+                auto aliveFn = std::make_shared<QuantumNative>();
+                aliveFn->name = "Fiber.alive";
+                aliveFn->fn = [done](std::vector<QuantumValue>) -> QuantumValue
+                { return QuantumValue(!*done); };
+                (*fiber)["alive"] = QuantumValue(aliveFn);
+                return QuantumValue(fiber);
+            };
+            (*fiberModule)["new"] = QuantumValue(fiberNew);
+            auto fiberYield = std::make_shared<QuantumNative>();
+            fiberYield->name = "Fiber.yield";
+            fiberYield->fn = [](std::vector<QuantumValue> a) -> QuantumValue
+            { return a.empty() ? QuantumValue() : a[0]; };
+            (*fiberModule)["yield"] = QuantumValue(fiberYield);
+            globals->define("Fiber", QuantumValue(fiberModule));
+        }
+
+        // Process.fork: no fork on Windows, and the VM can't be duplicated
+        // anyway — run the child body inline and hand back a fake pid, so
+        // fork/wait scripts still execute their work exactly once.
+        {
+            auto processModule = std::make_shared<Dict>();
+            auto forkFn = std::make_shared<QuantumNative>();
+            forkFn->name = "Process.fork";
+            forkFn->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+            {
+                for (auto &a : args)
+                    if (a.isFunction() || a.isNative() || a.isBoundMethod())
+                        invoke(a, {});
+                return QuantumValue(4242.0); // stand-in child pid
+            };
+            (*processModule)["fork"] = QuantumValue(forkFn);
+            auto waitFn = std::make_shared<QuantumNative>();
+            waitFn->name = "Process.wait";
+            waitFn->fn = [](std::vector<QuantumValue> a) -> QuantumValue
+            { return a.empty() ? QuantumValue(4242.0) : a[0]; };
+            (*processModule)["wait"] = QuantumValue(waitFn);
+            (*processModule)["waitall"] = QuantumValue(waitFn);
+            auto pidFn = std::make_shared<QuantumNative>();
+            pidFn->name = "Process.pid";
+            pidFn->fn = [](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(1.0); };
+            (*processModule)["pid"] = QuantumValue(pidFn);
+            globals->define("Process", QuantumValue(processModule));
+        }
+
+        // TCPServer / TCPSocket: an in-process loopback pair. A socket is
+        // backed by a shared buffer, so a script that writes to a client
+        // socket and reads it back on the server side still exercises its
+        // full message flow without touching the network.
+        {
+            auto makeSocket = []() -> std::shared_ptr<Dict>
+            {
+                auto buffer = std::make_shared<Array>();
+                auto sock = std::make_shared<Dict>();
+
+                auto writeFn = std::make_shared<QuantumNative>();
+                writeFn->name = "TCPSocket.puts";
+                writeFn->fn = [buffer](std::vector<QuantumValue> a) -> QuantumValue
+                {
+                    for (auto &v : a)
+                        buffer->push_back(v);
+                    return QuantumValue();
+                };
+                (*sock)["puts"] = QuantumValue(writeFn);
+                (*sock)["write"] = QuantumValue(writeFn);
+                (*sock)["print"] = QuantumValue(writeFn);
+
+                auto readFn = std::make_shared<QuantumNative>();
+                readFn->name = "TCPSocket.gets";
+                readFn->fn = [buffer](std::vector<QuantumValue>) -> QuantumValue
+                {
+                    if (buffer->empty())
+                        return QuantumValue();
+                    QuantumValue v = buffer->front();
+                    buffer->erase(buffer->begin());
+                    return v;
+                };
+                (*sock)["gets"] = QuantumValue(readFn);
+                (*sock)["read"] = QuantumValue(readFn);
+                (*sock)["readline"] = QuantumValue(readFn);
+                (*sock)["recv"] = QuantumValue(readFn);
+
+                auto closeFn = std::make_shared<QuantumNative>();
+                closeFn->name = "TCPSocket.close";
+                closeFn->fn = [](std::vector<QuantumValue>) -> QuantumValue
+                { return QuantumValue(); };
+                (*sock)["close"] = QuantumValue(closeFn);
+                (*sock)["flush"] = QuantumValue(closeFn);
+                return sock;
+            };
+
+            // One shared endpoint per process keeps a server's accept() and
+            // a client's connect() talking to the same buffer.
+            auto shared = std::make_shared<std::shared_ptr<Dict>>(makeSocket());
+
+            auto socketModule = std::make_shared<Dict>();
+            auto socketNew = std::make_shared<QuantumNative>();
+            socketNew->name = "TCPSocket.new";
+            socketNew->fn = [shared](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(*shared); };
+            (*socketModule)["new"] = QuantumValue(socketNew);
+            (*socketModule)["open"] = QuantumValue(socketNew);
+            globals->define("TCPSocket", QuantumValue(socketModule));
+
+            auto serverModule = std::make_shared<Dict>();
+            auto serverNew = std::make_shared<QuantumNative>();
+            serverNew->name = "TCPServer.new";
+            serverNew->fn = [shared](std::vector<QuantumValue>) -> QuantumValue
+            {
+                auto server = std::make_shared<Dict>();
+                auto acceptFn = std::make_shared<QuantumNative>();
+                acceptFn->name = "TCPServer.accept";
+                acceptFn->fn = [shared](std::vector<QuantumValue>) -> QuantumValue
+                { return QuantumValue(*shared); };
+                (*server)["accept"] = QuantumValue(acceptFn);
+                auto closeFn = std::make_shared<QuantumNative>();
+                closeFn->name = "TCPServer.close";
+                closeFn->fn = [](std::vector<QuantumValue>) -> QuantumValue
+                { return QuantumValue(); };
+                (*server)["close"] = QuantumValue(closeFn);
+                return QuantumValue(server);
+            };
+            (*serverModule)["new"] = QuantumValue(serverNew);
+            (*serverModule)["open"] = QuantumValue(serverNew);
+            globals->define("TCPServer", QuantumValue(serverModule));
+        }
+    }
+
+    // Ruby's range slice `obj[a..b]` / `obj[a...b]`, for strings and
+    // arrays. Negative bounds count back from the end; `inclusive` says
+    // whether the upper bound is part of the result.
+    reg("__slice_range", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() < 4) return QuantumValue();
+        int lo = (int)args[1].asNumber();
+        int hi = (int)args[2].asNumber();
+        bool inclusive = args[3].isTruthy();
+        auto bounds = [&](int n, int &start, int &count)
+        {
+            if (lo < 0) lo += n;
+            if (hi < 0) hi += n;
+            int stop = inclusive ? hi + 1 : hi;
+            start = std::max(0, std::min(lo, n));
+            stop  = std::max(start, std::min(stop, n));
+            count = stop - start;
+        };
+        if (args[0].isString())
+        {
+            const std::string &s = args[0].asString();
+            int start = 0, count = 0;
+            bounds((int)s.size(), start, count);
+            return QuantumValue(s.substr(start, count));
+        }
+        if (args[0].isArray())
+        {
+            auto src = args[0].asArray();
+            int start = 0, count = 0;
+            bounds((int)src->size(), start, count);
+            return QuantumValue(std::make_shared<Array>(src->begin() + start,
+                                                        src->begin() + start + count));
+        }
+        return QuantumValue(); });
+
+    // Ruby's two-argument slice `obj[start, length]`, for strings and
+    // arrays alike (start may be negative, counting from the end).
+    reg("__slice2", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() < 3) return QuantumValue();
+        int start = (int)args[1].asNumber();
+        int len   = (int)args[2].asNumber();
+        if (len < 0) len = 0;
+        if (args[0].isString())
+        {
+            const std::string &s = args[0].asString();
+            int n = (int)s.size();
+            if (start < 0) start += n;
+            if (start < 0 || start > n) return QuantumValue();
+            return QuantumValue(s.substr(start, std::min(len, n - start)));
+        }
+        if (args[0].isArray())
+        {
+            auto src = args[0].asArray();
+            int n = (int)src->size();
+            if (start < 0) start += n;
+            if (start < 0 || start > n) return QuantumValue();
+            int take = std::min(len, n - start);
+            return QuantumValue(std::make_shared<Array>(src->begin() + start,
+                                                        src->begin() + start + take));
+        }
+        return QuantumValue(); });
+
+
+    // Ruby's `Struct.new(:a, :b)` — builds a constructor for a simple
+    // record type. The instances are dicts keyed by the field names, so
+    // `s.a` / `s.a = v` work through the ordinary dict member paths.
+    {
+        auto structModule = std::make_shared<Dict>();
+        auto structNew = std::make_shared<QuantumNative>();
+        structNew->name = "Struct.new";
+        structNew->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            std::vector<std::string> fields;
+            for (auto &a : args)
+                if (a.isString())
+                    fields.push_back(a.asString());
+            auto ctor = std::make_shared<QuantumNative>();
+            ctor->name = "Struct.ctor";
+            ctor->fn = [fields](std::vector<QuantumValue> values) -> QuantumValue
+            {
+                auto inst = std::make_shared<Dict>();
+                for (size_t i = 0; i < fields.size(); ++i)
+                    (*inst)[fields[i]] = i < values.size() ? values[i] : QuantumValue();
+                return QuantumValue(inst);
+            };
+            return QuantumValue(ctor);
+        };
+        (*structModule)["new"] = QuantumValue(structNew);
+        globals->define("Struct", QuantumValue(structModule));
+    }
+
+    // Ruby's `defined?(X)` — true for anything that reached here as a
+    // value (an undefined global arrives as nil, which is the false case).
+    reg("defined", [](std::vector<QuantumValue> args) -> QuantumValue
+        { return QuantumValue(!args.empty() && !args[0].isNil()); });
+
+    // Ruby's defaulting Hash (`Hash.new(0)`) — read a key, falling back to
+    // the supplied default without storing it.
+    reg("__hget", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() < 3 || !args[0].isDict()) return QuantumValue();
+        auto &d = *args[0].asDict();
+        auto it = d.find(args[1].toString());
+        return it != d.end() ? it->second : args[2]; });
+
+    // Ruby's auto-vivifying Hash (`Hash.new { |h, k| h[k] = [] }`) — same,
+    // but the default is stored on first access, so that the common
+    // `hash[key] << value` idiom accumulates into the hash as intended.
+    reg("__hget_vivify", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() < 3 || !args[0].isDict()) return QuantumValue();
+        auto &d = *args[0].asDict();
+        std::string k = args[1].toString();
+        auto it = d.find(k);
+        if (it != d.end()) return it->second;
+        d[k] = args[2];
+        return d[k]; });
+
+    // Ruby's <=> spaceship operator: -1/0/1, numeric or lexical depending
+    // on operand type (matches how the existing native "sort" already
+    // compares values elsewhere in this file).
+    reg("__spaceship__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() < 2) return QuantumValue();
+        double result;
+        if (args[0].isNumber() && args[1].isNumber())
+        {
+            double a = args[0].asNumber(), b = args[1].asNumber();
+            result = a < b ? -1.0 : (a > b ? 1.0 : 0.0);
+        }
+        else
+        {
+            std::string a = args[0].toString(), b = args[1].toString();
+            result = a < b ? -1.0 : (a > b ? 1.0 : 0.0);
+        }
+        return QuantumValue(result); });
+
+    // ── Ruby-style File module (open/foreach/delete/exist) ────────────────
+    {
+        auto invoke = [this](QuantumValue fn, std::vector<QuantumValue> fnArgs) -> QuantumValue
+        {
+            if (fn.isNative())
+                return fn.asNative()->fn(fnArgs);
+            if (fn.isFunction())
+            {
+                push(fn);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(fn.asFunction(), static_cast<int>(fnArgs.size()), 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            if (fn.isBoundMethod())
+            {
+                auto bm = fn.asBoundMethod();
+                push(fn);
+                push(bm->self);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(bm->method, static_cast<int>(fnArgs.size()) + 1, 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            return QuantumValue();
+        };
+
+        auto fileModule = std::make_shared<Dict>();
+
+        auto openFn = std::make_shared<QuantumNative>();
+        openFn->name = "File.open";
+        openFn->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty())
+                throw RuntimeError("File.open requires a path");
+            std::string path = args[0].toString();
+            std::string mode = args.size() > 1 && !args[1].isFunction() && !args[1].isNative()
+                                    ? args[1].toString()
+                                    : "r";
+            QuantumValue callback;
+            for (auto &a : args)
+                if (a.isFunction() || a.isNative() || a.isBoundMethod())
+                    callback = a;
+
+            auto stream = std::make_shared<std::fstream>();
+            std::ios_base::openmode om = std::ios::in;
+            if (mode == "w")
+                om = std::ios::out | std::ios::trunc;
+            else if (mode == "a")
+                om = std::ios::out | std::ios::app;
+            else if (mode == "r+" || mode == "w+")
+                om = std::ios::in | std::ios::out;
+            stream->open(path, om);
+            if (!stream->is_open())
+                throw RuntimeError("File.open: cannot open '" + path + "'");
+
+            auto fileObj = std::make_shared<Dict>();
+
+            auto putsFn = std::make_shared<QuantumNative>();
+            putsFn->fn = [stream](std::vector<QuantumValue> a) -> QuantumValue
+            {
+                for (auto &v : a)
+                {
+                    std::string s = v.toString();
+                    *stream << s;
+                    if (s.empty() || s.back() != '\n')
+                        *stream << "\n";
+                }
+                if (a.empty())
+                    *stream << "\n";
+                return QuantumValue();
+            };
+            (*fileObj)["puts"] = QuantumValue(putsFn);
+
+            auto writeFn = std::make_shared<QuantumNative>();
+            writeFn->fn = [stream](std::vector<QuantumValue> a) -> QuantumValue
+            {
+                for (auto &v : a)
+                    *stream << v.toString();
+                return QuantumValue();
+            };
+            (*fileObj)["write"] = QuantumValue(writeFn);
+
+            auto closeFn = std::make_shared<QuantumNative>();
+            closeFn->fn = [stream](std::vector<QuantumValue>) -> QuantumValue
+            {
+                stream->close();
+                return QuantumValue();
+            };
+            (*fileObj)["close"] = QuantumValue(closeFn);
+
+            auto readFn = std::make_shared<QuantumNative>();
+            readFn->fn = [stream](std::vector<QuantumValue>) -> QuantumValue
+            {
+                std::string contents{std::istreambuf_iterator<char>(*stream),
+                                     std::istreambuf_iterator<char>()};
+                return QuantumValue(contents);
+            };
+
+            (*fileObj)["read"] = QuantumValue(readFn);
+            auto isOpenFn = std::make_shared<QuantumNative>();
+            isOpenFn->fn = [stream](std::vector<QuantumValue>) -> QuantumValue
+            {
+                return QuantumValue(stream->is_open());
+            };
+            (*fileObj)["is_open"] = QuantumValue(isOpenFn);
+
+            QuantumValue fileVal(fileObj);
+            if (!callback.isNil())
+            {
+                QuantumValue result = invoke(callback, {fileVal});
+                stream->close();
+                return result;
+            }
+            return fileVal;
+        };
+        (*fileModule)["open"] = QuantumValue(openFn);
+        reg("open", openFn->fn);   // Python bare open()
+
+        reg("ofstream", [openFn](std::vector<QuantumValue> args) -> QuantumValue {
+            std::vector<QuantumValue> a = { args.empty() ? QuantumValue(std::string("")) : args[0], QuantumValue(std::string("w")) };
+            return openFn->fn(a);
+        });
+
+        reg("ifstream", [openFn](std::vector<QuantumValue> args) -> QuantumValue {
+            std::vector<QuantumValue> a = { args.empty() ? QuantumValue(std::string("")) : args[0], QuantumValue(std::string("r")) };
+            return openFn->fn(a);
+        });
+
+        reg("fstream", [openFn](std::vector<QuantumValue> args) -> QuantumValue {
+            std::vector<QuantumValue> a = { args.empty() ? QuantumValue(std::string("")) : args[0], QuantumValue(std::string("r+")) };
+            return openFn->fn(a);
+        });
+
+        auto foreachFn = std::make_shared<QuantumNative>();
+        foreachFn->name = "File.foreach";
+        foreachFn->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty())
+                throw RuntimeError("File.foreach requires a path");
+            std::ifstream in(args[0].toString());
+            if (!in)
+                throw RuntimeError("File.foreach: cannot open '" + args[0].toString() + "'");
+            QuantumValue callback = args.size() > 1 ? args[1] : QuantumValue();
+            std::string line;
+            while (std::getline(in, line))
+                if (!callback.isNil())
+                    invoke(callback, {QuantumValue(line)});
+            return QuantumValue();
+        };
+        (*fileModule)["foreach"] = QuantumValue(foreachFn);
+
+        auto deleteFn = std::make_shared<QuantumNative>();
+        deleteFn->name = "File.delete";
+        deleteFn->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty())
+                return QuantumValue(false);
+            return QuantumValue(std::remove(args[0].toString().c_str()) == 0);
+        };
+        (*fileModule)["delete"] = QuantumValue(deleteFn);
+
+        auto existFn = std::make_shared<QuantumNative>();
+        existFn->name = "File.exist";
+        existFn->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty())
+                return QuantumValue(false);
+            std::ifstream in(args[0].toString());
+            return QuantumValue(in.good());
+        };
+        (*fileModule)["exist"] = QuantumValue(existFn);
+
+        globals->define("File", QuantumValue(fileModule));
+    }
+
+    // ── Ruby-style Time module ─────────────────────────────────────────────
+    {
+        auto timeModule = std::make_shared<Dict>();
+        auto nowFn = std::make_shared<QuantumNative>();
+        nowFn->name = "Time.now";
+        nowFn->fn = [](std::vector<QuantumValue>) -> QuantumValue
+        {
+            std::time_t now = std::time(nullptr);
+            std::tm tmValue{};
+#ifdef _WIN32
+            localtime_s(&tmValue, &now);
+#else
+            tmValue = *std::localtime(&now);
+#endif
+            char buf[64];
+            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %z", &tmValue);
+            return QuantumValue(std::string(buf));
+        };
+        (*timeModule)["now"] = QuantumValue(nowFn);
+        globals->define("Time", QuantumValue(timeModule));
+    }
 
     // ── console object (JavaScript compatibility) ─────────────────────────
     // console.log, console.error, console.warn, console.info

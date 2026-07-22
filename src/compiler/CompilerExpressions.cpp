@@ -609,6 +609,6 @@ void Compiler::compileDeref(DerefExpr &e, int line)
 void Compiler::compileArrow(ArrowExpr &e, int line)
 {
     compileExpr(*e.object);
-    emit(Op::DEREF, 0, line);
+    emit(Op::ARROW, 0, line);
     emit(Op::GET_MEMBER, addStr(e.member), line);
 }

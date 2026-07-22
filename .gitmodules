@@ -1,18 +1,14 @@
 [submodule "Website"]
 	path = Website
-	url = https://github.com/SENODROOM/QuantumLanguage-Website.git
-	branch = main
-[submodule "Library"]
-	path = examples/library
-	url = https://github.com/SENODROOM/Quantum-Library.git
+	url = https://github.com/QuantumLogicsLabs/QuantumLanguage-Website.git
 	branch = main
 [submodule "code-explaination"]
 	path = docs/code-explanation
 	url = https://github.com/SENODROOM/QuantumLangCodeExplaination.git
 	branch = main
-[submodule "demo"]
-	path = examples/demo
-	url = https://github.com/SENODROOM/QuantumCodeDemo.git
+[submodule "examples"]
+	path = examples
+	url = https://github.com/SENODROOM/QuantumLanguageExamples.git
 	branch = main
 [submodule "extensions"]
 	path = extensions
