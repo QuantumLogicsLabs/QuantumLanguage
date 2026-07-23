@@ -380,6 +380,7 @@ void VM::runFrame(size_t stopDepth)
                     frame.ip--;
                     break;
                 }
+                
             }
 
             if (callee.isClass())
@@ -553,7 +554,13 @@ void VM::runFrame(size_t stopDepth)
             {
                 auto &d = *obj.asDict();
                 auto it = d.find(idx.toString());
-                push(it != d.end() ? it->second : QuantumValue());
+                if (it != d.end())
+                    push(it->second);
+                else
+                {
+                    auto defIt = d.find("__hash_default__");
+                    push(defIt != d.end() ? defIt->second : QuantumValue());
+                }
             }
             else
                 throw TypeError("Cannot index into " + obj.typeName(), line);

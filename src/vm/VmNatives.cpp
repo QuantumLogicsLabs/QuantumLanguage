@@ -1523,6 +1523,157 @@ void VM::registerNatives()
         globals->define("Set", QuantumValue(setDict));
     }
 
+        // ── Hash (Ruby-style defaulting dict) ──────────────────────────────────
+    {
+        auto invoke = [this](QuantumValue fn, std::vector<QuantumValue> fnArgs) -> QuantumValue
+        {
+            if (fn.isNative())
+                return fn.asNative()->fn(fnArgs);
+            if (fn.isFunction())
+            {
+                push(fn);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(fn.asFunction(), static_cast<int>(fnArgs.size()), 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            if (fn.isBoundMethod())
+            {
+                auto bm = fn.asBoundMethod();
+                push(fn);
+                push(bm->self);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(bm->method, static_cast<int>(fnArgs.size()) + 1, 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            return QuantumValue();
+        };
+
+        auto hashDict = std::make_shared<Dict>();
+        auto hashNew = std::make_shared<QuantumNative>();
+        hashNew->name = "Hash.__new__";
+        hashNew->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            auto hashObj = std::make_shared<Dict>();
+            auto defaultVal = std::make_shared<QuantumValue>(); // nil
+            auto defaultBlock = std::make_shared<QuantumValue>(); // nil
+
+            if (!args.empty())
+            {
+                if (args[0].isFunction() || args[0].isNative() || args[0].isBoundMethod())
+                {
+                    *defaultBlock = args[0];
+                }
+                else
+                {
+                    *defaultVal = args[0];
+                }
+            }
+
+            // Store metadata so __hget / __hget_vivify can use it
+            (*hashObj)["__hash_default__"] = *defaultVal;
+            (*hashObj)["__hash_block__"] = *defaultBlock;
+
+            auto getFn = std::make_shared<QuantumNative>();
+            getFn->name = "Hash.[]";
+            getFn->fn = [hashObj, defaultVal, defaultBlock, invoke](std::vector<QuantumValue> callArgs) -> QuantumValue
+            {
+                if (callArgs.empty())
+                    return QuantumValue();
+                std::string key = callArgs[0].toString();
+                auto it = hashObj->find(key);
+                if (it != hashObj->end())
+                    return it->second;
+
+                if (!defaultBlock->isNil())
+                {
+                    // Auto-vivifying: call block with (hash, key), store result
+                    QuantumValue result = invoke(*defaultBlock, {QuantumValue(hashObj), QuantumValue(key)});
+                    (*hashObj)[key] = result;
+                    return result;
+                }
+
+                return *defaultVal;
+            };
+            (*hashObj)["__get__"] = QuantumValue(getFn);
+
+            auto setFn = std::make_shared<QuantumNative>();
+            setFn->name = "Hash.[]=";
+            setFn->fn = [hashObj](std::vector<QuantumValue> callArgs) -> QuantumValue
+            {
+                if (callArgs.size() < 2)
+                    return QuantumValue();
+                (*hashObj)[callArgs[0].toString()] = callArgs[1];
+                return callArgs[1];
+            };
+            (*hashObj)["__set__"] = QuantumValue(setFn);
+
+            auto hasKeyFn = std::make_shared<QuantumNative>();
+            hasKeyFn->name = "Hash.has_key?";
+            hasKeyFn->fn = [hashObj](std::vector<QuantumValue> callArgs) -> QuantumValue
+            {
+                if (callArgs.empty())
+                    return QuantumValue(false);
+                return QuantumValue(hashObj->count(callArgs[0].toString()) > 0);
+            };
+            (*hashObj)["has_key"] = QuantumValue(hasKeyFn);
+
+            auto sizeFn = std::make_shared<QuantumNative>();
+            sizeFn->name = "Hash.size";
+            sizeFn->fn = [hashObj](std::vector<QuantumValue>) -> QuantumValue
+            {
+                return QuantumValue((double)hashObj->size());
+            };
+            (*hashObj)["size"] = QuantumValue(sizeFn);
+            (*hashObj)["length"] = QuantumValue(sizeFn);
+
+            auto keysFn = std::make_shared<QuantumNative>();
+            keysFn->name = "Hash.keys";
+            keysFn->fn = [hashObj](std::vector<QuantumValue>) -> QuantumValue
+            {
+                auto arr = std::make_shared<Array>();
+                for (auto &[k, v] : *hashObj)
+                {
+                    if (k != "__hash_default__" && k != "__hash_block__" &&
+                        k != "__get__" && k != "__set__" &&
+                        k != "has_key" && k != "size" && k != "length" &&
+                        k != "keys" && k != "values")
+                        arr->push_back(QuantumValue(k));
+                }
+                return QuantumValue(arr);
+            };
+            (*hashObj)["keys"] = QuantumValue(keysFn);
+
+            auto valuesFn = std::make_shared<QuantumNative>();
+            valuesFn->name = "Hash.values";
+            valuesFn->fn = [hashObj](std::vector<QuantumValue>) -> QuantumValue
+            {
+                auto arr = std::make_shared<Array>();
+                for (auto &[k, v] : *hashObj)
+                {
+                    if (k != "__hash_default__" && k != "__hash_block__" &&
+                        k != "__get__" && k != "__set__" &&
+                        k != "has_key" && k != "size" && k != "length" &&
+                        k != "keys" && k != "values")
+                        arr->push_back(v);
+                }
+                return QuantumValue(arr);
+            };
+            (*hashObj)["values"] = QuantumValue(valuesFn);
+
+            return QuantumValue(hashObj);
+        };
+        (*hashDict)["__new__"] = QuantumValue(hashNew);
+        (*hashDict)["__call__"] = QuantumValue(hashNew);
+        (*hashDict)["new"] = QuantumValue(hashNew);
+        globals->define("Hash", QuantumValue(hashDict));
+    }
+
     {
         auto arrayDict = std::make_shared<Dict>();
         auto ctor = std::make_shared<QuantumNative>();
