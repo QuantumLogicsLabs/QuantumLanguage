@@ -542,15 +542,20 @@ void Compiler::compileListComp(ListComp &e, int line)
         pushToResult();
     }
 
+    // Same loop-exit convention as compileFor: the inner scope's POPs run
+    // first, then `continue` lands (having discarded the body's locals at
+    // its own site), and `break` lands before the outer endScope so the
+    // hidden iterator is popped exactly once on every path.
+    endScope(line);
+
     for (size_t ci : loops_.back().continueJumps)
         chunk().patch(ci, static_cast<int32_t>(chunk().code.size()) -
                               static_cast<int32_t>(ci) - 1);
 
-    endScope(line);
     emit(Op::LOOP, static_cast<int>(chunk().code.size()) - loopStart + 1, line);
     patchJump(exitJump);
-    endScope(line);
     endLoop();
+    endScope(line);
 
     emitLoad(resultName, line);
     endScope(line);

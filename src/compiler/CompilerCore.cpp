@@ -119,15 +119,33 @@ void Compiler::beginLoop(int startIp)
 {
     loops_.push_back({});
     loops_.back().loopStart = startIp;
+    loops_.back().scopeDepth = current_->scopeDepth;
+}
+
+// Locals live on the value stack, so leaving a loop body early has to discard
+// everything the body pushed — otherwise those slots leak for the rest of the
+// enclosing function. For a for-in loop that leak is silently destructive: the
+// hidden `__iter__` sits directly under the loop variable, so a stale slot left
+// by `break` makes the *next* for-in loop's FOR_ITER read the wrong iterator.
+void Compiler::emitLoopExitPops(int line)
+{
+    if (loops_.empty())
+        return;
+    int depth = loops_.back().scopeDepth;
+    for (int i = static_cast<int>(current_->locals.size()) - 1;
+         i >= 0 && current_->locals[i].depth > depth; --i)
+        emit(current_->locals[i].isCaptured ? Op::CLOSE_UPVALUE : Op::POP, 0, line);
 }
 
 void Compiler::emitBreak(int line)
 {
+    emitLoopExitPops(line);
     loops_.back().breakJumps.push_back(emitJump(Op::JUMP, line));
 }
 
 void Compiler::emitContinue(int line)
 {
+    emitLoopExitPops(line);
     loops_.back().continueJumps.push_back(emitJump(Op::JUMP, line));
 }
 

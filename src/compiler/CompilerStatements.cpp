@@ -246,19 +246,26 @@ void Compiler::compileFor(ForStmt &s, int line)
 
     compileNode(*s.body);
 
-    for (size_t ci : loops_.back().continueJumps)
-        chunk().patch(ci, static_cast<int32_t>(chunk().code.size()) - static_cast<int32_t>(ci) - 1);
-
     // End inner scope: pops loop variable(s) only, leaving iterator on stack
     endScope(line);
+
+    // `continue` lands *after* that cleanup, matching the stack state at the
+    // back-edge below — it discarded the body's locals itself (emitContinue),
+    // so letting it fall through endScope's POPs would double-pop them.
+    for (size_t ci : loops_.back().continueJumps)
+        chunk().patch(ci, static_cast<int32_t>(chunk().code.size()) - static_cast<int32_t>(ci) - 1);
 
     // Jump back to FOR_ITER (iterator is still on stack top)
     emit(Op::LOOP, static_cast<int>(chunk().code.size()) - loopStart + 1, line);
 
     patchJump(exitJump);
+    // Patch `break` to land here — *before* the outer scope ends — so both
+    // the exhausted path and the break path fall into the same endScope()
+    // and the hidden iterator is popped exactly once either way. (The body's
+    // own locals were already discarded at the break site by emitBreak.)
+    endLoop();
     // End outer scope: pops the iterator
     endScope(line);
-    endLoop();
 }
 
 void Compiler::compileReturn(ReturnStmt &s, int line)

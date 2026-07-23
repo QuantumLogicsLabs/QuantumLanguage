@@ -464,6 +464,28 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
             acc = callFn(fn, {acc, (*arr)[i], QuantumValue((double)i)});
         return acc;
     }
+    // Ruby Enumerable#each_with_index — same as each, but the callback is
+    // documented to receive (value, index), which forEach already passes.
+    // With no block it yields the [value, index] pairs instead, so
+    // `.each_with_index.map { |v, i| ... }` works.
+    if (m == "each_with_index")
+    {
+        if (args.empty())
+        {
+            auto pairs = std::make_shared<Array>();
+            for (size_t i = 0; i < arr->size(); ++i)
+            {
+                auto pair = std::make_shared<Array>();
+                pair->push_back((*arr)[i]);
+                pair->push_back(QuantumValue((double)i));
+                pairs->push_back(QuantumValue(pair));
+            }
+            return QuantumValue(pairs);
+        }
+        for (size_t i = 0; i < arr->size(); ++i)
+            callFn(args[0], {(*arr)[i], QuantumValue((double)i)});
+        return QuantumValue(arr);
+    }
     if (m == "forEach" || m == "each")
     {
         if (args.empty())

@@ -672,6 +672,33 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
         {
         }
     }
+    // Ruby invokes a Proc/lambda as `p.call(args)` (and `p.()`/`p[]`);
+    // in Quantum a closure is called directly, so `.call` on any callable
+    // just forwards to it.
+    if (method == "call" && (obj.isFunction() || obj.isNative() || obj.isBoundMethod()))
+    {
+        if (obj.isNative())
+            return obj.asNative()->fn(args);
+        if (obj.isFunction())
+        {
+            push(obj);
+            for (auto &a : args)
+                push(a);
+            callClosure(obj.asFunction(), (int)args.size(), line);
+            size_t depth = frames_.size() - 1;
+            runFrame(depth);
+            return pop();
+        }
+        auto bm = obj.asBoundMethod();
+        push(obj);
+        push(bm->self);
+        for (auto &a : args)
+            push(a);
+        callClosure(bm->method, (int)args.size() + 1, line);
+        size_t depth = frames_.size() - 1;
+        runFrame(depth);
+        return pop();
+    }
     throw TypeError("No method '" + method + "' on " + obj.typeName(), line);
 }
 

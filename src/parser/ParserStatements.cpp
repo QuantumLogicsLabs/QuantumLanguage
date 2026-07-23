@@ -205,7 +205,10 @@ ASTNodePtr Parser::parseStatement()
     {
         consume();
         ASTNodePtr val;
-        if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) && !atEnd())
+        // As with `return`, a bare re-raise can be closed by its enclosing
+        // block on the same line: `rescue => e { raise }`.
+        if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) &&
+            !check(TokenType::RBRACE) && !atEnd())
             val = parseExpr();
         while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
             consume();
@@ -2467,7 +2470,11 @@ ASTNodePtr Parser::parseReturnStmt()
 {
     int ln = current().line;
     ASTNodePtr val;
-    if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) && !atEnd())
+    // A value-less `return` can also be closed by the end of its enclosing
+    // block on the same line — `if (x) { return }` — not just by a newline
+    // or semicolon.
+    if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) &&
+        !check(TokenType::RBRACE) && !atEnd())
     {
         val = parseExpr();
         // Tuple return: return a, b  or  return a, b, c

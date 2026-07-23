@@ -141,10 +141,16 @@ private:
         std::vector<size_t> breakJumps;
         std::vector<size_t> continueJumps;
         int loopStart = 0;
+        // Scope depth at the loop's own level. `break`/`continue` jump out of
+        // the body without running its endScope(), so they must discard the
+        // locals it pushed themselves — everything deeper than this.
+        int scopeDepth = 0;
     };
     std::vector<LoopInfo> loops_;
 
     void beginLoop(int startIp);
+    // Pops the loop body's locals before a break/continue jumps out of it.
+    void emitLoopExitPops(int line);
     void emitBreak(int line);
     void emitContinue(int line);
     void endLoop();

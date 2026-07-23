@@ -1478,11 +1478,48 @@ void VM::registerNatives()
             };
             (*setObj)["add"] = QuantumValue(addNative);
             (*setObj)["has"] = QuantumValue(hasNative);
+            // Ruby spellings for the same operations (`set << x`
+            // transpiles to push; `include?`/`member?` for membership).
+            (*setObj)["push"] = QuantumValue(addNative);
+            (*setObj)["include"] = QuantumValue(hasNative);
+            (*setObj)["member"] = QuantumValue(hasNative);
+            (*setObj)["contains"] = QuantumValue(hasNative);
+            auto deleteNative = std::make_shared<QuantumNative>();
+            deleteNative->name = "Set.delete";
+            deleteNative->fn = [setObj, values, ordered](std::vector<QuantumValue> callArgs) -> QuantumValue
+            {
+                if (!callArgs.empty())
+                {
+                    std::string key = callArgs[0].toString();
+                    if (values->erase(key))
+                        for (auto it = ordered->begin(); it != ordered->end(); ++it)
+                            if (it->toString() == key)
+                            {
+                                ordered->erase(it);
+                                break;
+                            }
+                }
+                (*setObj)["size"] = QuantumValue((double)values->size());
+                return QuantumValue(setObj);
+            };
+            (*setObj)["delete"] = QuantumValue(deleteNative);
+            auto toArrayNative = std::make_shared<QuantumNative>();
+            toArrayNative->name = "Set.to_a";
+            toArrayNative->fn = [ordered](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(std::make_shared<Array>(*ordered)); };
+            (*setObj)["to_a"] = QuantumValue(toArrayNative);
+            auto emptyNative = std::make_shared<QuantumNative>();
+            emptyNative->name = "Set.empty";
+            emptyNative->fn = [values](std::vector<QuantumValue>) -> QuantumValue
+            { return QuantumValue(values->empty()); };
+            (*setObj)["empty"] = QuantumValue(emptyNative);
             (*setObj)["size"] = QuantumValue((double)values->size());
             (*setObj)["values"] = QuantumValue(ordered);
             return QuantumValue(setObj);
         };
         (*setDict)["__new__"] = QuantumValue(setNew);
+        // Ruby constructs it as `Set.new(...)` rather than `new Set(...)`.
+        (*setDict)["new"] = QuantumValue(setNew);
         globals->define("Set", QuantumValue(setDict));
     }
 
@@ -2469,6 +2506,41 @@ void VM::registerNatives()
         }
     }
 
+    // Ruby's range slice `obj[a..b]` / `obj[a...b]`, for strings and
+    // arrays. Negative bounds count back from the end; `inclusive` says
+    // whether the upper bound is part of the result.
+    reg("__slice_range", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() < 4) return QuantumValue();
+        int lo = (int)args[1].asNumber();
+        int hi = (int)args[2].asNumber();
+        bool inclusive = args[3].isTruthy();
+        auto bounds = [&](int n, int &start, int &count)
+        {
+            if (lo < 0) lo += n;
+            if (hi < 0) hi += n;
+            int stop = inclusive ? hi + 1 : hi;
+            start = std::max(0, std::min(lo, n));
+            stop  = std::max(start, std::min(stop, n));
+            count = stop - start;
+        };
+        if (args[0].isString())
+        {
+            const std::string &s = args[0].asString();
+            int start = 0, count = 0;
+            bounds((int)s.size(), start, count);
+            return QuantumValue(s.substr(start, count));
+        }
+        if (args[0].isArray())
+        {
+            auto src = args[0].asArray();
+            int start = 0, count = 0;
+            bounds((int)src->size(), start, count);
+            return QuantumValue(std::make_shared<Array>(src->begin() + start,
+                                                        src->begin() + start + count));
+        }
+        return QuantumValue(); });
+
     // Ruby's two-argument slice `obj[start, length]`, for strings and
     // arrays alike (start may be negative, counting from the end).
     reg("__slice2", [](std::vector<QuantumValue> args) -> QuantumValue
@@ -2496,6 +2568,35 @@ void VM::registerNatives()
                                                         src->begin() + start + take));
         }
         return QuantumValue(); });
+
+
+    // Ruby's `Struct.new(:a, :b)` — builds a constructor for a simple
+    // record type. The instances are dicts keyed by the field names, so
+    // `s.a` / `s.a = v` work through the ordinary dict member paths.
+    {
+        auto structModule = std::make_shared<Dict>();
+        auto structNew = std::make_shared<QuantumNative>();
+        structNew->name = "Struct.new";
+        structNew->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            std::vector<std::string> fields;
+            for (auto &a : args)
+                if (a.isString())
+                    fields.push_back(a.asString());
+            auto ctor = std::make_shared<QuantumNative>();
+            ctor->name = "Struct.ctor";
+            ctor->fn = [fields](std::vector<QuantumValue> values) -> QuantumValue
+            {
+                auto inst = std::make_shared<Dict>();
+                for (size_t i = 0; i < fields.size(); ++i)
+                    (*inst)[fields[i]] = i < values.size() ? values[i] : QuantumValue();
+                return QuantumValue(inst);
+            };
+            return QuantumValue(ctor);
+        };
+        (*structModule)["new"] = QuantumValue(structNew);
+        globals->define("Struct", QuantumValue(structModule));
+    }
 
     // Ruby's `defined?(X)` — true for anything that reached here as a
     // value (an undefined global arrives as nil, which is the false case).
