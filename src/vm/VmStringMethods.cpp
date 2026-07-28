@@ -102,12 +102,17 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
     }
     if (m == "each_char")
     {
-        // The callback is invoked through the same dispatch the array
-        // higher-order methods use, by delegating to a chars array.
         auto arr = std::make_shared<Array>();
         for (char c : str)
             arr->push_back(QuantumValue(std::string(1, c)));
+        if (args.empty())
+            return QuantumValue(arr);
         return callArrayMethod(arr, "each", args);
+    }
+    if (m == "ord")
+    {
+        if (str.empty()) return QuantumValue();
+        return QuantumValue((double)(unsigned char)str[0]);
     }
     // Ruby String#to_i / #to_f / #to_s — parse a leading numeric prefix.
     if (m == "to_i")
@@ -251,6 +256,41 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
             p += to.size();
         }
         return QuantumValue(s);
+    }
+    if (m == "match")
+    {
+        if (args.empty())
+            return QuantumValue();
+        std::string pat = args[0].toString();
+        std::string pattern = pat;
+        std::regex::flag_type regexFlags = std::regex::ECMAScript;
+        if (pat.size() >= 2 && pat.front() == '/' && pat.find_last_of('/') > 0)
+        {
+            size_t lastSlash = pat.find_last_of('/');
+            pattern = pat.substr(1, lastSlash - 1);
+            std::string flags = pat.substr(lastSlash + 1);
+            if (flags.find('i') != std::string::npos)
+                regexFlags |= std::regex::icase;
+        }
+        try
+        {
+            std::regex re(pattern, regexFlags);
+            std::smatch mResults;
+            if (std::regex_search(str, mResults, re))
+            {
+                auto arr = std::make_shared<Array>();
+                for (size_t i = 0; i < mResults.size(); ++i)
+                {
+                    QuantumValue gVal(mResults[i].str());
+                    arr->push_back(gVal);
+                    if (i > 0)
+                        globals->define("__re_match_" + std::to_string(i), gVal);
+                }
+                return QuantumValue(arr);
+            }
+        }
+        catch (...) {}
+        return QuantumValue();
     }
     // Ruby String#gsub / #sub — replace all/first matches. The pattern arg
     // follows the same "/regex/flags" convention already used by split/test;

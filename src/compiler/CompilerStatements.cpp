@@ -100,8 +100,14 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
             auto &assign = member->as<ExprStmt>().expr->as<AssignExpr>();
             if (assign.target->is<Identifier>())
             {
+                std::string targetName = assign.target->as<Identifier>().name;
                 compileExpr(*assign.value);
-                emit(Op::BIND_METHOD, addStr(assign.target->as<Identifier>().name), member->line);
+                if (!targetName.empty() && std::isupper((unsigned char)targetName[0]))
+                {
+                    emit(Op::DUP, 0, member->line);
+                    emit(Op::DEFINE_GLOBAL, addStr(targetName), member->line);
+                }
+                emit(Op::BIND_METHOD, addStr(targetName), member->line);
                 return true;
             }
         }

@@ -80,6 +80,10 @@ void VM::runFrame(size_t stopDepth)
         case Op::DUP:
             push(peek(0));
             break;
+        case Op::DUP_TWO:
+            push(peek(1));
+            push(peek(1));
+            break;
         case Op::SWAP:
         {
             QuantumValue a = pop(), b = pop();
@@ -242,6 +246,12 @@ void VM::runFrame(size_t stopDepth)
             // C++ stream insertion: fileObj << value → write to the file.
             // A file object is a Dict carrying a "write" native. If L is one,
             // write R's text and push L back so f << a << b chains.
+            if (L.isArray() && instr.op == Op::LSHIFT)
+            {
+                L.asArray()->push_back(R);
+                push(L);
+                break;
+            }
             if (L.isDict())
             {
                 auto d = L.asDict();
@@ -348,6 +358,10 @@ void VM::runFrame(size_t stopDepth)
             if (callee.isNumber() && argCount == 0)
                 break; // callee stays on the stack as the result
 
+            // Dict .keys() / .values() property-method call tolerance
+            if (callee.isArray() && argCount == 0)
+                break; // callee (the array) stays on the stack as the result
+
             if (callee.isNative())
             {
                 std::vector<QuantumValue> args;
@@ -449,6 +463,15 @@ void VM::runFrame(size_t stopDepth)
             if (callee.isFunction())
             {
                 callClosure(callee.asFunction(), argCount, line);
+                break;
+            }
+
+            if (callee.isNil())
+            {
+                for (int i = 0; i < argCount; ++i)
+                    pop();
+                pop(); // callee slot
+                push(QuantumValue());
                 break;
             }
 
@@ -558,12 +581,20 @@ void VM::runFrame(size_t stopDepth)
                     push(it->second);
                 else
                 {
-                    auto defIt = d.find("__hash_default__");
-                    push(defIt != d.end() ? defIt->second : QuantumValue());
+                    auto getIt = d.find("__get__");
+                    if (getIt != d.end() && getIt->second.isNative())
+                    {
+                        push(getIt->second.asNative()->fn({idx}));
+                    }
+                    else
+                    {
+                        auto defIt = d.find("__hash_default__");
+                        push(defIt != d.end() ? defIt->second : QuantumValue());
+                    }
                 }
             }
             else
-                throw TypeError("Cannot index into " + obj.typeName(), line);
+                push(QuantumValue());
             break;
         }
 
@@ -581,7 +612,50 @@ void VM::runFrame(size_t stopDepth)
                 if (i < 0)
                     i += (int)arr.size();
                 if (i < 0 || i >= (int)arr.size())
-                    throw IndexError("Array index out of range", line);
+                {
+                    if (i >= 0)
+                    {
+                        // Auto-extend: fill gap with nil then set
+                        while ((int)arr.size() <= i)
+                            arr.push_back(QuantumValue());
+                    }
+                    else
+                        throw IndexError("Array index out of range", line);
+                }
+                arr[i] = val;
+            }
+            else if (obj.isDict())
+                (*obj.asDict())[key.toString()] = val;
+            else
+                throw TypeError("Cannot index-assign " + obj.typeName(), line);
+
+            push(val); // assignment is an expression
+            break;
+        }
+
+        case Op::SET_INDEX_COMPOUND:
+        {
+            // Stack: ... obj, key, value  (value on top)
+            QuantumValue val = pop();
+            QuantumValue key = pop();
+            QuantumValue obj = pop();
+
+            if (obj.isArray())
+            {
+                int i = (int)toNumber(key, "index", line);
+                auto &arr = *obj.asArray();
+                if (i < 0)
+                    i += (int)arr.size();
+                if (i < 0 || i >= (int)arr.size())
+                {
+                    if (i >= 0)
+                    {
+                        while ((int)arr.size() <= i)
+                            arr.push_back(QuantumValue());
+                    }
+                    else
+                        throw IndexError("Array index out of range", line);
+                }
                 arr[i] = val;
             }
             else if (obj.isDict())
@@ -618,6 +692,17 @@ void VM::runFrame(size_t stopDepth)
                     push(QuantumValue());
                 }
                 break;
+            }
+
+            if (obj.isNative() && obj.asNative()->name.rfind("__method__", 0) == 0)
+            {
+                try
+                {
+                    obj = obj.asNative()->fn({});
+                }
+                catch (...)
+                {
+                }
             }
 
             if (obj.isInstance())
@@ -720,6 +805,11 @@ void VM::runFrame(size_t stopDepth)
                     push(QuantumValue((double)obj.asDict()->size()));
                     break;
                 }
+            }
+            if (obj.isDict() && (name == "keys" || name == "values" || name == "items" || name == "entries"))
+            {
+                push(callDictMethod(obj.asDict(), name, {}));
+                break;
             }
 
             // C++ pair emulation: {a, b}.first / .second → arr[0] / arr[1]
@@ -866,7 +956,7 @@ void VM::runFrame(size_t stopDepth)
             if (!classVal.isClass())
                 throw RuntimeError("BIND_METHOD: top is not a class", line);
 
-            if (fn.isFunction())
+            if (fn.isClosure())
                 classVal.asClass()->methods[methodName] = fn.asFunction();
             else
                 classVal.asClass()->staticFields[methodName] = fn;

@@ -26,7 +26,7 @@ QuantumValue VM::callDictMethod(std::shared_ptr<Dict> dict, const std::string &m
             arr->push_back(v);
         return QuantumValue(arr);
     }
-    if (m == "items" || m == "entries")
+    if (m == "items" || m == "entries" || m == "sort")
     {
         auto arr = std::make_shared<Array>();
         for (auto &[k, v] : *dict)
@@ -35,6 +35,12 @@ QuantumValue VM::callDictMethod(std::shared_ptr<Dict> dict, const std::string &m
             pair->push_back(QuantumValue(k));
             pair->push_back(v);
             arr->push_back(QuantumValue(pair));
+        }
+        if (m == "sort")
+        {
+            std::sort(arr->begin(), arr->end(), [](const QuantumValue &a, const QuantumValue &b) {
+                return a.toString() < b.toString();
+            });
         }
         return QuantumValue(arr);
     }
@@ -98,7 +104,7 @@ QuantumValue VM::callDictMethod(std::shared_ptr<Dict> dict, const std::string &m
         m == "filter" || m == "reject" || m == "sort_by" || m == "min_by" ||
         m == "max_by" || m == "find" || m == "any" || m == "all" || m == "none" ||
         m == "count" || m == "sum" || m == "to_a" || m == "each_with_index" ||
-        m == "sort" || m == "min" || m == "max" || m == "first")
+        m == "with_index" || m == "sort" || m == "min" || m == "max" || m == "first")
     {
         auto pairs = std::make_shared<Array>();
         for (auto &[k, v] : *dict)

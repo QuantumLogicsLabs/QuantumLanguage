@@ -19,6 +19,10 @@ static const char *opName(Op op)
         return "POP";
     case Op::DUP:
         return "DUP";
+    case Op::DUP_TWO:
+        return "DUP_TWO";
+    case Op::SET_INDEX_COMPOUND:
+        return "SET_INDEX_COMPOUND";
     case Op::SWAP:
         return "SWAP";
     case Op::NOP:

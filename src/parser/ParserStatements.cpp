@@ -1057,9 +1057,7 @@ ASTNodePtr Parser::parseVarDecl(bool isConst)
 {
     int ln = current().line;
     std::string name;
-    if (check(TokenType::IDENTIFIER))
-        name = consume().value;
-    else if (isCTypeKeyword(current().type))
+    if (check(TokenType::IDENTIFIER) || isCTypeKeyword(current().type))
         name = consume().value;
     else
         throw ParseError("Expected variable name (got '" + current().value + "')", current().line, current().col);
@@ -2610,7 +2608,7 @@ ASTNodePtr Parser::parseInputStmt()
     }
     while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
         consume();
-    return std::make_unique<ASTNode>(InputStmt{target, std::move(prompt)}, ln);
+    return std::make_unique<ASTNode>(InputStmt{target, std::move(prompt), nullptr}, ln);
 }
 
 ASTNodePtr Parser::parseCoutStmt()

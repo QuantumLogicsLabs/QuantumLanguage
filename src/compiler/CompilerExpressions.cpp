@@ -167,12 +167,24 @@ void Compiler::compileAssign(AssignExpr &e, int line)
     if (e.target->is<IndexExpr>())
     {
         auto &idx = e.target->as<IndexExpr>();
-        // VM SET_INDEX expects stack: val (bottom), obj, key (top)
+        if (compound)
+        {
+            compileExpr(*idx.object);                     // obj
+            compileExpr(*idx.index);                      // obj, key
+            emit(Op::DUP_TWO, 0, line);                   // obj, key, obj, key
+            emit(Op::GET_INDEX, 0, line);                 // obj, key, old_val
+            compileExpr(*e.value);                        // obj, key, old_val, rhs
+            auto it = cops.find(normalizedOp);
+            if (it != cops.end())
+                emit(it->second, 0, line);                // obj, key, new_val
+            emit(Op::SET_INDEX_COMPOUND, 0, line);
+            return;
+        }
+        // Plain assignment (=): VM SET_INDEX expects stack: val (bottom), obj, key (top)
         compileExpr(*e.value);    // val  <- bottom
         compileExpr(*idx.object); // obj
         compileExpr(*idx.index);  // key  <- top
         emit(Op::SET_INDEX, 0, line);
-        // SET_INDEX pushes val back as the expression result
         return;
     }
 
@@ -341,6 +353,36 @@ void Compiler::compileCall(CallExpr &e, int line)
     }
     // Regular call
     compileExpr(*e.callee);
+
+    // Check if all args are keyword arguments (name=value).
+    // If so, bundle them into a single dict argument for **kwargs support.
+    bool allKeyword = !e.args.empty();
+    for (auto &arg : e.args)
+    {
+        if (!arg->is<AssignExpr>() ||
+            arg->as<AssignExpr>().op != "=" ||
+            !arg->as<AssignExpr>().target->is<Identifier>())
+        {
+            allKeyword = false;
+            break;
+        }
+    }
+
+    if (allKeyword)
+    {
+        // Emit key-value pairs for MAKE_DICT
+        for (auto &arg : e.args)
+        {
+            auto &assign = arg->as<AssignExpr>();
+            auto &keyName = assign.target->as<Identifier>().name;
+            emit(Op::LOAD_CONST, addConst(QuantumValue(keyName)), line);
+            compileExpr(*assign.value);
+        }
+        emit(Op::MAKE_DICT, static_cast<int>(e.args.size()), line);
+        emit(Op::CALL, 1, line);
+        return;
+    }
+
     int argCount = 0;
     for (auto &arg : e.args)
         argCount += emitArgValues(*arg);

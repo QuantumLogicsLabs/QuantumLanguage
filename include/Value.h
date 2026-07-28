@@ -94,6 +94,7 @@ struct QuantumValue
     bool isArray() const { return std::holds_alternative<std::shared_ptr<Array>>(data); }
     bool isDict() const { return std::holds_alternative<std::shared_ptr<Dict>>(data); }
     bool isFunction() const { return std::holds_alternative<std::shared_ptr<Closure>>(data) || std::holds_alternative<std::shared_ptr<QuantumNative>>(data); }
+    bool isClosure() const { return std::holds_alternative<std::shared_ptr<Closure>>(data); }
     bool isInstance() const { return std::holds_alternative<std::shared_ptr<QuantumInstance>>(data); }
     bool isClass() const { return std::holds_alternative<std::shared_ptr<QuantumClass>>(data); }
     bool isBoundMethod() const { return std::holds_alternative<std::shared_ptr<QuantumBoundMethod>>(data); }

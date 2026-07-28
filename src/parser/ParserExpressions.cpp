@@ -9,7 +9,7 @@ ASTNodePtr Parser::parseAssignment()
     auto left = parseOr();
     // Python inline ternary: expr IF condition ELSE other_expr
     // e.g.  high = number if number > 1 else 1
-    if (check(TokenType::IF))
+    if (check(TokenType::IF) && (pos == 0 || (tokens[pos - 1].type != TokenType::NEWLINE && tokens[pos - 1].type != TokenType::SEMICOLON)))
     {
         // Lookahead to ensure this is actually a ternary, not a list comprehension filter:
         // A ternary MUST have an 'else' somewhere before a closing bracket/paren/newline.
@@ -19,6 +19,15 @@ ASTNodePtr Parser::parseAssignment()
         while (checkPos < tokens.size())
         {
             TokenType t = tokens[checkPos].type;
+            if (depth == 0 && t == TokenType::ELSE)
+            {
+                hasElse = true;
+                break;
+            }
+            if (depth == 0 && (t == TokenType::LBRACE || t == TokenType::COLON || t == TokenType::INDENT || t == TokenType::NEWLINE || t == TokenType::SEMICOLON || t == TokenType::COMMA))
+            {
+                break;
+            }
             if (t == TokenType::LPAREN || t == TokenType::LBRACKET || t == TokenType::LBRACE)
                 depth++;
             else if (t == TokenType::RPAREN || t == TokenType::RBRACKET || t == TokenType::RBRACE)
@@ -26,15 +35,6 @@ ASTNodePtr Parser::parseAssignment()
                 if (depth == 0)
                     break;
                 depth--;
-            }
-            else if (depth == 0 && t == TokenType::ELSE)
-            {
-                hasElse = true;
-                break;
-            }
-            else if (depth == 0 && (t == TokenType::NEWLINE || t == TokenType::SEMICOLON || t == TokenType::COMMA))
-            {
-                break;
             }
             checkPos++;
         }
@@ -520,6 +520,11 @@ ASTNodePtr Parser::parsePostfix()
         }
         else if (check(TokenType::LPAREN))
         {
+            if (savedPos != pos)
+            {
+                pos = savedPos; // newline separates statement from '('
+                break;
+            }
             auto args = parseArgList();
             expr = std::make_unique<ASTNode>(CallExpr{std::move(expr), std::move(args)}, ln);
         }
