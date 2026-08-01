@@ -169,7 +169,7 @@ void VM::registerNatives()
         }
         if (args[0].isBool()) return QuantumValue(args[0].asBool() ? 1.0 : 0.0);
         throw TypeError("Cannot convert to number"); });
-    reg("int", [](std::vector<QuantumValue> args) -> QuantumValue
+    auto intNat = [](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) return QuantumValue(0.0);
         if (args[0].isNumber()) return QuantumValue(std::floor(args[0].asNumber()));
@@ -178,8 +178,13 @@ void VM::registerNatives()
             catch (...) { return QuantumValue(0.0); }
         }
         if (args[0].isBool()) return QuantumValue(args[0].asBool() ? 1.0 : 0.0);
-        return QuantumValue(0.0); });
-    reg("float", [](std::vector<QuantumValue> args) -> QuantumValue
+        return QuantumValue(0.0); };
+    reg("int", intNat);
+    reg("_int_", intNat);
+    reg("_long_", intNat);
+    reg("_short_", intNat);
+
+    auto floatNat = [](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) return QuantumValue(0.0);
         if (args[0].isNumber()) return args[0];
@@ -187,7 +192,11 @@ void VM::registerNatives()
             try { return QuantumValue(std::stod(args[0].asString())); }
             catch (...) { return QuantumValue(0.0); }
         }
-        return QuantumValue(0.0); });
+        return QuantumValue(0.0); };
+    reg("float", floatNat);
+    reg("_float_", floatNat);
+    reg("_double_", floatNat);
+
     reg("parseFloat", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) return QuantumValue(std::numeric_limits<double>::quiet_NaN());
@@ -210,10 +219,15 @@ void VM::registerNatives()
         } catch (...) {
             return QuantumValue(true);
         } });
-    reg("str", [](std::vector<QuantumValue> args) -> QuantumValue
+
+    auto strNat = [](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) return QuantumValue(std::string(""));
-        return QuantumValue(args[0].toString()); });
+        return QuantumValue(args[0].toString()); };
+    reg("str", strNat);
+    reg("string", strNat);
+    reg("_string_", strNat);
+    reg("_char_", strNat);
     reg("hex", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         long long value = 0;
@@ -392,7 +406,8 @@ void VM::registerNatives()
         if (args[0].isBool()) return QuantumValue(std::string("boolean"));
         if (args[0].isNumber()) return QuantumValue(std::string("number"));
         if (args[0].isString()) return QuantumValue(std::string("string"));
-        if (args[0].isArray() || args[0].isDict() || args[0].isInstance() || args[0].isClass())
+        if (args[0].isArray()) return QuantumValue(std::string("array"));
+        if (args[0].isDict() || args[0].isInstance() || args[0].isClass())
             return QuantumValue(std::string("object"));
         if (args[0].isNative() || args[0].isFunction() || args[0].isBoundMethod())
             return QuantumValue(std::string("function"));
@@ -689,11 +704,17 @@ void VM::registerNatives()
         auto copy=std::make_shared<Array>(*args[0].asArray());
         std::reverse(copy->begin(),copy->end());
         return QuantumValue(copy); });
+
     reg("sum", [](std::vector<QuantumValue> args) -> QuantumValue
         {
-        if(args.empty()||!args[0].isArray()) throw RuntimeError("sum() requires array");
-        double s=0; for(auto &v:*args[0].asArray()) s+=toNum2(v,"sum");
-        return QuantumValue(s); });
+            if (args.empty()) throw RuntimeError("sum() requires at least one argument");
+            if (!args[0].isArray()) throw RuntimeError("sum() requires array");
+            double s = 0;
+            for (auto &v : *args[0].asArray())
+                s += toNum2(v, "sum");
+            return QuantumValue(s);
+        });
+
     reg("any", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) return QuantumValue(false);
@@ -1517,6 +1538,156 @@ void VM::registerNatives()
         globals->define("Set", QuantumValue(setDict));
     }
 
+        // ── Hash (Ruby-style defaulting dict) ──────────────────────────────────
+    {
+        auto invoke = [this](QuantumValue fn, std::vector<QuantumValue> fnArgs) -> QuantumValue
+        {
+            if (fn.isNative())
+                return fn.asNative()->fn(fnArgs);
+            if (fn.isFunction())
+            {
+                push(fn);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(fn.asFunction(), static_cast<int>(fnArgs.size()), 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            if (fn.isBoundMethod())
+            {
+                auto bm = fn.asBoundMethod();
+                push(fn);
+                push(bm->self);
+                for (auto &arg : fnArgs)
+                    push(arg);
+                callClosure(bm->method, static_cast<int>(fnArgs.size()) + 1, 0);
+                size_t depth = frames_.size() - 1;
+                runFrame(depth);
+                return pop();
+            }
+            return QuantumValue();
+        };
+
+        auto hashDict = std::make_shared<Dict>();
+        auto hashNew = std::make_shared<QuantumNative>();
+        hashNew->name = "Hash.__new__";
+        hashNew->fn = [invoke](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            auto hashObj = std::make_shared<Dict>();
+            auto defaultVal = std::make_shared<QuantumValue>(); // nil
+            auto defaultBlock = std::make_shared<QuantumValue>(); // nil
+
+            if (!args.empty())
+            {
+                if (args[0].isFunction() || args[0].isNative() || args[0].isBoundMethod())
+                {
+                    *defaultBlock = args[0];
+                }
+                else
+                {
+                    *defaultVal = args[0];
+                }
+            }
+
+            // Store metadata so __hget / __hget_vivify can use it
+            (*hashObj)["__hash_default__"] = *defaultVal;
+            (*hashObj)["__hash_block__"] = *defaultBlock;
+
+            auto getFn = std::make_shared<QuantumNative>();
+            getFn->name = "Hash.[]";
+            getFn->fn = [hashObj, defaultVal, defaultBlock, invoke](std::vector<QuantumValue> callArgs) -> QuantumValue
+            {
+                if (callArgs.empty())
+                    return QuantumValue();
+                std::string key = callArgs[0].toString();
+                auto it = hashObj->find(key);
+                if (it != hashObj->end())
+                    return it->second;
+
+                if (!defaultBlock->isNil())
+                {
+                    auto arr = std::make_shared<Array>();
+                    (*hashObj)[key] = QuantumValue(arr);
+                    return QuantumValue(arr);
+                }
+
+                return *defaultVal;
+            };
+            (*hashObj)["__get__"] = QuantumValue(getFn);
+
+            auto setFn = std::make_shared<QuantumNative>();
+            setFn->name = "Hash.[]=";
+            setFn->fn = [hashObj](std::vector<QuantumValue> callArgs) -> QuantumValue
+            {
+                if (callArgs.size() < 2)
+                    return QuantumValue();
+                (*hashObj)[callArgs[0].toString()] = callArgs[1];
+                return callArgs[1];
+            };
+            (*hashObj)["__set__"] = QuantumValue(setFn);
+
+            auto hasKeyFn = std::make_shared<QuantumNative>();
+            hasKeyFn->name = "Hash.has_key?";
+            hasKeyFn->fn = [hashObj](std::vector<QuantumValue> callArgs) -> QuantumValue
+            {
+                if (callArgs.empty())
+                    return QuantumValue(false);
+                return QuantumValue(hashObj->count(callArgs[0].toString()) > 0);
+            };
+            (*hashObj)["has_key"] = QuantumValue(hasKeyFn);
+
+            auto sizeFn = std::make_shared<QuantumNative>();
+            sizeFn->name = "Hash.size";
+            sizeFn->fn = [hashObj](std::vector<QuantumValue>) -> QuantumValue
+            {
+                return QuantumValue((double)hashObj->size());
+            };
+            (*hashObj)["size"] = QuantumValue(sizeFn);
+            (*hashObj)["length"] = QuantumValue(sizeFn);
+
+            auto keysFn = std::make_shared<QuantumNative>();
+            keysFn->name = "Hash.keys";
+            keysFn->fn = [hashObj](std::vector<QuantumValue>) -> QuantumValue
+            {
+                auto arr = std::make_shared<Array>();
+                for (auto &[k, v] : *hashObj)
+                {
+                    if (k != "__hash_default__" && k != "__hash_block__" &&
+                        k != "__get__" && k != "__set__" &&
+                        k != "has_key" && k != "size" && k != "length" &&
+                        k != "keys" && k != "values")
+                        arr->push_back(QuantumValue(k));
+                }
+                return QuantumValue(arr);
+            };
+            (*hashObj)["keys"] = QuantumValue(keysFn);
+
+            auto valuesFn = std::make_shared<QuantumNative>();
+            valuesFn->name = "Hash.values";
+            valuesFn->fn = [hashObj](std::vector<QuantumValue>) -> QuantumValue
+            {
+                auto arr = std::make_shared<Array>();
+                for (auto &[k, v] : *hashObj)
+                {
+                    if (k != "__hash_default__" && k != "__hash_block__" &&
+                        k != "__get__" && k != "__set__" &&
+                        k != "has_key" && k != "size" && k != "length" &&
+                        k != "keys" && k != "values")
+                        arr->push_back(v);
+                }
+                return QuantumValue(arr);
+            };
+            (*hashObj)["values"] = QuantumValue(valuesFn);
+
+            return QuantumValue(hashObj);
+        };
+        (*hashDict)["__new__"] = QuantumValue(hashNew);
+        (*hashDict)["__call__"] = QuantumValue(hashNew);
+        (*hashDict)["new"] = QuantumValue(hashNew);
+        globals->define("Hash", QuantumValue(hashDict));
+    }
+
     {
         auto arrayDict = std::make_shared<Dict>();
         auto ctor = std::make_shared<QuantumNative>();
@@ -1655,10 +1826,26 @@ void VM::registerNatives()
                 out->push_back(pool[i]);
             return QuantumValue(out);
         };
+        auto randNat = std::make_shared<QuantumNative>();
+        randNat->name = "rand";
+        randNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            static std::mt19937_64 rng(std::random_device{}());
+            if (args.empty()) {
+                std::uniform_real_distribution<double> dist(0.0, 1.0);
+                return QuantumValue(dist(rng));
+            }
+            double maxVal = args[0].asNumber();
+            if (maxVal <= 0) return QuantumValue(0.0);
+            std::uniform_real_distribution<double> dist(0.0, maxVal);
+            return QuantumValue(dist(rng));
+        };
+        (*randomDict)["rand"] = QuantumValue(randNat);
         (*randomDict)["random"] = QuantumValue(randomNat);
         (*randomDict)["randint"] = QuantumValue(randintNat);
         (*randomDict)["sample"] = QuantumValue(sampleNat);
         globals->define("random", QuantumValue(randomDict));
+        globals->define("rand", QuantumValue(randNat));
     }
 
     {
@@ -2616,7 +2803,12 @@ void VM::registerNatives()
         std::string k = args[1].toString();
         auto it = d.find(k);
         if (it != d.end()) return it->second;
-        d[k] = args[2];
+        if (args[2].isArray())
+            d[k] = QuantumValue(std::make_shared<Array>(*args[2].asArray()));
+        else if (args[2].isDict())
+            d[k] = QuantumValue(std::make_shared<Dict>(*args[2].asDict()));
+        else
+            d[k] = args[2];
         return d[k]; });
 
     // Ruby's <=> spaceship operator: -1/0/1, numeric or lexical depending
@@ -3908,7 +4100,105 @@ void VM::registerNatives()
             out += "0123456789abcdef"[c&0xF];
         }
         return QuantumValue(out); });
+
+    // ── os module (Python compatibility) ─────────────────────────────────────
+    {
+        auto osDict = std::make_shared<Dict>();
+
+        // os.remove(path) / os.unlink(path)
+        auto removeNat = std::make_shared<QuantumNative>();
+        removeNat->name = "os.remove";
+        removeNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty()) throw RuntimeError("os.remove() requires a filename");
+            std::string path = args[0].toString();
+            std::remove(path.c_str());
+            return QuantumValue();
+        };
+        (*osDict)["remove"] = QuantumValue(removeNat);
+        (*osDict)["unlink"] = QuantumValue(removeNat);
+
+        // os.rename(src, dst)
+        auto renameNat = std::make_shared<QuantumNative>();
+        renameNat->name = "os.rename";
+        renameNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.size() < 2) throw RuntimeError("os.rename() requires src and dst");
+            std::rename(args[0].toString().c_str(), args[1].toString().c_str());
+            return QuantumValue();
+        };
+        (*osDict)["rename"] = QuantumValue(renameNat);
+
+        // os.path sub-dict
+        auto pathDict = std::make_shared<Dict>();
+
+        auto existsNat = std::make_shared<QuantumNative>();
+        existsNat->name = "os.path.exists";
+        existsNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty()) return QuantumValue(false);
+            std::ifstream f(args[0].toString());
+            return QuantumValue(f.good());
+        };
+        (*pathDict)["exists"] = QuantumValue(existsNat);
+
+        auto joinNat = std::make_shared<QuantumNative>();
+        joinNat->name = "os.path.join";
+        joinNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            std::string result;
+            for (size_t i = 0; i < args.size(); ++i) {
+                std::string part = args[i].toString();
+                if (i > 0 && !result.empty() && result.back() != '/' && result.back() != '\\')
+                    result += '/';
+                result += part;
+            }
+            return QuantumValue(result);
+        };
+        (*pathDict)["join"] = QuantumValue(joinNat);
+
+        auto basenameNat = std::make_shared<QuantumNative>();
+        basenameNat->name = "os.path.basename";
+        basenameNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty()) return QuantumValue(std::string(""));
+            std::string p = args[0].toString();
+            size_t pos = p.find_last_of("/\\");
+            return QuantumValue(pos == std::string::npos ? p : p.substr(pos + 1));
+        };
+        (*pathDict)["basename"] = QuantumValue(basenameNat);
+
+        auto dirnameNat = std::make_shared<QuantumNative>();
+        dirnameNat->name = "os.path.dirname";
+        dirnameNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty()) return QuantumValue(std::string(""));
+            std::string p = args[0].toString();
+            size_t pos = p.find_last_of("/\\");
+            return QuantumValue(pos == std::string::npos ? std::string("") : p.substr(0, pos));
+        };
+        (*pathDict)["dirname"] = QuantumValue(dirnameNat);
+
+        (*osDict)["path"] = QuantumValue(pathDict);
+
+        // os.getenv(name)
+        auto getenvNat = std::make_shared<QuantumNative>();
+        getenvNat->name = "os.getenv";
+        getenvNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty()) return QuantumValue();
+            const char* val = std::getenv(args[0].toString().c_str());
+            return val ? QuantumValue(std::string(val)) : QuantumValue();
+        };
+        (*osDict)["getenv"] = QuantumValue(getenvNat);
+
+        // os.sep — path separator
+        (*osDict)["sep"] = QuantumValue(std::string("/"));
+
+        globals->define("os", QuantumValue(osDict));
+    }
 }
+
 
 // ─── Array methods ────────────────────────────────────────────────────────────
 

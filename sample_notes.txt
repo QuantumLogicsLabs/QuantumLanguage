@@ -1,4 +1,0 @@
-Line 1: Learning Python
-Line 2: File handling is useful
-Line 3: Practice makes perfect
-Line 4: Appended later

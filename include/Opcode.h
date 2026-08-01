@@ -112,6 +112,8 @@ enum class Op : uint8_t
     // Misc
     PRINT, // print operand args (optimised for print stmt)
     DUP,   // duplicate top of stack
+    DUP_TWO, // duplicate top two items of stack [A, B] -> [A, B, A, B]
+    SET_INDEX_COMPOUND, // obj[key] = value where stack is [obj, key, value]
     SWAP,  // swap top two
     NOP,
 };

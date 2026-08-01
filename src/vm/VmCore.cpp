@@ -53,8 +53,7 @@ void VM::run(std::shared_ptr<Chunk> chunk)
     stepCount_ = 0;
     pendingInstances_.clear();
     stack_.clear();
-    if (stack_.capacity() < 65536)
-        stack_.reserve(65536);
+
     frames_.clear();
     handlers_.clear();
 
@@ -93,6 +92,8 @@ void VM::runtimeError(const std::string &msg, int line)
 
 double VM::toNumber(const QuantumValue &v, const std::string &ctx, int line)
 {
+    if (v.isNative())
+        return toNumber(v.asNative()->fn({}), ctx, line);
     if (v.isNumber())
         return v.asNumber();
     if (v.isString())
@@ -127,8 +128,13 @@ bool VM::valuesEqual(const QuantumValue &a, const QuantumValue &b)
 
 // ─── Binary / unary execution ────────────────────────────────────────────────
 
-QuantumValue VM::execBinary(Op op, const QuantumValue &L, const QuantumValue &R, int line)
+QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue &R_in, int line)
 {
+    QuantumValue L = L_in;
+    QuantumValue R = R_in;
+    if (L.isNative()) L = L.asNative()->fn({});
+    if (R.isNative()) R = R.asNative()->fn({});
+
     // Operator overloading: dispatch to instance magic methods (__add__,
     // __lt__, ...) when the left operand is a class instance that defines one.
     // C++ operator methods (operator+, operator<, ...) are parsed to these names.
@@ -185,6 +191,13 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L, const QuantumValue &R,
         for (auto &v : *R.asArray())
             arr->push_back(v);
         return QuantumValue(arr);
+    }
+
+    // Array append (Ruby arr << elem)
+    if (op == Op::LSHIFT && L.isArray())
+    {
+        L.asArray()->push_back(R);
+        return L;
     }
 
     // Comparison operators — allow mixed types
@@ -402,18 +415,72 @@ void VM::callValue(QuantumValue callee, int argCount, int line)
         callClosure(bm->method, argCount + 1, line);
         return;
     }
+    if (callee.isNil())
+    {
+        for (int i = 0; i < argCount; ++i)
+            pop();
+        push(QuantumValue());
+        return;
+    }
     throw TypeError("Cannot call value of type " + callee.typeName(), line);
 }
 
 void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
 {
     auto &ch = *closure->chunk;
+    auto &params = ch.params;
 
-    while (argCount < (int)ch.params.size())
+    // --- Varargs (*args) support ---
+    int varargIndex = -1;
+    for (int i = 0; i < (int)params.size(); ++i)
     {
-        // Fill missing args with nil (default arg logic simplified)
+        if (params[i].size() >= 2 && params[i][0] == '*' && params[i][1] == '*')
+            continue; // skip **kwargs params
+        if (!params[i].empty() && params[i][0] == '*')
+        {
+            varargIndex = i;
+            break;
+        }
+    }
+
+    if (varargIndex != -1)
+    {
+        // Collect remaining args into an array for the *param
+        auto varargArray = std::make_shared<std::vector<QuantumValue>>();
+        int fixedArgs = varargIndex;
+        int extraArgs = argCount - fixedArgs;
+
+        if (extraArgs < 0) extraArgs = 0;
+
+        // Pop extra args into the array (in reverse order, then reverse)
+        std::vector<QuantumValue> collected;
+        for (int i = 0; i < extraArgs; ++i)
+        {
+            collected.push_back(stack_.back());
+            stack_.pop_back();
+        }
+        std::reverse(collected.begin(), collected.end());
+        *varargArray = std::move(collected);
+
+        // Push the array back as a single argument
+        stack_.push_back(QuantumValue(varargArray));
+
+        // Adjust argCount so it matches the parameter count (fixed + 1 for vararg)
+        argCount = fixedArgs + 1;
+    }
+
+    // Fill missing args with nil (existing logic)
+    while (argCount < (int)params.size())
+    {
         push(QuantumValue());
         argCount++;
+    }
+
+    // Discard extra args so locals align correctly
+    while (argCount > (int)params.size())
+    {
+        stack_.pop_back();
+        argCount--;
     }
 
     size_t stackBase = stack_.size() - argCount;
@@ -506,6 +573,17 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
             return QuantumValue(obj.asNumber() > 0.0);
         if (method == "negative")
             return QuantumValue(obj.asNumber() < 0.0);
+        if (method == "between")
+        {
+            if (args.size() >= 2)
+            {
+                double val = obj.asNumber();
+                double lo = args[0].asNumber();
+                double hi = args[1].asNumber();
+                return QuantumValue(val >= lo && val <= hi);
+            }
+            return QuantumValue(false);
+        }
         if (method == "abs")
             return QuantumValue(std::fabs(obj.asNumber()));
         if (method == "to_i" || method == "floor")
@@ -518,6 +596,19 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
             return QuantumValue(obj.asNumber());
         if (method == "to_s")
             return QuantumValue(obj.toString());
+        if (method == "pow")
+        {
+            if (args.empty()) return QuantumValue(1.0);
+            double base = obj.asNumber();
+            double exp = args[0].asNumber();
+            double res = std::pow(base, exp);
+            if (args.size() > 1) {
+                double mod = args[1].asNumber();
+                res = std::fmod(res, mod);
+                if (res < 0) res += mod;
+            }
+            return QuantumValue(res);
+        }
         // Ruby Integer#times / #upto — iterate by delegating to the array
         // higher-order dispatch, which already handles every callable kind.
         if (method == "times" || method == "upto" || method == "downto")
@@ -546,6 +637,24 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
                 return QuantumValue(range);
             return callArrayMethod(range, "each", cbArgs);
         }
+        if (method == "zero" || method == "isZero")
+            return QuantumValue(obj.asNumber() == 0);
+        if (method == "positive")
+            return QuantumValue(obj.asNumber() > 0);
+        if (method == "negative")
+            return QuantumValue(obj.asNumber() < 0);
+        if (method == "abs")
+            return QuantumValue(std::abs(obj.asNumber()));
+        if (method == "even")
+            return QuantumValue(static_cast<long long>(obj.asNumber()) % 2 == 0);
+        if (method == "odd")
+            return QuantumValue(static_cast<long long>(obj.asNumber()) % 2 != 0);
+        if (method == "floor")
+            return QuantumValue(std::floor(obj.asNumber()));
+        if (method == "ceil")
+            return QuantumValue(std::ceil(obj.asNumber()));
+        if (method == "round")
+            return QuantumValue(std::round(obj.asNumber()));
         if (method == "toFixed")
         {
             int places = args.empty() ? 0 : static_cast<int>(args[0].asNumber());
@@ -583,6 +692,12 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
         if (method == "receive_email" || method == "list_emails" ||
             method == "read_email" || method == "delete_email")
             return QuantumValue();
+        if (native->fn)
+        {
+            QuantumValue val = native->fn({});
+            if (val.isString())
+                return callStringMethod(val.asString(), method, args);
+        }
     }
     if (obj.isArray())
         return callArrayMethod(obj.asArray(), method, args);
