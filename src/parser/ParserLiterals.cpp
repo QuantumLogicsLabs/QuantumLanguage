@@ -812,6 +812,14 @@ std::vector<ASTNodePtr> Parser::parseArgList() {
   expect(TokenType::LPAREN, "Expected '('");
   std::vector<ASTNodePtr> args;
   skipNewlines();
+  // Within an argument list, commas separate arguments — they never start a
+  // tuple-unpacking assignment. Without this, a keyword value like the `t`
+  // in `f(sender=t, receiver=r, ...)` sees the following `receiver=` and is
+  // mis-parsed as the unpack target list `(t, receiver) = ...`, corrupting
+  // every argument after the first keyword. Restored before returning so a
+  // nested call/grouping outside this list is unaffected.
+  bool prevInCallArgList = inCallArgList;
+  inCallArgList = true;
   while (!check(TokenType::RPAREN) && !atEnd()) {
     int argLn = current().line;
     skipNewlines();
@@ -907,6 +915,7 @@ std::vector<ASTNodePtr> Parser::parseArgList() {
       break;
     skipNewlines();
   }
+  inCallArgList = prevInCallArgList;
   expect(TokenType::RPAREN, "Expected ')'");
   return args;
 }
