@@ -354,8 +354,14 @@ void Compiler::compileCall(CallExpr &e, int line)
     // Regular call
     compileExpr(*e.callee);
 
-    // Check if all args are keyword arguments (name=value).
-    // If so, bundle them into a single dict argument for **kwargs support.
+    // Keyword arguments, `f(name=value, ...)`. The callee's parameter list
+    // isn't known here (dispatch is dynamic), so bind them positionally in
+    // source order — which is how constructor/field calls like
+    // `Email(sender=self, receiver=receiver, ...)` are written, and matches
+    // the parameter order of the corresponding `def`. (An earlier design
+    // bundled them into one dict for `**kwargs`, but callClosure never had
+    // the collection logic to route that dict to a `**kwargs` parameter, so
+    // it only ever mis-bound every keyword arg — this is strictly better.)
     bool allKeyword = !e.args.empty();
     for (auto &arg : e.args)
     {
@@ -370,16 +376,9 @@ void Compiler::compileCall(CallExpr &e, int line)
 
     if (allKeyword)
     {
-        // Emit key-value pairs for MAKE_DICT
         for (auto &arg : e.args)
-        {
-            auto &assign = arg->as<AssignExpr>();
-            auto &keyName = assign.target->as<Identifier>().name;
-            emit(Op::LOAD_CONST, addConst(QuantumValue(keyName)), line);
-            compileExpr(*assign.value);
-        }
-        emit(Op::MAKE_DICT, static_cast<int>(e.args.size()), line);
-        emit(Op::CALL, 1, line);
+            compileExpr(*arg->as<AssignExpr>().value);
+        emit(Op::CALL, static_cast<int>(e.args.size()), line);
         return;
     }
 

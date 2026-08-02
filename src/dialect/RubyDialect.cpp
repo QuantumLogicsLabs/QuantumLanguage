@@ -661,6 +661,25 @@ static std::string rbConvertRanges(std::string line, bool strict = true) {
              line.substr(m.position() + m.length());
     }
   }
+  // Ruby's safe-navigation operator, `receiver&.method(args)` — evaluate to
+  // nil when the receiver is nil instead of erroring. Rewritten to a guarded
+  // conditional over a simple receiver (name / member / index chain), which
+  // covers the idioms in practice (`parts[0]&.upcase`, `node&.value`). The
+  // receiver is duplicated, so it must be side-effect free — always true for
+  // the matched shapes.
+  {
+    static const std::regex safeNavRe(
+        "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(?:\\[[^\\[\\]]*\\])*)&\\.([A-Za-z_][A-Za-z0-9_]*[?!]?(?:\\([^()]*\\))?)");
+    std::smatch m;
+    while (std::regex_search(line, m, safeNavRe)) {
+      std::string recv = m[1].str();
+      std::string call = m[2].str();
+      line = line.substr(0, m.position()) +
+             "(" + recv + " == null ? null : " + recv + "." + call + ")" +
+             line.substr(m.position() + m.length());
+    }
+  }
   // Ruby's `x.nil?` — a method that must work *on* nil, so it can't be
   // dispatched like an ordinary method (the receiver is exactly the case
   // it exists to detect). Becomes a plain comparison.
@@ -1002,6 +1021,11 @@ struct RBFrame {
   // Each branch's tail statement then becomes `x = <tail>` instead of
   // being left as a bare value.
   std::string assignTarget;
+  // ClosureDo only: index of its opener line (`coll.map(fn(x) {`). If the
+  // block-call turns out to be the tail expression of an enclosing method,
+  // this lets `return ` be prepended to the opener so the method returns
+  // the call's result (Ruby's `def f; coll.select { ... }; end`).
+  int openerLineIndex = -1;
 };
 
 // Extracts `module Name ... end` blocks from `lines`, storing their raw body
@@ -1310,7 +1334,15 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           // the leading `;` would split the expression in two.
           if (stmtStart < ln.size() && ln[stmtStart] == ';')
             ln.erase(stmtStart, 1);
-          if (rbLooksLikeReturnable(ln.substr(stmtStart)))
+          std::string stmtText = ln.substr(stmtStart);
+          // A block-call opener (`coll.select(fn(x) {`) as a method's tail:
+          // return the call's result. rbLooksLikeReturnable rejects it for
+          // ending in `{`, so allow it explicitly — `return coll.select(...`
+          // is valid, the `})` on the closing line finishes the expression.
+          bool isBlockOpener = !stmtText.empty() && stmtText.back() == '{' &&
+                               stmtText.find("(fn(") != std::string::npos &&
+                               !startsWith(stmtText, "return ");
+          if (isBlockOpener || rbLooksLikeReturnable(stmtText))
             ln.insert(stmtStart, "return ");
         } else if (info.kind == RBTailKind::Chain) {
           for (auto &b : branchGroups[info.chainGroup])
@@ -1819,8 +1851,13 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
         } else if (top.kind == RBFrameKind::ClosureDo) {
           outLines.push_back(indentation + "})");
           resolveTail(top.last);
+          // The whole block-call is itself a statement in the enclosing
+          // frame — record its opener line so that, if it is that frame's
+          // tail (a method ending in `coll.select { ... }`), resolveTail
+          // can prepend `return` and the method returns the call's result.
           if (!stack.empty())
-            stack.back().last = RBTailInfo{};
+            stack.back().last =
+                RBTailInfo{RBTailKind::Statement, top.openerLineIndex, -1};
         } else if (top.kind == RBFrameKind::ClosureLambda) {
           // A standalone closure literal — no call to close.
           outLines.push_back(indentation + "}");
@@ -2147,9 +2184,12 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       }
       outLines.push_back(indentation +
                          rbBuildBlockOpenText(convertedPrefix, params));
+      int openerIdx = (int)outLines.size() - 1;
       if (!destructure.empty())
         outLines.push_back(indentation + "  " + destructure);
-      stack.push_back(RBFrame{RBFrameKind::ClosureDo, -1, RBTailInfo{}});
+      RBFrame doFrame{RBFrameKind::ClosureDo, -1, RBTailInfo{}};
+      doFrame.openerLineIndex = openerIdx;
+      stack.push_back(doFrame);
       continue;
     }
 
