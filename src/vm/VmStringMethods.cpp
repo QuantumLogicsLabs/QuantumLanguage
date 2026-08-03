@@ -114,6 +114,43 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
         if (str.empty()) return QuantumValue();
         return QuantumValue((double)(unsigned char)str[0]);
     }
+    // Ruby String#lines — split into an array of lines, each keeping its
+    // trailing newline (matching Ruby). An optional argument gives a custom
+    // separator. A trailing separator does not yield an empty final element.
+    if (m == "lines")
+    {
+        std::string sep = "\n";
+        if (!args.empty() && args[0].isString())
+            sep = args[0].asString();
+        auto arr = std::make_shared<Array>();
+        if (sep.empty())
+        {
+            if (!str.empty()) arr->push_back(QuantumValue(str));
+            return QuantumValue(arr);
+        }
+        size_t pos = 0;
+        while (pos < str.size())
+        {
+            size_t next = str.find(sep, pos);
+            if (next == std::string::npos)
+            {
+                arr->push_back(QuantumValue(str.substr(pos)));
+                break;
+            }
+            arr->push_back(QuantumValue(str.substr(pos, next - pos + sep.size())));
+            pos = next + sep.size();
+        }
+        return QuantumValue(arr);
+    }
+    // Ruby String#each_line — like #lines but invokes a block per line when
+    // one is supplied; block-less it behaves like #lines.
+    if (m == "each_line")
+    {
+        QuantumValue linesResult = callStringMethod(str, "lines", {});
+        if (args.empty())
+            return linesResult;
+        return callArrayMethod(linesResult.asArray(), "each", args);
+    }
     // Ruby String#to_i / #to_f / #to_s — parse a leading numeric prefix.
     if (m == "to_i")
     {

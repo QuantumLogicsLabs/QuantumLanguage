@@ -244,7 +244,15 @@ void Compiler::compileCall(CallExpr &e, int line)
             auto &assign = arg.as<AssignExpr>();
             if (assign.op == "=" && assign.target->is<Identifier>())
             {
-                compileExpr(*assign.value);
+                // `f(name = value)` — compile the full assignment, which
+                // performs the store *and* leaves its value on the stack as
+                // the positional argument (compileAssign is an expression:
+                // it self-balances to leave exactly the value). Serves both
+                // a Python keyword arg (value binds positionally to the param
+                // of that name; the incidental global write is harmless) and
+                // a Ruby assignment-in-argument, `arr.unshift(cur = x)`,
+                // where updating `cur` is the whole point.
+                compileExpr(arg);
                 return 1;
             }
             if (assign.op == "unpack" && assign.target->is<TupleLiteral>())
@@ -351,36 +359,9 @@ void Compiler::compileCall(CallExpr &e, int line)
         emit(Op::CALL, argCount, line);
         return;
     }
-    // Regular call
+    // Regular call. Keyword/assignment args (`f(name=value)`) are handled
+    // uniformly by emitArgValues, the same as in the method-call path above.
     compileExpr(*e.callee);
-
-    // Keyword arguments, `f(name=value, ...)`. The callee's parameter list
-    // isn't known here (dispatch is dynamic), so bind them positionally in
-    // source order — which is how constructor/field calls like
-    // `Email(sender=self, receiver=receiver, ...)` are written, and matches
-    // the parameter order of the corresponding `def`. (An earlier design
-    // bundled them into one dict for `**kwargs`, but callClosure never had
-    // the collection logic to route that dict to a `**kwargs` parameter, so
-    // it only ever mis-bound every keyword arg — this is strictly better.)
-    bool allKeyword = !e.args.empty();
-    for (auto &arg : e.args)
-    {
-        if (!arg->is<AssignExpr>() ||
-            arg->as<AssignExpr>().op != "=" ||
-            !arg->as<AssignExpr>().target->is<Identifier>())
-        {
-            allKeyword = false;
-            break;
-        }
-    }
-
-    if (allKeyword)
-    {
-        for (auto &arg : e.args)
-            compileExpr(*arg->as<AssignExpr>().value);
-        emit(Op::CALL, static_cast<int>(e.args.size()), line);
-        return;
-    }
 
     int argCount = 0;
     for (auto &arg : e.args)

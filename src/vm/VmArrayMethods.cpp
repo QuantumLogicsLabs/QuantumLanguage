@@ -8,6 +8,18 @@
 QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr,
                                  const std::string &m,
                                  std::vector<QuantumValue> args) {
+  // Ruby's mutating "bang" methods (`reject!`, `map!`, `sort!`, ...): run the
+  // ordinary version, then copy its result back into this array so the change
+  // is visible to every holder of the array (an in-place `reject!` loop relies
+  // on the receiver actually shrinking). Returns the mutated array.
+  if (m.size() > 5 && m.compare(m.size() - 5, 5, "_bang") == 0) {
+    QuantumValue res = callArrayMethod(arr, m.substr(0, m.size() - 5), args);
+    if (res.isArray()) {
+      *arr = *res.asArray();
+      return QuantumValue(arr);
+    }
+    return res;
+  }
   if (m == "push" || m == "append") {
     arr->push_back(args.empty() ? QuantumValue() : args[0]);
     return QuantumValue(arr);

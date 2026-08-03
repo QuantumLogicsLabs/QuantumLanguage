@@ -70,7 +70,10 @@ static const std::set<std::string> &rbZeroArgMethods(bool strict) {
       "flatten", "compact", "min", "max", "count", "to_a", "to_sym", "abs",
       "round", "floor", "ceil", "even", "odd", "positive", "negative",
       "capitalize", "swapcase", "join", "close", "lines", "split", "sort_by",
-      "freeze", "inspect"};
+      "freeze", "inspect",
+      // Thread/Fiber lifecycle methods, also idiomatically paren-less.
+      // (`value`/`take` are omitted — too likely to be a field/variable name.)
+      "resume", "alive", "kill", "shutdown"};
   static const std::set<std::string> mixedNames = {
       "reverse", "chomp", "downcase", "upcase", "dup",
       "clone",   "to_i",  "to_f",     "to_s",   "chars"};
@@ -134,19 +137,10 @@ rbNormalizeAtoms(const std::string &s,
       i = j;
       continue;
     }
-    if (c == '$' && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1])) {
-      size_t j = i + 1;
-      while (j < s.size() && std::isdigit((unsigned char)s[j]))
-        j++;
-      out += "__re_match_" + s.substr(i + 1, j - i - 1);
-      i = j;
-      continue;
-    }
-    if (c == '=' && i + 1 < s.size() && s[i + 1] == '~') {
-      out += ".match";
-      i += 2;
-      continue;
-    }
+    // (`=~` match operator and `$1`..`$9` capture globals are handled in
+    // rbConvertRanges — mapped to __rx_match / __rx_N — which runs before
+    // this pass; `$0` deliberately survives here so rbSubstituteMainGuard
+    // can still recognize the `__FILE__ == $0` idiom.)
     // Ruby numeric literals allow `_` as a readability separator
     // (`1_000_000_007`) — Quantum's lexer doesn't, so strip them here.
     if (std::isdigit((unsigned char)c)) {
@@ -186,11 +180,26 @@ rbNormalizeAtoms(const std::string &s,
       std::string ident = s.substr(i, j - i);
       bool hadDotBefore = !out.empty() && out.back() == '.';
       bool suffixStripped = false;
+      char suffixChar = '\0';
       if (j < s.size() && (s[j] == '?' || s[j] == '!')) {
+        suffixChar = s[j];
         j++;
         suffixStripped = true;
       }
       bool followedByParen = (j < s.size() && s[j] == '(');
+      // Ruby's mutating "bang" collection methods (`arr.reject!`, `map!`,
+      // `sort!`, ...) modify the receiver in place — dropping the `!` would
+      // leave `reject`, which returns a *new* array and never mutates the
+      // original (an in-place `reject!` loop then never terminates). Route
+      // them to distinct `<name>_bang` natives that mutate in place.
+      static const std::set<std::string> bangMethods = {
+          "map", "select", "filter", "reject", "sort", "sort_by", "reverse",
+          "uniq", "compact", "flatten", "shuffle"};
+      if (suffixChar == '!' && hadDotBefore && bangMethods.count(ident)) {
+        out += ident + "_bang";
+        i = j;
+        continue;
+      }
       // Ruby's `block_given?` reflection check — the transpiled
       // equivalent of an implicit block is the trailing `__block__`
       // parameter a `def` gains once its body is seen to use
@@ -738,6 +747,17 @@ static std::string rbConvertRanges(std::string line, bool strict = true) {
   line = std::regex_replace(line, infinityRe, "INF");
   static const std::regex nanRe("Float::NAN");
   line = std::regex_replace(line, nanRe, "NaN");
+  // Ruby's match operator, `str =~ /re/` (and `str !~ /re/`), plus the
+  // capture globals `$1`..`$9`. `=~` becomes a call to the __rx_match native,
+  // which runs the regex and stores each capture group in a `__rx_N` global;
+  // `$N` then reads those. (The `/re/` regex literal is already lexed as a
+  // string, so it passes straight through as the second argument.)
+  static const std::regex notMatchRe("(\\S+)\\s*!~\\s*(/(?:[^/\\\\]|\\\\.)*/[a-z]*)");
+  line = std::regex_replace(line, notMatchRe, "!__rx_match($1, $2)");
+  static const std::regex matchRe("(\\S+)\\s*=~\\s*(/(?:[^/\\\\]|\\\\.)*/[a-z]*)");
+  line = std::regex_replace(line, matchRe, "__rx_match($1, $2)");
+  static const std::regex captureRe("\\$([1-9])");
+  line = std::regex_replace(line, captureRe, "__rx_$1");
   return line;
 }
 
@@ -1028,6 +1048,92 @@ struct RBFrame {
   int openerLineIndex = -1;
 };
 
+// Escapes a run of text into a double-quoted Quantum string literal body.
+static std::string rbEscapeForString(const std::string &raw) {
+  std::string out;
+  for (char c : raw) {
+    switch (c) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    case '\r':
+      break;
+    default:
+      out += c;
+    }
+  }
+  return out;
+}
+
+// Expands Ruby heredocs into ordinary string literals on their opening line.
+//   x = <<~TAG        (squiggly: strips the least-indented line's indentation)
+//   x = <<-TAG        (dash: allows an indented terminator)
+//   x = <<TAG / <<"TAG" / <<'TAG'
+// The body runs from the next line until a line whose trimmed content is TAG.
+// Consumed body/terminator lines are blanked so line numbers are preserved.
+static std::vector<std::string>
+rbExpandHeredocs(std::vector<std::string> lines) {
+  static const std::regex startRe(
+      "^(.*?)<<([~-]?)([\"']?)([A-Za-z_][A-Za-z0-9_]*)\\3(.*)$");
+  for (size_t i = 0; i < lines.size(); i++) {
+    std::smatch m;
+    if (!std::regex_match(lines[i], m, startRe))
+      continue;
+    std::string before = m[1].str();
+    std::string squiggly = m[2].str(); // "~", "-", or ""
+    std::string tag = m[4].str();
+    std::string after = m[5].str(); // text after the tag on the opener line
+
+    // Collect body lines until the terminator.
+    std::vector<std::string> body;
+    size_t j = i + 1;
+    bool closed = false;
+    for (; j < lines.size(); j++) {
+      if (trimCopy(lines[j]) == tag) {
+        closed = true;
+        break;
+      }
+      body.push_back(lines[j]);
+    }
+    if (!closed)
+      continue; // not a real heredoc — leave the line alone
+
+    // `<<~` strips the smallest leading-whitespace run common to all
+    // non-blank body lines.
+    if (squiggly == "~") {
+      size_t minIndent = std::string::npos;
+      for (auto &b : body) {
+        if (trimCopy(b).empty())
+          continue;
+        size_t ind = b.find_first_not_of(" \t");
+        if (ind != std::string::npos)
+          minIndent = std::min(minIndent, ind);
+      }
+      if (minIndent != std::string::npos && minIndent > 0)
+        for (auto &b : body)
+          b = b.size() >= minIndent ? b.substr(minIndent) : b;
+    }
+
+    std::string joined;
+    for (auto &b : body)
+      joined += b + "\n";
+
+    lines[i] = before + "\"" + rbEscapeForString(joined) + "\"" + after;
+    for (size_t k = i + 1; k <= j && k < lines.size(); k++)
+      lines[k] = "";
+  }
+  return lines;
+}
+
 // Extracts `module Name ... end` blocks from `lines`, storing their raw body
 // text keyed by module name, and removes them from the line list (replaced
 // with blanks to preserve line numbers). Any `include Name` line still
@@ -1258,6 +1364,10 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     while (std::getline(input, line))
       rawLines.push_back(line);
   }
+  // Heredocs are collapsed to single-line string literals first, so no later
+  // pass has to reason about their multi-line bodies. Strict (.rb) only.
+  if (strict)
+    rawLines = rbExpandHeredocs(std::move(rawLines));
   rawLines = rbFlattenModules(std::move(rawLines));
 
   RubySymbolTable symbols;
@@ -1323,10 +1433,19 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           // `case/when ... then EXPR` (and modifier-if) share their line
           // with an opener, e.g. `if (cond) { a + b` — target the
           // statement text after the last "{ ", not the whole line.
+          size_t firstNonSpace = ln.find_first_not_of(" \t");
           size_t braceSpace = ln.rfind("{ ");
-          size_t stmtStart = (braceSpace != std::string::npos)
-                                 ? braceSpace + 2
-                                 : ln.find_first_not_of(" \t");
+          // Use the after-`{ ` split only for a genuine opener-plus-statement
+          // line (`if (cond) { stmt`), where real content precedes the brace.
+          // A line that *begins* with `{` is a hash literal being returned
+          // (`{ counts: stats }`) — return the whole thing, don't slice into
+          // the middle of it.
+          size_t stmtStart;
+          if (braceSpace != std::string::npos && firstNonSpace != std::string::npos &&
+              braceSpace > firstNonSpace)
+            stmtStart = braceSpace + 2;
+          else
+            stmtStart = firstNonSpace;
           if (stmtStart == std::string::npos)
             stmtStart = ln.size();
           // The array-literal `;` guard is only meaningful for a
@@ -1713,6 +1832,17 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       continue;
     }
 
+    // Rewrite reads of a defaulting Hash (`g_score[k]` -> `__hget(g_score, k,
+    // default)`) once, up front, so every downstream path sees it — not just
+    // leaf statements but also `if`/`while`/`until` conditions and block
+    // openers (a-star's `if tentative_g < g_score[neighbor]` needs the
+    // Float::INFINITY default, or the comparison is against nil). Writes
+    // (`h[k] = v`) are left untouched by rbApplyDefaultHashReads, and a
+    // defaulting-hash *declaration* line hasn't registered its own name yet,
+    // so this can't corrupt either.
+    if (strict && !defaultHashes.empty())
+      code = rbApplyDefaultHashReads(code, defaultHashes);
+
     if (strict) {
       bool inSQuote = false;
       bool inDQuote = false;
@@ -1866,7 +1996,16 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
             stack.back().last = RBTailInfo{};
         } else if (top.kind == RBFrameKind::Def) {
           outLines.push_back(indentation + "}");
-          resolveTail(top.last);
+          // A constructor implicitly returns the new instance, never its
+          // last expression — so `initialize` must not get an implicit
+          // return (e.g. `@pool = Array.new(size) { ... }` as the last line
+          // would otherwise make `new` yield the array, not the object).
+          bool isConstructor =
+              top.signatureLineIndex >= 0 &&
+              outLines[top.signatureLineIndex].find("function init(") !=
+                  std::string::npos;
+          if (!isConstructor)
+            resolveTail(top.last);
           // Ruby methods take a block implicitly (no declared
           // parameter); yield/block_given? inside the body is
           // what signals one is expected. Retrofit it onto the

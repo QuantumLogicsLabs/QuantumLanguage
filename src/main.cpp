@@ -117,6 +117,9 @@ int main(int argc, char *argv[])
     }
     if (a1 == "--test")
         return runTestExamples(argc >= 3 ? argv[2] : "examples");
+    // Hidden: run one file in this process for the batch runner (child worker).
+    if (a1 == "--__runone" && argc >= 3)
+        return runSingleFileForTest(argv[2]);
     // Any supported source file runs natively on the Quantum VM —
     // .js/.py/.rb/.c/.cpp go through the same multi-syntax front-end as .sa,
     // so no node/python/gcc/g++ is required.
@@ -165,6 +168,9 @@ int main(int argc, char *argv[])
         return checkFile(argv[2]);
     if (arg == "--test")
         return runTestExamples(argc >= 3 ? argv[2] : "examples");
+    // Hidden: run one file in this process for the batch runner (child worker).
+    if (arg == "--__runone" && argc >= 3)
+        return runSingleFileForTest(argv[2]);
     if (arg == "--debug" && argc >= 3)
     {
         runFile(argv[2], true);

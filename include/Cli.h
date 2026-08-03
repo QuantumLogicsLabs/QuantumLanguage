@@ -25,6 +25,13 @@ void runREPL(bool debug = false);
 // writes test_results.txt. Returns a process exit code (non-zero if any FAIL).
 int runTestExamples(const std::string &dir);
 
+// Runs exactly one file in THIS process for the batch runner (hidden
+// `--__runone` verb). The parent `--test` runner spawns a fresh child per
+// file so a hard crash (stack overflow / segfault) can only take down the
+// child, never the whole suite. On a handled error it prints a structured
+// marker line to stdout and returns 2; a clean run returns 0.
+int runSingleFileForTest(const std::string &path);
+
 // ─── Standalone .exe bundling ─────────────────────────────────────────────
 // Path of the currently running executable.
 std::string getExecutablePath();

@@ -7,8 +7,7 @@
 #include "Error.h"
 
 #include <algorithm>
-#include <csignal>
-#include <csetjmp>
+#include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +16,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -46,105 +49,124 @@ static bool isInputDriven(const std::string &m)
            m.find("Cannot convert ''") != m.npos;
 }
 
-// ── Crash-guarded VM execution ───────────────────────────────────────────────
-// MinGW/GCC does not support __try/__except.  Instead we use POSIX signals
-// (SIGSEGV / SIGFPE / SIGILL / SIGABRT) combined with setjmp/longjmp to
-// intercept hard crashes without killing the whole process.
+// ── Process-isolated VM execution ────────────────────────────────────────────
+// A test file can crash hard — a runaway recursion overflows the stack, a VM
+// bug dereferences bad memory — and on MinGW/Windows there is no reliable way
+// to catch that in-process (SEH is a language extension GCC lacks, and
+// longjmp-out-of-a-signal-handler is UB that leaves the C++ runtime corrupted,
+// so a *later* file then dies at random). The robust answer used by every
+// serious test runner: run each file in its own child process. A crash there
+// takes down only the child; the parent reads the exit code and moves on.
 //
-// The pattern:
-//   1. Install signal handlers that longjmp back to a safe point.
-//   2. setjmp() — if a signal fires, longjmp brings us back here with a
-//      non-zero value that encodes which signal hit.
-//   3. Run the VM.
-//   4. Restore the original signal handlers.
-//
-// Limitation: longjmp out of a signal handler is technically UB in C++, but
-// it is the standard approach on MinGW/GCC Windows where SEH is unavailable,
-// and works reliably in practice for our use-case (test runner, not production).
+// The child (`--__runone <file>`, dispatched to runSingleFileForTest below)
+// prints the program's own output to stdout, and on a *handled* error appends
+// one marker line — QTEST_ERR_MARKER + kind|line|col|message — then exits 2.
+// A clean run exits 0 with no marker. Any other exit (or a marker-less
+// non-zero) means the child crashed.
 
-static jmp_buf g_crashJmpBuf;
-static int g_crashSignal = 0; // signal number that fired, 0 = none
+static const char *QTEST_ERR_MARKER = "\x1E__QTEST_ERR__\x1F";
 
-static void crashSignalHandler(int sig)
+// One line, so it survives being embedded in captured stdout.
+static std::string flattenLine(const std::string &s)
 {
-    g_crashSignal = sig;
-    // Re-install the handler so repeated signals work (required on some targets)
-    signal(sig, crashSignalHandler);
-    longjmp(g_crashJmpBuf, sig);
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+        out += (c == '\n' || c == '\r') ? ' ' : c;
+    return out;
 }
 
-static std::string runVmGuarded(const std::string &source,
-                                const std::string &path,
-                                std::string &outCapture)
+int runSingleFileForTest(const std::string &path)
 {
-    // --- set up output capture ---
-    std::ostringstream sink;
-    std::streambuf *savedOut = std::cout.rdbuf(sink.rdbuf());
-    std::streambuf *savedErr = std::cerr.rdbuf(sink.rdbuf());
+    g_testMode = true;
+    redirectStdinToNull();
 
-    // --- install crash signal handlers ---
-    g_crashSignal = 0;
-    auto prevSEGV = signal(SIGSEGV, crashSignalHandler);
-    auto prevFPE = signal(SIGFPE, crashSignalHandler);
-    auto prevILL = signal(SIGILL, crashSignalHandler);
-    auto prevABRT = signal(SIGABRT, crashSignalHandler);
-
-    std::string errorMsg;
-
-    int jumpVal = setjmp(g_crashJmpBuf);
-    if (jumpVal == 0)
+    std::ifstream f(path);
+    if (!f.is_open())
     {
-        // Normal path — run the VM
-        try
-        {
-            VM vm;
-            vm.run(compileSource(applyDialect(source, path), path, false));
-        }
-        catch (...)
-        {
-            // Restore before re-throwing so the caller's catch blocks work
-            signal(SIGSEGV, prevSEGV);
-            signal(SIGFPE, prevFPE);
-            signal(SIGILL, prevILL);
-            signal(SIGABRT, prevABRT);
-            std::cout.rdbuf(savedOut);
-            std::cerr.rdbuf(savedErr);
-            outCapture = sink.str();
-            throw;
-        }
+        std::cout << "\n"
+                  << QTEST_ERR_MARKER << "OpenError\x1F0\x1F0\x1FCannot open file\n";
+        return 2;
     }
-    else
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string source = ss.str();
+
+    std::string kind, msg;
+    int line = 0, col = 0;
+    try
     {
-        // Signal fired — longjmp landed here
-        switch (jumpVal)
-        {
-        case SIGSEGV:
-            errorMsg = "CrashError: Segmentation fault (stack overflow or bad memory access)";
-            break;
-        case SIGFPE:
-            errorMsg = "CrashError: Floating point exception";
-            break;
-        case SIGILL:
-            errorMsg = "CrashError: Illegal instruction";
-            break;
-        case SIGABRT:
-            errorMsg = "CrashError: Abort signal (assertion or OOM)";
-            break;
-        default:
-            errorMsg = "CrashError: Unknown signal " + std::to_string(jumpVal);
-            break;
-        }
+        VM vm;
+        vm.run(compileSource(applyDialect(source, path), path, false));
+        return 0; // clean
+    }
+    catch (const ParseError &e)
+    {
+        if (isInputDriven(e.what()))
+            return 0; // program merely wanted stdin — not a failure
+        kind = "ParseError";
+        msg = e.what();
+        line = e.line;
+        col = e.col;
+    }
+    catch (const QuantumError &e)
+    {
+        if (isInputDriven(e.what()))
+            return 0;
+        kind = e.kind;
+        msg = e.what();
+        line = e.line;
+    }
+    catch (const std::exception &e)
+    {
+        if (isInputDriven(e.what()))
+            return 0;
+        kind = "Fatal";
+        msg = e.what();
+    }
+    catch (...)
+    {
+        kind = "Fatal";
+        msg = "unknown exception";
     }
 
-    // Restore signal handlers and streams
-    signal(SIGSEGV, prevSEGV);
-    signal(SIGFPE, prevFPE);
-    signal(SIGILL, prevILL);
-    signal(SIGABRT, prevABRT);
-    std::cout.rdbuf(savedOut);
-    std::cerr.rdbuf(savedErr);
-    outCapture = sink.str();
-    return errorMsg;
+    std::cout << "\n"
+              << QTEST_ERR_MARKER << kind << "\x1F" << line << "\x1F" << col
+              << "\x1F" << flattenLine(msg) << "\n";
+    return 2;
+}
+
+// Spawn "<thisExe> --__runone <path>" and capture merged stdout+stderr plus
+// the child's exit code. Returns the captured text; sets exitCode.
+static std::string spawnChild(const std::string &path, int &exitCode)
+{
+    std::string exe = getExecutablePath();
+#ifdef _WIN32
+    // cmd.exe strips the outermost pair of quotes from the whole command, so
+    // wrap everything once more: ""exe" --__runone "path" 2>&1".
+    std::string cmd = "\"\"" + exe + "\" --__runone \"" + path + "\" 2>&1\"";
+    FILE *pipe = _popen(cmd.c_str(), "r");
+#else
+    std::string cmd = "\"" + exe + "\" --__runone \"" + path + "\" 2>&1";
+    FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe)
+    {
+        exitCode = -1;
+        return "";
+    }
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0)
+        out.append(buf, n);
+#ifdef _WIN32
+    exitCode = _pclose(pipe);
+#else
+    int status = pclose(pipe);
+    exitCode = (status == -1) ? -1 : (WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+#endif
+    return out;
 }
 
 static TestResult testFile(const std::string &path)
@@ -152,84 +174,62 @@ static TestResult testFile(const std::string &path)
     TestResult res;
     res.path = path;
 
-    // ── Read source ──────────────────────────────────────────────────────────
-    std::ifstream f(path);
-    if (!f.is_open())
+    // Keep the full source for the failure report.
     {
-        res.error = "Cannot open file";
-        return res;
-    }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    res.source = ss.str();
-
-    // ── Lex + parse ──────────────────────────────────────────────────────────
-    // Dialect-translate first (.rb/.c/.cpp) — parsing the raw source here would
-    // reject valid Ruby/C/C++ files before the real (dialect-aware) run below.
-    try
-    {
-        Lexer l(applyDialect(res.source, path));
-        auto tok = l.tokenize();
-        Parser p(std::move(tok));
-        auto ast = p.parse();
-        (void)ast;
-    }
-    catch (const ParseError &e)
-    {
-        res.error = "ParseError: " + std::string(e.what());
-        res.line = e.line;
-        res.col = e.col;
-        return res;
-    }
-    catch (const std::exception &e)
-    {
-        res.error = "LexError: " + std::string(e.what());
-        res.line = 1;
-        return res;
-    }
-    catch (...)
-    {
-        res.error = "LexError: unknown";
-        return res;
-    }
-
-    // ── Compile + run (SEH-guarded so a crash can't kill the process) ────────
-    std::string sehError;
-    try
-    {
-        sehError = runVmGuarded(res.source, path, res.output);
-    }
-    catch (const ParseError &e)
-    {
-        if (!isInputDriven(e.what()))
+        std::ifstream f(path);
+        if (!f.is_open())
         {
-            res.error = "ParseError: " + std::string(e.what());
-            res.line = e.line;
+            res.error = "Cannot open file";
+            return res;
         }
-    }
-    catch (const QuantumError &e)
-    {
-        if (!isInputDriven(e.what()))
-        {
-            res.error = e.kind + ": " + std::string(e.what());
-            res.line = e.line;
-        }
-    }
-    catch (const std::exception &e)
-    {
-        if (!isInputDriven(e.what()))
-            res.error = "Fatal: " + std::string(e.what());
-    }
-    catch (...)
-    {
-        res.error = "Fatal: unknown exception";
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        res.source = ss.str();
     }
 
-    // SEH error takes priority if set
-    if (!sehError.empty())
+    // Run the file in an isolated child process.
+    int exitCode = 0;
+    std::string captured = spawnChild(path, exitCode);
+
+    // Split the child's structured error marker (if any) out of the output.
+    std::string marker(QTEST_ERR_MARKER);
+    size_t mpos = captured.find(marker);
+    if (mpos != std::string::npos)
     {
-        res.error = sehError;
-        res.crashed = true;
+        res.output = captured.substr(0, mpos);
+        // Trim a trailing newline the child emitted before the marker.
+        if (!res.output.empty() && res.output.back() == '\n')
+            res.output.pop_back();
+
+        std::string rest = captured.substr(mpos + marker.size());
+        if (!rest.empty() && rest.back() == '\n')
+            rest.pop_back();
+        // rest = kind \x1F line \x1F col \x1F message
+        std::vector<std::string> parts;
+        size_t start = 0;
+        for (int field = 0; field < 3; ++field)
+        {
+            size_t sep = rest.find('\x1F', start);
+            if (sep == std::string::npos) break;
+            parts.push_back(rest.substr(start, sep - start));
+            start = sep + 1;
+        }
+        std::string kind = parts.size() > 0 ? parts[0] : "Error";
+        res.line = parts.size() > 1 ? std::atoi(parts[1].c_str()) : 0;
+        res.col = parts.size() > 2 ? std::atoi(parts[2].c_str()) : 0;
+        std::string emsg = rest.substr(start);
+        res.error = kind + ": " + emsg;
+    }
+    else
+    {
+        res.output = captured;
+        if (exitCode != 0)
+        {
+            // Non-zero exit with no structured error = the child crashed.
+            res.crashed = true;
+            res.error = "CrashError: child process terminated abnormally (exit code " +
+                        std::to_string(exitCode) + ")";
+        }
     }
 
     res.passed = res.error.empty();

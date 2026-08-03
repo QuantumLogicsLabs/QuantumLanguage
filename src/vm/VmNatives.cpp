@@ -2830,6 +2830,39 @@ void VM::registerNatives()
         }
         return QuantumValue(result); });
 
+    // Ruby's `str =~ /re/` match operator. Runs the regex over the string,
+    // stores each capture group in a `__rx_1`..`__rx_9` global (which the
+    // transpiler maps `$1`..`$9` onto), and returns the matched text (truthy)
+    // or nil so `if line =~ /re/` works. The `/pattern/flags` argument is the
+    // same string convention split() and gsub() already use.
+    reg("__rx_match", [this](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        // Clear stale captures so a failed match doesn't read old groups.
+        for (int i = 1; i <= 9; ++i)
+            globals->define("__rx_" + std::to_string(i), QuantumValue());
+        if (args.size() < 2) return QuantumValue();
+        std::string subject = args[0].toString();
+        std::string pat = args[1].toString();
+        std::string pattern = pat, flagsStr;
+        if (pat.size() >= 2 && pat.front() == '/')
+        {
+            size_t last = pat.find_last_of('/');
+            if (last > 0) { pattern = pat.substr(1, last - 1); flagsStr = pat.substr(last + 1); }
+        }
+        auto reFlags = std::regex::ECMAScript;
+        if (flagsStr.find('i') != std::string::npos) reFlags |= std::regex::icase;
+        try {
+            std::smatch m;
+            std::regex re(pattern, reFlags);
+            if (!std::regex_search(subject, m, re)) return QuantumValue();
+            for (size_t i = 1; i < m.size() && i <= 9; ++i)
+                globals->define("__rx_" + std::to_string(i),
+                                QuantumValue(m[i].matched ? m[i].str() : std::string()));
+            return QuantumValue(m[0].str());
+        } catch (const std::regex_error &) {
+            return QuantumValue();
+        } });
+
     // ── Ruby-style File module (open/foreach/delete/exist) ────────────────
     {
         auto invoke = [this](QuantumValue fn, std::vector<QuantumValue> fnArgs) -> QuantumValue

@@ -122,7 +122,38 @@ bool VM::valuesEqual(const QuantumValue &a, const QuantumValue &b)
     if (a.isString() && b.isString())
         return a.asString() == b.asString();
     if (a.isArray() && b.isArray())
-        return a.asArray() == b.asArray(); // ptr eq
+    {
+        // Deep, element-wise equality. `[1,2] == [1,2]` is true; this also
+        // makes array keys / includes?/index_of behave as expected (a-star's
+        // `current == goal` over `[r,c]` coordinates relies on it). Same
+        // pointer short-circuits the recursion.
+        auto pa = a.asArray();
+        auto pb = b.asArray();
+        if (pa == pb)
+            return true;
+        if (pa->size() != pb->size())
+            return false;
+        for (size_t i = 0; i < pa->size(); ++i)
+            if (!valuesEqual((*pa)[i], (*pb)[i]))
+                return false;
+        return true;
+    }
+    if (a.isDict() && b.isDict())
+    {
+        auto da = a.asDict();
+        auto db = b.asDict();
+        if (da == db)
+            return true;
+        if (da->size() != db->size())
+            return false;
+        for (auto &[k, v] : *da)
+        {
+            auto it = db->find(k);
+            if (it == db->end() || !valuesEqual(v, it->second))
+                return false;
+        }
+        return true;
+    }
     return false;
 }
 
