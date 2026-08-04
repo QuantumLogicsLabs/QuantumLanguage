@@ -631,9 +631,10 @@ static std::string rbConvertRanges(std::string line, bool strict = true) {
   }
   // A small set of Ruby constructs that are *not* valid syntax in any of the
   // other dialects sharing a `.sa` file, so converting them can never collide
-  // with Python/JS/C/C++ — they are applied in mixed mode too (the strict
-  // block below re-runs them harmlessly, each already a no-op by then).
-  {
+  // with Python/JS/C/C++. NON-STRICT ONLY — strict `.rb` gets each of these
+  // from its own dedicated block below; running them here as well would risk
+  // a subtly different (narrower) rewrite winning for `.rb` files.
+  if (!strict) {
     // Conditional-assignment operators Quantum's parser rejects outright.
     static const std::regex mixedOrAssignRe(
         "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
@@ -652,14 +653,12 @@ static std::string rbConvertRanges(std::string line, bool strict = true) {
     line = std::regex_replace(line, mixedArraySizeRe,
                               "range(0, $1).map(fn(__ai) { return nil })");
     // Ruby-style construction `ClassName.new(args)` -> `ClassName(args)`.
-    // Quantum has no `.new` method on user classes; `::` is already reduced
-    // to `.` by the lexer, so `Foo::new` arrives here as `Foo.new` too. The
-    // native builtin modules (Thread/Queue/…) expose their own `.new` and
-    // are excluded. Only fires when `Name` is capitalized — Ruby class names
-    // always are — so an ordinary lowercase `obj.new(...)` method is untouched.
-    static const char *kMixedBuiltins =
-        "(?!(?:Thread|Mutex|ConditionVariable|Queue|SizedQueue|File|Time|"
-        "Ractor|Fiber|TCPServer|TCPSocket|Struct|Set|Dir|IO|Hash|Array)\\b)";
+    // In a `.sa` file a capitalized `Name.new` is almost always a user class
+    // (`Queue`, `Stack`, `Server`, …) — only `Hash`/`Array` (rewritten just
+    // above) are held back. `::` is already reduced to `.` by the lexer, so
+    // `Foo::new` arrives here as `Foo.new` too. Strict `.rb` never reaches this
+    // (the enclosing `if (!strict)`); it keeps its full-exclusion rewrite below.
+    static const char *kMixedBuiltins = "(?!(?:Hash|Array)\\b)";
     static const std::regex mixedNewCallRe(std::string("\\b") + kMixedBuiltins +
                                            "([A-Z][A-Za-z0-9_]*)(?:\\.|::)new\\(");
     line = std::regex_replace(line, mixedNewCallRe, "$1(");
@@ -1709,9 +1708,14 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       return ""; // direct field access already works; no getter needed
 
     // `require`/`require_relative` have no analogue — everything these
-    // scripts require (thread, set, ...) is built into the VM already.
-    if (strict &&
-        (startsWith(code, "require ") || startsWith(code, "require_relative ")))
+    // scripts require (thread, set, ...) is built into the VM already. In
+    // mixed mode only drop the string-argument form (`require 'socket'`), the
+    // unambiguous Ruby spelling — never a lone `require` identifier.
+    if ((strict &&
+         (startsWith(code, "require ") ||
+          startsWith(code, "require_relative "))) ||
+        std::regex_match(
+            code, std::regex("^require(?:_relative)?\\s+['\"].*['\"]\\s*$")))
       return "";
 
     // A bare call to a method defined in this file (`some_method` alone
@@ -1828,8 +1832,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           rbUnambiguous(code) && (code.empty() || code[0] != '}') &&
           rbFindTopLevel(code, "else if ") == std::string::npos &&
           std::regex_match(code, m, modIfRe) &&
-          // The loop modifiers are Ruby-only: in mixed .sa mode a
-          // trailing `while (...)` is C's do-while tail, not a modifier.
+          // The loop modifiers stay Ruby-only: in mixed .sa mode `x; while (c) s`
+          // is a legitimate inline C loop, not a `stmt while cond` modifier, so
+          // enabling them here would mis-rewrite C/JS code.
           (strict || (m[2].str() != "while" && m[2].str() != "until")) &&
           rbFindTopLevel(code, " " + m[2].str() + " ") != std::string::npos &&
           rbFindTopLevel(m[3].str(), " else ") == std::string::npos &&
@@ -2094,8 +2099,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           rbUnambiguous(code) && code[0] != '}' &&
           rbFindTopLevel(code, "else if ") == std::string::npos &&
           std::regex_match(code, m, modIfRe) &&
-          // The loop modifiers are Ruby-only: in mixed .sa mode a
-          // trailing `while (...)` is C's do-while tail, not a modifier.
+          // The loop modifiers stay Ruby-only: in mixed .sa mode `x; while (c) s`
+          // is a legitimate inline C loop, not a `stmt while cond` modifier, so
+          // enabling them here would mis-rewrite C/JS code.
           (strict || (m[2].str() != "while" && m[2].str() != "until")) &&
           rbFindTopLevel(code, " " + m[2].str() + " ") != std::string::npos &&
           // Python inline ternary (`x = a if cond else b`) also matches

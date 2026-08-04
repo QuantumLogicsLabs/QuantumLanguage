@@ -7,7 +7,9 @@
 #include "Error.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +17,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -80,6 +83,20 @@ int runSingleFileForTest(const std::string &path)
 {
     g_testMode = true;
     redirectStdinToNull();
+
+    // Watchdog: a test file that never terminates (an infinite loop) must not
+    // hang the whole suite. A detached timer thread force-exits this child with
+    // a timeout marker if execution runs long, so the parent records a FAIL and
+    // moves on. 20s is far above any legitimate test's runtime.
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+        std::cout << "\n"
+                  << QTEST_ERR_MARKER
+                  << "TimeoutError\x1F0\x1F0\x1Fexecution exceeded 20s "
+                     "(possible infinite loop)\n";
+        std::cout.flush();
+        std::_Exit(2);
+    }).detach();
 
     std::ifstream f(path);
     if (!f.is_open())
