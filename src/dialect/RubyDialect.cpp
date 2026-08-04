@@ -294,12 +294,17 @@ static bool rbUnambiguous(const std::string &code) {
 }
 
 // Ruby's `if COND then` / `while COND do` write the keyword that introduces
-// the body on the condition line. Once the condition is wrapped in `( )` and
-// a `{` block is emitted, that trailing keyword must be dropped or it leaks
-// into the condition (`if (n <= 1 then)`). Strips a trailing ` then` / ` do`
-// (word-boundary, outside strings) from an already-trimmed condition.
+// the body on the condition line; Python's `if COND:` / `while COND:` uses a
+// trailing colon. Once the condition is wrapped in `( )` and a `{` block is
+// emitted, that introducer must be dropped or it leaks into the condition
+// (`if (n <= 1 then)` / `while (cond:)`). Strips a trailing `:`, ` then`, or
+// ` do` from an already-trimmed condition.
 static std::string rbStripTrailingThen(std::string cond) {
   cond = trimCopy(cond);
+  if (!cond.empty() && cond.back() == ':') {
+    cond.pop_back();
+    return trimCopy(cond);
+  }
   for (const char *kw : {"then", "do"}) {
     size_t klen = std::string(kw).size();
     if (cond.size() > klen && cond.compare(cond.size() - klen, klen, kw) == 0) {
@@ -311,6 +316,19 @@ static std::string rbStripTrailingThen(std::string cond) {
     }
   }
   return cond;
+}
+
+// Like rbUnambiguous, but tolerates a single trailing `:` so a Python-style
+// block introducer (`while cond:`, `if cond:`) still qualifies. Used only in
+// combination with a matching-`end` check, so a colon-block closed by a Ruby
+// `end` (rather than by dedent) becomes a real brace block and the `end`->`}`
+// bookkeeping stays balanced. A colon-block closed by dedent has no matching
+// `end`, so it is left for the native parser untouched.
+static bool rbUnambiguousAllowingColon(const std::string &code) {
+  std::string c = code;
+  if (!c.empty() && c.back() == ':')
+    c.pop_back();
+  return rbFindTopLevel(c, "{") == std::string::npos;
 }
 
 // True when the line contains a C-style comment marker (`//`, `/*`, `*/`)
@@ -343,7 +361,10 @@ static bool rbOpensBlockComment(const std::string &s) {
 
 // Rough opener detection used only by the forward `end`-scan below.
 static bool rbLineIsRubyOpener(const std::string &code) {
-  if (!rbUnambiguous(code))
+  // A trailing `:` (Python block introducer) is allowed: `while cond:` /
+  // `def f():` nest exactly like their Ruby `end`-closed counterparts, so they
+  // must count toward block depth when matching an `end`.
+  if (!rbUnambiguousAllowingColon(code))
     return false;
   if (startsWith(code, "if ") || startsWith(code, "unless ") ||
       startsWith(code, "while ") || startsWith(code, "until ") ||
@@ -623,6 +644,16 @@ static std::string rbConvertRangesOnce(const std::string &line, bool &changed) {
 // arrow function there, `->` a return-type annotation, `.new` an ordinary
 // method name. Those must only be rewritten for real `.rb` files.
 static std::string rbConvertRanges(std::string line, bool strict = true) {
+  // Ruby's `expr.nil?` predicate -> the explicit nil test `(expr == nil)`.
+  // There is no `.nil` method and the `?` suffix isn't valid Quantum, so this
+  // is unambiguous in any dialect. Handles a simple receiver chain / index
+  // (`node.nil?`, `node.left.nil?`, `@head.nil?`, `arr[i].nil?`).
+  {
+    static const std::regex nilPredRe(
+        "(@?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(?:\\[[^\\[\\]]*\\])?)\\.nil\\?");
+    line = std::regex_replace(line, nilPredRe, "($1 == nil)");
+  }
   for (int guard = 0; guard < 8; guard++) {
     bool changed = false;
     line = rbConvertRangesOnce(line, changed);
@@ -2128,6 +2159,27 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       }
     }
 
+    // A Ruby `elsif` chained onto a *native* brace `if (...) { }` arrives as
+    // `} elsif COND` — the enclosing `if` wasn't Ruby-tracked, so the
+    // frame-based handler below never sees a Branch frame. Rewrite it to a
+    // brace `else if`; the source's own `}` closes the branch it opens.
+    {
+      bool rubyBranch =
+          stack.size() > 1 && stack.back().kind == RBFrameKind::Branch;
+      static const std::regex braceElsifRe("^\\}\\s*elsif\\s+(.+)$");
+      std::smatch m;
+      if (!rubyBranch && std::regex_match(code, m, braceElsifRe)) {
+        std::string cond = rbNormalizeAtoms(
+            rbConvertInterpolation(
+                rbConvertRanges(rbStripTrailingThen(trimCopy(m[1].str())),
+                                strict),
+                symbols),
+            symbols, strict, inClassBody);
+        outLines.push_back(indentation + "} else if (" + cond + ") {");
+        continue;
+      }
+    }
+
     // elsif/else/end only transform when the innermost open frame is one
     // Ruby-mode itself pushed (stack beyond the file-scope sentinel) —
     // otherwise the line belongs to native syntax and falls through.
@@ -2271,7 +2323,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     }
 
     if (startsWith(code, "unless ") &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string cond = rbSubstituteMainGuard(rbNormalizeAtoms(
           rbConvertInterpolation(
               rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(7))),
@@ -2284,7 +2336,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       continue;
     }
     if (startsWith(code, "if ") &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string cond = rbSubstituteMainGuard(rbNormalizeAtoms(
           rbConvertInterpolation(
               rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(3))),
@@ -2297,7 +2349,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       continue;
     }
     if (startsWith(code, "until ") &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string cond = rbNormalizeAtoms(
           rbConvertInterpolation(
               rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(6))),
@@ -2309,7 +2361,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       continue;
     }
     if (startsWith(code, "while ") &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string cond = rbNormalizeAtoms(
           rbConvertInterpolation(
               rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(6))),
@@ -2321,13 +2373,13 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       continue;
     }
     if ((code == "loop" || code == "loop do") &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       outLines.push_back(indentation + "while (true) {");
       stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
       continue;
     }
     if (startsWith(code, "begin") && trimCopy(code) == "begin" &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       outLines.push_back(indentation + "try {");
       stack.push_back(RBFrame{RBFrameKind::Other, -1, RBTailInfo{}});
       continue;
@@ -2354,7 +2406,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     }
 
     if (startsWith(code, "case ") &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string subject = rbNormalizeAtoms(
           rbConvertInterpolation(
               rbConvertRanges(trimCopy(code.substr(5)), strict), symbols),
@@ -2415,8 +2467,10 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     }
 
     if (startsWith(code, "class ") &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string rest = trimCopy(code.substr(6));
+      if (!rest.empty() && rest.back() == ':') // Python `class Foo:`
+        rest = trimCopy(rest.substr(0, rest.size() - 1));
       static const std::regex classRe(
           "^([A-Za-z_][A-Za-z0-9_]*)\\s*(<\\s*([A-Za-z_][A-Za-z0-9_]*))?\\s*$");
       std::smatch m;
@@ -2442,8 +2496,10 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     }
 
     if (startsWith(code, "def ") &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string signature = trimCopy(code.substr(4));
+      if (!signature.empty() && signature.back() == ':') // Python `def f():`
+        signature = trimCopy(signature.substr(0, signature.size() - 1));
       static const std::regex initRe("^initialize(\\s*\\(.*)?$");
       signature = std::regex_replace(signature, initRe, "init$1");
       signature = rbConvertBlockCapture(signature, strict);
@@ -2475,7 +2531,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
 
     std::string prefix, params;
     if (rbTryTrailingDoOpener(code, prefix, params) && !prefix.empty() &&
-        (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       // Multi-line `do` openers bypass transformCore, so the
       // defaulting-hash read rewriting has to be applied here too
       // (e.g. `adj[u].each do |v|`).

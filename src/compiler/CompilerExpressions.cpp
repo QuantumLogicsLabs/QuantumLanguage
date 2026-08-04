@@ -231,6 +231,59 @@ void Compiler::compileAssign(AssignExpr &e, int line)
         return;
     }
 
+    // Assignment through `->` (`obj->member = val`). Identical to the member
+    // case, with an Op::ARROW after the object (a no-op for a plain object,
+    // a deref for a real pointer) so `this->head = x` — and any pointer
+    // field write — actually stores. Without this the target fell through to
+    // the discard-rhs fallback below and the write was silently lost.
+    if (e.target->is<ArrowExpr>())
+    {
+        auto &arr = e.target->as<ArrowExpr>();
+
+        if (e.op == "post+=" || e.op == "post-=")
+        {
+            compileExpr(*arr.object);
+            emit(Op::ARROW, 0, line);
+            emit(Op::GET_MEMBER, addStr(arr.member), line); // old
+            emit(Op::DUP, 0, line);                         // old old
+            compileExpr(*e.value);
+            emit(e.op == "post+=" ? Op::ADD : Op::SUB, 0, line); // old new
+            compileExpr(*arr.object);
+            emit(Op::ARROW, 0, line);                            // old new obj
+            emit(Op::SWAP, 0, line);                             // old obj new
+            emit(Op::SET_MEMBER, addStr(arr.member), line);      // old obj
+            emit(Op::POP, 0, line);                              // old
+            return;
+        }
+
+        if (compound)
+        {
+            compileExpr(*arr.object);
+            emit(Op::ARROW, 0, line);
+            emit(Op::GET_MEMBER, addStr(arr.member), line); // old
+            compileExpr(*e.value);
+            auto it = cops.find(normalizedOp);
+            if (it != cops.end())
+                emit(it->second, 0, line);                  // new
+            emit(Op::DUP, 0, line);                         // new new
+            compileExpr(*arr.object);
+            emit(Op::ARROW, 0, line);                       // new new obj
+            emit(Op::SWAP, 0, line);                        // new obj new
+            emit(Op::SET_MEMBER, addStr(arr.member), line); // new obj
+            emit(Op::POP, 0, line);                         // new
+            return;
+        }
+
+        compileExpr(*e.value);                              // val
+        emit(Op::DUP, 0, line);                             // val val
+        compileExpr(*arr.object);                           // val val obj
+        emit(Op::ARROW, 0, line);                           // val val obj'
+        emit(Op::SWAP, 0, line);                            // val obj' val
+        emit(Op::SET_MEMBER, addStr(arr.member), line);     // val obj'
+        emit(Op::POP, 0, line);                             // val
+        return;
+    }
+
     // Fallback: evaluate rhs and leave on stack
     compileExpr(*e.value);
 }
