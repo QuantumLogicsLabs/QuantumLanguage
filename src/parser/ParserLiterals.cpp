@@ -867,6 +867,30 @@ std::vector<ASTNodePtr> Parser::parseArgList() {
         skipNewlines();
         continue;
       }
+      // Ruby-style keyword argument: name: expr — equivalent to name=expr.
+      // Only `IDENT :` at the very start of an argument is a keyword; a
+      // ternary's `:` always follows an expression, never begins an argument,
+      // so this cannot collide with `cond ? a : b`.
+      if (la < tokens.size() && tokens[la].type == TokenType::COLON) {
+        std::string kwName = consume().value; // save keyword name
+        while (check(TokenType::NEWLINE))
+          consume();
+        consume(); // ':'
+        skipNewlines();
+        auto val = parseExpr();
+        skipNewlines();
+        auto keyIdent = std::make_unique<ASTNode>(Identifier{kwName}, argLn);
+        AssignExpr ae;
+        ae.op = "=";
+        ae.target = std::move(keyIdent);
+        ae.value = std::move(val);
+        args.push_back(std::make_unique<ASTNode>(std::move(ae), argLn));
+        skipNewlines();
+        if (!match(TokenType::COMMA))
+          break;
+        skipNewlines();
+        continue;
+      }
     }
 
     auto expr = parseExpr();

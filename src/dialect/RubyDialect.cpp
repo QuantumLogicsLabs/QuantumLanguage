@@ -113,9 +113,18 @@ rbNormalizeAtoms(const std::string &s,
   // interpolation pipeline passes bare `@ivar` snippets through here.
   if (!strict) {
     static const std::regex decoratorRe(
-        "^@[A-Za-z_][A-Za-z0-9_.]*(\\(.*\\))?$");
-    if (std::regex_match(trimCopy(s), decoratorRe))
-      return s;
+        "^@([A-Za-z_][A-Za-z0-9_]*)[A-Za-z0-9_.]*(\\(.*\\))?$");
+    std::smatch dm;
+    std::string trimmed = trimCopy(s);
+    if (std::regex_match(trimmed, dm, decoratorRe)) {
+      // `@name…` is a Python decorator only when `name` is NOT a known
+      // instance variable of this file's classes. Otherwise it is a Ruby
+      // ivar expression on its own line — `@items.push(x)`, `@count.times` —
+      // which must still become `self.items.push(x)`, not be passed through
+      // as if it were `@app.route("/x")`.
+      if (!st.fields.count(dm[1].str()))
+        return s;
+    }
   }
 
   std::string out;
@@ -282,6 +291,26 @@ static bool rbUnambiguous(const std::string &code) {
   if (!code.empty() && code.back() == ':')
     return false;
   return rbFindTopLevel(code, "{") == std::string::npos;
+}
+
+// Ruby's `if COND then` / `while COND do` write the keyword that introduces
+// the body on the condition line. Once the condition is wrapped in `( )` and
+// a `{` block is emitted, that trailing keyword must be dropped or it leaks
+// into the condition (`if (n <= 1 then)`). Strips a trailing ` then` / ` do`
+// (word-boundary, outside strings) from an already-trimmed condition.
+static std::string rbStripTrailingThen(std::string cond) {
+  cond = trimCopy(cond);
+  for (const char *kw : {"then", "do"}) {
+    size_t klen = std::string(kw).size();
+    if (cond.size() > klen && cond.compare(cond.size() - klen, klen, kw) == 0) {
+      char before = cond[cond.size() - klen - 1];
+      if (before == ' ' || before == '\t') {
+        cond.erase(cond.size() - klen);
+        return trimCopy(cond);
+      }
+    }
+  }
+  return cond;
 }
 
 // True when the line contains a C-style comment marker (`//`, `/*`, `*/`)
@@ -599,6 +628,45 @@ static std::string rbConvertRanges(std::string line, bool strict = true) {
     line = rbConvertRangesOnce(line, changed);
     if (!changed)
       break;
+  }
+  // A small set of Ruby constructs that are *not* valid syntax in any of the
+  // other dialects sharing a `.sa` file, so converting them can never collide
+  // with Python/JS/C/C++ — they are applied in mixed mode too (the strict
+  // block below re-runs them harmlessly, each already a no-op by then).
+  {
+    // Conditional-assignment operators Quantum's parser rejects outright.
+    static const std::regex mixedOrAssignRe(
+        "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(?:\\[[^\\[\\]]*\\])*)\\s*\\|\\|=\\s*(.+)$");
+    line = std::regex_replace(line, mixedOrAssignRe, "$1 = $1 || ($2)");
+    static const std::regex mixedAndAssignRe(
+        "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(?:\\[[^\\[\\]]*\\])*)\\s*&&=\\s*(.+)$");
+    line = std::regex_replace(line, mixedAndAssignRe, "$1 = $1 && ($2)");
+    // Ruby's sized-array constructor — "Array" is not a Quantum builtin.
+    static const std::regex mixedArrayFillRe(
+        "Array\\.new\\(([^(),]*),\\s*([^()]*)\\)");
+    line = std::regex_replace(line, mixedArrayFillRe,
+                              "range(0, $1).map(fn(__ai) { return $2 })");
+    static const std::regex mixedArraySizeRe("Array\\.new\\(([^(),]*)\\)");
+    line = std::regex_replace(line, mixedArraySizeRe,
+                              "range(0, $1).map(fn(__ai) { return nil })");
+    // Ruby-style construction `ClassName.new(args)` -> `ClassName(args)`.
+    // Quantum has no `.new` method on user classes; `::` is already reduced
+    // to `.` by the lexer, so `Foo::new` arrives here as `Foo.new` too. The
+    // native builtin modules (Thread/Queue/…) expose their own `.new` and
+    // are excluded. Only fires when `Name` is capitalized — Ruby class names
+    // always are — so an ordinary lowercase `obj.new(...)` method is untouched.
+    static const char *kMixedBuiltins =
+        "(?!(?:Thread|Mutex|ConditionVariable|Queue|SizedQueue|File|Time|"
+        "Ractor|Fiber|TCPServer|TCPSocket|Struct|Set|Dir|IO|Hash|Array)\\b)";
+    static const std::regex mixedNewCallRe(std::string("\\b") + kMixedBuiltins +
+                                           "([A-Z][A-Za-z0-9_]*)(?:\\.|::)new\\(");
+    line = std::regex_replace(line, mixedNewCallRe, "$1(");
+    static const std::regex mixedNewBareRe(
+        std::string("\\b") + kMixedBuiltins +
+        "([A-Z][A-Za-z0-9_]*)(?:\\.|::)new\\b(?!\\()");
+    line = std::regex_replace(line, mixedNewBareRe, "$1()");
   }
   if (!strict)
     return line;
@@ -958,6 +1026,64 @@ static bool rbTryTrailingDoOpener(const std::string &code, std::string &prefix,
   prefix = trimCopy(m[1].str());
   params = trimCopy(m[2].str());
   return true;
+}
+
+// Converts a multi-line brace block `EXPR { |params|` … `}` into the
+// equivalent `EXPR do |params|` … `end` up front, so the existing do/end
+// machinery (implicit-return, destructuring, closing `})`) handles it. Only
+// the pipe-param brace form is converted — `{ |x|` is unambiguously a Ruby
+// block, never a hash/object literal or a C/JS brace. The matching `}` is
+// found by brace-depth counting across lines (skipping string contents), so
+// nested `{ }` inside the body are preserved.
+static std::vector<std::string>
+rbConvertBracePipeBlocks(std::vector<std::string> lines) {
+  static const std::regex openerRe("^(\\s*)(.*?)\\{[ \t]*\\|([^|]*)\\|[ \t]*$");
+  for (size_t i = 0; i < lines.size(); i++) {
+    std::smatch m;
+    if (!std::regex_match(lines[i], m, openerRe))
+      continue;
+    std::string prefix = trimCopy(m[2].str());
+    if (prefix.empty())
+      continue;
+    if (rbFindTopLevel(lines[i], "{") == std::string::npos)
+      continue; // the `{` is not this line's own top-level opener
+    // Find the matching `}` on a later line, counting only braces outside
+    // strings; depth starts at 1 for the opener `{`.
+    int depth = 1;
+    size_t closeLine = std::string::npos, closeCol = 0;
+    for (size_t j = i + 1; j < lines.size() && closeLine == std::string::npos;
+         j++) {
+      const std::string &s = lines[j];
+      for (size_t k = 0; k < s.size();) {
+        char c = s[k];
+        if (rbIsQuote(c)) {
+          k = rbSkipString(s, k);
+          continue;
+        }
+        if (c == '{')
+          depth++;
+        else if (c == '}') {
+          if (--depth == 0) {
+            closeLine = j;
+            closeCol = k;
+            break;
+          }
+        }
+        k++;
+      }
+    }
+    if (closeLine == std::string::npos)
+      continue; // no clean match — leave the line untouched
+    lines[i] = m[1].str() + prefix + " do |" + m[3].str() + "|";
+    std::string &cl = lines[closeLine];
+    if (trimCopy(cl) == "}") {
+      lines[closeLine] = cl.substr(0, cl.find('}')) + "end";
+    } else {
+      // `}` shares its line with other code — replace just that brace.
+      cl = cl.substr(0, closeCol) + "end" + cl.substr(closeCol + 1);
+    }
+  }
+  return lines;
 }
 
 // A Ruby block with multiple params (`{ |a, b| }`) attached to a method
@@ -1369,6 +1495,10 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
   if (strict)
     rawLines = rbExpandHeredocs(std::move(rawLines));
   rawLines = rbFlattenModules(std::move(rawLines));
+  // Normalize multi-line `{ |x| … }` brace blocks into `do |x| … end` so the
+  // do/end machinery handles them (the `|params|` form is unambiguously a
+  // Ruby block in any dialect).
+  rawLines = rbConvertBracePipeBlocks(std::move(rawLines));
 
   RubySymbolTable symbols;
   rbCollectSymbols(rawLines, symbols);
@@ -1492,6 +1622,69 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
   std::function<std::string(const std::string &)> transformCore =
       [&](const std::string &codeIn) -> std::string {
     std::string code = codeIn;
+
+    // `func name(...)` — a function-definition keyword some styles use.
+    // Quantum spells it `function`; `func` is not a keyword, so a bare
+    // rename at statement start (only when followed by an identifier) makes
+    // the definition parse. Safe across dialects: `func` is never a Quantum
+    // keyword and real code uses `function`/`def`/`fn`.
+    {
+      static const std::regex funcKwRe("^func(\\s+[A-Za-z_])");
+      code = std::regex_replace(code, funcKwRe, "function$1");
+    }
+
+    // ── Polyglot noise with no runtime meaning in a dynamic VM ──────────
+    // Bare access modifiers (`private`/`public`/`protected`, with or without
+    // a trailing colon) have no analogue and are dropped. `typedef` and
+    // `template<...>` are deliberately NOT dropped — the native parser already
+    // accepts them, and a `typedef struct { … } Name;` spans multiple lines,
+    // so removing the opener would orphan its body.
+    // Python `from X import Y` has no analogue — everything these scripts pull
+    // in is either built into the VM or ignored. Drop the whole statement
+    // (including any trailing `as`/`-> alias` noise) rather than let the native
+    // parser trip over `from`/`import`.
+    {
+      static const std::regex fromImportRe("^from\\s+\\S+\\s+import\\b.*$");
+      if (std::regex_match(code, fromImportRe))
+        return "";
+    }
+    {
+      static const std::regex bareAccessRe(
+          "^(public|private|protected)\\s*:?\\s*$");
+      if (std::regex_match(code, bareAccessRe))
+        return "";
+      // Leading access label sharing its line with a declaration:
+      // `public: void f(int x) {` -> `void f(int x) {`.
+      static const std::regex accessLabelRe(
+          "^(public|private|protected)\\s*:\\s*(?=\\S)");
+      code = std::regex_replace(code, accessLabelRe, "");
+    }
+    // `async`/`await` — the VM is synchronous, so drop the keywords and let
+    // the body run in order (`async def run()` -> `def run()`,
+    // `await x.call()` -> `x.call()`).
+    {
+      static const std::regex asyncRe("^async\\s+");
+      code = std::regex_replace(code, asyncRe, "");
+      static const std::regex awaitRe("\\bawait\\s+");
+      code = std::regex_replace(code, awaitRe, "");
+    }
+    // Strip C++ generic parameters from a class/struct header so the native
+    // parser sees a plain name: `class Stack<T> {` -> `class Stack {`.
+    {
+      static const std::regex genRe("^(class|struct)\\s+([A-Za-z_]\\w*)<[^<>]*>");
+      code = std::regex_replace(code, genRe, "$1 $2");
+    }
+    // Typed variable declaration/assignment (Python/TS annotation):
+    // `B: Matrix = expr` -> `B = expr`. Requires the `=` so dict entries
+    // (`key: value,`) and case/labels are left untouched.
+    {
+      static const std::regex typedVarRe(
+          "^([A-Za-z_]\\w*)\\s*:\\s*[A-Za-z_][A-Za-z0-9_:<>,*&\\[\\] ]*?\\s*=\\s*"
+          "(.+)$");
+      std::smatch tvm;
+      if (std::regex_match(code, tvm, typedVarRe))
+        code = tvm[1].str() + " = " + tvm[2].str();
+    }
 
     // Multiple assignment can also appear as the statement of a
     // modifier (`l, r = i, i + 1 if cond`), where the outer pass hands
@@ -1775,8 +1968,10 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     // `.map`, ...). A line that merely starts with `[` because it is a
     // continuation row of a multi-line literal, or an element of one,
     // must be left alone.
-    if (strict && !code.empty() && code[0] == '[' &&
-        previousLineCanContinueExpression()) {
+    // Applied in mixed mode too: it only fires when the previous line could
+    // otherwise swallow this `[...]` as a postfix index, which is a misparse
+    // in any dialect — never a layout an existing file depends on.
+    if (!code.empty() && code[0] == '[' && previousLineCanContinueExpression()) {
       size_t close = rbMatchBracket(code, 0);
       if (close != std::string::npos && close + 1 < code.size() &&
           code[close + 1] == '.')
@@ -1825,6 +2020,14 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     if (!code.empty() && code[0] == '#') {
       outLines.push_back(indentation + "//" + code.substr(1));
       continue;
+    }
+
+    // `async` is a no-op for the synchronous VM. Strip it here — before the
+    // def/function/class handlers below — so `async def run()` is processed as
+    // an ordinary `def run()` (and `async function f()` / `async { … }` too).
+    {
+      static const std::regex asyncPrefixRe("^async\\s+");
+      code = std::regex_replace(code, asyncPrefixRe, "");
     }
 
     if (code == "private" || code == "protected" || code == "public") {
@@ -1930,7 +2133,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       stack.pop_back();
       std::string cond = rbNormalizeAtoms(
           rbConvertInterpolation(
-              rbConvertRanges(trimCopy(code.substr(6)), strict), symbols),
+              rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(6))),
+                              strict),
+              symbols),
           symbols, strict, inClassBody);
       outLines.push_back(indentation + "} else if (" + cond + ") {");
       RBFrame f{RBFrameKind::Branch, gid, RBTailInfo{}};
@@ -2063,7 +2268,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
         (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string cond = rbSubstituteMainGuard(rbNormalizeAtoms(
           rbConvertInterpolation(
-              rbConvertRanges(trimCopy(code.substr(7)), strict), symbols),
+              rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(7))),
+                              strict),
+              symbols),
           symbols, strict, inClassBody));
       outLines.push_back(indentation + "if (!(" + cond + ")) {");
       stack.push_back(
@@ -2074,7 +2281,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
         (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string cond = rbSubstituteMainGuard(rbNormalizeAtoms(
           rbConvertInterpolation(
-              rbConvertRanges(trimCopy(code.substr(3)), strict), symbols),
+              rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(3))),
+                              strict),
+              symbols),
           symbols, strict, inClassBody));
       outLines.push_back(indentation + "if (" + cond + ") {");
       stack.push_back(
@@ -2085,7 +2294,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
         (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string cond = rbNormalizeAtoms(
           rbConvertInterpolation(
-              rbConvertRanges(trimCopy(code.substr(6)), strict), symbols),
+              rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(6))),
+                              strict),
+              symbols),
           symbols, strict, inClassBody);
       outLines.push_back(indentation + "while (!(" + cond + ")) {");
       stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
@@ -2095,7 +2306,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
         (strict || (rbUnambiguous(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string cond = rbNormalizeAtoms(
           rbConvertInterpolation(
-              rbConvertRanges(trimCopy(code.substr(6)), strict), symbols),
+              rbConvertRanges(rbStripTrailingThen(trimCopy(code.substr(6))),
+                              strict),
+              symbols),
           symbols, strict, inClassBody);
       outLines.push_back(indentation + "while (" + cond + ") {");
       stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
@@ -2313,8 +2526,8 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       std::string destructure =
           rbApplyBlockDestructuring(convertedPrefix, params);
       // Same statement-start array-literal ambiguity guard as in
-      // transformCore (`["a","b"].each do |x|`).
-      if (strict && !convertedPrefix.empty() && convertedPrefix[0] == '[' &&
+      // transformCore (`["a","b"].each do |x|`) — mixed mode too.
+      if (!convertedPrefix.empty() && convertedPrefix[0] == '[' &&
           previousLineCanContinueExpression()) {
         size_t close = rbMatchBracket(convertedPrefix, 0);
         if (close != std::string::npos && close + 1 < convertedPrefix.size() &&

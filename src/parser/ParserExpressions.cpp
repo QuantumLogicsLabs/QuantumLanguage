@@ -591,11 +591,15 @@ ASTNodePtr Parser::parsePostfix()
                 mem = expect(TokenType::IDENTIFIER, "Expected member name after ->").value;
             if (check(TokenType::LPAREN))
             {
-                // ptr->method(args) — treat as method call on dereferenced object
-                auto deref = std::make_unique<ASTNode>(DerefExpr{std::move(expr)}, ln);
-                auto memExpr = std::make_unique<ASTNode>(MemberExpr{std::move(deref), mem}, ln);
+                // ptr->method(args) — a method call through `->`. Use the
+                // tolerant ArrowExpr access (Op::ARROW derefs a real pointer
+                // but passes a plain object/array through), so `->` works as a
+                // general member-access operator the way these polyglot files
+                // use it (`node.left`, `node->left`, `arr[0]->size()`), not
+                // only on genuine pointers. compileCall binds the receiver.
+                auto arrowExpr = std::make_unique<ASTNode>(ArrowExpr{std::move(expr), mem}, ln);
                 auto args = parseArgList();
-                expr = std::make_unique<ASTNode>(CallExpr{std::move(memExpr), std::move(args)}, ln);
+                expr = std::make_unique<ASTNode>(CallExpr{std::move(arrowExpr), std::move(args)}, ln);
             }
             else
             {

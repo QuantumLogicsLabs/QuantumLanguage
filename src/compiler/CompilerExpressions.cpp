@@ -359,6 +359,21 @@ void Compiler::compileCall(CallExpr &e, int line)
         emit(Op::CALL, argCount, line);
         return;
     }
+    // Arrow method call: obj->method(args). Same shape as the member-call
+    // path with an Op::ARROW in front (a no-op for non-pointers, a deref for
+    // real pointers), so the receiver binds exactly as for obj.method(args).
+    if (e.callee->is<ArrowExpr>())
+    {
+        auto &arr = e.callee->as<ArrowExpr>();
+        compileExpr(*arr.object);
+        emit(Op::ARROW, 0, line);
+        emit(Op::GET_MEMBER, addStr(arr.member), line);
+        int argCount = 0;
+        for (auto &arg : e.args)
+            argCount += emitArgValues(*arg);
+        emit(Op::CALL, argCount, line);
+        return;
+    }
     // Regular call. Keyword/assignment args (`f(name=value)`) are handled
     // uniformly by emitArgValues, the same as in the method-call path above.
     compileExpr(*e.callee);
