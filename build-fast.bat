@@ -65,10 +65,11 @@ if errorlevel 1 (
 )
 cd ..
 
-rem ── Copy all THREE binaries to the project root ───────────────────────────────
+rem ── Copy all FOUR binaries to the project root ────────────────────────────────
 copy /Y build\quantum.exe      quantum.exe      >nul
 copy /Y build\qrun.exe         qrun.exe         >nul
 copy /Y build\quantum_stub.exe quantum_stub.exe >nul
+copy /Y build\qpm.exe          qpm.exe          >nul
 
 echo.
 echo   Incremental build successful
@@ -77,6 +78,7 @@ echo   Binaries copied to project root:
 echo     quantum.exe       ^<-- compiler + bundler
 echo     qrun.exe          ^<-- direct interpreter
 echo     quantum_stub.exe  ^<-- standalone runtime  ^(template for hello.exe etc.^)
+echo     qpm.exe           ^<-- standalone npm-compatible package manager
 echo.
 echo   Usage:
 echo     quantum hello.sa        ^<-- compiles hello.sa into hello.exe, then runs it

@@ -18,6 +18,9 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 # ── Collect sources ────────────────────────────────────────────────────────────
 file(GLOB_RECURSE QUANTUM_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*main_vm\\.cpp$")
+# qpm is a standalone tool (its own main(), no VM/lexer/parser/compiler needed)
+# built from src/qpm/ separately — keep it out of the other 3 targets' sources.
+list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*/src/qpm/.*\\.cpp$")
 
 # ── quantum  — compiler + bundler ─────────────────────────────────────────────
 add_executable(quantum ${QUANTUM_SOURCES})
@@ -39,5 +42,16 @@ if(WIN32)
     target_link_libraries(quantum_stub advapi32)
 endif()
 
+# ── qpm  — standalone npm-compatible package manager ──────────────────────────
+file(GLOB QPM_SOURCES CONFIGURE_DEPENDS "src/qpm/*.cpp")
+add_executable(qpm ${QPM_SOURCES})
+if(WIN32)
+    # z: zlib (statically linked via the -static link flag above, same as the
+    #    other 3 targets already get a DLL-free libstdc++/libgcc).
+    # winhttp/crypt32/ws2_32: Windows system DLLs, present on every install —
+    #    linked the same way `advapi32` already is above.
+    target_link_libraries(qpm z winhttp crypt32 ws2_32)
+endif()
+
 message(STATUS "Quantum v2.0.0 — Bytecode VM  (static linking enabled)")
-message(STATUS "  Binaries : quantum  qrun  quantum_stub")
+message(STATUS "  Binaries : quantum  qrun  quantum_stub  qpm")

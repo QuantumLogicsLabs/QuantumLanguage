@@ -270,7 +270,16 @@ static void collectTestFilesRecursive(const fs::path &dir, std::vector<fs::path>
         for (auto &e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied))
         {
             if (e.is_directory())
+            {
+                // node_modules (npm dependency trees, e.g. downloaded by qpm) and
+                // dotfolders (.git, .bin, ...) are never test fixtures — walking
+                // into them would sweep up thousands of real-world .js files this
+                // compiler was never meant to run, drowning the actual test signal.
+                std::string dirName = e.path().filename().string();
+                if (dirName == "node_modules" || (!dirName.empty() && dirName[0] == '.'))
+                    continue;
                 subdirs.push_back(e.path());
+            }
             else if (e.is_regular_file() && hasSupportedExt(e.path().string()))
                 out.push_back(e.path());
         }

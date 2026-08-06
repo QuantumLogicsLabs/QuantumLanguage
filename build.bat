@@ -178,6 +178,7 @@ rem ═════════════════════════�
 copy /Y build\quantum.exe      quantum.exe      >nul
 copy /Y build\qrun.exe         qrun.exe         >nul
 copy /Y build\quantum_stub.exe quantum_stub.exe >nul
+copy /Y build\qpm.exe          qpm.exe          >nul
 
 echo.
 echo   Build successful
@@ -186,6 +187,7 @@ echo   Binaries copied to project root:
 echo     quantum.exe       ^<-- compiler + bundler
 echo     qrun.exe          ^<-- direct interpreter
 echo     quantum_stub.exe  ^<-- standalone runtime  ^(template for hello.exe etc.^)
+echo     qpm.exe           ^<-- standalone npm-compatible package manager
 echo.
 echo   Usage:
 echo     quantum hello.sa        ^<-- compiles hello.sa into hello.exe, then runs it
@@ -197,5 +199,11 @@ echo     quantum --debug hello.sa    ^<-- dump bytecode then run
 echo     quantum --dis   hello.sa    ^<-- dump bytecode only
 echo     quantum --check hello.sa    ^<-- parse + type-check only
 echo     quantum --test  examples    ^<-- batch test all .sa files
+echo.
+echo   Package manager:
+echo     qpm install              ^<-- downloads all npm packages from package.json
+echo     qpm install express      ^<-- adds + installs a specific package
+echo     qpm run dev               ^<-- runs a package.json "scripts" entry
+echo     qpm start                 ^<-- shorthand for `qpm run start`
 echo.
 endlocal
