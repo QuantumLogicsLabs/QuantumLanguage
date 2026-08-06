@@ -11,6 +11,10 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
@@ -71,20 +75,8 @@ namespace qpm
             writeFile(binDir / (cmdName + ".cmd"), content);
         }
 
-        void writeBinShimsForPackage(const fs::path &destDir)
+        void writeBinShimsForPackage(const fs::path &destDir, const JsonValue &pkg)
         {
-            fs::path pkgJsonPath = destDir / "package.json";
-            if (!fs::exists(pkgJsonPath))
-                return;
-            JsonValue pkg;
-            try
-            {
-                pkg = JsonValue::parse(readFile(pkgJsonPath));
-            }
-            catch (...)
-            {
-                return;
-            }
             const JsonValue *bin = pkg.find("bin");
             if (!bin)
                 return;
@@ -110,20 +102,72 @@ namespace qpm
             }
         }
 
+        // A single-line terminal spinner that ticks on a background thread
+        // while the calling thread blocks on a network call. stop() always
+        // joins the thread before returning, so by the time the caller does
+        // its own console output (e.g. an error to stderr), the spinner
+        // thread is guaranteed dead — no concurrent-stdout hazard.
+        class Spinner
+        {
+        public:
+            explicit Spinner(std::string label) : label_(std::move(label))
+            {
+                running_.store(true);
+                thread_ = std::thread([this]
+                {
+                    static const char frames[] = {'|', '/', '-', '\\'};
+                    size_t i = 0;
+                    while (running_.load(std::memory_order_relaxed))
+                    {
+                        std::cout << '\r' << "  " << frames[i % 4] << ' ' << label_ << std::flush;
+                        ++i;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(90));
+                    }
+                });
+            }
+
+            // Stops the spinner and overwrites its line with `finalLine` (or
+            // just clears it, cursor back at column 0, if `finalLine` is empty).
+            void stop(const std::string &finalLine)
+            {
+                if (!running_.exchange(false))
+                    return;
+                if (thread_.joinable())
+                    thread_.join();
+                size_t width = label_.size() + 4;
+                std::string padded = finalLine;
+                if (padded.size() < width)
+                    padded.append(width - padded.size(), ' ');
+                std::cout << '\r' << padded << '\r';
+                if (!finalLine.empty())
+                    std::cout << finalLine << '\n';
+                std::cout.flush();
+            }
+
+            ~Spinner() { stop(""); }
+
+        private:
+            std::string label_;
+            std::atomic<bool> running_{false};
+            std::thread thread_;
+        };
+
         struct ResolveState
         {
             fs::path projectDir;
             fs::path rootNodeModules;
-            std::map<std::string, std::string> rootChosen;   // name -> version
-            std::map<std::string, JsonValue> metaCache;       // name -> registry doc
-            std::map<std::string, std::string> tarballCache;  // "name@version" -> inflated tar bytes
-            std::set<std::string> expandedDeps;               // "name@version" already had children enqueued
+            std::map<std::string, std::string> rootChosen;      // name -> version
+            std::map<std::string, JsonValue> metaCache;          // name -> registry doc
+            std::map<std::string, std::string> tarballCache;     // "name@version" -> inflated tar bytes
+            std::set<std::string> expandedDeps;                  // "name@version" already had children enqueued
+            std::map<std::string, std::string> previousResolved; // lock key -> resolved URL, from a prior qpm-lock.json
             JsonValue lockPackages = JsonValue::makeObject();
             int installedCount = 0;
+            int upToDateCount = 0;
             int failedCount = 0;
         };
 
-        const JsonValue *fetchMeta(ResolveState &st, const std::string &name)
+        const JsonValue *fetchMeta(ResolveState &st, const std::string &name, std::string &error)
         {
             auto it = st.metaCache.find(name);
             if (it != st.metaCache.end())
@@ -133,8 +177,8 @@ namespace qpm
             HttpResponse resp = httpGet(url, "application/vnd.npm.install-v1+json");
             if (!resp.ok())
             {
-                std::cerr << "[qpm] failed to fetch metadata for " << name
-                          << " (" << (resp.error.empty() ? ("HTTP " + std::to_string(resp.status)) : resp.error) << ")\n";
+                error = "failed to fetch metadata for " + name + " (" +
+                        (resp.error.empty() ? ("HTTP " + std::to_string(resp.status)) : resp.error) + ")";
                 return nullptr;
             }
             try
@@ -145,7 +189,7 @@ namespace qpm
             }
             catch (const std::exception &e)
             {
-                std::cerr << "[qpm] bad registry response for " << name << ": " << e.what() << "\n";
+                error = "bad registry response for " + name + ": " + e.what();
                 return nullptr;
             }
         }
@@ -175,7 +219,7 @@ namespace qpm
         }
 
         bool downloadAndExtract(ResolveState &st, const std::string &name, const std::string &version,
-                                 const std::string &tarballUrl, const fs::path &destDir)
+                                 const std::string &tarballUrl, const fs::path &destDir, std::string &error)
         {
             std::string key = name + "@" + version;
             auto cacheIt = st.tarballCache.find(key);
@@ -189,14 +233,14 @@ namespace qpm
                 HttpResponse resp = httpGet(tarballUrl);
                 if (!resp.ok())
                 {
-                    std::cerr << "[qpm] failed to download " << key << " ("
-                              << (resp.error.empty() ? ("HTTP " + std::to_string(resp.status)) : resp.error) << ")\n";
+                    error = "failed to download " + key + " (" +
+                            (resp.error.empty() ? ("HTTP " + std::to_string(resp.status)) : resp.error) + ")";
                     return false;
                 }
-                std::string inflated, err;
-                if (!gzipInflate(resp.body, inflated, err))
+                std::string inflated, gzErr;
+                if (!gzipInflate(resp.body, inflated, gzErr))
                 {
-                    std::cerr << "[qpm] failed to decompress " << key << ": " << err << "\n";
+                    error = "failed to decompress " + key + ": " + gzErr;
                     return false;
                 }
                 st.tarballCache[key] = inflated;
@@ -205,13 +249,49 @@ namespace qpm
 
             std::error_code ec;
             fs::remove_all(destDir, ec);
-            std::string err;
-            if (!tarExtract(tarBytes, destDir.string(), err))
+            std::string tarErr;
+            if (!tarExtract(tarBytes, destDir.string(), tarErr))
             {
-                std::cerr << "[qpm] failed to extract " << key << ": " << err << "\n";
+                error = "failed to extract " + key + ": " + tarErr;
                 return false;
             }
-            writeBinShimsForPackage(destDir);
+
+            JsonValue pkg;
+            try
+            {
+                pkg = JsonValue::parse(readFile(destDir / "package.json"));
+            }
+            catch (...)
+            {
+            }
+            writeBinShimsForPackage(destDir, pkg);
+            return true;
+        }
+
+        // Returns true and fills `versionOut` if `destDir` already holds a
+        // package.json whose version satisfies `range` — lets the caller skip
+        // the network entirely for a package that's already correctly installed.
+        bool trySatisfyFromDisk(const std::string &range, const fs::path &destDir, std::string &versionOut)
+        {
+            fs::path pkgJsonPath = destDir / "package.json";
+            if (!fs::exists(pkgJsonPath))
+                return false;
+            JsonValue pkg;
+            try
+            {
+                pkg = JsonValue::parse(readFile(pkgJsonPath));
+            }
+            catch (...)
+            {
+                return false;
+            }
+            std::string version = pkg.get("version").asString();
+            SemVer sv;
+            if (version.empty() || !SemVer::tryParse(version, sv))
+                return false;
+            if (!SemVerRange(range).satisfies(sv))
+                return false;
+            versionOut = version;
             return true;
         }
 
@@ -232,15 +312,67 @@ namespace qpm
                     return true; // shared with the already-installed root copy
             }
 
-            const JsonValue *meta = fetchMeta(st, name);
+            bool useRoot = isRootLevel || rootIt == st.rootChosen.end();
+            fs::path destDir = useRoot ? (st.rootNodeModules / name) : (parentPkgDir / "node_modules" / name);
+            std::string lockKey = toPosix(fs::relative(destDir, st.projectDir));
+
+            auto recordLock = [&](const std::string &version, const std::string &resolvedUrl)
+            {
+                JsonValue entry = JsonValue::makeObject();
+                entry.set("version", version);
+                entry.set("resolved", resolvedUrl);
+                st.lockPackages.set(lockKey, entry);
+            };
+
+            auto expandChildren = [&](const std::string &version, const JsonValue *depsObj)
+            {
+                std::string key = name + "@" + version;
+                if (st.expandedDeps.count(key))
+                    return;
+                st.expandedDeps.insert(key);
+                if (depsObj && depsObj->isObject())
+                    for (const auto &m : depsObj->object())
+                        installTransitive(st, m.first, m.second.asString(), destDir);
+            };
+
+            // Fast path: already correctly installed on disk from a previous
+            // run — skip metadata fetch + download entirely.
+            std::string diskVersion;
+            if (trySatisfyFromDisk(range, destDir, diskVersion))
+            {
+                if (useRoot)
+                    st.rootChosen[name] = diskVersion;
+                ++st.upToDateCount;
+
+                JsonValue diskPkg;
+                try
+                {
+                    diskPkg = JsonValue::parse(readFile(destDir / "package.json"));
+                }
+                catch (...)
+                {
+                }
+                auto prev = st.previousResolved.find(lockKey);
+                recordLock(diskVersion, prev != st.previousResolved.end() ? prev->second : "");
+                expandChildren(diskVersion, diskPkg.find("dependencies"));
+                return true;
+            }
+
+            Spinner spinner("resolving " + name + (range.empty() ? "" : " " + range) + " ...");
+            std::string opError;
+
+            const JsonValue *meta = fetchMeta(st, name, opError);
             if (!meta)
             {
+                spinner.stop("");
+                std::cerr << "[qpm] " << opError << "\n";
                 ++st.failedCount;
                 return false;
             }
             std::string version = resolveVersion(*meta, range);
             if (version.empty())
             {
+                spinner.stop("");
                 std::cerr << "[qpm] no version of " << name << " satisfies \"" << range << "\"\n";
                 ++st.failedCount;
                 return false;
@@ -251,43 +383,31 @@ namespace qpm
             std::string tarballUrl = verMeta ? verMeta->get("dist").get("tarball").asString() : "";
             if (tarballUrl.empty())
             {
+                spinner.stop("");
                 std::cerr << "[qpm] no tarball URL for " << name << "@" << version << "\n";
                 ++st.failedCount;
                 return false;
             }
 
-            bool useRoot = isRootLevel || rootIt == st.rootChosen.end();
-            fs::path destDir = useRoot ? (st.rootNodeModules / name) : (parentPkgDir / "node_modules" / name);
-
-            std::string key = name + "@" + version;
-            bool alreadyExpanded = st.expandedDeps.count(key) != 0;
-
-            if (!downloadAndExtract(st, name, version, tarballUrl, destDir))
+            if (!downloadAndExtract(st, name, version, tarballUrl, destDir, opError))
+            {
+                spinner.stop("");
+                std::cerr << "[qpm] " << opError << "\n";
+                ++st.failedCount;
                 return false;
+            }
 
             if (useRoot)
                 st.rootChosen[name] = version;
 
             ++st.installedCount;
-            std::cout << "  + " << name << "@" << version
-                      << (useRoot ? "" : "  (nested under " + parentPkgDir.filename().string() + ")") << "\n";
+            std::string resultLine = "  + " + name + "@" + version +
+                                      (useRoot ? "" : "  (nested under " + parentPkgDir.filename().string() + ")");
+            spinner.stop(resultLine);
 
-            std::string lockKey = toPosix(fs::relative(destDir, st.projectDir));
-            JsonValue entry = JsonValue::makeObject();
-            entry.set("version", version);
-            entry.set("resolved", tarballUrl);
-            st.lockPackages.set(lockKey, entry);
-
-            if (!alreadyExpanded)
-            {
-                st.expandedDeps.insert(key);
-                const JsonValue *deps = verMeta ? verMeta->find("dependencies") : nullptr;
-                if (deps && deps->isObject())
-                {
-                    for (const auto &m : deps->object())
-                        installTransitive(st, m.first, m.second.asString(), destDir);
-                }
-            }
+            recordLock(version, tarballUrl);
+            const JsonValue *deps = verMeta ? verMeta->find("dependencies") : nullptr;
+            expandChildren(version, deps);
             return true;
         }
 
@@ -344,6 +464,22 @@ namespace qpm
         st.projectDir = projectDir;
         st.rootNodeModules = nodeModules;
 
+        fs::path lockPath = projectDir / "qpm-lock.json";
+        if (fs::exists(lockPath))
+        {
+            try
+            {
+                JsonValue oldLock = JsonValue::parse(readFile(lockPath));
+                const JsonValue *packages = oldLock.find("packages");
+                if (packages && packages->isObject())
+                    for (const auto &m : packages->object())
+                        st.previousResolved[m.first] = m.second.get("resolved").asString();
+            }
+            catch (...)
+            {
+            }
+        }
+
         for (const auto &spec : opts.addPackages)
         {
             std::string name, range;
@@ -352,7 +488,8 @@ namespace qpm
             std::string recordedRange = range;
             if (recordedRange.empty())
             {
-                const JsonValue *meta = fetchMeta(st, name);
+                std::string ignoredError;
+                const JsonValue *meta = fetchMeta(st, name, ignoredError);
                 if (meta)
                 {
                     std::string latest = resolveVersion(*meta, "latest");
@@ -391,9 +528,10 @@ namespace qpm
         JsonValue lockDoc = JsonValue::makeObject();
         lockDoc.set("lockfileVersion", 1);
         lockDoc.set("packages", st.lockPackages);
-        writeFile(projectDir / "qpm-lock.json", lockDoc.stringify(2) + "\n");
+        writeFile(lockPath, lockDoc.stringify(2) + "\n");
 
-        std::cout << "\n[qpm] added " << st.installedCount << " package(s)";
+        std::cout << "\n[qpm] " << st.installedCount << " package(s) installed, "
+                  << st.upToDateCount << " already up to date";
         if (st.failedCount > 0)
             std::cout << ", " << st.failedCount << " failed to resolve";
         std::cout << "\n";
