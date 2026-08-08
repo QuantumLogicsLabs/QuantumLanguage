@@ -216,8 +216,16 @@ namespace qpm
             out.push_back({op, fillLow(p)});
         }
 
+        bool isBareOperatorToken(const std::string &s)
+        {
+            return s == ">=" || s == "<=" || s == ">" || s == "<" || s == "=" || s == "^" || s == "~";
+        }
+
         // Splits a comparator-set string on whitespace, but keeps a hyphen range
-        // ("1.2.3 - 2.3.4") intact as one logical unit.
+        // ("1.2.3 - 2.3.4") intact as one logical unit, and re-glues an operator
+        // that got separated from its version by whitespace (node-semver accepts
+        // both ">=1.2.3" and ">= 1.2.3" — e.g. iconv-lite pins safer-buffer as
+        // literally ">= 2.1.2 < 3").
         std::vector<std::string> splitComparatorSet(const std::string &setStr)
         {
             std::vector<std::string> raw;
@@ -226,17 +234,32 @@ namespace qpm
                 std::string w;
                 while (iss >> w) raw.push_back(w);
             }
-            std::vector<std::string> merged;
+
+            std::vector<std::string> opMerged;
             for (size_t i = 0; i < raw.size(); ++i)
             {
-                if (raw[i] == "-" && i > 0 && i + 1 < raw.size())
+                if (isBareOperatorToken(raw[i]) && i + 1 < raw.size())
                 {
-                    merged.back() = merged.back() + " - " + raw[i + 1];
+                    opMerged.push_back(raw[i] + raw[i + 1]);
                     ++i;
                 }
                 else
                 {
-                    merged.push_back(raw[i]);
+                    opMerged.push_back(raw[i]);
+                }
+            }
+
+            std::vector<std::string> merged;
+            for (size_t i = 0; i < opMerged.size(); ++i)
+            {
+                if (opMerged[i] == "-" && i > 0 && i + 1 < opMerged.size())
+                {
+                    merged.back() = merged.back() + " - " + opMerged[i + 1];
+                    ++i;
+                }
+                else
+                {
+                    merged.push_back(opMerged[i]);
                 }
             }
             return merged;
