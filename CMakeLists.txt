@@ -42,16 +42,13 @@ if(WIN32)
     target_link_libraries(quantum_stub advapi32)
 endif()
 
-# ── qpm  — standalone npm-compatible package manager ──────────────────────────
-file(GLOB QPM_SOURCES CONFIGURE_DEPENDS "src/qpm/*.cpp")
-add_executable(qpm ${QPM_SOURCES})
+# ── qpm  — standalone npm-compatible package manager (Windows only) ───────────
 if(WIN32)
-    # z: zlib (statically linked via the -static link flag above, same as the
-    #    other 3 targets already get a DLL-free libstdc++/libgcc).
-    # winhttp/crypt32/ws2_32: Windows system DLLs, present on every install —
-    #    linked the same way `advapi32` already is above.
+    file(GLOB QPM_SOURCES CONFIGURE_DEPENDS "src/qpm/*.cpp")
+    add_executable(qpm ${QPM_SOURCES})
     target_link_libraries(qpm z winhttp crypt32 ws2_32)
 endif()
+
 
 message(STATUS "Quantum v2.0.0 — Bytecode VM  (static linking enabled)")
 message(STATUS "  Binaries : quantum  qrun  quantum_stub  qpm")
