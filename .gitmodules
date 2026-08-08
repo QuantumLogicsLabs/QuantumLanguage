@@ -26,3 +26,7 @@
 	path= installer
 	url= https://github.com/QuantumLogicsLabs/quantumlanguage-windowsinstaller.git
 	branch=main
+[submodule "qpmexamples"]
+	path= qpmexamples
+	url= https://github.com/QuantumLogicsLabs/quantumlanguage-windowsinstaller.git
+	branch=main
