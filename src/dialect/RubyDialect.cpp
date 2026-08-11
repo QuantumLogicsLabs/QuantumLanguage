@@ -76,7 +76,8 @@ static const std::set<std::string> &rbZeroArgMethods(bool strict) {
       "resume", "alive", "kill", "shutdown"};
   static const std::set<std::string> mixedNames = {
       "reverse", "chomp", "downcase", "upcase", "dup",
-      "clone",   "to_i",  "to_f",     "to_s",   "chars"};
+      "clone",   "to_i",  "to_f",     "to_s",   "chars",
+      "shift",   "pop",   "empty",    "keys",   "first",  "last"};
   return strict ? strictNames : mixedNames;
 }
 
@@ -519,7 +520,7 @@ static std::string rbQualifySelf(const std::string &expr,
       if (afterSuffix < s.size() &&
           (s[afterSuffix] == '?' || s[afterSuffix] == '!'))
         afterSuffix++;
-      bool hadDotBefore = !out.empty() && out.back() == '.';
+      bool hadDotBefore = !out.empty() && (out.back() == '.' || out.back() == '>' || (out.size() >= 2 && out.substr(out.size() - 2) == "->"));
       bool followedByParen = (afterSuffix < s.size() && s[afterSuffix] == '(');
       if (!hadDotBefore && !followedByParen && st.fields.count(ident))
         out += "self." + ident;
@@ -698,6 +699,23 @@ static std::string rbConvertRanges(std::string line, bool strict = true) {
         "([A-Z][A-Za-z0-9_]*)(?:\\.|::)new\\b(?!\\()");
     line = std::regex_replace(line, mixedNewBareRe, "$1()");
   }
+  // Ruby's namespaced float constants -> Quantum's globals.
+  static const std::regex infinityRe("Float::INFINITY");
+  line = std::regex_replace(line, infinityRe, "INF");
+  static const std::regex nanRe("Float::NAN");
+  line = std::regex_replace(line, nanRe, "NaN");
+  // Ruby's match operator, `str =~ /re/` (and `str !~ /re/`), plus the
+  // capture globals `$1`..`$9`. `=~` becomes a call to the __rx_match native,
+  // which runs the regex and stores each capture group in a `__rx_N` global;
+  // `$N` then reads those. (The `/re/` regex literal is already lexed as a
+  // string, so it passes straight through as the second argument.)
+  static const std::regex notMatchRe("\\b([A-Za-z_@][A-Za-z0-9_$.()\\[\\]>-]*)\\s*!~\\s*(/(?:[^/\\\\]|\\\\.)*/[a-z]*|\"(?:[^\"]|\\\\.)*\")");
+  line = std::regex_replace(line, notMatchRe, "!__rx_match($1, $2)");
+  static const std::regex matchRe("\\b([A-Za-z_@][A-Za-z0-9_$.()\\[\\]>-]*)\\s*=~\\s*(/(?:[^/\\\\]|\\\\.)*/[a-z]*|\"(?:[^\"]|\\\\.)*\")");
+  line = std::regex_replace(line, matchRe, "__rx_match($1, $2)");
+  static const std::regex captureRe("\\$([1-9])");
+  line = std::regex_replace(line, captureRe, "__rx_$1");
+
   if (!strict)
     return line;
   // Ruby's sized-array constructors. These must precede the generic
@@ -840,22 +858,6 @@ static std::string rbConvertRanges(std::string line, bool strict = true) {
       "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
       "(?:\\[[^\\[\\]]*\\])*)\\s*&&=\\s*(.+)$");
   line = std::regex_replace(line, andAssignRe, "$1 = $1 && ($2)");
-  // Ruby's namespaced float constants -> Quantum's globals.
-  static const std::regex infinityRe("Float::INFINITY");
-  line = std::regex_replace(line, infinityRe, "INF");
-  static const std::regex nanRe("Float::NAN");
-  line = std::regex_replace(line, nanRe, "NaN");
-  // Ruby's match operator, `str =~ /re/` (and `str !~ /re/`), plus the
-  // capture globals `$1`..`$9`. `=~` becomes a call to the __rx_match native,
-  // which runs the regex and stores each capture group in a `__rx_N` global;
-  // `$N` then reads those. (The `/re/` regex literal is already lexed as a
-  // string, so it passes straight through as the second argument.)
-  static const std::regex notMatchRe("(\\S+)\\s*!~\\s*(/(?:[^/\\\\]|\\\\.)*/[a-z]*)");
-  line = std::regex_replace(line, notMatchRe, "!__rx_match($1, $2)");
-  static const std::regex matchRe("(\\S+)\\s*=~\\s*(/(?:[^/\\\\]|\\\\.)*/[a-z]*)");
-  line = std::regex_replace(line, matchRe, "__rx_match($1, $2)");
-  static const std::regex captureRe("\\$([1-9])");
-  line = std::regex_replace(line, captureRe, "__rx_$1");
   return line;
 }
 
@@ -1866,7 +1868,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           // The loop modifiers stay Ruby-only: in mixed .sa mode `x; while (c) s`
           // is a legitimate inline C loop, not a `stmt while cond` modifier, so
           // enabling them here would mis-rewrite C/JS code.
-          (strict || (m[2].str() != "while" && m[2].str() != "until")) &&
+          (strict || (m[2].str() != "while" && m[2].str() != "until") || (trimCopy(m[1].str()).back() != ';' && !startsWith(trimCopy(m[3].str()), "("))) &&
           rbFindTopLevel(code, " " + m[2].str() + " ") != std::string::npos &&
           rbFindTopLevel(m[3].str(), " else ") == std::string::npos &&
           // `x = if cond` is an if-*expression*, not a modifier-if:
@@ -2133,7 +2135,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           // The loop modifiers stay Ruby-only: in mixed .sa mode `x; while (c) s`
           // is a legitimate inline C loop, not a `stmt while cond` modifier, so
           // enabling them here would mis-rewrite C/JS code.
-          (strict || (m[2].str() != "while" && m[2].str() != "until")) &&
+          (strict || (m[2].str() != "while" && m[2].str() != "until") || (trimCopy(m[1].str()).back() != ';' && !startsWith(trimCopy(m[3].str()), "("))) &&
           rbFindTopLevel(code, " " + m[2].str() + " ") != std::string::npos &&
           // Python inline ternary (`x = a if cond else b`) also matches
           // this shape — its giveaway is a top-level ` else `, which a
@@ -2212,6 +2214,17 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       RBFrame f{RBFrameKind::Branch, gid, RBTailInfo{}};
       f.assignTarget = carriedTarget;
       stack.push_back(f);
+      continue;
+    }
+    if (code == "}" && stack.size() > 1 &&
+        (stack.back().kind == RBFrameKind::Branch ||
+         stack.back().kind == RBFrameKind::Loop ||
+         stack.back().kind == RBFrameKind::Other)) {
+      RBFrame top = stack.back();
+      stack.pop_back();
+      outLines.push_back(indentation + "}");
+      if (!stack.empty())
+        stack.back().last = RBTailInfo{};
       continue;
     }
     if (code == "end" && stack.size() > 1) {
@@ -2369,6 +2382,15 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
               symbols),
           symbols, strict, inClassBody);
       outLines.push_back(indentation + "while (" + cond + ") {");
+      stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
+      continue;
+    }
+    if (startsWith(code, "for ") &&
+        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
+      std::string rest = trimCopy(code.substr(4));
+      if (!rest.empty() && rest.back() == ':')
+        rest = trimCopy(rest.substr(0, rest.size() - 1));
+      outLines.push_back(indentation + "for " + rest + " {");
       stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
       continue;
     }
@@ -2531,7 +2553,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
 
     std::string prefix, params;
     if (rbTryTrailingDoOpener(code, prefix, params) && !prefix.empty() &&
-        (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
+        (strict || rbUnambiguousAllowingColon(code))) {
       // Multi-line `do` openers bypass transformCore, so the
       // defaulting-hash read rewriting has to be applied here too
       // (e.g. `adj[u].each do |v|`).
