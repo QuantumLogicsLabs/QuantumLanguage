@@ -8,7 +8,7 @@
 	branch = main
 [submodule "examples"]
 	path = examples
-	url = https://github.com/SENODROOM/QuantumLanguageExamples.git
+	url = https://github.com/QuantumLogicsLabs/QuantumLanguageExamples.git
 	branch = main
 [submodule "extensions"]
 	path = extensions
