@@ -9,6 +9,7 @@
 
 #include "QpmResolver.h"
 #include "QpmScripts.h"
+#include "QpmUninstall.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -38,6 +39,7 @@ namespace
             "  qpm install                installs all dependencies from package.json\n"
             "  qpm install <pkg> [...]     adds and installs one or more packages\n"
             "  qpm install --no-dev        skip devDependencies\n"
+            "  qpm uninstall <pkg> [...]   removes one or more packages\n"
             "  qpm run <script>            runs a package.json \"scripts\" entry\n"
             "  qpm start                   shorthand for `qpm run start`\n"
             "  qpm --help                  show this help\n"
@@ -83,6 +85,15 @@ int main(int argc, char *argv[])
                 opts.addPackages.push_back(args[i]);
         }
         return qpm::runInstall(opts);
+    }
+
+    if (args[0] == "uninstall" || args[0] == "un" || args[0] == "remove" || args[0] == "rm")
+    {
+        qpm::UninstallOptions opts;
+        opts.projectDir = cwd;
+        for (size_t i = 1; i < args.size(); ++i)
+            opts.packages.push_back(args[i]);
+        return qpm::runUninstall(opts);
     }
 
     if (args[0] == "run")
