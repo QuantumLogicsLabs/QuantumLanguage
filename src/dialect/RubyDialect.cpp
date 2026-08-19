@@ -756,6 +756,10 @@ static std::string rbConvertRanges(std::string line, bool strict = true) {
   line = std::regex_replace(line, lambdaParamsRe, "fn($1) {");
   static const std::regex lambdaNoParamsRe("->\\s*\\{");
   line = std::regex_replace(line, lambdaNoParamsRe, "fn() {");
+  static const std::regex lambdaPipeRe("\\blambda\\s*\\|([^|]*)\\|\\s*\\{");
+  line = std::regex_replace(line, lambdaPipeRe, "fn($1) {");
+  static const std::regex inlineBraceBlockRe("\\{\\s*\\|([^|]*)\\|");
+  line = std::regex_replace(line, inlineBraceBlockRe, "fn($1) {");
   // Ruby's old-style hash-rocket literal (`{ key => value }`) -> Quantum's
   // `key: value` dict syntax. `rescue X => e` is handled by its own
   // dedicated whole-line match before this ever runs, so it never reaches
@@ -2385,7 +2389,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
       stack.push_back(RBFrame{RBFrameKind::Loop, -1, RBTailInfo{}});
       continue;
     }
-    if (startsWith(code, "for ") &&
+    if (startsWith(code, "for ") && (code.empty() || code.back() != '{') &&
         (strict || (rbUnambiguousAllowingColon(code) && rbHasMatchingEnd(rawLines, li)))) {
       std::string rest = trimCopy(code.substr(4));
       if (!rest.empty() && rest.back() == ':')
@@ -2611,11 +2615,15 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           rbApplyBlockDestructuring(convertedPrefix, params);
       // Same statement-start array-literal ambiguity guard as in
       // transformCore (`["a","b"].each do |x|`) — mixed mode too.
-      if (!convertedPrefix.empty() && convertedPrefix[0] == '[') {
-        size_t close = rbMatchBracket(convertedPrefix, 0);
-        if (close != std::string::npos && close + 1 < convertedPrefix.size() &&
-            convertedPrefix[close + 1] == '.')
-          convertedPrefix = "(" + convertedPrefix.substr(0, close + 1) + ")" + convertedPrefix.substr(close + 1);
+      if (!convertedPrefix.empty() && convertedPrefix[0] == '[' &&
+          !outLines.empty() && !outLines.back().empty()) {
+        char lastChar = outLines.back().back();
+        if (lastChar != ';' && lastChar != '{' && lastChar != '}') {
+          size_t close = rbMatchBracket(convertedPrefix, 0);
+          if (close != std::string::npos && close + 1 < convertedPrefix.size() &&
+              convertedPrefix[close + 1] == '.')
+            convertedPrefix = ";" + convertedPrefix;
+        }
       }
       outLines.push_back(indentation +
                          rbBuildBlockOpenText(convertedPrefix, params));

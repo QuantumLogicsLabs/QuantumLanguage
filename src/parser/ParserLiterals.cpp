@@ -1118,17 +1118,20 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
                                       tokens[la + 1].type == TokenType::LT))))
         la++;
       if (la < tokens.size() && tokens[la].type == TokenType::LT) {
-        int tdepth = 0;
+        int tdepth = 0, pdepth = 0;
         while (la < tokens.size()) {
           if (tokens[la].type == TokenType::LT)
             tdepth++;
-          else if (tokens[la].type == TokenType::GT) {
+          else if (tokens[la].type == TokenType::GT && pdepth == 0) {
             tdepth--;
             if (tdepth <= 0) {
               la++;
               break;
             }
-          }
+          } else if (tokens[la].type == TokenType::LPAREN)
+            pdepth++;
+          else if (tokens[la].type == TokenType::RPAREN && pdepth > 0)
+            pdepth--;
           la++;
         }
         while (la < tokens.size() && (tokens[la].type == TokenType::BIT_AND ||
@@ -1144,17 +1147,20 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
         // Skip template arguments: unique_ptr<int[]>, shared_ptr<Foo>, etc.
         if (check(TokenType::LT)) {
           consume(); // eat '<'
-          int tdepth = 1;
+          int tdepth = 1, pdepth = 0;
           while (!atEnd() && tdepth > 0) {
             if (check(TokenType::LT))
               tdepth++;
-            else if (check(TokenType::GT))
+            else if (check(TokenType::GT) && pdepth == 0)
               tdepth--;
-            else if (check(TokenType::RSHIFT)) {
+            else if (check(TokenType::RSHIFT) && pdepth == 0) {
               tdepth -= 2;
               consume();
               continue;
-            }
+            } else if (check(TokenType::LPAREN))
+              pdepth++;
+            else if (check(TokenType::RPAREN) && pdepth > 0)
+              pdepth--;
             consume();
           }
         }
@@ -1204,8 +1210,8 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
       if (outIsRef)
         outIsRef->push_back(isRef);
     } else if (check(TokenType::COMMA) || check(TokenType::RPAREN) ||
-               check(TokenType::GT)) {
-      // Unnamed parameter: e.g. void foo(int*, int) — just skip, no name to
+               check(TokenType::GT) || check(TokenType::ASSIGN)) {
+      // Unnamed parameter: e.g. void foo(int*, int) or void foo(int = 16) — just skip, no name to
       // bind Generate a placeholder name so param count stays consistent
       params.push_back("__unnamed_" + std::to_string(params.size()));
       if (outIsRef)
