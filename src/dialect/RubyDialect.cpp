@@ -2611,12 +2611,11 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           rbApplyBlockDestructuring(convertedPrefix, params);
       // Same statement-start array-literal ambiguity guard as in
       // transformCore (`["a","b"].each do |x|`) — mixed mode too.
-      if (!convertedPrefix.empty() && convertedPrefix[0] == '[' &&
-          previousLineCanContinueExpression()) {
+      if (!convertedPrefix.empty() && convertedPrefix[0] == '[') {
         size_t close = rbMatchBracket(convertedPrefix, 0);
         if (close != std::string::npos && close + 1 < convertedPrefix.size() &&
             convertedPrefix[close + 1] == '.')
-          convertedPrefix = ";" + convertedPrefix;
+          convertedPrefix = "(" + convertedPrefix.substr(0, close + 1) + ")" + convertedPrefix.substr(close + 1);
       }
       outLines.push_back(indentation +
                          rbBuildBlockOpenText(convertedPrefix, params));
