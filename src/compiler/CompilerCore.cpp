@@ -270,6 +270,8 @@ void Compiler::compileExpr(ASTNode &node) {
           compileArrow(n, ln);
         else if constexpr (std::is_same_v<T, ReturnStmt>)
           compileReturn(n, ln);
+        else if constexpr (std::is_same_v<T, RaiseStmt>)
+          compileRaise(n, ln);
         else
           throw std::runtime_error("Compiler: unhandled expression node");
       },

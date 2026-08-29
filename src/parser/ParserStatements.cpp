@@ -7,29 +7,50 @@ ASTNodePtr Parser::parseStatement()
 {
     skipNewlines();
 
-    // Skip Python-style decorators (e.g. @property, @dataclass)
+    // Skip Python-style decorators (e.g. @property, @dataclass) only when followed by def/class/fn
     while (check(TokenType::DECORATOR))
     {
-        consume(); // eat @
-        if (check(TokenType::IDENTIFIER))
+        size_t la = pos + 1;
+        if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER)
         {
-            consume(); // eat decorator name
-            // Optional call parens e.g. @decorator(args)
-            if (check(TokenType::LPAREN))
+            la++;
+            if (la < tokens.size() && tokens[la].type == TokenType::LPAREN)
             {
-                consume(); // eat (
                 int depth = 1;
-                while (!atEnd() && depth > 0)
+                la++;
+                while (la < tokens.size() && depth > 0)
                 {
-                    if (check(TokenType::LPAREN))
-                        depth++;
-                    else if (check(TokenType::RPAREN))
-                        depth--;
-                    consume();
+                    if (tokens[la].type == TokenType::LPAREN) depth++;
+                    else if (tokens[la].type == TokenType::RPAREN) depth--;
+                    la++;
                 }
             }
+            while (la < tokens.size() && tokens[la].type == TokenType::NEWLINE)
+                la++;
+            if (la < tokens.size() && (tokens[la].type == TokenType::DEF ||
+                                       tokens[la].type == TokenType::CLASS ||
+                                       tokens[la].type == TokenType::FN ||
+                                       tokens[la].type == TokenType::FUNCTION ||
+                                       tokens[la].type == TokenType::DECORATOR))
+            {
+                consume(); // eat @
+                consume(); // eat decorator name
+                if (check(TokenType::LPAREN))
+                {
+                    consume(); // eat (
+                    int depth = 1;
+                    while (!atEnd() && depth > 0)
+                    {
+                        if (check(TokenType::LPAREN)) depth++;
+                        else if (check(TokenType::RPAREN)) depth--;
+                        consume();
+                    }
+                }
+                skipNewlines();
+                continue;
+            }
         }
-        skipNewlines();
+        break;
     }
 
     int ln = current().line;
@@ -1143,6 +1164,8 @@ ASTNodePtr Parser::parseFunctionDecl()
     }
 
     match(TokenType::COLON); // optional Python-style colon
+    if (check(TokenType::IDENTIFIER) && current().value == "async")
+        consume(); // eat async modifier
     // C++ constructor initializer list: skip  member(val), member2(val2)  before body
     if (check(TokenType::IDENTIFIER))
     {

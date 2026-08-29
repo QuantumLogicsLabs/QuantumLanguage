@@ -207,8 +207,80 @@ ASTNodePtr Parser::parsePrimary() {
     }
     return parseArrayLiteral();
   }
-  if (tok.type == TokenType::LBRACE)
+  if (tok.type == TokenType::LBRACE) {
+    if (pos + 1 < tokens.size() &&
+        (tokens[pos + 1].type == TokenType::BIT_OR ||
+         (tokens[pos + 1].type == TokenType::IDENTIFIER &&
+          pos + 2 < tokens.size() &&
+          tokens[pos + 2].type == TokenType::BIT_OR))) {
+      int ln = tok.line;
+      consume(); // eat '{'
+      if (check(TokenType::BIT_OR))
+        consume(); // eat '|'
+      std::vector<std::string> params;
+      while (!check(TokenType::BIT_OR) && !check(TokenType::RBRACE) &&
+             !atEnd()) {
+        if (check(TokenType::IDENTIFIER)) {
+          params.push_back(consume().value);
+        } else if (!match(TokenType::COMMA)) {
+          break;
+        }
+      }
+      match(TokenType::BIT_OR); // eat closing '|'
+      skipNewlines();
+      BlockStmt block;
+      while (!check(TokenType::RBRACE) && !atEnd()) {
+        block.statements.push_back(parseStatement());
+        skipNewlines();
+      }
+      expect(TokenType::RBRACE, "Expected '}'");
+      LambdaExpr le;
+      le.params = std::move(params);
+      le.body = std::make_unique<ASTNode>(std::move(block), ln);
+      return std::make_unique<ASTNode>(std::move(le), ln);
+    }
     return parseDictLiteral();
+  }
+
+  if (tok.type == TokenType::DECORATOR) {
+    int ln = tok.line;
+    consume(); // eat '@'
+    if (check(TokenType::IDENTIFIER)) {
+      std::string name = consume().value;
+      MemberExpr me;
+      me.object = std::make_unique<ASTNode>(Identifier{"self"}, ln);
+      me.member = name;
+      return std::make_unique<ASTNode>(std::move(me), ln);
+    }
+    throw ParseError("Expected identifier after '@'", current().line,
+                     current().col);
+  }
+
+  if (tok.type == TokenType::ARROW && pos + 1 < tokens.size() &&
+      tokens[pos + 1].type == TokenType::LPAREN) {
+    int ln = tok.line;
+    consume(); // eat '->'
+    std::vector<ASTNodePtr> defaultArgs;
+    std::vector<std::string> paramTypes;
+    auto params = parseParamList(nullptr, &defaultArgs, &paramTypes);
+    skipNewlines();
+    auto body = (check(TokenType::LBRACE) || check(TokenType::INDENT))
+                    ? parseBlock()
+                    : parseExpr();
+    LambdaExpr le;
+    le.params = std::move(params);
+    le.paramTypes = std::move(paramTypes);
+    le.defaultArgs = std::move(defaultArgs);
+    le.body = std::move(body);
+    return std::make_unique<ASTNode>(std::move(le), ln);
+  }
+
+  if (tok.type == TokenType::RAISE) {
+    int ln = tok.line;
+    consume(); // eat 'raise'
+    auto expr = parseExpr();
+    return std::make_unique<ASTNode>(RaiseStmt{std::move(expr)}, ln);
+  }
 
   if (tok.type == TokenType::RETURN) {
     consume();                // eat 'return'
@@ -272,6 +344,7 @@ ASTNodePtr Parser::parsePrimary() {
         skipNewlines();
       }
       expect(TokenType::RPAREN, "Expected ')'");
+      skipNewlines();
       return parseArrowFunction(std::move(arrowParams), ln);
     }
 
@@ -742,7 +815,8 @@ ASTNodePtr Parser::parseDictLiteral() {
         // Map to dict with value "true" for membership testing
         val = std::make_unique<ASTNode>(BoolLiteral{true}, ln);
       } else {
-        expect(TokenType::COLON, "Expected ':'");
+        if (!match(TokenType::COLON))
+          expect(TokenType::FAT_ARROW, "Expected ':' or '=>'");
         skipNewlines();
         val = parseExpr();
       }
@@ -762,16 +836,28 @@ ASTNodePtr Parser::parseDictLiteral() {
 }
 
 ASTNodePtr Parser::parseLambda() {
-  // Called after consuming fn / function / def keyword (anonymous form)
+  // Called after consuming fn / function / def keyword (anonymous form or named
+  // expression)
   int ln = current().line;
+  std::string funcName;
+  if (check(TokenType::IDENTIFIER) && pos + 1 < tokens.size() &&
+      tokens[pos + 1].type == TokenType::LPAREN) {
+    funcName = consume().value;
+  }
   std::vector<ASTNodePtr> defaultArgs;
   std::vector<std::string> paramTypes;
   auto params = parseParamList(nullptr, &defaultArgs, &paramTypes);
-  match(TokenType::COLON); // Python: def style
-  if (!match(TokenType::FAT_ARROW))
-    match(TokenType::ARROW); // JS => or Quantum ->
+  if (!match(TokenType::COLON)) {
+    if (!match(TokenType::FAT_ARROW))
+      match(TokenType::ARROW); // JS => or Quantum ->
+  }
   skipNewlines();
-  auto body = parseBlock();
+  ASTNodePtr body;
+  if (check(TokenType::LBRACE) || check(TokenType::INDENT)) {
+    body = parseBlock();
+  } else {
+    body = parseStatement();
+  }
   LambdaExpr le;
   le.params = std::move(params);
   le.paramTypes = std::move(paramTypes);
@@ -840,7 +926,8 @@ std::vector<ASTNodePtr> Parser::parseArgList() {
       continue;
     }
 
-    // keyword argument: name=expr — preserve as AssignExpr so **kwargs detection works
+    // keyword argument: name=expr — preserve as AssignExpr so **kwargs
+    // detection works
     if (check(TokenType::IDENTIFIER)) {
       size_t la = pos + 1;
       while (la < tokens.size() && tokens[la].type == TokenType::NEWLINE)
@@ -948,9 +1035,14 @@ std::vector<std::string>
 Parser::parseParamList(std::vector<bool> *outIsRef,
                        std::vector<ASTNodePtr> *outDefaultArgs,
                        std::vector<std::string> *outParamTypes) {
-  expect(TokenType::LPAREN, "Expected '('");
+  TokenType closingTok = TokenType::RPAREN;
+  if (match(TokenType::BIT_OR)) {
+    closingTok = TokenType::BIT_OR;
+  } else {
+    expect(TokenType::LPAREN, "Expected '('");
+  }
   std::vector<std::string> params;
-  while (!check(TokenType::RPAREN) && !atEnd()) {
+  while (!check(closingTok) && !atEnd()) {
     // C++ style: "const" modifier before type
     if (check(TokenType::CONST))
       consume(); // eat const
@@ -958,12 +1050,30 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
     bool hasCType = false;
     while ((isCTypeKeyword(current().type) || check(TokenType::CONST)) &&
            pos + 1 < tokens.size() &&
-           (isCTypeKeyword(tokens[pos + 1].type) || tokens[pos + 1].type == TokenType::IDENTIFIER ||
-            tokens[pos + 1].type == TokenType::STAR || tokens[pos + 1].type == TokenType::BIT_AND)) {
+           (isCTypeKeyword(tokens[pos + 1].type) ||
+            tokens[pos + 1].type == TokenType::IDENTIFIER ||
+            tokens[pos + 1].type == TokenType::STAR ||
+            tokens[pos + 1].type == TokenType::BIT_AND)) {
       consume(); // eat return/param type keyword or const
       hasCType = true;
     }
     if (hasCType) {
+      if (check(TokenType::LT)) {
+        consume(); // eat '<'
+        int tdepth = 1;
+        while (!atEnd() && tdepth > 0) {
+          if (check(TokenType::LT))
+            tdepth++;
+          else if (check(TokenType::GT))
+            tdepth--;
+          else if (check(TokenType::RSHIFT)) {
+            tdepth -= 2;
+            consume();
+            continue;
+          }
+          consume();
+        }
+      }
       while (check(TokenType::STAR) || check(TokenType::BIT_AND)) {
         consume(); // eat pointer/ref qualifier on type
       }
@@ -1000,26 +1110,57 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
       }
       while (la < tokens.size() && (tokens[la].type == TokenType::BIT_AND ||
                                     tokens[la].type == TokenType::STAR ||
-                                    tokens[la].type == TokenType::CONST))
+                                    tokens[la].type == TokenType::CONST ||
+                                    tokens[la].type == TokenType::COLON ||
+                                    (tokens[la].type == TokenType::IDENTIFIER &&
+                                     la + 1 < tokens.size() &&
+                                     (tokens[la + 1].type == TokenType::COLON ||
+                                      tokens[la + 1].type == TokenType::LT))))
         la++;
+      if (la < tokens.size() && tokens[la].type == TokenType::LT) {
+        int tdepth = 0, pdepth = 0;
+        while (la < tokens.size()) {
+          if (tokens[la].type == TokenType::LT)
+            tdepth++;
+          else if (tokens[la].type == TokenType::GT && pdepth == 0) {
+            tdepth--;
+            if (tdepth <= 0) {
+              la++;
+              break;
+            }
+          } else if (tokens[la].type == TokenType::LPAREN)
+            pdepth++;
+          else if (tokens[la].type == TokenType::RPAREN && pdepth > 0)
+            pdepth--;
+          la++;
+        }
+        while (la < tokens.size() && (tokens[la].type == TokenType::BIT_AND ||
+                                      tokens[la].type == TokenType::STAR ||
+                                      tokens[la].type == TokenType::CONST))
+          la++;
+      }
       if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER) {
         std::string tName =
-            consume().value; // eat type name (e.g. "Entity", "Room", "Cell",
-                             // "string", "unique_ptr")
+            consume().value; // eat first identifier (e.g. "std")
+        while (check(TokenType::COLON) || check(TokenType::IDENTIFIER))
+          tName += consume().value;
         // Skip template arguments: unique_ptr<int[]>, shared_ptr<Foo>, etc.
         if (check(TokenType::LT)) {
           consume(); // eat '<'
-          int tdepth = 1;
+          int tdepth = 1, pdepth = 0;
           while (!atEnd() && tdepth > 0) {
             if (check(TokenType::LT))
               tdepth++;
-            else if (check(TokenType::GT))
+            else if (check(TokenType::GT) && pdepth == 0)
               tdepth--;
-            else if (check(TokenType::RSHIFT)) {
+            else if (check(TokenType::RSHIFT) && pdepth == 0) {
               tdepth -= 2;
               consume();
               continue;
-            }
+            } else if (check(TokenType::LPAREN))
+              pdepth++;
+            else if (check(TokenType::RPAREN) && pdepth > 0)
+              pdepth--;
             consume();
           }
         }
@@ -1063,12 +1204,14 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
     } else if (check(TokenType::INPUT) || check(TokenType::PRINT) ||
                check(TokenType::COUT) || check(TokenType::CIN) ||
                isCTypeKeyword(current().type)) {
-      // keyword tokens used as param names: e.g. void foo(int input, int* cout, long n)
+      // keyword tokens used as param names: e.g. void foo(int input, int* cout,
+      // long n)
       params.push_back(consume().value);
       if (outIsRef)
         outIsRef->push_back(isRef);
-    } else if (check(TokenType::COMMA) || check(TokenType::RPAREN)) {
-      // Unnamed parameter: e.g. void foo(int*, int) — just skip, no name to
+    } else if (check(TokenType::COMMA) || check(TokenType::RPAREN) ||
+               check(TokenType::GT) || check(TokenType::ASSIGN)) {
+      // Unnamed parameter: e.g. void foo(int*, int) or void foo(int = 16) — just skip, no name to
       // bind Generate a placeholder name so param count stays consistent
       params.push_back("__unnamed_" + std::to_string(params.size()));
       if (outIsRef)
@@ -1127,7 +1270,8 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
     if (!match(TokenType::COMMA))
       break;
   }
-  expect(TokenType::RPAREN, "Expected ')'");
+  expect(closingTok,
+         closingTok == TokenType::BIT_OR ? "Expected '|'" : "Expected ')'");
   return params;
 }
 

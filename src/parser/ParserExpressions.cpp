@@ -432,7 +432,11 @@ ASTNodePtr Parser::parsePostfix()
                 consume(); // eat second :
                 std::string mem;
                 if (!atEnd() && current().type != TokenType::NEWLINE && current().type != TokenType::SEMICOLON)
+                {
                     mem = consume().value;
+                    while (!atEnd() && (check(TokenType::IDENTIFIER) || check(TokenType::THIS) || isCTypeKeyword(current().type)))
+                        mem += consume().value;
+                }
                 if (check(TokenType::LPAREN))
                 {
                     auto args = parseArgList();
