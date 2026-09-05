@@ -1,3 +1,4 @@
+#include "ModuleResolver.h"
 #include "Pipeline.h"
 #include "Lexer.h"
 #include "Parser.h"
@@ -20,6 +21,8 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
     auto tokens = lexer.tokenize();
     Parser parser(std::move(tokens));
     auto ast = parser.parse();
+
+    resolveImports(*ast, sourcePath);
 
     try
     {

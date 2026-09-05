@@ -42,6 +42,7 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords = {
     {"cin", TokenType::CIN},
     {"import", TokenType::IMPORT},
     {"from", TokenType::FROM},
+    {"export", TokenType::EXPORT},
     {"true", TokenType::BOOL_TRUE},
     {"True", TokenType::BOOL_TRUE}, // Python
     {"false", TokenType::BOOL_FALSE},

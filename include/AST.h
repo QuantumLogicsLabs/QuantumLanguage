@@ -139,6 +139,7 @@ struct VarDecl
     ASTNodePtr initializer; // may be null
     std::string typeHint;   // e.g. "int", "float", "char", "" = none
     bool isPointer = false; // int* p = ...
+    bool isExported = false;
 };
 
 struct FunctionDecl
@@ -150,6 +151,7 @@ struct FunctionDecl
     std::vector<ASTNodePtr> defaultArgs;
     std::string returnType;              // NEW: fn name(...) -> int
     ASTNodePtr body;              // BlockStmt
+    bool isExported = false;
 };
 
 struct ReturnStmt
