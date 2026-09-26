@@ -578,6 +578,18 @@ ASTNodePtr Parser::parsePrimary() {
     break;
   }
 
+  // `raise`/`throw` in expression position (C++'s `c ? x : throw e`, or
+  // `a / b if b != 0 else raise ZeroDivisionError`): raises when evaluated.
+  if (tok.type == TokenType::RAISE) {
+    consume();
+    ASTNodePtr val;
+    if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) &&
+        !check(TokenType::RBRACE) && !check(TokenType::RPAREN) &&
+        !check(TokenType::COMMA) && !atEnd())
+      val = parseExpr();
+    return std::make_unique<ASTNode>(RaiseStmt{std::move(val)}, ln);
+  }
+
   throw ParseError("Unexpected token: '" + tok.value + "'", tok.line, tok.col);
 }
 
@@ -969,6 +981,27 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
       }
     }
 
+    // `std::function<void(int)> cb` — with the `std::` qualifier dropped by
+    // the lexer, the type name arrives as the `function` keyword. Skip it and
+    // its template arguments.
+    if (check(TokenType::FUNCTION) && pos + 1 < tokens.size() &&
+        tokens[pos + 1].type == TokenType::LT) {
+      consume(); // eat 'function'
+      consume(); // eat '<'
+      int tdepth = 1;
+      while (!atEnd() && tdepth > 0) {
+        if (check(TokenType::LT))
+          tdepth++;
+        else if (check(TokenType::GT))
+          tdepth--;
+        else if (check(TokenType::RSHIFT))
+          tdepth -= 2;
+        consume();
+      }
+      while (check(TokenType::STAR) || check(TokenType::CONST))
+        consume();
+    }
+
     // C++ style: identifier type before name (e.g. "string name", "Entity *m",
     // "Room &r") Detect: IDENTIFIER followed by (BIT_AND or STAR or IDENTIFIER)
     // — means it's a type name
@@ -1023,6 +1056,10 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
             consume();
           }
         }
+        // A `*` after the type name is a pointer qualifier (`TreeNode* node`),
+        // not a Python `*args` marker; `&` is left for the ref check below.
+        while (check(TokenType::STAR) || check(TokenType::CONST))
+          consume();
         // Store C++ type name if needed
       }
     }

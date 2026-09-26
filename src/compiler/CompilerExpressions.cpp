@@ -324,9 +324,30 @@ void Compiler::compileCall(CallExpr &e, int line)
         return 1;
     };
 
+    // `f(*args)` forwarding a Python `*args` parameter spreads it into the
+    // call. The parser reads that `*` as a C dereference, so it is recognised
+    // by name: only a declared vararg parameter qualifies, which leaves C's
+    // `f(*ptr)` a dereference.
+    auto isVarargSplat = [&](ASTNode &arg) -> bool
+    {
+        if (!arg.is<DerefExpr>() || !arg.as<DerefExpr>().operand->is<Identifier>())
+            return false;
+        const std::string starred = "*" + arg.as<DerefExpr>().operand->as<Identifier>().name;
+        for (CompilerState *st = current_; st; st = st->enclosing)
+            for (auto &p : st->chunk->params)
+                if (p == starred)
+                    return true;
+        return false;
+    };
+
     bool hasSpread = false;
     for (auto &arg : e.args)
     {
+        if (isVarargSplat(*arg))
+        {
+            hasSpread = true;
+            break;
+        }
         if (arg->is<UnaryExpr>())
         {
             const auto &unary = arg->as<UnaryExpr>();
@@ -345,11 +366,14 @@ void Compiler::compileCall(CallExpr &e, int line)
         emit(Op::MAKE_ARRAY, 0, line);
         for (auto &arg : e.args)
         {
-            bool isSpread = arg->is<UnaryExpr>() &&
-                            (arg->as<UnaryExpr>().op == "..." || arg->as<UnaryExpr>().op == "**");
+            bool isSplat = isVarargSplat(*arg);
+            bool isSpread = isSplat || (arg->is<UnaryExpr>() &&
+                                        (arg->as<UnaryExpr>().op == "..." || arg->as<UnaryExpr>().op == "**"));
             emit(Op::LOAD_GLOBAL, addStr(isSpread ? "__array_extend__" : "__listcomp_push__"), line);
             emit(Op::SWAP, 0, line);
-            if (isSpread)
+            if (isSplat)
+                compileExpr(*arg->as<DerefExpr>().operand);
+            else if (isSpread)
                 compileExpr(*arg->as<UnaryExpr>().operand);
             else
                 emitArgValues(*arg);

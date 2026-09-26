@@ -173,7 +173,13 @@ namespace qpm
             if (it != st.metaCache.end())
                 return &it->second;
 
-            std::string url = "https://registry.npmjs.org/" + urlEncodeComponent(name);
+            const char *regEnv = std::getenv("QPM_REGISTRY");
+            std::string registryBase = (regEnv && *regEnv) ? std::string(regEnv) : "http://localhost:8000/api/registry/";
+            if (registryBase.back() != '/')
+            {
+                registryBase += "/";
+            }
+            std::string url = registryBase + urlEncodeComponent(name);
             HttpResponse resp = httpGet(url, "application/vnd.npm.install-v1+json");
             if (!resp.ok())
             {

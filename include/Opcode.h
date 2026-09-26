@@ -116,6 +116,9 @@ enum class Op : uint8_t
     SET_INDEX_COMPOUND, // obj[key] = value where stack is [obj, key, value]
     SWAP,  // swap top two
     NOP,
+
+    // Default parameters
+    ARG_PASSED, // push whether the caller supplied argument slot[operand]
 };
 
 // ─── Instruction ─────────────────────────────────────────────────────────────

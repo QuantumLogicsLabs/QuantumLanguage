@@ -8,6 +8,8 @@
 std::vector<Token> Lexer::tokenize()
 {
     std::vector<Token> rawTokens;
+    // Index of the token that directly follows a dropped "std::" qualifier.
+    size_t afterStdQualifier = std::string::npos;
 
     while (pos < src.size())
     {
@@ -431,14 +433,18 @@ std::vector<Token> Lexer::tokenize()
         case ':':
             if (current() == ':' &&
                 !rawTokens.empty() && rawTokens.back().type == TokenType::IDENTIFIER &&
-                rawTokens.back().value == "std")
+                (rawTokens.back().value == "std" ||
+                 rawTokens.size() - 1 == afterStdQualifier))
             {
                 // C++ scope resolution "std::" — drop the qualifier so
-                // std::cout / std::string lex as plain cout / string.
-                // Only "std" is treated this way: a bare "ident::" must stay
-                // two COLONs so Python slices like a[i::2] keep working.
+                // std::cout / std::string lex as plain cout / string, along
+                // with nested namespaces right after it (std::chrono::,
+                // std::this_thread::). Only a chain rooted at "std" is treated
+                // this way: a bare "ident::" must stay two COLONs so Python
+                // slices like a[i::2] keep working.
                 advance();
                 rawTokens.pop_back();
+                afterStdQualifier = rawTokens.size();
             }
             else
                 rawTokens.emplace_back(TokenType::COLON, ":", startLine, startCol);

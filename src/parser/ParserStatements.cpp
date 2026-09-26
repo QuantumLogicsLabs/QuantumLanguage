@@ -44,6 +44,18 @@ ASTNodePtr Parser::parseStatement()
     }
     switch (current().type)
     {
+    case TokenType::EXPORT:
+    {
+    consume(); // eat 'export'
+    ASTNodePtr decl = parseStatement(); // parse the function/let/const that follows
+    if (decl->is<FunctionDecl>())
+        decl->as<FunctionDecl>().isExported = true;
+    else if (decl->is<VarDecl>())
+        decl->as<VarDecl>().isExported = true;
+    else
+        throw ParseError("`export` can only be used before a function or variable declaration", ln, current().col);
+    return decl;
+    }
     case TokenType::LET:
     {
         consume();
@@ -1730,7 +1742,8 @@ ASTNodePtr Parser::parseClassDecl()
             }
 
             std::vector<bool> methodParamIsRef;
-            auto params = parseParamList(&methodParamIsRef);
+            std::vector<ASTNodePtr> methodDefaultArgs;
+            auto params = parseParamList(&methodParamIsRef, &methodDefaultArgs);
 
             // Skip trailing C++ const: method() const { }
             if (check(TokenType::CONST))
@@ -1869,6 +1882,7 @@ ASTNodePtr Parser::parseClassDecl()
             methodFd.name = methodName;
             methodFd.params = std::move(params);
             methodFd.paramIsRef = std::move(methodParamIsRef);
+            methodFd.defaultArgs = std::move(methodDefaultArgs);
             methodFd.body = std::move(body);
             auto fn = std::make_unique<ASTNode>(std::move(methodFd), ln);
 

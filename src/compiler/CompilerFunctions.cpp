@@ -29,17 +29,17 @@ std::shared_ptr<Chunk> Compiler::compileFunction(
 
   for (size_t i = 0; i < defaultArgs.size(); ++i) {
     if (defaultArgs[i]) {
-      emit(Op::LOAD_LOCAL, static_cast<int32_t>(i), line);
-      emit(Op::LOAD_NIL, 0, line);
-      emit(Op::EQ, 0, line);
-      size_t jumpIfFalse = emitJump(Op::JUMP_IF_FALSE, line);
-      emit(Op::POP, 0, line); // pop true
+      // Only an argument the caller omitted takes the default; an explicit
+      // nil is a real value (`inorder(node.left, acc)` with a nil child).
+      emit(Op::ARG_PASSED, static_cast<int32_t>(i), line);
+      size_t jumpIfPassed = emitJump(Op::JUMP_IF_TRUE, line);
+      emit(Op::POP, 0, line); // pop false
       compileExpr(*defaultArgs[i]);
       emit(Op::STORE_LOCAL, static_cast<int32_t>(i), line);
       emit(Op::POP, 0, line); // pop assigned value
       size_t jumpEnd = emitJump(Op::JUMP, line);
-      patchJump(jumpIfFalse);
-      emit(Op::POP, 0, line); // pop false
+      patchJump(jumpIfPassed);
+      emit(Op::POP, 0, line); // pop true
       patchJump(jumpEnd);
     }
   }

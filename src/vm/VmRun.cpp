@@ -93,6 +93,9 @@ void VM::runFrame(size_t stopDepth)
         }
         case Op::NOP:
             break;
+        case Op::ARG_PASSED:
+            push(QuantumValue(instr.operand < frame.argCount));
+            break;
 
         // ── Globals ───────────────────────────────────────────────────────
         case Op::DEFINE_GLOBAL:

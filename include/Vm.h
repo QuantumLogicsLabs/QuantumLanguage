@@ -38,6 +38,7 @@ struct CallFrame
     std::shared_ptr<Closure> closure;
     size_t ip;        // instruction pointer
     size_t stackBase; // where locals start on the value stack
+    int argCount = 0; // arguments the caller actually supplied (incl. self)
 };
 
 // ─── ExceptionHandler ─────────────────────────────────────────────────────────

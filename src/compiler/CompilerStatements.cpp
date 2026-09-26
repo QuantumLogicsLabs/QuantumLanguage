@@ -130,11 +130,15 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
         // "this" references are resolved to "self" by emitLoad/emitStore.
         std::vector<std::string> methodParams;
         std::vector<bool> methodRefs;
+        // Default values are indexed by parameter slot, so they shift along
+        // with the parameters when an implicit `self` is prepended.
+        std::vector<ASTNodePtr> methodDefaults;
         size_t startIndex = 0;
         if (fd.params.empty() || (fd.params[0] != "self" && fd.params[0] != "this"))
         {
             methodParams.push_back("self");
             methodRefs.push_back(false);
+            methodDefaults.push_back(nullptr);
         }
         else
         {
@@ -147,8 +151,13 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
             methodParams.push_back(fd.params[i]);
             methodRefs.push_back(i < fd.paramIsRef.size() ? fd.paramIsRef[i] : false);
         }
+        for (auto &d : fd.defaultArgs)
+            methodDefaults.push_back(std::move(d));
 
-        auto fnChunk = compileFunction(fd.name, methodParams, methodRefs, fd.defaultArgs, fd.body.get(), method->line);
+        auto fnChunk = compileFunction(fd.name, methodParams, methodRefs, methodDefaults, fd.body.get(), method->line);
+        // Hand the default expressions back to the AST node that owns them.
+        for (size_t i = 0; i < fd.defaultArgs.size(); ++i)
+            fd.defaultArgs[i] = std::move(methodDefaults[methodDefaults.size() - fd.defaultArgs.size() + i]);
         auto closureTpl = std::make_shared<Closure>(fnChunk);
         emit(Op::LOAD_CONST, addConst(QuantumValue(closureTpl)), method->line);
         // A method body may itself contain a nested closure capturing the

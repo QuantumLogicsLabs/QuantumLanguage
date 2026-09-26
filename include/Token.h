@@ -45,6 +45,7 @@ enum class TokenType
     CIN,  // cin
     FROM,
     IMPORT,
+    EXPORT,
     // C/C++ style type keywords
     TYPE_INT,
     TYPE_FLOAT,
