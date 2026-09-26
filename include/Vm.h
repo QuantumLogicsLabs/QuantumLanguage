@@ -10,15 +10,40 @@
 #include <string>
 
 // ─── Upvalue (heap cell for captured variables) ───────────────────────────────
+// While the captured variable is still live, the upvalue refers to its stack
+// slot by index — never by address: the stack is a std::deque, and inserting
+// into its middle (a bound method call slots `self` in under the arguments)
+// invalidates every element reference. Once the variable leaves the stack
+// the upvalue is closed and owns the value.
 struct Upvalue
 {
-    std::shared_ptr<QuantumValue> cell; // points to the live value
-    QuantumValue closed;                // storage after variable leaves stack
+    std::deque<QuantumValue> *stack = nullptr; // non-null while open
+    size_t index = 0;                           // stack slot while open
+    QuantumValue closed;                        // the value once closed
 
-    explicit Upvalue(std::shared_ptr<QuantumValue> c) : cell(c) {}
+    Upvalue(std::deque<QuantumValue> *s, size_t i) : stack(s), index(i) {}
 
-    QuantumValue get() const { return *cell; }
-    void set(QuantumValue v) { *cell = std::move(v); }
+    QuantumValue get() const
+    {
+        if (!stack)
+            return closed;
+        return index < stack->size() ? (*stack)[index] : QuantumValue();
+    }
+    void set(QuantumValue v)
+    {
+        if (!stack)
+            closed = std::move(v);
+        else if (index < stack->size())
+            (*stack)[index] = std::move(v);
+    }
+    void close()
+    {
+        if (!stack)
+            return;
+        if (index < stack->size())
+            closed = (*stack)[index];
+        stack = nullptr;
+    }
 };
 
 // ─── Closure ──────────────────────────────────────────────────────────────────
@@ -107,6 +132,9 @@ private:
     // ── Upvalue helpers ───────────────────────────────────────────────────────
     std::shared_ptr<Upvalue> captureUpvalue(size_t stackIdx);
     void closeUpvalues(size_t fromIdx);
+    // Inserts below the top of the stack, keeping open upvalues on the
+    // shifted slots attached to their variables.
+    void insertOnStack(size_t pos, QuantumValue v);
 
     // ── Binary / unary ops ────────────────────────────────────────────────────
     QuantumValue execBinary(Op op, const QuantumValue &left, const QuantumValue &right, int line);

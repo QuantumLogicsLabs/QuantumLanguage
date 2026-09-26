@@ -72,7 +72,13 @@ const std::unordered_map<std::string, TokenType> Lexer::keywords = {
 };
 
 Lexer::Lexer(const std::string &source)
-    : src(source), pos(0), line(1), col(1) {}
+    : src(source), pos(0), line(1), col(1)
+{
+    // Skip a UTF-8 byte-order mark (common from Windows editors).
+    if (src.size() >= 3 && (unsigned char)src[0] == 0xEF &&
+        (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF)
+        pos = 3;
+}
 
 char Lexer::current() const
 {

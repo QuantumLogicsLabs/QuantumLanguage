@@ -21,6 +21,9 @@ list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*main_vm\\.cpp$")
 # qpm is a standalone tool (its own main(), no VM/lexer/parser/compiler needed)
 # built from src/qpm/ separately — keep it out of the other 3 targets' sources.
 list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*/src/qpm/.*\\.cpp$")
+# ...except its self-contained JSON parser: `# @use` package resolution
+# (src/ModuleResolver.cpp) reads package.json.
+list(APPEND QUANTUM_SOURCES "${CMAKE_SOURCE_DIR}/src/qpm/QpmJson.cpp")
 
 # ── quantum  — compiler + bundler ─────────────────────────────────────────────
 add_executable(quantum ${QUANTUM_SOURCES})

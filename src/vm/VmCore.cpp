@@ -52,6 +52,7 @@ void VM::run(std::shared_ptr<Chunk> chunk)
 {
     stepCount_ = 0;
     pendingInstances_.clear();
+    closeUpvalues(0);
     stack_.clear();
 
     frames_.clear();
@@ -366,36 +367,39 @@ QuantumValue VM::execUnary(Op op, const QuantumValue &v, int line)
 
 std::shared_ptr<Upvalue> VM::captureUpvalue(size_t stackIdx)
 {
-    // Check if we already have an open upvalue for this slot
+    // Reuse the open upvalue for this slot, so every closure capturing the
+    // same variable shares one cell.
     for (auto &uv : openUpvalues_)
-        if (uv->cell.get() == &stack_[stackIdx])
+        if (uv->index == stackIdx)
             return uv;
 
-    // Create a new open upvalue pointing directly into the stack
-    // We use a shared_ptr alias to avoid copying
-    auto cell = std::shared_ptr<QuantumValue>(
-        std::shared_ptr<QuantumValue>(), &stack_[stackIdx]);
-    auto uv = std::make_shared<Upvalue>(cell);
+    auto uv = std::make_shared<Upvalue>(&stack_, stackIdx);
     openUpvalues_.push_back(uv);
     return uv;
 }
 
+// Closes every open upvalue on a slot at or above `fromIdx` — called before
+// those slots leave the stack.
 void VM::closeUpvalues(size_t fromIdx)
 {
     for (auto it = openUpvalues_.begin(); it != openUpvalues_.end();)
     {
-        auto &uv = *it;
-        // If the cell points into stack at or above fromIdx, close it
-        if (uv->cell.get() >= &stack_[fromIdx])
+        if ((*it)->index >= fromIdx)
         {
-            uv->closed = *uv->cell;
-            uv->cell = std::shared_ptr<QuantumValue>(
-                std::shared_ptr<QuantumValue>(), &uv->closed);
+            (*it)->close();
             it = openUpvalues_.erase(it);
         }
         else
             ++it;
     }
+}
+
+void VM::insertOnStack(size_t pos, QuantumValue v)
+{
+    stack_.insert(stack_.begin() + pos, std::move(v));
+    for (auto &uv : openUpvalues_)
+        if (uv->index >= pos)
+            ++uv->index;
 }
 
 // ─── Call helpers ─────────────────────────────────────────────────────────────
@@ -442,7 +446,7 @@ void VM::callValue(QuantumValue callee, int argCount, int line)
     {
         auto bm = callee.asBoundMethod();
         size_t calleeIndex = stack_.size() - argCount - 1;
-        stack_.insert(stack_.begin() + calleeIndex + 1, bm->self);
+        insertOnStack(calleeIndex + 1, bm->self);
         callClosure(bm->method, argCount + 1, line);
         return;
     }
@@ -578,7 +582,7 @@ void VM::callClass(std::shared_ptr<QuantumClass> klass, int argCount, int line)
     if (initFn)
     {
         size_t calleeIndex = stack_.size() - argCount - 1;
-        stack_.insert(stack_.begin() + calleeIndex + 1, instVal);
+        insertOnStack(calleeIndex + 1, instVal);
         pendingInstances_.push_back({instVal, frames_.size()});
         callClosure(initFn, argCount + 1, line);
         return;

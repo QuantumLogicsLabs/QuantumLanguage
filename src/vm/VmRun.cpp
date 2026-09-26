@@ -25,6 +25,7 @@ void VM::runFrame(size_t stopDepth)
         {
             // Function fell off the end
             size_t base = frame.stackBase;
+            closeUpvalues(base);
             frames_.pop_back();
             // Trim stack back to base, push nil
             while (stack_.size() > base)
@@ -418,7 +419,7 @@ void VM::runFrame(size_t stopDepth)
                         if (it != k->methods.end())
                         {
                             size_t calleeIndex = stack_.size() - argCount - 1;
-                            stack_.insert(stack_.begin() + calleeIndex + 1, instVal);
+                            insertOnStack(calleeIndex + 1, instVal);
                             pendingInstances_.push_back({instVal, frames_.size()});
                             callClosure(it->second, argCount + 1, line);
                             initFound = true;
@@ -458,7 +459,7 @@ void VM::runFrame(size_t stopDepth)
             {
                 auto bm = callee.asBoundMethod();
                 size_t calleeIndex = stack_.size() - argCount - 1;
-                stack_.insert(stack_.begin() + calleeIndex + 1, bm->self);
+                insertOnStack(calleeIndex + 1, bm->self);
                 callClosure(bm->method, argCount + 1, line);
                 break;
             }
@@ -1028,7 +1029,7 @@ void VM::runFrame(size_t stopDepth)
                     if (it != k->methods.end())
                     {
                         size_t calleeIndex = stack_.size() - argCount - 1;
-                        stack_.insert(stack_.begin() + calleeIndex + 1, instVal);
+                        insertOnStack(calleeIndex + 1, instVal);
                         pendingInstances_.push_back({instVal, frames_.size()});
                         callClosure(it->second, argCount + 1, line);
                         initFound = true;
@@ -1112,6 +1113,7 @@ void VM::runFrame(size_t stopDepth)
             handlers_.pop_back();
             while (frames_.size() > h.frameDepth)
                 frames_.pop_back();
+            closeUpvalues(h.stackDepth);
             while (stack_.size() > h.stackDepth)
                 stack_.pop_back();
             push(val);
@@ -1206,6 +1208,7 @@ void VM::runFrame(size_t stopDepth)
             handlers_.pop_back();
             while (frames_.size() > h.frameDepth)
                 frames_.pop_back();
+            closeUpvalues(h.stackDepth);
             while (stack_.size() > h.stackDepth)
                 stack_.pop_back();
             push(QuantumValue(std::string(e.what())));

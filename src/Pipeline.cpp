@@ -22,6 +22,7 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
     Parser parser(std::move(tokens));
     auto ast = parser.parse();
 
+    resolveUseDirectives(*ast, source, sourcePath);
     resolveImports(*ast, sourcePath);
 
     try

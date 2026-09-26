@@ -31,6 +31,12 @@ std::string applyDialect(std::string source, const std::string &path)
 {
     std::string ext = fileExtLower(path);
 
+    // A UTF-8 byte-order mark (common from Windows editors) would otherwise
+    // sit in front of the first line's code.
+    if (source.size() >= 3 && (unsigned char)source[0] == 0xEF &&
+        (unsigned char)source[1] == 0xBB && (unsigned char)source[2] == 0xBF)
+        source.erase(0, 3);
+
     if (ext == ".rb")
         source = applyRubyDialect(source, /*strict=*/true);
     else if (ext == ".sa")

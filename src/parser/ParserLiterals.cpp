@@ -218,6 +218,20 @@ ASTNodePtr Parser::parsePrimary() {
   if (tok.type == TokenType::FN || tok.type == TokenType::FUNCTION ||
       tok.type == TokenType::DEF) {
     consume();
+    // JS named function expression, `(function step() { ... })()`: the name
+    // lets the body refer to the function itself. There is no
+    // expression-local binding, so it becomes `step = <function>` and the
+    // body finds `step` when it runs (unlike JS, the name is visible outside
+    // the function too).
+    if (check(TokenType::IDENTIFIER) && pos + 1 < tokens.size() &&
+        tokens[pos + 1].type == TokenType::LPAREN) {
+      std::string name = consume().value;
+      auto fn = parseLambda();
+      return std::make_unique<ASTNode>(
+          AssignExpr{"=", std::make_unique<ASTNode>(Identifier{name}, ln),
+                     std::move(fn)},
+          ln);
+    }
     return parseLambda();
   }
 

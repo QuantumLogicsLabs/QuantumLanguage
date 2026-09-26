@@ -153,18 +153,52 @@ int runSingleFileForTest(const std::string &path)
     return 2;
 }
 
+// The package a test file belongs to: the nearest directory at or above it,
+// within the tested tree, that holds a package.json. Package files use paths
+// relative to their package root (`data/sales.csv`, `../quantum-test`) — the
+// directory their package.json scripts run them from — so the runner runs
+// them there too. Empty for a file outside any package.
+static fs::path packageRootFor(const fs::path &file, const fs::path &testRoot)
+{
+    std::error_code ec;
+    fs::path root = fs::weakly_canonical(testRoot, ec);
+    for (fs::path dir = fs::weakly_canonical(file, ec).parent_path();;
+         dir = dir.parent_path())
+    {
+        fs::path rel = dir.lexically_relative(root);
+        if (rel.empty() || *rel.begin() == "..")
+            return {}; // left the tested tree
+        if (fs::is_regular_file(dir / "package.json", ec))
+            return dir;
+        if (dir == root || dir == dir.parent_path())
+            return {};
+    }
+}
+
 // Spawn "<thisExe> --__runone <path>" and capture merged stdout+stderr plus
-// the child's exit code. Returns the captured text; sets exitCode.
-static std::string spawnChild(const std::string &path, int &exitCode)
+// the child's exit code. With a `workDir`, the child runs there (and gets an
+// absolute path). Returns the captured text; sets exitCode.
+static std::string spawnChild(const std::string &path, const fs::path &workDir,
+                              int &exitCode)
 {
     std::string exe = getExecutablePath();
+    std::string target = path, cdPrefix;
+    if (!workDir.empty())
+    {
+        target = fs::absolute(path).string();
+#ifdef _WIN32
+        cdPrefix = "cd /d \"" + workDir.string() + "\" && ";
+#else
+        cdPrefix = "cd \"" + workDir.string() + "\" && ";
+#endif
+    }
 #ifdef _WIN32
     // cmd.exe strips the outermost pair of quotes from the whole command, so
     // wrap everything once more: ""exe" --__runone "path" 2>&1".
-    std::string cmd = "\"\"" + exe + "\" --__runone \"" + path + "\" 2>&1\"";
+    std::string cmd = "\"" + cdPrefix + "\"" + exe + "\" --__runone \"" + target + "\" 2>&1\"";
     FILE *pipe = _popen(cmd.c_str(), "r");
 #else
-    std::string cmd = "\"" + exe + "\" --__runone \"" + path + "\" 2>&1";
+    std::string cmd = cdPrefix + "\"" + exe + "\" --__runone \"" + target + "\" 2>&1";
     FILE *pipe = popen(cmd.c_str(), "r");
 #endif
     if (!pipe)
@@ -186,7 +220,7 @@ static std::string spawnChild(const std::string &path, int &exitCode)
     return out;
 }
 
-static TestResult testFile(const std::string &path)
+static TestResult testFile(const std::string &path, const fs::path &workDir)
 {
     TestResult res;
     res.path = path;
@@ -206,7 +240,7 @@ static TestResult testFile(const std::string &path)
 
     // Run the file in an isolated child process.
     int exitCode = 0;
-    std::string captured = spawnChild(path, exitCode);
+    std::string captured = spawnChild(path, workDir, exitCode);
 
     // Split the child's structured error marker (if any) out of the output.
     std::string marker(QTEST_ERR_MARKER);
@@ -474,7 +508,7 @@ int runTestExamples(const std::string &dir)
                   << "/" << total << "] " << Colors::RESET << disp << " ... ";
         std::cout.flush();
 
-        TestResult tr = testFile(ps);
+        TestResult tr = testFile(ps, packageRootFor(fp, d));
         tr.path = disp;
 
         if (tr.passed)
