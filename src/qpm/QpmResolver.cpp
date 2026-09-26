@@ -447,7 +447,8 @@ namespace qpm
         {
             if (opts.addPackages.empty())
             {
-                std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n";
+                std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n"
+                          << "[qpm] run `qpm init` to create one, or `qpm i <pkg>` to add a dependency\n";
                 return 1;
             }
             pkgJson = JsonValue::makeObject();
