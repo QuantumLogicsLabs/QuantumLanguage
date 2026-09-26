@@ -1,6 +1,7 @@
 #include "QpmResolver.h"
 #include "QpmJson.h"
 #include "QpmHttp.h"
+#include "QpmRegistry.h"
 #include "QpmSemver.h"
 #include "QpmGzip.h"
 #include "QpmTar.h"
@@ -173,13 +174,7 @@ namespace qpm
             if (it != st.metaCache.end())
                 return &it->second;
 
-            const char *regEnv = std::getenv("QPM_REGISTRY");
-            std::string registryBase = (regEnv && *regEnv) ? std::string(regEnv) : "http://localhost:8000/api/registry/";
-            if (registryBase.back() != '/')
-            {
-                registryBase += "/";
-            }
-            std::string url = registryBase + urlEncodeComponent(name);
+            std::string url = registryBaseUrl() + urlEncodeComponent(name);
             HttpResponse resp = httpGet(url, "application/vnd.npm.install-v1+json");
             if (!resp.ok())
             {

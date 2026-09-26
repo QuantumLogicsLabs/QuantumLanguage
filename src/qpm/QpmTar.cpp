@@ -1,6 +1,7 @@
 #include "QpmTar.h"
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -136,6 +137,56 @@ namespace qpm
                 pos += recLen;
             }
         }
+
+        // npm stamps every entry with this fixed time (1985-10-26 08:15 UTC)
+        // so packing the same files twice yields byte-identical tarballs.
+        constexpr unsigned long long FIXED_MTIME = 499162500;
+
+        void writeOctal(char *field, size_t len, unsigned long long value)
+        {
+            // len-1 zero-padded octal digits followed by a NUL.
+            for (size_t i = len - 1; i-- > 0;)
+            {
+                field[i] = static_cast<char>('0' + (value & 7));
+                value >>= 3;
+            }
+            field[len - 1] = '\0';
+        }
+
+        void appendHeader(std::string &out, const std::string &name, const std::string &prefix,
+                          unsigned long long size, char typeflag)
+        {
+            char header[BLOCK];
+            std::memset(header, 0, BLOCK);
+            std::memcpy(header + 0, name.data(), std::min(name.size(), size_t(100)));
+            writeOctal(header + 100, 8, 0644);
+            writeOctal(header + 108, 8, 0);
+            writeOctal(header + 116, 8, 0);
+            writeOctal(header + 124, 12, size);
+            writeOctal(header + 136, 12, FIXED_MTIME);
+            header[156] = typeflag;
+            std::memcpy(header + 257, "ustar", 6); // magic incl. NUL
+            std::memcpy(header + 263, "00", 2);
+            std::memcpy(header + 345, prefix.data(), std::min(prefix.size(), size_t(155)));
+
+            // Checksum is computed with its own field filled with spaces.
+            std::memset(header + 148, ' ', 8);
+            unsigned long long sum = 0;
+            for (size_t i = 0; i < BLOCK; ++i)
+                sum += static_cast<unsigned char>(header[i]);
+            writeOctal(header + 148, 7, sum);
+            header[155] = ' ';
+
+            out.append(header, BLOCK);
+        }
+
+        void appendData(std::string &out, const std::string &data)
+        {
+            out += data;
+            size_t rem = data.size() % BLOCK;
+            if (rem)
+                out.append(BLOCK - rem, '\0');
+        }
     } // namespace
 
     bool tarExtract(const std::string &tarBytes, const std::string &destDir, std::string &error)
@@ -227,6 +278,40 @@ namespace qpm
         }
 
         return true;
+    }
+
+    std::string tarCreate(const std::vector<TarEntry> &entries)
+    {
+        std::string out;
+        for (const auto &e : entries)
+        {
+            std::string full = "package/" + e.path;
+            std::string name = full, prefix;
+
+            if (full.size() > 100)
+            {
+                // Try a standard USTAR split: prefix (<=155) + '/' + name (<=100).
+                size_t cut = full.find('/');
+                while (cut != std::string::npos && full.size() - cut - 1 > 100)
+                    cut = full.find('/', cut + 1);
+                if (cut != std::string::npos && cut <= 155)
+                {
+                    prefix = full.substr(0, cut);
+                    name = full.substr(cut + 1);
+                }
+                else
+                {
+                    appendHeader(out, "././@LongLink", "", full.size() + 1, 'L');
+                    appendData(out, full + '\0');
+                    name = full.substr(0, 100);
+                }
+            }
+
+            appendHeader(out, name, prefix, e.data.size(), '0');
+            appendData(out, e.data);
+        }
+        out.append(BLOCK * 2, '\0'); // end-of-archive marker
+        return out;
     }
 
 } // namespace qpm
