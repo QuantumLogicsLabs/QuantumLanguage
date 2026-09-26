@@ -1673,6 +1673,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     // in is either built into the VM or ignored. Drop the whole statement
     // (including any trailing `as`/`-> alias` noise) rather than let the native
     // parser trip over `from`/`import`.
+    if (strict)
     {
       static const std::regex fromImportRe("^from\\s+\\S+\\s+import\\b.*$");
       if (std::regex_match(code, fromImportRe))
