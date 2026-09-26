@@ -156,6 +156,12 @@ void VM::registerNatives()
             runFrame(depth);
             return pop();
         }
+        // A settled Promise (see the Promise global) awaits to its value.
+        if (first.isDict()) {
+            auto it = first.asDict()->find("__value");
+            if (it != first.asDict()->end())
+                return it->second;
+        }
         return first; });
 
     // ── Type conversion ───────────────────────────────────────────────────
@@ -1215,20 +1221,39 @@ void VM::registerNatives()
             return QuantumValue();
         };
 
-        std::function<QuantumValue(QuantumValue)> makeResolvedPromise;
-        makeResolvedPromise = [invoke, &makeResolvedPromise](QuantumValue initialValue) -> QuantumValue
+        // A settled promise's value, or the value itself when it isn't one
+        // (a `.then` handler or Promise.all element may be either).
+        auto settledValue = [](const QuantumValue &v) -> QuantumValue
+        {
+            if (v.isDict())
+            {
+                auto it = v.asDict()->find("__value");
+                if (it != v.asDict()->end())
+                    return it->second;
+            }
+            return v;
+        };
+
+        // Held by shared_ptr: the `then` natives it creates call back into it
+        // long after this registration scope has ended (a reference to a
+        // local std::function would dangle by then).
+        using PromiseFactory = std::function<QuantumValue(QuantumValue)>;
+        auto makeResolvedPromisePtr = std::make_shared<PromiseFactory>();
+        std::weak_ptr<PromiseFactory> factoryRef = makeResolvedPromisePtr;
+        *makeResolvedPromisePtr = [invoke, settledValue, factoryRef](QuantumValue initialValue) -> QuantumValue
         {
             auto promise = std::make_shared<Dict>();
             auto state = std::make_shared<QuantumValue>(initialValue);
 
             auto thenNative = std::make_shared<QuantumNative>();
             thenNative->name = "Promise.then";
-            thenNative->fn = [invoke, state, &makeResolvedPromise](std::vector<QuantumValue> args) -> QuantumValue
+            thenNative->fn = [invoke, settledValue, state, factoryRef](std::vector<QuantumValue> args) -> QuantumValue
             {
                 QuantumValue next = *state;
                 if (!args.empty())
-                    next = invoke(args[0], {*state});
-                return makeResolvedPromise(next);
+                    next = settledValue(invoke(args[0], {*state}));
+                auto factory = factoryRef.lock();
+                return factory ? (*factory)(next) : next;
             };
 
             auto catchNative = std::make_shared<QuantumNative>();
@@ -1243,6 +1268,55 @@ void VM::registerNatives()
             (*promise)["__value"] = *state;
             return QuantumValue(promise);
         };
+
+        // JS `Promise`. The VM is synchronous, so `new Promise(executor)` runs
+        // the executor immediately and yields an already-settled promise.
+        {
+            auto promiseDict = std::make_shared<Dict>();
+            auto makeResolved = makeResolvedPromisePtr; // strong ref keeps the factory alive
+
+            auto ctor = std::make_shared<QuantumNative>();
+            ctor->name = "Promise";
+            ctor->fn = [invoke, settledValue, makeResolved](std::vector<QuantumValue> args) -> QuantumValue
+            {
+                auto result = std::make_shared<QuantumValue>();
+                auto settle = std::make_shared<QuantumNative>();
+                settle->name = "Promise.resolve";
+                settle->fn = [result, settledValue](std::vector<QuantumValue> a) -> QuantumValue
+                {
+                    if (!a.empty())
+                        *result = settledValue(a[0]);
+                    return QuantumValue();
+                };
+                if (!args.empty())
+                    invoke(args[0], {QuantumValue(settle), QuantumValue(settle)});
+                return (*makeResolved)(*result);
+            };
+
+            auto resolveNat = std::make_shared<QuantumNative>();
+            resolveNat->name = "Promise.resolve";
+            resolveNat->fn = [settledValue, makeResolved](std::vector<QuantumValue> args) -> QuantumValue
+            {
+                return (*makeResolved)(args.empty() ? QuantumValue() : settledValue(args[0]));
+            };
+
+            auto allNat = std::make_shared<QuantumNative>();
+            allNat->name = "Promise.all";
+            allNat->fn = [settledValue, makeResolved](std::vector<QuantumValue> args) -> QuantumValue
+            {
+                auto values = std::make_shared<Array>();
+                if (!args.empty() && args[0].isArray())
+                    for (auto &v : *args[0].asArray())
+                        values->push_back(settledValue(v));
+                return (*makeResolved)(QuantumValue(values));
+            };
+
+            (*promiseDict)["__new__"] = QuantumValue(ctor);
+            (*promiseDict)["__call__"] = QuantumValue(ctor);
+            (*promiseDict)["resolve"] = QuantumValue(resolveNat);
+            (*promiseDict)["all"] = QuantumValue(allNat);
+            globals->define("Promise", QuantumValue(promiseDict));
+        }
 
         auto makeClassList = []() -> QuantumValue
         {

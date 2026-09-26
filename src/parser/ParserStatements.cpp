@@ -1742,7 +1742,8 @@ ASTNodePtr Parser::parseClassDecl()
             }
 
             std::vector<bool> methodParamIsRef;
-            auto params = parseParamList(&methodParamIsRef);
+            std::vector<ASTNodePtr> methodDefaultArgs;
+            auto params = parseParamList(&methodParamIsRef, &methodDefaultArgs);
 
             // Skip trailing C++ const: method() const { }
             if (check(TokenType::CONST))
@@ -1881,6 +1882,7 @@ ASTNodePtr Parser::parseClassDecl()
             methodFd.name = methodName;
             methodFd.params = std::move(params);
             methodFd.paramIsRef = std::move(methodParamIsRef);
+            methodFd.defaultArgs = std::move(methodDefaultArgs);
             methodFd.body = std::move(body);
             auto fn = std::make_unique<ASTNode>(std::move(methodFd), ln);
 

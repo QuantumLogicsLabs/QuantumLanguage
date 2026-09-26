@@ -36,13 +36,13 @@ namespace
     //   4. repeat 2-3 in each parent directory up to the filesystem root
     fs::path resolveModulePath(const std::string &module, const fs::path &fromDir)
     {
+        fs::path local = fromDir / (module + ".sa");
+        if (fs::exists(local))
+            return local;
+
         fs::path dir = fromDir;
         for (;;)
         {
-            fs::path local = dir / (module + ".sa");
-            if (fs::exists(local))
-                return local;
-
             fs::path pkgMain = dir / "node_modules" / module / (module + ".sa");
             if (fs::exists(pkgMain))
                 return pkgMain;
@@ -129,14 +129,20 @@ namespace
 
             const ImportStmt &imp = stmt->as<ImportStmt>();
 
+            // A module with no file on disk is a host-language library
+            // (`import math`, `from abc import ABC`, `import numpy as np`).
+            // The VM either provides it as a native global or it has no
+            // runtime meaning, so it compiles to a no-op -- the behaviour
+            // before module resolution existed.
             if (!imp.module.empty())
             {
                 // from <module> import a, b as c, ...
                 fs::path modPath = resolveModulePath(imp.module, dir);
                 if (modPath.empty())
-                    throw ParseError("Cannot resolve module \"" + imp.module +
-                                          "\" (searched local files and node_modules/)",
-                                      stmt->line, 0);
+                {
+                    newStmts.push_back(std::move(stmt));
+                    continue;
+                }
 
                 auto exports = loadModuleExports(modPath, resolving);
 
@@ -167,9 +173,7 @@ namespace
                 {
                     fs::path modPath = resolveModulePath(item.name, dir);
                     if (modPath.empty())
-                        throw ParseError("Cannot resolve module \"" + item.name +
-                                              "\" (searched local files and node_modules/)",
-                                          stmt->line, 0);
+                        continue; // host-language library, see above
 
                     auto exports = loadModuleExports(modPath, resolving);
                     for (auto &kv : exports)

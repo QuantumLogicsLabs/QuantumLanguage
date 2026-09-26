@@ -27,6 +27,8 @@ static const char *opName(Op op)
         return "SWAP";
     case Op::NOP:
         return "NOP";
+    case Op::ARG_PASSED:
+        return "ARG_PASSED";
     case Op::DEFINE_GLOBAL:
         return "DEFINE_GLOBAL";
     case Op::LOAD_GLOBAL:
@@ -194,6 +196,7 @@ void disassembleInstruction(const Chunk &chunk, size_t idx, std::ostream &out)
     case Op::LOAD_LOCAL:
     case Op::STORE_LOCAL:
     case Op::DEFINE_LOCAL:
+    case Op::ARG_PASSED:
         out << " slot[" << instr.operand << "]";
         if (instr.operand < (int)chunk.params.size())
             out << " (" << chunk.params[instr.operand] << ")";

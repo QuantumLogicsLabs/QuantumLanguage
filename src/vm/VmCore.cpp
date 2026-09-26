@@ -460,6 +460,9 @@ void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
 {
     auto &ch = *closure->chunk;
     auto &params = ch.params;
+    // Recorded before padding: a parameter default applies only to an
+    // argument the caller left out, never to an explicitly passed nil.
+    int suppliedArgs = argCount;
 
     // --- Varargs (*args) support ---
     int varargIndex = -1;
@@ -515,7 +518,7 @@ void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
     }
 
     size_t stackBase = stack_.size() - argCount;
-    frames_.push_back({closure, 0, stackBase});
+    frames_.push_back({closure, 0, stackBase, suppliedArgs});
 }
 
 void VM::callNativeFn(std::shared_ptr<QuantumNative> fn, int argCount, int line)
