@@ -1,4 +1,5 @@
 #include "QpmHttp.h"
+#include "QpmJson.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -60,7 +61,8 @@ namespace qpm
         return out;
     }
 
-    HttpResponse httpGet(const std::string &url, const std::string &acceptHeader)
+    HttpResponse httpRequest(const std::string &method, const std::string &url,
+                             const std::string &body, const std::vector<std::string> &headers)
     {
         HttpResponse result;
 
@@ -97,7 +99,10 @@ namespace qpm
         }
         HandleGuard sessionGuard(hSession);
 
-        WinHttpSetTimeouts(hSession, 15000, 15000, 30000, 30000);
+        // An upload waits on the registry storing the tarball before it
+        // answers, so give requests that carry a body a longer read timeout.
+        int receiveTimeout = body.empty() ? 30000 : 120000;
+        WinHttpSetTimeouts(hSession, 15000, 15000, 30000, receiveTimeout);
 
         HINTERNET hConnect = WinHttpConnect(hSession, host, port, 0);
         if (!hConnect)
@@ -108,7 +113,8 @@ namespace qpm
         HandleGuard connectGuard(hConnect);
 
         DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path, nullptr,
+        std::wstring wmethod = utf8ToWide(method);
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, wmethod.c_str(), path, nullptr,
                                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
         if (!hRequest)
         {
@@ -117,15 +123,17 @@ namespace qpm
         }
         HandleGuard requestGuard(hRequest);
 
-        if (!acceptHeader.empty())
+        for (const auto &h : headers)
         {
-            std::wstring header = L"Accept: " + utf8ToWide(acceptHeader);
+            std::wstring header = utf8ToWide(h);
             WinHttpAddRequestHeaders(hRequest, header.c_str(), static_cast<DWORD>(-1),
                                       WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
         }
 
+        LPVOID payload = body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char *>(body.data());
+        DWORD payloadSize = static_cast<DWORD>(body.size());
         if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
+                                 payload, payloadSize, payloadSize, 0))
         {
             result.error = "WinHttpSendRequest failed (network unreachable?)";
             return result;
@@ -142,7 +150,7 @@ namespace qpm
                              WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
         result.status = static_cast<int>(statusCode);
 
-        std::string body;
+        std::string responseBody;
         for (;;)
         {
             DWORD available = 0;
@@ -161,11 +169,36 @@ namespace qpm
                 result.error = "WinHttpReadData failed";
                 return result;
             }
-            body.append(buf.data(), read);
+            responseBody.append(buf.data(), read);
         }
 
-        result.body = std::move(body);
+        result.body = std::move(responseBody);
         return result;
+    }
+
+    HttpResponse httpGet(const std::string &url, const std::string &acceptHeader)
+    {
+        std::vector<std::string> headers;
+        if (!acceptHeader.empty())
+            headers.push_back("Accept: " + acceptHeader);
+        return httpRequest("GET", url, "", headers);
+    }
+
+    std::string describeFailure(const HttpResponse &resp)
+    {
+        if (!resp.error.empty())
+            return resp.error;
+        std::string reason = "HTTP " + std::to_string(resp.status);
+        try
+        {
+            std::string message = JsonValue::parse(resp.body).get("error").asString();
+            if (!message.empty())
+                reason += ": " + message;
+        }
+        catch (...)
+        {
+        }
+        return reason;
     }
 
 } // namespace qpm

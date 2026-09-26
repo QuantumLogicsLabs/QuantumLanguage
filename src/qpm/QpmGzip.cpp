@@ -55,4 +55,40 @@ namespace qpm
         return true;
     }
 
+    bool gzipDeflate(const std::string &input, std::string &output, std::string &error)
+    {
+        output.clear();
+
+        z_stream zs{};
+        // windowBits = 15 + 16 asks zlib for a gzip header/trailer instead of zlib's.
+        if (deflateInit2(&zs, Z_BEST_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+        {
+            error = "deflateInit2 failed";
+            return false;
+        }
+
+        zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(input.data()));
+        zs.avail_in = static_cast<uInt>(input.size());
+
+        std::vector<char> chunk(256 * 1024);
+        int ret = Z_OK;
+        do
+        {
+            zs.next_out = reinterpret_cast<Bytef *>(chunk.data());
+            zs.avail_out = static_cast<uInt>(chunk.size());
+
+            ret = deflate(&zs, Z_FINISH);
+            if (ret == Z_STREAM_ERROR)
+            {
+                error = zs.msg ? zs.msg : "deflate failed";
+                deflateEnd(&zs);
+                return false;
+            }
+            output.append(chunk.data(), chunk.size() - zs.avail_out);
+        } while (ret != Z_STREAM_END);
+
+        deflateEnd(&zs);
+        return true;
+    }
+
 } // namespace qpm
