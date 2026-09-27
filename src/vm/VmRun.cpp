@@ -103,17 +103,52 @@ void VM::runFrame(size_t stopDepth)
         {
             const std::string &name = consts[instr.operand].asString();
             globals->define(name, pop());
+            weakGlobals_.erase(name); // a user definition replaces a weak builtin
             break;
         }
         case Op::DEFINE_CONST:
         {
             const std::string &name = consts[instr.operand].asString();
             globals->define(name, pop(), true);
+            weakGlobals_.erase(name);
             break;
         }
         case Op::LOAD_GLOBAL:
         {
             const std::string &name = consts[instr.operand].asString();
+            // A weak builtin (e.g. the STL `next`) yields to a same-named
+            // member of `this` inside a method: a node's own `next` field.
+            if (!weakGlobals_.empty() && weakGlobals_.count(name))
+            {
+                auto &params = frame.closure->chunk->params;
+                if (!params.empty() && params[0] == "self" &&
+                    frame.stackBase < stack_.size() && stack_[frame.stackBase].isInstance())
+                {
+                    QuantumValue self = stack_[frame.stackBase];
+                    auto inst = self.asInstance();
+                    auto fit = inst->fields.find(name);
+                    if (fit != inst->fields.end())
+                    {
+                        push(fit->second);
+                        break;
+                    }
+                    bool isMethod = false;
+                    for (auto *k = inst->klass.get(); k && !isMethod; k = k->base.get())
+                    {
+                        auto mit = k->methods.find(name);
+                        if (mit != k->methods.end())
+                        {
+                            auto bm = std::make_shared<QuantumBoundMethod>();
+                            bm->method = mit->second;
+                            bm->self = self;
+                            push(QuantumValue(bm));
+                            isMethod = true;
+                        }
+                    }
+                    if (isMethod)
+                        break;
+                }
+            }
             try
             {
                 push(globals->get(name));
@@ -181,7 +216,7 @@ void VM::runFrame(size_t stopDepth)
             bool inMethod = !params.empty() && params[0] == "self" &&
                             frame.stackBase < stack_.size() &&
                             stack_[frame.stackBase].isInstance();
-            if (inMethod && !globals->has(name))
+            if (inMethod && (!globals->has(name) || weakGlobals_.count(name)))
                 stack_[frame.stackBase].asInstance()->setField(name, peek(0));
             else if (globals->has(name))
                 globals->set(name, peek(0));
@@ -597,6 +632,13 @@ void VM::runFrame(size_t stopDepth)
                     }
                 }
             }
+            else if (obj.isInstance())
+            {
+                // obj[i] → __getitem__ (Python) / operator[] (C++)
+                QuantumValue result;
+                invokeMagic(obj, "__getitem__", {idx}, result);
+                push(result);
+            }
             else
                 push(QuantumValue());
             break;
@@ -630,7 +672,7 @@ void VM::runFrame(size_t stopDepth)
             }
             else if (obj.isDict())
                 (*obj.asDict())[key.toString()] = val;
-            else
+            else if (QuantumValue ignored; !invokeMagic(obj, "__setitem__", {key, val}, ignored))
                 throw TypeError("Cannot index-assign " + obj.typeName(), line);
 
             push(val); // assignment is an expression
@@ -664,7 +706,7 @@ void VM::runFrame(size_t stopDepth)
             }
             else if (obj.isDict())
                 (*obj.asDict())[key.toString()] = val;
-            else
+            else if (QuantumValue ignored; !invokeMagic(obj, "__setitem__", {key, val}, ignored))
                 throw TypeError("Cannot index-assign " + obj.typeName(), line);
 
             push(val); // assignment is an expression
@@ -1148,6 +1190,11 @@ void VM::runFrame(size_t stopDepth)
         case Op::DEREF:
         {
             QuantumValue v = pop();
+            if (isStlIterator(v))
+            {
+                push(stlIteratorDeref(v)); // *it
+                break;
+            }
             if (!v.isPointer())
                 throw TypeError("Cannot dereference non-pointer", line);
             push(v.asPointer()->deref());
@@ -1159,6 +1206,8 @@ void VM::runFrame(size_t stopDepth)
             QuantumValue val = pop();
             if (val.isPointer()){
                 push(val.asPointer()->deref());
+            }else if (isStlIterator(val)){
+                push(stlIteratorDeref(val)); // it->member
             }else{
                 push(val);
             }

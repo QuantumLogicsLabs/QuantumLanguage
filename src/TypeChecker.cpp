@@ -25,10 +25,30 @@ void TypeChecker::check(const ASTNodePtr& node) {
     }
 }
 
+// Whether a value of type `found` may initialize a variable declared `declared`.
+// Numbers widen freely across the C numeric types (an integer literal is a
+// fine `double`, `long`, `size_t`, ...), since the VM has one number type.
+static bool typeCompatible(const std::string& declared, const std::string& found) {
+    if (declared == found) return true;
+    if ((declared == "str" || declared == "String") && found == "string") return true;
+    static const char* numeric[] = {"int", "float", "double", "long", "short", "unsigned",
+                                    "unsigned int", "long long", "unsigned long", "size_t",
+                                    "char", "number"};
+    bool declNum = false, foundNum = false;
+    for (const char* t : numeric) {
+        if (declared == t) declNum = true;
+        if (found == t) foundNum = true;
+    }
+    return declNum && foundNum;
+}
+
 std::string TypeChecker::checkNode(const ASTNodePtr& node, std::shared_ptr<TypeEnv> env) {
     if (!node) return "void";
 
-    if (node->is<NumberLiteral>()) return "float";
+    if (node->is<NumberLiteral>()) {
+        double v = node->as<NumberLiteral>().value;
+        return (v == static_cast<long long>(v)) ? "int" : "float";
+    }
     if (node->is<StringLiteral>()) return "string";
     if (node->is<BoolLiteral>()) return "bool";
     
@@ -44,7 +64,8 @@ std::string TypeChecker::checkNode(const ASTNodePtr& node, std::shared_ptr<TypeE
         std::string declaredType = vd.typeHint.empty() ? initType : vd.typeHint;
         
         // Basic type check
-        if (!vd.typeHint.empty() && vd.typeHint != "any" && initType != "any" && vd.typeHint != initType) {
+        if (!vd.typeHint.empty() && vd.typeHint != "any" && initType != "any" &&
+            !typeCompatible(vd.typeHint, initType)) {
             std::cerr << Colors::YELLOW << "[StaticTypeWarning] " << Colors::RESET 
                       << "Type mismatch for '" << vd.name << "'. Found " << initType 
                       << " but expected " << vd.typeHint << " (line " << node->line << ")\n";

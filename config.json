@@ -1,0 +1,1 @@
+{"features":["interpreter","compiler","debugger"],"settings":{"timeout":30,"max_connections":100,"debug":true},"version":"1.0.0","app_name":"Quantum Language"}

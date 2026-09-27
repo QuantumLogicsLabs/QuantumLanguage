@@ -23,6 +23,26 @@ private:
     size_t pos;
     bool inCallArgList = false;
 
+    // > 0 while parsing a C/C++ initializer (`vector<P> v = {...}`, a return
+    // in a C++ function): there `{a, b}` is a brace-init list, not a JS
+    // shorthand object or Python set.
+    int braceInitDepth_ = 0;
+    struct BraceInitScope
+    {
+        int &depth;
+        explicit BraceInitScope(int &d) : depth(d) { ++depth; }
+        ~BraceInitScope() { --depth; }
+    };
+    // Whether each enclosing function body was declared C/C++-style (with a
+    // return type). Set for the next parseFunctionDecl by nextFnIsCpp_.
+    std::vector<bool> fnIsCpp_;
+    bool nextFnIsCpp_ = false;
+    // True when the '{' at pos holds no top-level `key: value` colon.
+    bool braceIsInitList() const;
+    // Merges same-named C++ methods into one dispatcher that picks an
+    // overload by argument count and type at call time.
+    void buildOverloadDispatchers(ClassDecl &cd, int ln);
+
     // Token helpers
     Token &current();
     Token &peek(int offset = 1);
@@ -38,6 +58,7 @@ private:
     ASTNodePtr parseBlock();
     ASTNodePtr parseBodyOrStatement(); // block OR single statement (brace-optional)
     ASTNodePtr parseVarDecl(bool isConst);
+    ASTNodePtr parseDestructuringDecl(bool isConst);
     ASTNodePtr parseFunctionDecl();
     ASTNodePtr parseClassDecl();
     ASTNodePtr parseIfStmt();
@@ -76,5 +97,7 @@ private:
     ASTNodePtr parseArrowFunction(std::vector<std::string> params, int ln);
     std::vector<ASTNodePtr> parseArgList();
     // Returns param names; populates outIsRef with true for each & (reference) param
-    std::vector<std::string> parseParamList(std::vector<bool> *outIsRef = nullptr, std::vector<ASTNodePtr> *outDefaultArgs = nullptr, std::vector<std::string> *outParamTypes = nullptr);
+    // outCppTypes receives each parameter's C/C++ declared type ("string",
+    // "RopeNode*", "int"; "" when untyped) for overload resolution.
+    std::vector<std::string> parseParamList(std::vector<bool> *outIsRef = nullptr, std::vector<ASTNodePtr> *outDefaultArgs = nullptr, std::vector<std::string> *outParamTypes = nullptr, std::vector<std::string> *outCppTypes = nullptr);
 };

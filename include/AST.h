@@ -140,6 +140,7 @@ struct VarDecl
     std::string typeHint;   // e.g. "int", "float", "char", "" = none
     bool isPointer = false; // int* p = ...
     bool isExported = false;
+    bool cTyped = false;    // declared C-style (`int x = ...`), not `let x: int`
 };
 
 struct FunctionDecl
@@ -152,6 +153,7 @@ struct FunctionDecl
     std::string returnType;              // NEW: fn name(...) -> int
     ASTNodePtr body;              // BlockStmt
     bool isExported = false;
+    std::vector<std::string> cppParamTypes; // C++ param types, for overloads
 };
 
 struct ReturnStmt
@@ -171,6 +173,9 @@ struct WhileStmt
 {
     ASTNodePtr condition;
     ASTNodePtr body;
+    // Runs after each iteration, including one ended by `continue`: the
+    // increment of a desugared C `for`, or a do-while's condition check.
+    ASTNodePtr post; // may be null
 };
 
 struct ForStmt

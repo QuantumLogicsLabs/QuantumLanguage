@@ -179,6 +179,111 @@ Token Lexer::readString(char quote)
     return Token(TokenType::STRING, str, startLine, startCol);
 }
 
+bool Lexer::atTripleQuote(char quote) const
+{
+    return current() == quote && peek(1) == quote && peek(2) == quote;
+}
+
+// Python """...""" / '''...''' — may span lines and contain lone quotes.
+// Escapes are processed as in readString unless `raw` (r"""...""").
+Token Lexer::readTripleString(char quote, bool raw)
+{
+    int startLine = line, startCol = col;
+    advance();
+    advance();
+    advance(); // opening quotes
+    std::string str;
+    while (pos < src.size() && !atTripleQuote(quote))
+    {
+        if (current() == '\\' && !raw && pos + 1 < src.size())
+        {
+            advance();
+            switch (current())
+            {
+            case 'n':
+                str += '\n';
+                break;
+            case 't':
+                str += '\t';
+                break;
+            case 'r':
+                str += '\r';
+                break;
+            case '0':
+                str += '\0';
+                break;
+            case '\n':
+                break; // backslash-newline continues the line
+            default:
+                str += current();
+            }
+            advance();
+        }
+        else
+            str += advance();
+    }
+    if (pos >= src.size())
+        throw QuantumError("LexError", "Unterminated triple-quoted string literal", startLine);
+    advance();
+    advance();
+    advance(); // closing quotes
+    return Token(TokenType::STRING, str, startLine, startCol);
+}
+
+bool Lexer::slashSlashIsComment() const
+{
+    // pos is at the second '/'. Prose gives a comment away: nothing
+    // operand-like follows, or two bare words sit side by side
+    // ("// Remove HTML tags"), which no expression has.
+    size_t p = pos + 1;
+    while (p < src.size() && (src[p] == ' ' || src[p] == '\t'))
+        p++;
+    if (p >= src.size() || src[p] == '\n' || src[p] == '\r')
+        return true;
+    char c = src[p];
+    if (!(std::isalnum((unsigned char)c) || c == '_' || c == '(' || c == '[' ||
+          c == '-' || c == '+' || c == '"' || c == '\'' || c == '.'))
+        return true;
+
+    auto isOperatorWord = [](const std::string &w)
+    {
+        return w == "and" || w == "or" || w == "not" || w == "if" || w == "else" ||
+               w == "in" || w == "is" || w == "for" || w == "lambda";
+    };
+    bool prevWasWord = false;
+    std::string prevWord;
+    while (p < src.size() && src[p] != '\n')
+    {
+        char ch = src[p];
+        if (ch == '#' || ch == ';')
+            break; // trailing comment / statement end
+        if (ch == '"' || ch == '\'')
+        {
+            p++;
+            while (p < src.size() && src[p] != ch && src[p] != '\n')
+                p += (src[p] == '\\') ? 2 : 1;
+            p++;
+            prevWasWord = false;
+            continue;
+        }
+        if (std::isalnum((unsigned char)ch) || ch == '_')
+        {
+            std::string w;
+            while (p < src.size() && (std::isalnum((unsigned char)src[p]) || src[p] == '_' || src[p] == '.'))
+                w += src[p++];
+            if (prevWasWord && !isOperatorWord(prevWord) && !isOperatorWord(w))
+                return true;
+            prevWord = w;
+            prevWasWord = true;
+            continue;
+        }
+        if (ch != ' ' && ch != '\t' && ch != '\r')
+            prevWasWord = false;
+        p++;
+    }
+    return false;
+}
+
 Token Lexer::readIdentifierOrKeyword()
 {
     int startLine = line, startCol = col;
@@ -190,6 +295,8 @@ Token Lexer::readIdentifierOrKeyword()
     if ((id == "r" || id == "R") && pos < src.size() && (current() == '"' || current() == '\''))
     {
         char quote = current();
+        if (atTripleQuote(quote))
+            return readTripleString(quote, /*raw=*/true);
         int strStartLine = line, strStartCol = col;
         advance(); // skip opening quote
         std::string raw;
@@ -206,10 +313,19 @@ Token Lexer::readIdentifierOrKeyword()
     if ((id == "f" || id == "F") && pos < src.size() && (current() == '"' || current() == '\''))
     {
         char quote = current();
+        // f"""...""" spans lines and ends only at the matching triple quote.
+        const bool triple = atTripleQuote(quote);
+        auto atClose = [&]()
+        { return triple ? atTripleQuote(quote) : current() == quote; };
         advance(); // skip opening quote
+        if (triple)
+        {
+            advance();
+            advance();
+        }
         // Convert {expr} → ${expr} then re-lex as template
         std::string raw;
-        while (pos < src.size() && current() != quote)
+        while (pos < src.size() && !atClose())
         {
             if (current() == '{')
             {
@@ -225,7 +341,7 @@ Token Lexer::readIdentifierOrKeyword()
                 {
                     char ch = current();
                     // Track string literals inside the expression to avoid false colon matches
-                    if (!inDoubleQ && ch == '\'\'' && !inFormat)
+                    if (!inDoubleQ && ch == '\'' && !inFormat)
                         inSingleQ = !inSingleQ;
                     else if (!inSingleQ && ch == '"' && !inFormat)
                         inDoubleQ = !inDoubleQ;
@@ -292,8 +408,8 @@ Token Lexer::readIdentifierOrKeyword()
                 advance();
             }
         }
-        if (pos < src.size())
-            advance(); // skip closing quote
+        for (int q = triple ? 3 : 1; q > 0 && pos < src.size(); --q)
+            advance(); // skip closing quote(s)
         // Re-lex wrapped in backticks using the existing template literal engine
         std::string backtickSrc = "`" + raw + "`";
         Lexer subLex(backtickSrc);

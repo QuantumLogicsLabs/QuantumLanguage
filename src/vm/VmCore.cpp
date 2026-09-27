@@ -44,6 +44,7 @@ VM::VM()
 {
     globals = std::make_shared<Environment>();
     registerNatives();
+    registerStlNatives();
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
@@ -166,6 +167,40 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
     QuantumValue R = R_in;
     if (L.isNative()) L = L.asNative()->fn({});
     if (R.isNative()) R = R.asNative()->fn({});
+
+    // STL iterator arithmetic and comparison: v.begin() + n, it - first,
+    // it != v.end(), ++it.
+    {
+        bool li = isStlIterator(L), ri = isStlIterator(R);
+        if (li || ri)
+        {
+            if (li && R.isNumber() && (op == Op::ADD || op == Op::SUB))
+                return makeStlIterator(stlIteratorArray(L),
+                                       stlIteratorPos(L) + (op == Op::ADD ? 1 : -1) *
+                                                               static_cast<long>(R.asNumber()));
+            if (ri && L.isNumber() && op == Op::ADD)
+                return makeStlIterator(stlIteratorArray(R),
+                                       stlIteratorPos(R) + static_cast<long>(L.asNumber()));
+            if (li && ri)
+            {
+                long a = stlIteratorPos(L), b = stlIteratorPos(R);
+                bool same = stlIteratorArray(L) == stlIteratorArray(R);
+                switch (op)
+                {
+                case Op::SUB: return QuantumValue(static_cast<double>(a - b));
+                case Op::EQ:  return QuantumValue(same && a == b);
+                case Op::NEQ: return QuantumValue(!same || a != b);
+                case Op::LT:  return QuantumValue(a < b);
+                case Op::GT:  return QuantumValue(a > b);
+                case Op::LTE: return QuantumValue(a <= b);
+                case Op::GTE: return QuantumValue(a >= b);
+                default: break;
+                }
+            }
+            if (op == Op::EQ || op == Op::NEQ)
+                return QuantumValue(op == Op::NEQ); // iterator vs non-iterator
+        }
+    }
 
     // Operator overloading: dispatch to instance magic methods (__add__,
     // __lt__, ...) when the left operand is a class instance that defines one.
@@ -523,6 +558,52 @@ void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
 
     size_t stackBase = stack_.size() - argCount;
     frames_.push_back({closure, 0, stackBase, suppliedArgs});
+}
+
+QuantumValue VM::invokeCallable(const QuantumValue &fn, const std::vector<QuantumValue> &args)
+{
+    if (fn.isNative())
+        return fn.asNative()->fn(args);
+    if (fn.isClosure())
+    {
+        push(fn);
+        for (auto &a : args)
+            push(a);
+        callClosure(fn.asFunction(), static_cast<int>(args.size()), 0);
+        runFrame(frames_.size() - 1);
+        return pop();
+    }
+    if (fn.isBoundMethod())
+    {
+        auto bm = fn.asBoundMethod();
+        push(fn);
+        push(bm->self);
+        for (auto &a : args)
+            push(a);
+        callClosure(bm->method, static_cast<int>(args.size()) + 1, 0);
+        runFrame(frames_.size() - 1);
+        return pop();
+    }
+    throw TypeError("Value of type " + fn.typeName() + " is not callable");
+}
+
+bool VM::invokeMagic(const QuantumValue &inst, const char *name,
+                     const std::vector<QuantumValue> &args, QuantumValue &out)
+{
+    if (!inst.isInstance())
+        return false;
+    for (auto *k = inst.asInstance()->klass.get(); k; k = k->base.get())
+    {
+        auto it = k->methods.find(name);
+        if (it == k->methods.end())
+            continue;
+        auto bm = std::make_shared<QuantumBoundMethod>();
+        bm->method = it->second;
+        bm->self = inst;
+        out = invokeCallable(QuantumValue(bm), args);
+        return true;
+    }
+    return false;
 }
 
 void VM::callNativeFn(std::shared_ptr<QuantumNative> fn, int argCount, int line)

@@ -9,9 +9,107 @@
 #include <string>
 #include <vector>
 
+// JS regex literals reach the VM as strings spelled "/pattern/flags". A plain
+// path like "/api/" has the same shape: with no flags and no metacharacter,
+// it is taken literally when `subject` contains it verbatim.
+static bool asRegexLiteral(const std::string &s, std::regex &re, bool &global,
+                           const std::string &subject)
+{
+    if (s.size() < 2 || s.front() != '/')
+        return false;
+    size_t last = s.find_last_of('/');
+    if (last == 0)
+        return false;
+    std::string flags = s.substr(last + 1);
+    std::string pattern = s.substr(1, last - 1);
+    if (flags.find_first_not_of("gimsuy") != std::string::npos)
+        return false;
+    if (flags.empty() && pattern.find_first_of("\\[]()*+?.^$|{") == std::string::npos &&
+        subject.find(s) != std::string::npos)
+        return false;
+    std::regex::flag_type rf = std::regex::ECMAScript;
+    if (flags.find('i') != std::string::npos)
+        rf |= std::regex::icase;
+    try
+    {
+        re = std::regex(pattern, rf);
+    }
+    catch (const std::regex_error &)
+    {
+        return false;
+    }
+    global = flags.find('g') != std::string::npos;
+    return true;
+}
+
 QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
                                   std::vector<QuantumValue> args)
 {
+    // replace / replaceAll with a regex literal and/or a replacer function.
+    if ((m == "replace" || m == "replaceAll") && args.size() >= 2)
+    {
+        std::regex re;
+        bool global = false;
+        bool isRegex = asRegexLiteral(args[0].toString(), re, global, str);
+        if (m == "replaceAll")
+            global = true;
+        const QuantumValue &repl = args[1];
+        bool replFn = repl.isClosure() || repl.isBoundMethod() || repl.isNative();
+        if (isRegex && !replFn)
+            return QuantumValue(std::regex_replace(
+                str, re, repl.toString(),
+                global ? std::regex_constants::format_default
+                       : std::regex_constants::format_first_only));
+        if (replFn)
+        {
+            if (!isRegex)
+                re = std::regex(std::regex_replace(args[0].toString(),
+                                                   std::regex(R"([.^$|()\[\]{}*+?\\])"), "\\$&"));
+            std::string out;
+            auto begin = std::sregex_iterator(str.begin(), str.end(), re);
+            size_t last = 0;
+            for (auto it = begin; it != std::sregex_iterator(); ++it)
+            {
+                const std::smatch &mt = *it;
+                std::vector<QuantumValue> cbArgs;
+                for (size_t g = 0; g < mt.size(); ++g)
+                    cbArgs.push_back(mt[g].matched ? QuantumValue(mt[g].str()) : QuantumValue());
+                cbArgs.push_back(QuantumValue((double)mt.position(0)));
+                out += str.substr(last, mt.position(0) - last);
+                out += invokeCallable(repl, cbArgs).toString();
+                last = mt.position(0) + mt.length(0);
+                if (!global)
+                    break;
+            }
+            return QuantumValue(out + str.substr(last));
+        }
+    }
+    if (m == "match" && !args.empty())
+    {
+        std::regex re;
+        bool global = false;
+        if (asRegexLiteral(args[0].toString(), re, global, str) && global)
+        {
+            // /g: every full match, no groups (JS String#match semantics)
+            auto arr = std::make_shared<Array>();
+            for (auto it = std::sregex_iterator(str.begin(), str.end(), re);
+                 it != std::sregex_iterator(); ++it)
+                arr->push_back(QuantumValue(it->str()));
+            if (arr->empty())
+                return QuantumValue();
+            return QuantumValue(arr);
+        }
+    }
+    if (m == "search" && !args.empty())
+    {
+        std::regex re;
+        bool global = false;
+        std::smatch mt;
+        if (asRegexLiteral(args[0].toString(), re, global, str))
+            return QuantumValue(std::regex_search(str, mt, re) ? (double)mt.position(0) : -1.0);
+        size_t p = str.find(args[0].toString());
+        return QuantumValue(p == std::string::npos ? -1.0 : (double)p);
+    }
     if (m == "length" || m == "size")
         return QuantumValue((double)str.size());
     // C++ compatibility: e.what() on caught exception strings; s.begin()/s.end()

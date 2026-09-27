@@ -2,6 +2,9 @@
 #include <sstream>
 #include <unordered_set>
 #include <cctype>
+#include <functional>
+#include <algorithm>
+#include <unordered_map>
 
 ASTNodePtr Parser::parseStatement()
 {
@@ -429,6 +432,7 @@ ASTNodePtr Parser::parseStatement()
                 // Also eat any pointer/reference qualifiers: int* funcName → eat *
                 while (check(TokenType::STAR) || check(TokenType::BIT_AND) || check(TokenType::CONST))
                     consume();
+                nextFnIsCpp_ = true;
                 return parseFunctionDecl();
             }
             auto typeHint = consume().value;
@@ -552,6 +556,77 @@ ASTNodePtr Parser::parseStatement()
             {
                 consume(); // eat 'struct' / 'union'
                 return parseClassDecl();
+            }
+        }
+        // C/C++ `enum [class] Name [: type] { A, B = 5, C };` — each enumerator
+        // becomes a constant, also reachable as Name::A and Name.A. Values
+        // are computed at runtime (previous + 1), so `B = A << 2` works too.
+        if (check(TokenType::IDENTIFIER) && current().value == "enum")
+        {
+            size_t la = pos + 1;
+            if (la < tokens.size() && (tokens[la].type == TokenType::CLASS ||
+                                       (tokens[la].type == TokenType::IDENTIFIER &&
+                                        tokens[la].value == "struct")))
+                la++;
+            std::string enumName;
+            if (la < tokens.size() && tokens[la].type == TokenType::IDENTIFIER)
+                enumName = tokens[la++].value;
+            if (la < tokens.size() && tokens[la].type == TokenType::COLON)
+                while (la < tokens.size() && tokens[la].type != TokenType::LBRACE &&
+                       tokens[la].type != TokenType::SEMICOLON && tokens[la].type != TokenType::NEWLINE)
+                    la++; // underlying type: enum Color : int
+            size_t lb = la;
+            while (lb < tokens.size() && tokens[lb].type == TokenType::NEWLINE)
+                lb++;
+            if (lb < tokens.size() && tokens[lb].type == TokenType::LBRACE)
+            {
+                pos = lb + 1;
+                auto block = std::make_unique<ASTNode>(BlockStmt{}, ln);
+                auto &stmts = block->as<BlockStmt>().statements;
+                DictLiteral members;
+                std::string prev;
+                while (!atEnd() && !check(TokenType::RBRACE))
+                {
+                    skipNewlines();
+                    if (check(TokenType::RBRACE))
+                        break;
+                    std::string name = expect(TokenType::IDENTIFIER, "Expected enumerator name").value;
+                    ASTNodePtr value;
+                    if (match(TokenType::ASSIGN))
+                        value = parseExpr();
+                    else if (prev.empty())
+                        value = std::make_unique<ASTNode>(NumberLiteral{0}, ln);
+                    else
+                        value = std::make_unique<ASTNode>(
+                            BinaryExpr{"+", std::make_unique<ASTNode>(Identifier{prev}, ln),
+                                       std::make_unique<ASTNode>(NumberLiteral{1}, ln)},
+                            ln);
+                    stmts.push_back(std::make_unique<ASTNode>(VarDecl{false, name, std::move(value), ""}, ln));
+                    if (!enumName.empty())
+                    {
+                        stmts.push_back(std::make_unique<ASTNode>(
+                            VarDecl{false, enumName + "::" + name,
+                                    std::make_unique<ASTNode>(Identifier{name}, ln), ""},
+                            ln));
+                        members.pairs.emplace_back(std::make_unique<ASTNode>(StringLiteral{name}, ln),
+                                                   std::make_unique<ASTNode>(Identifier{name}, ln));
+                    }
+                    prev = name;
+                    skipNewlines();
+                    if (!match(TokenType::COMMA))
+                        break;
+                }
+                skipNewlines();
+                expect(TokenType::RBRACE, "Expected '}' to close enum");
+                if (!enumName.empty())
+                    stmts.push_back(std::make_unique<ASTNode>(
+                        VarDecl{false, enumName, std::make_unique<ASTNode>(std::move(members), ln), ""}, ln));
+                // `enum Color { ... } c;` — skip any trailing declarators
+                while (!atEnd() && !check(TokenType::SEMICOLON) && !check(TokenType::NEWLINE))
+                    consume();
+                while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
+                    consume();
+                return block;
             }
         }
         // Handle GCC/Clang __asm__ volatile (...) — skip as a no-op
@@ -815,6 +890,7 @@ ASTNodePtr Parser::parseStatement()
                         consume();     // eat return type (e.g. 'Node')
                         while (check(TokenType::STAR) || check(TokenType::BIT_AND) || check(TokenType::CONST))
                             consume(); // eat pointer/ref qualifiers
+                        nextFnIsCpp_ = true;
                         return parseFunctionDecl();
                     }
                 }
@@ -905,6 +981,7 @@ ASTNodePtr Parser::parseStatement()
                             CallExpr ce;
                             ce.callee = std::move(callee);
                             consume(); // eat (
+                            BraceInitScope braceInit(braceInitDepth_);
                             while (!check(TokenType::RPAREN) && !atEnd())
                             {
                                 ce.args.push_back(parseExpr());
@@ -917,6 +994,7 @@ ASTNodePtr Parser::parseStatement()
                         }
                         else if (match(TokenType::ASSIGN))
                         {
+                            BraceInitScope braceInit(braceInitDepth_);
                             init = parseExpr();
                         }
                         else
@@ -973,11 +1051,9 @@ ASTNodePtr Parser::parseStatement()
             while (check(TokenType::SEMICOLON) || check(TokenType::NEWLINE))
                 consume();
 
-            // Desugar to: while(true) { body; if(!cond) break; }
-            BlockStmt whileBody;
-            for (auto &s : body->as<BlockStmt>().statements)
-                whileBody.statements.push_back(std::move(const_cast<ASTNodePtr &>(s)));
-            // Add if(!cond){break;} at end
+            // Desugar to: while(true) { body } with post `if(!cond) break;`
+            // — the post clause is the continue target, so `continue` in a
+            // do-while re-checks the condition as in C.
             UnaryExpr notCond;
             notCond.op = "!";
             notCond.operand = std::move(condition);
@@ -986,11 +1062,12 @@ ASTNodePtr Parser::parseStatement()
             IfStmt ifBreak;
             ifBreak.condition = std::make_unique<ASTNode>(std::move(notCond), ln);
             ifBreak.thenBranch = std::make_unique<ASTNode>(std::move(breakBlock), ln);
-            whileBody.statements.push_back(std::make_unique<ASTNode>(std::move(ifBreak), ln));
 
-            auto whileBodyNode = std::make_unique<ASTNode>(std::move(whileBody), ln);
             auto trueNode = std::make_unique<ASTNode>(BoolLiteral{true}, ln);
-            return std::make_unique<ASTNode>(WhileStmt{std::move(trueNode), std::move(whileBodyNode)}, ln);
+            return std::make_unique<ASTNode>(
+                WhileStmt{std::move(trueNode), std::move(body),
+                          std::make_unique<ASTNode>(std::move(ifBreak), ln)},
+                ln);
         }
         return parseExprStmt();
     }
@@ -1065,9 +1142,111 @@ ASTNodePtr Parser::parseBodyOrStatement()
     return std::make_unique<ASTNode>(std::move(block), ln);
 }
 
+// JS destructuring declaration, after `let`/`const`/`var`:
+//   let [a, , b = 1, ...rest] = expr     const {x, y: alias, z = 0} = expr
+// Desugars to a hidden temp holding `expr` plus one VarDecl per name, reading
+// through __destructure__ so a missing element is nil (JS `undefined`), not
+// an index error.
+ASTNodePtr Parser::parseDestructuringDecl(bool isConst)
+{
+    int ln = current().line;
+    bool isArray = check(TokenType::LBRACKET);
+    TokenType closer = isArray ? TokenType::RBRACKET : TokenType::RBRACE;
+    consume(); // [ or {
+
+    struct Target
+    {
+        std::string name, key;
+        int index = 0;
+        bool rest = false;
+        ASTNodePtr def;
+    };
+    std::vector<Target> targets;
+    int index = 0;
+    bool prevInCallArgList = inCallArgList;
+    inCallArgList = true; // commas separate names, never a tuple-unpack
+    while (!check(closer) && !atEnd())
+    {
+        skipNewlines();
+        if (isArray && check(TokenType::COMMA))
+        {
+            consume(); // hole: `[a, , b]`
+            index++;
+            continue;
+        }
+        Target t;
+        if (check(TokenType::IDENTIFIER) && current().value == "...")
+        {
+            consume();
+            t.rest = true;
+        }
+        std::string first = consume().value;
+        if (!isArray && check(TokenType::COLON))
+        {
+            consume();
+            t.key = first;
+            t.name = consume().value;
+        }
+        else
+            t.name = t.key = first;
+        if (match(TokenType::ASSIGN))
+            t.def = parseExpr();
+        t.index = index++;
+        targets.push_back(std::move(t));
+        skipNewlines();
+        if (!match(TokenType::COMMA))
+            break;
+    }
+    inCallArgList = prevInCallArgList;
+    skipNewlines();
+    expect(closer, isArray ? "Expected ']' in destructuring pattern"
+                           : "Expected '}' in destructuring pattern");
+    expect(TokenType::ASSIGN, "Expected '=' after destructuring pattern");
+    auto init = parseExpr();
+
+    static int destructCounter = 0;
+    std::string tmp = "__destruct_" + std::to_string(destructCounter++);
+    auto block = std::make_unique<ASTNode>(BlockStmt{}, ln);
+    auto &stmts = block->as<BlockStmt>().statements;
+    stmts.push_back(std::make_unique<ASTNode>(VarDecl{false, tmp, std::move(init), ""}, ln));
+    for (auto &t : targets)
+    {
+        // __destructure__(tmp, index-or-key, isRest, [taken keys for object rest])
+        CallExpr call;
+        call.callee = std::make_unique<ASTNode>(Identifier{"__destructure__"}, ln);
+        call.args.push_back(std::make_unique<ASTNode>(Identifier{tmp}, ln));
+        if (isArray)
+            call.args.push_back(std::make_unique<ASTNode>(NumberLiteral{(double)t.index}, ln));
+        else
+            call.args.push_back(std::make_unique<ASTNode>(StringLiteral{t.key}, ln));
+        call.args.push_back(std::make_unique<ASTNode>(BoolLiteral{t.rest}, ln));
+        if (t.rest && !isArray)
+        {
+            ArrayLiteral taken;
+            for (auto &o : targets)
+                if (!o.rest)
+                    taken.elements.push_back(std::make_unique<ASTNode>(StringLiteral{o.key}, ln));
+            call.args.push_back(std::make_unique<ASTNode>(std::move(taken), ln));
+        }
+        ASTNodePtr value = std::make_unique<ASTNode>(std::move(call), ln);
+        if (t.def)
+        {
+            // value ?? default — JS applies a default only for undefined
+            value = std::make_unique<ASTNode>(
+                BinaryExpr{"??", std::move(value), std::move(t.def)}, ln);
+        }
+        stmts.push_back(std::make_unique<ASTNode>(VarDecl{isConst, t.name, std::move(value), ""}, ln));
+    }
+    while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
+        consume();
+    return block;
+}
+
 ASTNodePtr Parser::parseVarDecl(bool isConst)
 {
     int ln = current().line;
+    if (check(TokenType::LBRACKET) || check(TokenType::LBRACE))
+        return parseDestructuringDecl(isConst);
     std::string name;
     if (check(TokenType::IDENTIFIER) || isCTypeKeyword(current().type))
         name = consume().value;
@@ -1132,6 +1311,8 @@ ASTNodePtr Parser::parseVarDecl(bool isConst)
 ASTNodePtr Parser::parseFunctionDecl()
 {
     int ln = current().line;
+    const bool isCpp = nextFnIsCpp_;
+    nextFnIsCpp_ = false;
     // Accept IDENTIFIER or keyword tokens used as function names (e.g. "input", "display")
     Token nameToken = check(TokenType::IDENTIFIER) ? consume() : (check(TokenType::INPUT) || check(TokenType::PRINT)) ? consume()
                                                                                                                       : expect(TokenType::IDENTIFIER, "Expected function name");
@@ -1194,7 +1375,18 @@ ASTNodePtr Parser::parseFunctionDecl()
         return std::make_unique<ASTNode>(std::move(fd), ln);
     }
 
-    auto body = parseBlock();
+    fnIsCpp_.push_back(isCpp);
+    ASTNodePtr body;
+    try
+    {
+        body = parseBlock();
+    }
+    catch (...)
+    {
+        fnIsCpp_.pop_back();
+        throw;
+    }
+    fnIsCpp_.pop_back();
     FunctionDecl fd;
     fd.name = nameToken.value;
     fd.params = std::move(params);
@@ -1319,6 +1511,7 @@ ASTNodePtr Parser::parseClassDecl()
             }
 
             bool isStatic = false;
+            bool methodHasReturnType = false; // `int f()` rather than a ctor or Python def
 
             // Skip access modifiers and C++ qualifiers
             while (check(TokenType::IDENTIFIER) &&
@@ -1452,6 +1645,7 @@ ASTNodePtr Parser::parseClassDecl()
                                 consume(); // multi-word types
                             while (check(TokenType::BIT_AND) || check(TokenType::STAR))
                                 consume();
+                            methodHasReturnType = true;
                             // Fall through to method name parsing
                         }
                         else
@@ -1547,6 +1741,7 @@ ASTNodePtr Parser::parseClassDecl()
                             }
                             while (check(TokenType::BIT_AND) || check(TokenType::STAR))
                                 consume();
+                            methodHasReturnType = true;
                             // Fall through to method name parsing below
                         }
                         else
@@ -1619,7 +1814,10 @@ ASTNodePtr Parser::parseClassDecl()
                                 consume();
                         }
                         if (match(TokenType::ASSIGN))
+                        {
+                            BraceInitScope braceInit(braceInitDepth_);
                             init = parseExpr();
+                        }
                         else if (!dims.empty())
                         {
                             // int arr[MAX]; — allocate a zero-filled array
@@ -1743,7 +1941,8 @@ ASTNodePtr Parser::parseClassDecl()
 
             std::vector<bool> methodParamIsRef;
             std::vector<ASTNodePtr> methodDefaultArgs;
-            auto params = parseParamList(&methodParamIsRef, &methodDefaultArgs);
+            std::vector<std::string> methodCppTypes;
+            auto params = parseParamList(&methodParamIsRef, &methodDefaultArgs, nullptr, &methodCppTypes);
 
             // Skip trailing C++ const: method() const { }
             if (check(TokenType::CONST))
@@ -1867,7 +2066,18 @@ ASTNodePtr Parser::parseClassDecl()
                 }
             }
             skipNewlines();
-            auto body = parseBlock();
+            fnIsCpp_.push_back(methodHasReturnType);
+            ASTNodePtr body;
+            try
+            {
+                body = parseBlock();
+            }
+            catch (...)
+            {
+                fnIsCpp_.pop_back();
+                throw;
+            }
+            fnIsCpp_.pop_back();
 
             if (!initAssignments.empty())
             {
@@ -1883,6 +2093,7 @@ ASTNodePtr Parser::parseClassDecl()
             methodFd.params = std::move(params);
             methodFd.paramIsRef = std::move(methodParamIsRef);
             methodFd.defaultArgs = std::move(methodDefaultArgs);
+            methodFd.cppParamTypes = std::move(methodCppTypes);
             methodFd.body = std::move(body);
             auto fn = std::make_unique<ASTNode>(std::move(methodFd), ln);
 
@@ -1902,6 +2113,7 @@ ASTNodePtr Parser::parseClassDecl()
         // C++ style: class Foo { }; — skip trailing semicolon
         while (check(TokenType::SEMICOLON))
             consume();
+        buildOverloadDispatchers(cd, ln);
     }
     else if (check(TokenType::INDENT))
     {
@@ -1924,6 +2136,141 @@ ASTNodePtr Parser::parseClassDecl()
         throw ParseError("Expected \'{\' or indented class body", current().line, current().col);
 
     return std::make_unique<ASTNode>(std::move(cd), ln);
+}
+
+// C++ overloads (`split(int)` / `split(RopeNode*, int)`, several
+// constructors) share one name, but a class maps each name to one method.
+// Each overload is renamed `name__ovl<k>` and a dispatcher takes the name:
+//
+//   name(*__ovl_args) {
+//       __ovl_k = __ovl_pick__(__ovl_args, [[min, max, [types]], ...])
+//       if (__ovl_k == k*64 + n) { return self.name__ovl<k>(args[0..n-1]) }
+//       ...
+//   }
+//
+// __ovl_pick__ matches argument count first, then the declared C++ parameter
+// types against the runtime values. Only typed (C++) same-name methods are
+// merged: a Python property getter/setter pair keeps last-definition-wins.
+void Parser::buildOverloadDispatchers(ClassDecl &cd, int ln)
+{
+    std::vector<std::string> order;
+    std::unordered_map<std::string, std::vector<size_t>> groups;
+    for (size_t i = 0; i < cd.methods.size(); ++i)
+    {
+        if (!cd.methods[i] || !cd.methods[i]->is<FunctionDecl>())
+            continue;
+        const std::string &name = cd.methods[i]->as<FunctionDecl>().name;
+        if (!groups.count(name))
+            order.push_back(name);
+        groups[name].push_back(i);
+    }
+
+    struct Sig
+    {
+        size_t idx;
+        int minArgs = 0, maxArgs = 0;
+        std::vector<std::string> types;
+    };
+    std::vector<bool> drop(cd.methods.size(), false);
+    std::vector<ASTNodePtr> dispatchers;
+    auto node = [&](auto &&n)
+    { return std::make_unique<ASTNode>(std::forward<decltype(n)>(n), ln); };
+
+    for (const std::string &name : order)
+    {
+        const auto &idxs = groups[name];
+        if (idxs.size() < 2)
+            continue;
+        bool typed = false;
+        for (size_t i : idxs)
+            for (auto &t : cd.methods[i]->as<FunctionDecl>().cppParamTypes)
+                typed = typed || !t.empty();
+        if (!typed)
+            continue;
+
+        std::vector<Sig> sigs;
+        for (size_t i : idxs)
+        {
+            auto &fd = cd.methods[i]->as<FunctionDecl>();
+            Sig s;
+            s.idx = i;
+            for (size_t p = 0; p < fd.params.size(); ++p)
+            {
+                if (p == 0 && (fd.params[0] == "self" || fd.params[0] == "this"))
+                    continue;
+                s.maxArgs++;
+                if (!(p < fd.defaultArgs.size() && fd.defaultArgs[p]))
+                    s.minArgs = s.maxArgs;
+                s.types.push_back(p < fd.cppParamTypes.size() ? fd.cppParamTypes[p] : "");
+            }
+            // An identical signature (C++ const / non-const pair) replaces
+            // the earlier one, as the single-definition behaviour always did.
+            auto same = std::find_if(sigs.begin(), sigs.end(), [&](const Sig &o)
+                                     { return o.minArgs == s.minArgs && o.maxArgs == s.maxArgs &&
+                                              o.types == s.types; });
+            if (same != sigs.end())
+            {
+                drop[same->idx] = true;
+                *same = s;
+            }
+            else
+                sigs.push_back(s);
+        }
+        if (sigs.size() < 2)
+            continue;
+
+        ArrayLiteral spec;
+        BlockStmt body;
+        CallExpr pick;
+        pick.callee = node(Identifier{"__ovl_pick__"});
+        pick.args.push_back(node(Identifier{"__ovl_args"}));
+        for (size_t k = 0; k < sigs.size(); ++k)
+        {
+            const Sig &s = sigs[k];
+            std::string target = name + "__ovl" + std::to_string(k);
+            cd.methods[s.idx]->as<FunctionDecl>().name = target;
+
+            ArrayLiteral entry, types;
+            entry.elements.push_back(node(NumberLiteral{(double)s.minArgs}));
+            entry.elements.push_back(node(NumberLiteral{(double)s.maxArgs}));
+            for (auto &t : s.types)
+                types.elements.push_back(node(StringLiteral{t}));
+            entry.elements.push_back(node(std::move(types)));
+            spec.elements.push_back(node(std::move(entry)));
+
+            for (int n = s.minArgs; n <= s.maxArgs; ++n)
+            {
+                CallExpr call;
+                call.callee = node(MemberExpr{node(Identifier{"self"}), target});
+                for (int a = 0; a < n; ++a)
+                    call.args.push_back(node(IndexExpr{node(Identifier{"__ovl_args"}),
+                                                       node(NumberLiteral{(double)a})}));
+                BlockStmt then;
+                then.statements.push_back(node(ReturnStmt{node(std::move(call))}));
+                body.statements.push_back(node(IfStmt{
+                    node(BinaryExpr{"==", node(Identifier{"__ovl_k"}),
+                                    node(NumberLiteral{(double)(k * 64 + n)})}),
+                    node(std::move(then)), nullptr}));
+            }
+        }
+        pick.args.push_back(node(std::move(spec)));
+        body.statements.insert(body.statements.begin(),
+                               node(VarDecl{false, "__ovl_k", node(std::move(pick)), ""}));
+
+        FunctionDecl disp;
+        disp.name = name;
+        disp.params = {"*__ovl_args"};
+        disp.body = node(std::move(body));
+        dispatchers.push_back(node(std::move(disp)));
+    }
+
+    std::vector<ASTNodePtr> kept;
+    for (size_t i = 0; i < cd.methods.size(); ++i)
+        if (!drop[i])
+            kept.push_back(std::move(cd.methods[i]));
+    for (auto &d : dispatchers)
+        kept.push_back(std::move(d));
+    cd.methods = std::move(kept);
 }
 
 ASTNodePtr Parser::parseIfStmt()
@@ -2133,9 +2480,28 @@ ASTNodePtr Parser::parseForStmt()
 {
     int ln = current().line;
 
+    // Python `for (a, b) in pairs:` — a parenthesized tuple target, not the
+    // opening of a C-style header.
+    bool parenTupleTarget = false;
+    if (check(TokenType::LPAREN))
+    {
+        size_t p = pos + 1;
+        int depth = 1;
+        while (p < tokens.size() && depth > 0)
+        {
+            if (tokens[p].type == TokenType::LPAREN)
+                depth++;
+            else if (tokens[p].type == TokenType::RPAREN)
+                depth--;
+            p++;
+        }
+        parenTupleTarget = depth == 0 && p < tokens.size() &&
+                           (tokens[p].type == TokenType::IN || tokens[p].type == TokenType::COMMA);
+    }
+
     // C-style for: for (init; condition; post) { body }
     // Detected by: for ( ...
-    if (check(TokenType::LPAREN))
+    if (check(TokenType::LPAREN) && !parenTupleTarget)
     {
         consume(); // eat (
 
@@ -2421,20 +2787,12 @@ ASTNodePtr Parser::parseForStmt()
         skipNewlines();
 
         // ── Body ──────────────────────────────────────────────────────────
-        auto rawBody = parseBodyOrStatement();
+        auto loopBody = parseBodyOrStatement();
 
-        // Append post expression at end of body block
-        BlockStmt loopBlock;
-        // Copy existing body statements
-        for (auto &s : rawBody->as<BlockStmt>().statements)
-            loopBlock.statements.push_back(std::move(const_cast<ASTNodePtr &>(s)));
-        if (postNode)
-            loopBlock.statements.push_back(std::move(postNode));
-        auto loopBody = std::make_unique<ASTNode>(std::move(loopBlock), ln);
-
-        // Build: while (condition) { body; post }
+        // Build: while (condition) { body } with `post` as the loop's
+        // continue target, so `continue` still runs the increment.
         auto whileNode = std::make_unique<ASTNode>(
-            WhileStmt{std::move(condition), std::move(loopBody)}, ln);
+            WhileStmt{std::move(condition), std::move(loopBody), std::move(postNode)}, ln);
 
         // Wrap in block: { init; while(...){...} }
         BlockStmt outer;
@@ -2446,9 +2804,29 @@ ASTNodePtr Parser::parseForStmt()
 
     // Python / Quantum / JS for-in / for-of
     // Supports tuple unpacking: for k, v in dict.items()
-    // Also accepts type keywords as variable names
-    auto readLoopVar = [&]() -> std::string
+    // Also accepts type keywords as variable names. A parenthesized or
+    // bracketed target — `for i, (word, count) in ...` — becomes a "[a,b]"
+    // pattern that the compiler unpacks (Compiler::emitPatternLocals).
+    std::function<std::string()> readLoopVar = [&]() -> std::string
     {
+        if (check(TokenType::LPAREN) || check(TokenType::LBRACKET))
+        {
+            TokenType closer = check(TokenType::LPAREN) ? TokenType::RPAREN : TokenType::RBRACKET;
+            consume();
+            std::string pat = "[";
+            bool firstEl = true;
+            while (!check(closer) && !atEnd())
+            {
+                if (!firstEl)
+                    pat += ",";
+                pat += readLoopVar();
+                firstEl = false;
+                if (!match(TokenType::COMMA))
+                    break;
+            }
+            expect(closer, "Expected closing bracket in for-loop target");
+            return pat + "]";
+        }
         if (check(TokenType::IDENTIFIER))
             return consume().value;
         if (isCTypeKeyword(current().type))
@@ -2457,14 +2835,19 @@ ASTNodePtr Parser::parseForStmt()
         return "";
     };
 
-    std::string var = readLoopVar();
-    std::string var2; // second variable for tuple unpacking
-
-    // Tuple unpacking: for k, v in ...
-    if (check(TokenType::COMMA))
+    std::vector<std::string> loopVars{readLoopVar()};
+    while (match(TokenType::COMMA))
+        loopVars.push_back(readLoopVar());
+    std::string var = loopVars[0];
+    std::string var2; // second variable for tuple unpacking: for k, v in ...
+    if (loopVars.size() == 2)
+        var2 = loopVars[1];
+    else if (loopVars.size() > 2)
     {
-        consume();
-        var2 = readLoopVar();
+        var = "[";
+        for (size_t i = 0; i < loopVars.size(); ++i)
+            var += (i ? "," : "") + loopVars[i];
+        var += "]";
     }
 
     // Accept both 'in' and 'of' (JavaScript for...of)
@@ -2488,7 +2871,19 @@ ASTNodePtr Parser::parseReturnStmt()
     if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) &&
         !check(TokenType::RBRACE) && !atEnd())
     {
-        val = parseExpr();
+        // `return {a, b};` in a C++ function is a brace-init (pair / vector).
+        int braceInit = (!fnIsCpp_.empty() && fnIsCpp_.back()) ? 1 : 0;
+        braceInitDepth_ += braceInit;
+        try
+        {
+            val = parseExpr();
+        }
+        catch (...)
+        {
+            braceInitDepth_ -= braceInit;
+            throw;
+        }
+        braceInitDepth_ -= braceInit;
         // Tuple return: return a, b  or  return a, b, c
         if (check(TokenType::COMMA))
         {
@@ -2634,7 +3029,6 @@ ASTNodePtr Parser::parseCoutStmt()
     // stays available as the stream-insertion separator.
     int ln = current().line;
     std::vector<ASTNodePtr> args;
-    bool newline = false;
 
     while (true)
     {
@@ -2645,29 +3039,27 @@ ASTNodePtr Parser::parseCoutStmt()
 
         skipNewlines();
 
-        // "endl" triggers a newline (no value pushed)
+        // "endl" is a newline at its position in the stream
         if (check(TokenType::IDENTIFIER) && current().value == "endl")
         {
             consume();
-            newline = true;
+            args.push_back(std::make_unique<ASTNode>(StringLiteral{"\n"}, ln));
             continue;
         }
 
         // Parse the next segment at add/sub precedence so << isn't swallowed
-        auto expr = parseAddSub();
-
-        // If the segment is a string ending with \n, keep it as-is (contains the newline)
-        // Only treat a bare "\n" string as endl
-        if (expr->is<StringLiteral>() && expr->as<StringLiteral>().value == "\n")
-            newline = true;
-        else
-            args.push_back(std::move(expr));
+        args.push_back(parseAddSub());
     }
 
     while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
         consume();
 
-    return std::make_unique<ASTNode>(PrintStmt{std::move(args), newline}, ln);
+    // A stream writes exactly what it is given: no separators, and no
+    // newline beyond the endl / "\n" segments in the chain.
+    PrintStmt ps{std::move(args), false};
+    ps.sep = "";
+    ps.end = "";
+    return std::make_unique<ASTNode>(std::move(ps), ln);
 }
 
 ASTNodePtr Parser::parseCinStmt()
@@ -2797,7 +3189,10 @@ ASTNodePtr Parser::parseImportStmt(bool isFrom)
     {
         // from module.sub import A, B
         // Actually, we'll just read an identifier (maybe with dots in the future)
-        stmt.module = expect(TokenType::IDENTIFIER, "Expected module name after 'from'").value;
+        if (isCTypeKeyword(current().type))
+            stmt.module = consume().value; // from string import ascii_letters
+        else
+            stmt.module = expect(TokenType::IDENTIFIER, "Expected module name after 'from'").value;
         expect(TokenType::IMPORT, "Expected 'import' after module name in 'from' statement");
 
         do
@@ -2818,7 +3213,11 @@ ASTNodePtr Parser::parseImportStmt(bool isFrom)
         do
         {
             ImportStmt::Item item;
-            item.name = expect(TokenType::IDENTIFIER, "Expected module name to import").value;
+            // Python's `string` module lexes as the C type keyword.
+            if (isCTypeKeyword(current().type))
+                item.name = consume().value;
+            else
+                item.name = expect(TokenType::IDENTIFIER, "Expected module name to import").value;
             if (match(TokenType::AS))
             {
                 item.alias = expect(TokenType::IDENTIFIER, "Expected alias after 'as'").value;
