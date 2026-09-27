@@ -3444,6 +3444,19 @@ void VM::registerNatives()
     for (const char *arrLike : {"vector", "stack", "queue", "deque", "priority_queue"})
         reg(arrLike, [](std::vector<QuantumValue> a) -> QuantumValue
             {
+            // vector(first, last) — copy of an iterator range
+            if (!a.empty() && isStlIterator(a[0]))
+            {
+                auto src = stlIteratorArray(a[0]);
+                long b = std::clamp(stlIteratorPos(a[0]), 0L, (long)src->size());
+                long e = (a.size() > 1 && isStlIterator(a[1])) ? stlIteratorPos(a[1])
+                                                               : (long)src->size();
+                e = std::clamp(e, b, (long)src->size());
+                return QuantumValue(std::make_shared<Array>(src->begin() + b, src->begin() + e));
+            }
+            // vector(other) — copy
+            if (!a.empty() && a[0].isArray())
+                return QuantumValue(std::make_shared<Array>(*a[0].asArray()));
             // vector(n) / vector(n, fill) — sized construction
             auto arr = std::make_shared<Array>();
             if (!a.empty() && a[0].isNumber())

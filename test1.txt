@@ -1,2 +1,0 @@
-This is test file 1
-Content for batch processing.

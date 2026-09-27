@@ -38,10 +38,25 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr,
   }
   if (m == "length" || m == "size")
     return QuantumValue((double)arr->size());
-  // C++ compatibility: a.begin()/a.end() return the array itself so
-  // iterator-style calls like sort(a.begin(), a.end()) see the array.
-  if (m == "begin" || m == "end")
-    return QuantumValue(arr);
+  // C++ iterators: a.begin() + n, *it, sort(a.begin(), a.end()) — see VmStl.cpp.
+  if (m == "begin" || m == "cbegin")
+    return makeStlIterator(arr, 0);
+  if (m == "end" || m == "cend")
+    return makeStlIterator(arr, (long)arr->size());
+  // v.erase(it) / v.erase(first, last) / v.erase(index)
+  if (m == "erase") {
+    if (args.empty())
+      return QuantumValue();
+    auto posOf = [&](const QuantumValue &v) {
+      long p = isStlIterator(v) ? stlIteratorPos(v) : (long)v.asNumber();
+      return std::clamp(p, 0L, (long)arr->size());
+    };
+    long first = posOf(args[0]);
+    long last = args.size() > 1 ? std::max(first, posOf(args[1]))
+                                : std::min(first + 1, (long)arr->size());
+    arr->erase(arr->begin() + first, arr->begin() + last);
+    return makeStlIterator(arr, first);
+  }
   // C++ std::vector / stack / queue / Ruby array method names
   if (m == "push_back" || m == "emplace_back" || m == "push_front" || m == "unshift") {
     for (auto &v : args) {
@@ -265,7 +280,8 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr,
   }
   if (m == "insert") {
     if (args.size() >= 2) {
-      int idx = (int)args[0].asNumber();
+      int idx = isStlIterator(args[0]) ? (int)stlIteratorPos(args[0])
+                                       : (int)args[0].asNumber();
       if (idx < 0)
         idx = std::max(0, (int)arr->size() + idx);
       idx = std::min(idx, (int)arr->size());

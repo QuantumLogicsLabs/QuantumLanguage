@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <string>
 
@@ -137,6 +138,10 @@ private:
     // Calls any callable (closure, bound method, native) to completion from
     // native code — e.g. a JS replace() callback — and returns its result.
     QuantumValue invokeCallable(const QuantumValue &fn, const std::vector<QuantumValue> &args);
+    // Calls instance method `name` (e.g. __getitem__) if the instance's
+    // class defines it; returns false otherwise.
+    bool invokeMagic(const QuantumValue &inst, const char *name,
+                     const std::vector<QuantumValue> &args, QuantumValue &out);
     QuantumValue callBuiltinMethod(QuantumValue &obj,
                                    const std::string &method,
                                    std::vector<QuantumValue> args,
@@ -159,4 +164,14 @@ private:
     void insertOnStack(size_t pos, QuantumValue v);
 
     // ── Binary / unary ops ────────────────────────────────────────────────────
-    QuantumValue execBinary(Op op, const QuantumValue &left, const QuantumValue &right, in
+    QuantumValue execBinary(Op op, const QuantumValue &left, const QuantumValue &right, int line);
+    QuantumValue execUnary(Op op, const QuantumValue &val, int line);
+
+    // Iterator state is stored inside each iterator native's fn closure
+
+    // ── Misc helpers ──────────────────────────────────────────────────────────
+    static std::string valueEq(const QuantumValue &a, const QuantumValue &b);
+    static bool valuesEqual(const QuantumValue &a, const QuantumValue &b);
+    double toNumber(const QuantumValue &v, const std::string &ctx, int line);
+    void runtimeError(const std::string &msg, int line);
+};
