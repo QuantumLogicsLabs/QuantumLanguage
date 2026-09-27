@@ -53,6 +53,7 @@ int main(int argc, char *argv[])
         auto embedded = loadEmbeddedBytecode(exePath);
         if (embedded)
         {
+            g_scriptArgv.assign(argv, argv + argc);
             try
             {
                 VM vm;
@@ -125,6 +126,7 @@ int main(int argc, char *argv[])
     // so no node/python/gcc/g++ is required.
     if (hasSupportedExt(a1))
     {
+        g_scriptArgv.assign(argv + 1, argv + argc);
         runFile(a1);
         return 0;
     }
@@ -178,6 +180,7 @@ int main(int argc, char *argv[])
     }
     if (arg == "--run" && argc >= 3)
     {
+        g_scriptArgv.assign(argv + 2, argv + argc);
         runFile(argv[2]);
         return 0;
     }

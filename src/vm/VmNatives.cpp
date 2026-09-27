@@ -17,8 +17,12 @@
 #include <cstdio>
 #include <fstream>
 #include <cstring>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 extern bool g_testMode;
+extern std::vector<std::string> g_scriptArgv;
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -4236,6 +4240,27 @@ void VM::registerNatives()
         };
         (*osDict)["rename"] = QuantumValue(renameNat);
 
+        // os.listdir(path=".") — entry names (not paths), sorted; raises if
+        // the directory can't be read. Paths are UTF-8 in and out.
+        auto listdirNat = std::make_shared<QuantumNative>();
+        listdirNat->name = "os.listdir";
+        listdirNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            std::string dir = args.empty() ? "." : args[0].toString();
+            std::vector<std::string> names;
+            std::error_code ec;
+            for (fs::directory_iterator it(fs::u8path(dir), ec), end; !ec && it != end; it.increment(ec))
+                names.push_back(it->path().filename().u8string());
+            if (ec)
+                throw RuntimeError("os.listdir(): cannot read directory '" + dir + "': " + ec.message());
+            std::sort(names.begin(), names.end());
+            auto arr = std::make_shared<Array>();
+            for (auto &n : names)
+                arr->push_back(QuantumValue(n));
+            return QuantumValue(arr);
+        };
+        (*osDict)["listdir"] = QuantumValue(listdirNat);
+
         // os.path sub-dict
         auto pathDict = std::make_shared<Dict>();
 
@@ -4248,6 +4273,34 @@ void VM::registerNatives()
             return QuantumValue(f.good());
         };
         (*pathDict)["exists"] = QuantumValue(existsNat);
+
+        auto isdirNat = std::make_shared<QuantumNative>();
+        isdirNat->name = "os.path.isdir";
+        isdirNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            if (args.empty()) return QuantumValue(false);
+            std::error_code ec;
+            return QuantumValue(fs::is_directory(fs::u8path(args[0].toString()), ec));
+        };
+        (*pathDict)["isdir"] = QuantumValue(isdirNat);
+
+        // os.path.abspath(path) — absolute, normalized, "/"-separated (like os.sep)
+        auto abspathNat = std::make_shared<QuantumNative>();
+        abspathNat->name = "os.path.abspath";
+        abspathNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+            std::string p = args.empty() ? "" : args[0].toString();
+            std::error_code ec;
+            fs::path abs = fs::absolute(fs::u8path(p.empty() ? "." : p), ec);
+            if (ec)
+                throw RuntimeError("os.path.abspath(): " + ec.message());
+            std::string out = abs.lexically_normal().generic_u8string();
+            // "C:/proj/." normalizes to "C:/proj/"; keep the slash only on a root.
+            while (out.size() > 1 && out.back() == '/' && !(out.size() == 3 && out[1] == ':'))
+                out.pop_back();
+            return QuantumValue(out);
+        };
+        (*pathDict)["abspath"] = QuantumValue(abspathNat);
 
         auto joinNat = std::make_shared<QuantumNative>();
         joinNat->name = "os.path.join";
@@ -4303,6 +4356,16 @@ void VM::registerNatives()
         (*osDict)["sep"] = QuantumValue(std::string("/"));
 
         globals->define("os", QuantumValue(osDict));
+    }
+
+    // ── sys module (Python compatibility) ────────────────────────────────────
+    {
+        auto sysDict = std::make_shared<Dict>();
+        auto argvArr = std::make_shared<Array>();
+        for (const auto &a : g_scriptArgv)
+            argvArr->push_back(QuantumValue(a));
+        (*sysDict)["argv"] = QuantumValue(argvArr);
+        globals->define("sys", QuantumValue(sysDict));
     }
 }
 

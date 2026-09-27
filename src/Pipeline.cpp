@@ -10,6 +10,7 @@
 
 // Shared with src/vm/VmNatives.cpp (declared extern there).
 bool g_testMode = false;
+std::vector<std::string> g_scriptArgv;
 
 // ─── Compile source → Chunk ───────────────────────────────────────────────────
 

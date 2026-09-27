@@ -205,7 +205,8 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr,
       start = std::max(0, len + start);
     if (stop < 0)
       stop = std::max(0, len + stop);
-    stop = std::min(stop, len);
+    start = std::min(start, len);
+    stop = std::max(start, std::min(stop, len));
     auto r = std::make_shared<Array>(arr->begin() + start, arr->begin() + stop);
     return QuantumValue(r);
   }
