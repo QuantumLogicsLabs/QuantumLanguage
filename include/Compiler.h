@@ -135,6 +135,9 @@ private:
     void emitLoad(const std::string &name, int line);
     void emitStore(const std::string &name, int line);
 
+    // Unpacks a "[a,b]" loop-variable pattern held in local `slot`.
+    void emitPatternLocals(int slot, const std::string &pattern, int line);
+
     // Loop stack for break/continue patching
     struct LoopInfo
     {

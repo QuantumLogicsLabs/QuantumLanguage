@@ -30,6 +30,11 @@ private:
 
     Token readNumber();
     Token readString(char quote);
+    bool atTripleQuote(char quote) const;
+    Token readTripleString(char quote, bool raw);
+    // After a value token, whether the `//` at pos is a C/JS line comment
+    // rather than Python floor division.
+    bool slashSlashIsComment() const;
     void readTemplateLiteral(std::vector<Token> &out, int startLine, int startCol);
     Token readIdentifierOrKeyword();
     Token readOperator();

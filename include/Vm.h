@@ -74,6 +74,16 @@ struct ExceptionHandler
     size_t stackDepth; // value stack depth to restore
 };
 
+// ─── STL-style iterators (VmStl.cpp) ──────────────────────────────────────────
+// `v.begin() + n` into an array is a Dict {"__it_arr": array, "__it_pos": n};
+// iterator arithmetic, comparison and `*it` are handled in the VM, and the
+// <algorithm> natives (sort, find, max_element, ...) take such ranges.
+bool isStlIterator(const QuantumValue &v);
+QuantumValue makeStlIterator(std::shared_ptr<Array> arr, long pos);
+std::shared_ptr<Array> stlIteratorArray(const QuantumValue &v);
+long stlIteratorPos(const QuantumValue &v);
+QuantumValue stlIteratorDeref(const QuantumValue &v);
+
 // ─── VM ───────────────────────────────────────────────────────────────────────
 class VM
 {
@@ -101,6 +111,15 @@ private:
 
     // ── Native registration ───────────────────────────────────────────────────
     void registerNatives();
+    void registerStlNatives(); // <algorithm>-style free functions (VmStl.cpp)
+    // Globals that yield to a same-named member inside a method: common
+    // identifiers like `next`/`count`/`find` registered as STL algorithms
+    // must not shadow a C++ class's own `next` field or `find()` method under
+    // implicit `this`. A user definition of the name removes it from the set.
+    std::unordered_set<std::string> weakGlobals_;
+    // Ordering used by sort/max_element/... without a comparator: numbers,
+    // strings, arrays (pairs) lexicographically, instances via __lt__.
+    bool stlLess(const QuantumValue &a, const QuantumValue &b);
 
     // ── Execution ────────────────────────────────────────────────────────────
     void runFrame(size_t stopDepth = 0);
@@ -115,6 +134,9 @@ private:
     void callClosure(std::shared_ptr<Closure> closure, int argCount, int line);
     void callNativeFn(std::shared_ptr<QuantumNative> fn, int argCount, int line);
     void callClass(std::shared_ptr<QuantumClass> klass, int argCount, int line);
+    // Calls any callable (closure, bound method, native) to completion from
+    // native code — e.g. a JS replace() callback — and returns its result.
+    QuantumValue invokeCallable(const QuantumValue &fn, const std::vector<QuantumValue> &args);
     QuantumValue callBuiltinMethod(QuantumValue &obj,
                                    const std::string &method,
                                    std::vector<QuantumValue> args,
@@ -137,14 +159,4 @@ private:
     void insertOnStack(size_t pos, QuantumValue v);
 
     // ── Binary / unary ops ────────────────────────────────────────────────────
-    QuantumValue execBinary(Op op, const QuantumValue &left, const QuantumValue &right, int line);
-    QuantumValue execUnary(Op op, const QuantumValue &val, int line);
-
-    // Iterator state is stored inside each iterator native's fn closure
-
-    // ── Misc helpers ──────────────────────────────────────────────────────────
-    static std::string valueEq(const QuantumValue &a, const QuantumValue &b);
-    static bool valuesEqual(const QuantumValue &a, const QuantumValue &b);
-    double toNumber(const QuantumValue &v, const std::string &ctx, int line);
-    void runtimeError(const std::string &msg, int line);
-};
+    QuantumValue execBinary(Op op, const QuantumValue &left, const QuantumValue &right, in

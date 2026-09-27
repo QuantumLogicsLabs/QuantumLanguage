@@ -196,6 +196,7 @@ ASTNodePtr Parser::parseBitwise()
     {
         int ln = current().line;
         auto op = consume().value;
+        skipNewlines(); // a trailing operator continues onto the next line
         auto right = parseEquality();
         left = std::make_unique<ASTNode>(BinaryExpr{op, std::move(left), std::move(right)}, ln);
     }
@@ -212,6 +213,7 @@ ASTNodePtr Parser::parseEquality()
         // Treat === as == and !== as != (Quantum is dynamically typed)
         std::string opStr = (op.type == TokenType::STRICT_EQ) ? "==" : (op.type == TokenType::STRICT_NEQ) ? "!="
                                                                                                           : op.value;
+        skipNewlines(); // a trailing operator continues onto the next line
         auto right = parseComparison();
         left = std::make_unique<ASTNode>(BinaryExpr{opStr, std::move(left), std::move(right)}, ln);
     }
@@ -263,6 +265,7 @@ ASTNodePtr Parser::parseComparison()
         }
 
         auto op = consume().value;
+        skipNewlines(); // a trailing operator continues onto the next line
         auto right = parseShift();
         left = std::make_unique<ASTNode>(BinaryExpr{op, std::move(left), std::move(right)}, ln);
     }
@@ -279,6 +282,7 @@ ASTNodePtr Parser::parseShift()
             break;
         int ln = current().line;
         auto op = consume().value;
+        skipNewlines(); // a trailing operator continues onto the next line
         auto right = parseAddSub();
         left = std::make_unique<ASTNode>(BinaryExpr{op, std::move(left), std::move(right)}, ln);
     }
@@ -292,6 +296,7 @@ ASTNodePtr Parser::parseAddSub()
     {
         int ln = current().line;
         auto op = consume().value;
+        skipNewlines(); // a trailing operator continues onto the next line
         auto right = parseMulDiv();
         left = std::make_unique<ASTNode>(BinaryExpr{op, std::move(left), std::move(right)}, ln);
     }
@@ -305,6 +310,7 @@ ASTNodePtr Parser::parseMulDiv()
     {
         int ln = current().line;
         auto op = consume().value;
+        skipNewlines(); // a trailing operator continues onto the next line
         auto right = parsePower();
         left = std::make_unique<ASTNode>(BinaryExpr{op, std::move(left), std::move(right)}, ln);
     }
@@ -318,6 +324,7 @@ ASTNodePtr Parser::parsePower()
     {
         int ln = current().line;
         consume();
+        skipNewlines(); // a trailing operator continues onto the next line
         auto right = parsePower(); // right-associative
         return std::make_unique<ASTNode>(BinaryExpr{"**", std::move(left), std::move(right)}, ln);
     }

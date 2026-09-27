@@ -191,6 +191,16 @@ void VM::registerNatives()
         return QuantumValue(0.0); };
     reg("int", intNat);
     reg("_int_", intNat);
+    // Initializer of a C integer declaration (`int mid = n / 2`): numbers
+    // truncate toward zero as C does; anything else (a char read into an
+    // int, nil) passes through untouched.
+    reg("__c_int__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.empty()) return QuantumValue(0.0);
+        if (args[0].isBool()) return QuantumValue(args[0].asBool() ? 1.0 : 0.0);
+        if (args[0].isNumber() && std::isfinite(args[0].asNumber()))
+            return QuantumValue(std::trunc(args[0].asNumber()));
+        return args[0]; });
     reg("_long_", intNat);
     reg("_short_", intNat);
 
@@ -485,6 +495,107 @@ void VM::registerNatives()
             for (auto &[k, v] : *args[1].asDict())
                 (*dict)[k] = v;
         return QuantumValue(dict); });
+    // One binding of a JS destructuring declaration (see
+    // Parser::parseDestructuringDecl): __destructure__(src, indexOrKey,
+    // isRest, [takenKeys]). A missing element reads as nil (JS undefined).
+    reg("__destructure__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() < 3) return QuantumValue();
+        const QuantumValue &src = args[0];
+        bool rest = args[2].isTruthy();
+        if (args[1].isNumber()) {
+            size_t idx = static_cast<size_t>(args[1].asNumber());
+            Array items;
+            if (src.isArray()) items = *src.asArray();
+            else if (src.isString())
+                for (char c : src.asString()) items.push_back(QuantumValue(std::string(1, c)));
+            if (rest) {
+                auto out = std::make_shared<Array>();
+                for (size_t i = idx; i < items.size(); ++i) out->push_back(items[i]);
+                return QuantumValue(out);
+            }
+            return idx < items.size() ? items[idx] : QuantumValue();
+        }
+        std::string key = args[1].toString();
+        if (src.isDict()) {
+            auto d = src.asDict();
+            if (rest) {
+                auto out = std::make_shared<Dict>(*d);
+                if (args.size() > 3 && args[3].isArray())
+                    for (auto &k : *args[3].asArray()) out->erase(k.toString());
+                return QuantumValue(out);
+            }
+            auto it = d->find(key);
+            return it != d->end() ? it->second : QuantumValue();
+        }
+        if (src.isInstance()) {
+            auto &fields = src.asInstance()->fields;
+            auto it = fields.find(key);
+            return it != fields.end() ? it->second : QuantumValue();
+        }
+        return QuantumValue(); });
+
+    // C++ overload resolution for a dispatcher built by
+    // Parser::buildOverloadDispatchers: __ovl_pick__(callArgs,
+    // [[minArgs, maxArgs, [paramTypes]], ...]) → k*64 + argCount of the first
+    // overload whose arity and declared parameter types fit the arguments
+    // (falling back to arity alone).
+    reg("__ovl_pick__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.size() < 2 || !args[0].isArray() || !args[1].isArray())
+            throw TypeError("__ovl_pick__ requires arguments and an overload table");
+        const Array &callArgs = *args[0].asArray();
+        const Array &spec = *args[1].asArray();
+        auto isNumericType = [](const std::string &t) {
+            static const std::unordered_set<std::string> nums = {
+                "int", "long", "short", "float", "double", "size_t", "long long",
+                "unsigned", "unsigned int", "unsigned long", "long double"};
+            return nums.count(t) > 0;
+        };
+        auto instanceOf = [](const QuantumValue &v, const std::string &cls) {
+            if (!v.isInstance()) return false;
+            for (auto *k = v.asInstance()->klass.get(); k; k = k->base.get())
+                if (k->name == cls) return true;
+            return false;
+        };
+        auto fits = [&](const QuantumValue &v, std::string type) {
+            if (type.empty() || type == "auto") return true;
+            bool ptr = false;
+            while (!type.empty() && type.back() == '*') { type.pop_back(); ptr = true; }
+            if (ptr) {
+                if (v.isNil() || v.isPointer() || v.isArray()) return true;
+                if (type == "char") return v.isString();
+                return v.isInstance() ? instanceOf(v, type) : false;
+            }
+            if (isNumericType(type)) return v.isNumber() || v.isBool();
+            if (type == "char") return (v.isString() && v.asString().size() == 1) || v.isNumber();
+            if (type == "bool") return v.isBool() || v.isNumber();
+            if (type == "string") return v.isString();
+            if (type == "vector" || type == "list" || type == "deque" || type == "array")
+                return v.isArray();
+            if (type == "map" || type == "unordered_map" || type == "set" || type == "unordered_set")
+                return v.isDict() || v.isArray();
+            if (type == "function") return v.isFunction() || v.isBoundMethod();
+            if (v.isInstance()) return instanceOf(v, type);
+            return !v.isNumber() && !v.isString() && !v.isBool();
+        };
+        const size_t n = callArgs.size();
+        for (int pass = 0; pass < 2; ++pass)
+            for (size_t k = 0; k < spec.size(); ++k) {
+                if (!spec[k].isArray()) continue;
+                const Array &s = *spec[k].asArray();
+                size_t minA = (size_t)s[0].asNumber(), maxA = (size_t)s[1].asNumber();
+                if (n < minA || n > maxA) continue;
+                bool ok = true;
+                if (pass == 0 && s.size() > 2 && s[2].isArray()) {
+                    const Array &types = *s[2].asArray();
+                    for (size_t j = 0; j < n && j < types.size() && ok; ++j)
+                        ok = fits(callArgs[j], types[j].toString());
+                }
+                if (ok) return QuantumValue((double)(k * 64 + n));
+            }
+        throw TypeError("No overload accepts " + std::to_string(n) + " argument(s)"); });
+
     reg("__call_spread__", [this](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.size() < 2 || !args[1].isArray())
@@ -2320,7 +2431,10 @@ void VM::registerNatives()
         {
         if (args.size() < 2)
             return QuantumValue(false);
-        std::ofstream out(args[0].toString(), std::ios::binary);
+        // write_file(path, content, append) — a truthy third argument appends.
+        bool append = args.size() > 2 && args[2].isTruthy();
+        std::ofstream out(args[0].toString(),
+                          append ? std::ios::binary | std::ios::app : std::ios::binary);
         if (!out)
             return QuantumValue(false);
         out << args[1].toString();

@@ -7,7 +7,19 @@
 
 void Compiler::compileVarDecl(VarDecl &s, int line)
 {
-    if (s.initializer)
+    // C integer declarations truncate their initializer: `int mid = n / 2`.
+    const std::string &t = s.typeHint;
+    bool cInteger = s.cTyped && !s.isPointer && t.find("[]") == std::string::npos &&
+                    (t == "int" || t == "long" || t == "short" || t == "size_t" ||
+                     t.rfind("long ", 0) == 0 || t.rfind("unsigned", 0) == 0 ||
+                     t.rfind("short ", 0) == 0);
+    if (s.initializer && cInteger)
+    {
+        emit(Op::LOAD_GLOBAL, addStr("__c_int__"), line);
+        compileExpr(*s.initializer);
+        emit(Op::CALL, 1, line);
+    }
+    else if (s.initializer)
         compileExpr(*s.initializer);
     // C/C++ typed declarations default like value-initialisation:
     // string/char → "", bool → false, numeric types → 0
@@ -215,10 +227,59 @@ void Compiler::compileWhile(WhileStmt &s, int line)
     for (size_t ci : loops_.back().continueJumps)
         chunk().patch(ci, static_cast<int32_t>(chunk().code.size()) - static_cast<int32_t>(ci) - 1);
 
+    if (s.post)
+    {
+        beginScope();
+        compileNode(*s.post);
+        endScope(line);
+    }
+
     emit(Op::LOOP, static_cast<int>(chunk().code.size()) - loopStart + 1, line);
     patchJump(exitJump);
     emit(Op::POP, 0, line);
     endLoop();
+}
+
+// A loop variable spelled as a pattern — "[k,v]" from `for (const [k, v] of
+// ...)`, or "[word,count]" from Python's `for i, (word, count) in ...` —
+// unpacks the local in `slot` into fresh locals, recursing into nested
+// patterns ("[a,[b,c]]").
+void Compiler::emitPatternLocals(int slot, const std::string &pattern, int line)
+{
+    if (pattern.size() < 2 || pattern.front() != '[' || pattern.back() != ']')
+        return;
+    std::vector<std::string> parts;
+    std::string cur;
+    int depth = 0;
+    for (size_t i = 1; i + 1 < pattern.size(); ++i)
+    {
+        char ch = pattern[i];
+        if (ch == '[')
+            depth++;
+        else if (ch == ']')
+            depth--;
+        if (ch == ',' && depth == 0)
+        {
+            parts.push_back(cur);
+            cur.clear();
+            continue;
+        }
+        if (!std::isspace(static_cast<unsigned char>(ch)))
+            cur += ch;
+    }
+    parts.push_back(cur);
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+        if (parts[i].empty())
+            continue; // hole
+        emit(Op::LOAD_LOCAL, slot, line);
+        emit(Op::LOAD_CONST, addConst(QuantumValue(static_cast<double>(i))), line);
+        emit(Op::GET_INDEX, 0, line);
+        declareLocal(parts[i], line);
+        int partSlot = static_cast<int>(current_->locals.size()) - 1;
+        emit(Op::DEFINE_LOCAL, partSlot, line);
+        emitPatternLocals(partSlot, parts[i], line);
+    }
 }
 
 void Compiler::compileFor(ForStmt &s, int line)
@@ -251,13 +312,16 @@ void Compiler::compileFor(ForStmt &s, int line)
         emit(Op::LOAD_CONST, addConst(QuantumValue(1.0)), line);
         emit(Op::GET_INDEX, 0, line);
         declareLocal(s.var2, line);
-        emit(Op::DEFINE_LOCAL, static_cast<int>(current_->locals.size()) - 1, line);
+        int var2Slot = static_cast<int>(current_->locals.size()) - 1;
+        emit(Op::DEFINE_LOCAL, var2Slot, line);
         emit(Op::LOAD_LOCAL, varSlot, line);
         emit(Op::LOAD_CONST, addConst(QuantumValue(0.0)), line);
         emit(Op::GET_INDEX, 0, line);
         emit(Op::STORE_LOCAL, varSlot, line);
         emit(Op::POP, 0, line);
+        emitPatternLocals(var2Slot, s.var2, line);
     }
+    emitPatternLocals(varSlot, s.var, line);
 
     compileNode(*s.body);
 

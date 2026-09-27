@@ -191,8 +191,11 @@ rbNormalizeAtoms(const std::string &s,
     // `key: value` hash shorthand (colon *after* the identifier) never
     // match — only a colon immediately followed by an identifier, not
     // itself preceded or followed by another colon, is a real symbol.
+    // A colon glued to a preceding operand (`{a:b}`, `c?x:y`) separates a
+    // key or ternary branch; a symbol always follows a space or delimiter.
     if (c == ':' && i + 1 < s.size() && rbIsIdentStart(s[i + 1]) &&
-        (i == 0 || s[i - 1] != ':')) {
+        (i == 0 || (s[i - 1] != ':' && !rbIsIdentChar(s[i - 1]) &&
+                    s[i - 1] != ')' && s[i - 1] != ']' && !rbIsQuote(s[i - 1])))) {
       size_t j = i + 1;
       while (j < s.size() && rbIsIdentChar(s[j]))
         j++;
@@ -210,7 +213,15 @@ rbNormalizeAtoms(const std::string &s,
       bool hadDotBefore = !out.empty() && out.back() == '.';
       bool suffixStripped = false;
       char suffixChar = '\0';
-      if (j < s.size() && (s[j] == '?' || s[j] == '!')) {
+      // Not a suffix: `ch!=EOF` is the `!=` operator, and in C's
+      // `c?1:2` the `?` opens a ternary whose operand follows at once.
+      char afterSuffix = j + 1 < s.size() ? s[j + 1] : '\0';
+      bool isNeqOperator = j < s.size() && s[j] == '!' && afterSuffix == '=';
+      bool isTightTernary = j < s.size() && s[j] == '?' &&
+                            (rbIsIdentChar(afterSuffix) || rbIsQuote(afterSuffix) ||
+                             afterSuffix == '-');
+      if (j < s.size() && (s[j] == '?' || s[j] == '!') && !isNeqOperator &&
+          !isTightTernary) {
         suffixChar = s[j];
         j++;
         suffixStripped = true;
@@ -1656,6 +1667,119 @@ static bool rbIsRubyLoopModifier(const std::string &stmt,
          st != "do" && !cd.empty() && cd[0] != '(';
 }
 
+// Mixed (.sa) mode: whether `STMT if COND` is Ruby's modifier-if rather than
+// two C statements on one line. `x = 1;  if (x > n) x = n;` puts a `;`
+// before the `if`, and C's `if (c) stmt` has code after the condition's
+// closing paren — a Ruby modifier has neither.
+static bool rbIsRubyIfModifier(const std::string &stmt,
+                               const std::string &cond) {
+  std::string st = trimCopy(stmt), cd = trimCopy(cond);
+  if (st.empty() || st.back() == ';')
+    return false;
+  if (!cd.empty() && cd[0] == '(') {
+    size_t close = rbMatchBracket(cd, 0);
+    if (close != std::string::npos) {
+      std::string rest = trimCopy(cd.substr(close + 1));
+      if (!rest.empty() && rest != ";")
+        return false;
+    }
+  }
+  return true;
+}
+
+// rbNormalizeAtoms renames a bare `input` variable (not an `input(...)`
+// call) to `__rb_input`. Lines that bypass normalization — mixed-mode lines
+// carrying a `//` comment — must get the same rename in their code part, or
+// `function f(input) { return input.trim(); // note` would read the
+// parameter under one name and the builtin under the other.
+static std::string rbRenameBareInput(const std::string &s) {
+  std::string out;
+  for (size_t i = 0; i < s.size();) {
+    char c = s[i];
+    if (rbIsQuote(c)) {
+      size_t j = rbSkipString(s, i);
+      out += s.substr(i, j - i);
+      i = j;
+      continue;
+    }
+    if (c == '/' && i + 1 < s.size() && (s[i + 1] == '/' || s[i + 1] == '*')) {
+      out += s.substr(i); // the comment itself stays as written
+      break;
+    }
+    if (rbIsIdentStart(c) && (i == 0 || !rbIsIdentChar(s[i - 1]))) {
+      size_t j = i;
+      while (j < s.size() && rbIsIdentChar(s[j]))
+        j++;
+      std::string ident = s.substr(i, j - i);
+      size_t k = j;
+      while (k < s.size() && (s[k] == ' ' || s[k] == '\t'))
+        k++;
+      bool call = k < s.size() && s[k] == '(';
+      out += (ident == "input" && !call) ? "__rb_input" : ident;
+      i = j;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+// Index of a `#` that starts a trailing comment (outside string literals,
+// preceded by whitespace), or npos.
+static size_t rbFindHashComment(const std::string &s) {
+  for (size_t i = 0; i < s.size();) {
+    char c = s[i];
+    if (rbIsQuote(c)) {
+      i = rbSkipString(s, i);
+      continue;
+    }
+    if (c == '#' && i > 0 && (s[i - 1] == ' ' || s[i - 1] == '\t'))
+      return i;
+    i++;
+  }
+  return std::string::npos;
+}
+
+// C preprocessor line (`#include`, `#define X 1`, ...). The lexer handles
+// these, so mixed mode must not turn them into comments.
+static bool rbIsPreprocessorLine(const std::string &code) {
+  static const std::regex ppRe(
+      "^#(include|define|undef|ifdef|ifndef|if|elif|else|endif|pragma|error|"
+      "warning|line)\\b.*");
+  return std::regex_match(code, ppRe);
+}
+
+// Tracks Python triple-quoted strings across lines. Given the state on
+// entry (`quote` is 0 outside one, else the quote char), returns the state
+// after scanning `line`.
+static char rbScanTripleQuotes(const std::string &line, char quote) {
+  for (size_t i = 0; i < line.size();) {
+    if (quote) {
+      if (line.compare(i, 3, std::string(3, quote)) == 0) {
+        quote = 0;
+        i += 3;
+      } else
+        i += (line[i] == '\\') ? 2 : 1;
+      continue;
+    }
+    char c = line[i];
+    if ((c == '"' || c == '\'') && line.compare(i, 3, std::string(3, c)) == 0) {
+      quote = c;
+      i += 3;
+      continue;
+    }
+    if (rbIsQuote(c)) {
+      i = rbSkipString(line, i);
+      continue;
+    }
+    if (c == '#')
+      break;
+    i++;
+  }
+  return quote;
+}
+
 // Mixed (.sa) mode: inline Ruby closure literals, none of which is valid
 // syntax in the other dialects sharing the file —
 //   lambda { |a, b| a + b }     ->(a, b) { a - b }     lambda |x| { ... }
@@ -2190,6 +2314,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           // enabling them here would mis-rewrite C/JS code.
           (strict || (m[2].str() != "while" && m[2].str() != "until") ||
            rbIsRubyLoopModifier(m[1].str(), m[3].str())) &&
+          // Likewise `x = 1;  if (c) y` is two C statements, not a modifier-if.
+          (strict || m[2].str() == "while" || m[2].str() == "until" ||
+           rbIsRubyIfModifier(m[1].str(), m[3].str())) &&
           rbFindTopLevel(code, " " + m[2].str() + " ") != std::string::npos &&
           rbFindTopLevel(m[3].str(), " else ") == std::string::npos &&
           // `x = if cond` is an if-*expression*, not a modifier-if:
@@ -2439,6 +2566,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
   };
 
   bool inBlockComment = false;
+  char tripleQuote = 0; // open """ / ''' string spanning lines (mixed mode)
   for (size_t li = 0; li < rawLines.size(); li++) {
     const std::string &rawLine = rawLines[li];
     // Recomputed each line: are we lexically inside a `class ... end`?
@@ -2467,12 +2595,34 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
         outLines.push_back(rawLine);
         continue;
       }
+      // Lines inside (or opening) a Python triple-quoted string are string
+      // content, not code — "Check if found" in a docstring must not
+      // become a modifier-if.
+      char tripleBefore = tripleQuote;
+      tripleQuote = rbScanTripleQuotes(rawLine, tripleQuote);
+      if (tripleBefore || tripleQuote) {
+        outLines.push_back(rawLine);
+        continue;
+      }
       if (rbHasCStyleComment(code)) {
         if (rbOpensBlockComment(code))
           inBlockComment = true;
-        outLines.push_back(rawLine);
+        outLines.push_back(indentation + rbRenameBareInput(code));
         trackNativeBraces(code);
         continue;
+      }
+      if (rbIsPreprocessorLine(code)) {
+        outLines.push_back(rawLine);
+        continue;
+      }
+      // A trailing `# comment` is prose too.
+      size_t hashAt = rbFindHashComment(code);
+      if (hashAt != std::string::npos) {
+        code = trimCopy(code.substr(0, hashAt));
+        if (code.empty()) {
+          outLines.push_back(rawLine);
+          continue;
+        }
       }
     }
 
@@ -2558,6 +2708,9 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
           // enabling them here would mis-rewrite C/JS code.
           (strict || (m[2].str() != "while" && m[2].str() != "until") ||
            rbIsRubyLoopModifier(m[1].str(), m[3].str())) &&
+          // Likewise `x = 1;  if (c) y` is two C statements, not a modifier-if.
+          (strict || m[2].str() == "while" || m[2].str() == "until" ||
+           rbIsRubyIfModifier(m[1].str(), m[3].str())) &&
           rbFindTopLevel(code, " " + m[2].str() + " ") != std::string::npos &&
           // Python inline ternary (`x = a if cond else b`) also matches
           // this shape — its giveaway is a top-level ` else `, which a

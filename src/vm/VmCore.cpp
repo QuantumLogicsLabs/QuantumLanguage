@@ -525,6 +525,33 @@ void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
     frames_.push_back({closure, 0, stackBase, suppliedArgs});
 }
 
+QuantumValue VM::invokeCallable(const QuantumValue &fn, const std::vector<QuantumValue> &args)
+{
+    if (fn.isNative())
+        return fn.asNative()->fn(args);
+    if (fn.isClosure())
+    {
+        push(fn);
+        for (auto &a : args)
+            push(a);
+        callClosure(fn.asFunction(), static_cast<int>(args.size()), 0);
+        runFrame(frames_.size() - 1);
+        return pop();
+    }
+    if (fn.isBoundMethod())
+    {
+        auto bm = fn.asBoundMethod();
+        push(fn);
+        push(bm->self);
+        for (auto &a : args)
+            push(a);
+        callClosure(bm->method, static_cast<int>(args.size()) + 1, 0);
+        runFrame(frames_.size() - 1);
+        return pop();
+    }
+    throw TypeError("Value of type " + fn.typeName() + " is not callable");
+}
+
 void VM::callNativeFn(std::shared_ptr<QuantumNative> fn, int argCount, int line)
 {
     std::vector<QuantumValue> args;

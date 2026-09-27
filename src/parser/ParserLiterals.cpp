@@ -680,15 +680,43 @@ ASTNodePtr Parser::parseArrayLiteral() {
   return std::make_unique<ASTNode>(std::move(arr), ln);
 }
 
+bool Parser::braceIsInitList() const {
+  int depth = 0;
+  int pendingTernaries = 0; // `?` whose `:` is not a key separator
+  for (size_t p = pos + 1; p < tokens.size(); ++p) {
+    TokenType t = tokens[p].type;
+    if (t == TokenType::LBRACE || t == TokenType::LPAREN || t == TokenType::LBRACKET)
+      depth++;
+    else if (t == TokenType::RBRACE || t == TokenType::RPAREN || t == TokenType::RBRACKET) {
+      if (depth == 0)
+        return true;
+      depth--;
+    } else if (depth == 0 && t == TokenType::QUESTION)
+      pendingTernaries++;
+    else if (depth == 0 && t == TokenType::COLON) {
+      if (p + 1 < tokens.size() && tokens[p + 1].type == TokenType::COLON) {
+        ++p; // `::` scope access
+        continue;
+      }
+      if (pendingTernaries > 0)
+        pendingTernaries--;
+      else
+        return false;
+    }
+  }
+  return true;
+}
+
 ASTNodePtr Parser::parseDictLiteral() {
   int ln = current().line;
+  bool cppInitList = braceInitDepth_ > 0 && braceIsInitList();
   expect(TokenType::LBRACE, "Expected '{'");
   skipNewlines();
 
   // C++ brace-initializer list: {"apple", "banana"}, {1, 2, 3}, or nested
   // {{"a", x}, {"b", y}} — a literal first element followed by ',' or '}'
   // (or an immediately nested '{') can't be a dict; parse as an array.
-  bool braceInitList = false;
+  bool braceInitList = cppInitList && !check(TokenType::RBRACE);
   if (check(TokenType::LBRACE))
     braceInitList = true; // nested init list → array of arrays
   else if (check(TokenType::STRING) || check(TokenType::NUMBER)) {
@@ -973,10 +1001,12 @@ std::vector<ASTNodePtr> Parser::parseArgList() {
 std::vector<std::string>
 Parser::parseParamList(std::vector<bool> *outIsRef,
                        std::vector<ASTNodePtr> *outDefaultArgs,
-                       std::vector<std::string> *outParamTypes) {
+                       std::vector<std::string> *outParamTypes,
+                       std::vector<std::string> *outCppTypes) {
   expect(TokenType::LPAREN, "Expected '('");
   std::vector<std::string> params;
   while (!check(TokenType::RPAREN) && !atEnd()) {
+    std::string cppType; // declared C/C++ type of this parameter, if any
     // C++ style: "const" modifier before type
     if (check(TokenType::CONST))
       consume(); // eat const
@@ -986,11 +1016,15 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
            pos + 1 < tokens.size() &&
            (isCTypeKeyword(tokens[pos + 1].type) || tokens[pos + 1].type == TokenType::IDENTIFIER ||
             tokens[pos + 1].type == TokenType::STAR || tokens[pos + 1].type == TokenType::BIT_AND)) {
+      if (isCTypeKeyword(current().type))
+        cppType += (cppType.empty() ? "" : " ") + current().value;
       consume(); // eat return/param type keyword or const
       hasCType = true;
     }
     if (hasCType) {
       while (check(TokenType::STAR) || check(TokenType::BIT_AND)) {
+        if (check(TokenType::STAR))
+          cppType += "*";
         consume(); // eat pointer/ref qualifier on type
       }
     }
@@ -1014,6 +1048,7 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
       }
       while (check(TokenType::STAR) || check(TokenType::CONST))
         consume();
+      cppType = "function";
     }
 
     // C++ style: identifier type before name (e.g. "string name", "Entity *m",
@@ -1072,9 +1107,12 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
         }
         // A `*` after the type name is a pointer qualifier (`TreeNode* node`),
         // not a Python `*args` marker; `&` is left for the ref check below.
-        while (check(TokenType::STAR) || check(TokenType::CONST))
+        cppType = tName;
+        while (check(TokenType::STAR) || check(TokenType::CONST)) {
+          if (check(TokenType::STAR))
+            cppType += "*";
           consume();
-        // Store C++ type name if needed
+        }
       }
     }
 
@@ -1128,6 +1166,8 @@ Parser::parseParamList(std::vector<bool> *outIsRef,
       throw ParseError("Expected parameter name", current().line,
                        current().col);
     }
+    if (outCppTypes)
+      outCppTypes->push_back(cppType);
 
     // Python-style annotation: "x: int" or "x: str" — skip ": type"
     if (check(TokenType::COLON)) {
@@ -1295,7 +1335,10 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint) {
     finalTypeHint += "[]";
   ASTNodePtr init;
   if (match(TokenType::ASSIGN)) {
-    init = parseExpr();
+    {
+      BraceInitScope braceInit(braceInitDepth_);
+      init = parseExpr();
+    }
     // C aggregate zero-init: int m[10][10] = {0}; — "{0}" means
     // "zero-fill the whole array", not a one-element array.
     bool zeroFillIdiom = false;
@@ -1320,6 +1363,7 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint) {
   }
   auto decl = VarDecl{false, nameToken.value, std::move(init), finalTypeHint};
   decl.isPointer = isPointer;
+  decl.cTyped = true;
   auto node = std::make_unique<ASTNode>(std::move(decl), ln);
   // Do NOT consume trailing semicolons here — callers that need them (for-loop
   // init, multi-var comma lists) handle their own terminators.  Eating ';' here

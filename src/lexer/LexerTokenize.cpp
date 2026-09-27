@@ -110,7 +110,7 @@ std::vector<Token> Lexer::tokenize()
         }
         if (c == '"' || c == '\'')
         {
-            rawTokens.push_back(readString(c));
+            rawTokens.push_back(atTripleQuote(c) ? readTripleString(c, false) : readString(c));
             continue;
         }
         if (c == '`')
@@ -264,7 +264,7 @@ std::vector<Token> Lexer::tokenize()
                                        pt == TokenType::RPAREN ||
                                        pt == TokenType::RBRACKET);
                     }
-                    if (prevIsValue)
+                    if (prevIsValue && !slashSlashIsComment())
                     {
                         advance(); // consume second '/'
                         rawTokens.emplace_back(TokenType::FLOOR_DIV, "//", startLine, startCol);
