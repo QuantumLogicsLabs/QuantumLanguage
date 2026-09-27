@@ -46,7 +46,8 @@ namespace qpm
         fs::path pkgJsonPath = projectDir / "package.json";
         if (!fs::exists(pkgJsonPath))
         {
-            std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n";
+            std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n"
+                      << "[qpm] run `qpm init` to create one\n";
             return 1;
         }
 

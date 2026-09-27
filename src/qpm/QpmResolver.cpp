@@ -62,7 +62,8 @@ namespace qpm
             }
         }
 
-        // Writes a Windows .cmd shim that forwards to `node <script>`.
+        // Writes a Windows .cmd shim that forwards to `qrun <script>` for a
+        // Quantum (.sa) bin, or `node <script>` for anything else.
         void writeBinShim(const fs::path &binDir, const std::string &cmdName,
                            const std::string &pkgFolderName, const std::string &relScript)
         {
@@ -72,7 +73,9 @@ namespace qpm
             for (char &c : rel)
                 if (c == '/')
                     c = '\\';
-            std::string content = "@ECHO off\r\nnode \"%~dp0\\..\\" + pkgFolderName + "\\" + rel + "\" %*\r\n";
+            bool isQuantum = rel.size() >= 3 && rel.compare(rel.size() - 3, 3, ".sa") == 0;
+            std::string runner = isQuantum ? "qrun" : "node";
+            std::string content = "@ECHO off\r\n" + runner + " \"%~dp0\\..\\" + pkgFolderName + "\\" + rel + "\" %*\r\n";
             writeFile(binDir / (cmdName + ".cmd"), content);
         }
 
@@ -447,7 +450,8 @@ namespace qpm
         {
             if (opts.addPackages.empty())
             {
-                std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n";
+                std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n"
+                          << "[qpm] run `qpm init` to create one, or `qpm i <pkg>` to add a dependency\n";
                 return 1;
             }
             pkgJson = JsonValue::makeObject();

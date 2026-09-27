@@ -585,6 +585,15 @@ s = format("Hello, %s! You scored %d%%", name, score)
 | `keys(dict)` | Dict keys as array |
 | `values(dict)` | Dict values as array |
 
+### Folders & Script Arguments
+
+| Function | Description |
+|---|---|
+| `sys.argv` | Script path followed by its arguments: `qrun tool.sa --json` → `["tool.sa", "--json"]` |
+| `os.listdir(path)` | Names of the entries in a folder, sorted; raises if the folder can't be read |
+| `os.path.isdir(path)` | `true` if `path` is a folder |
+| `os.path.abspath(path)` | Absolute, normalized path with `/` separators |
+
 ---
 
 ## Bitwise Operations
@@ -632,6 +641,7 @@ These keywords are **reserved** for upcoming features and cannot be used as iden
 
 ```
 quantum <file.sa>          Run a Quantum script
+qrun <file.sa> [args...]   Interpret a script; args are available in sys.argv
 quantum                    Start interactive REPL
 quantum --check <file.sa>  Syntax check without execution
 quantum --version          Display version string

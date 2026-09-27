@@ -300,6 +300,62 @@ namespace qpm
             return "";
         }
 
+        // The folder name as a valid package name ("My Lib" -> "my-lib").
+        std::string defaultPackageName(const fs::path &projectDir)
+        {
+            std::string name;
+            for (char c : projectDir.filename().u8string())
+            {
+                char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                bool ok = (lower >= 'a' && lower <= 'z') || (lower >= '0' && lower <= '9') ||
+                          lower == '-' || lower == '.' || lower == '_' || lower == '~';
+                name += ok ? lower : '-';
+            }
+            while (!name.empty() && (name[0] == '.' || name[0] == '_'))
+                name.erase(0, 1);
+            return nameProblem(name).empty() ? name : "my-package";
+        }
+
+        // index.sa, else main.sa, else the first .sa file in the folder, else index.sa.
+        std::string defaultEntryPoint(const fs::path &projectDir)
+        {
+            for (const char *candidate : {"index.sa", "main.sa"})
+                if (fs::is_regular_file(projectDir / candidate))
+                    return candidate;
+            std::vector<std::string> saFiles;
+            std::error_code ec;
+            for (const auto &entry : fs::directory_iterator(projectDir, ec))
+                if (entry.path().extension() == ".sa" && entry.is_regular_file(ec))
+                    saFiles.push_back(entry.path().filename().u8string());
+            std::sort(saFiles.begin(), saFiles.end());
+            return saFiles.empty() ? "index.sa" : saFiles.front();
+        }
+
+        std::string trim(const std::string &s)
+        {
+            size_t start = 0, stop = s.size();
+            while (start < stop && std::isspace(static_cast<unsigned char>(s[start])))
+                ++start;
+            while (stop > start && std::isspace(static_cast<unsigned char>(s[stop - 1])))
+                --stop;
+            return s.substr(start, stop - start);
+        }
+
+        // Prints "label: (default) " and returns the typed answer, or `def` on
+        // an empty line or end of input.
+        std::string ask(const std::string &label, const std::string &def)
+        {
+            std::cout << label << ": " << (def.empty() ? "" : "(" + def + ") ") << std::flush;
+            std::string line;
+            if (!std::getline(std::cin, line))
+            {
+                std::cout << "\n";
+                return def;
+            }
+            line = trim(line);
+            return line.empty() ? def : line;
+        }
+
         std::string formatSize(size_t bytes)
         {
             if (bytes < 1000)
@@ -358,7 +414,8 @@ namespace qpm
             std::string text;
             if (!readFile(projectDir / "package.json", text))
             {
-                std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n";
+                std::cerr << "[qpm] no package.json found in " << projectDir.string() << "\n"
+                          << "[qpm] run `qpm init` to create one\n";
                 return false;
             }
             try
@@ -435,6 +492,83 @@ namespace qpm
             return true;
         }
     } // namespace
+
+    int runInit(const std::string &projectDirStr, bool acceptDefaults)
+    {
+        fs::path projectDir = fs::absolute(projectDirStr);
+        fs::path pkgJsonPath = projectDir / "package.json";
+        if (fs::exists(pkgJsonPath))
+        {
+            std::cerr << "[qpm] package.json already exists in " << projectDir.string() << "\n";
+            return 1;
+        }
+
+        std::string name = defaultPackageName(projectDir);
+        std::string version = "1.0.0";
+        std::string description, keywords, author;
+        std::string mainFile = defaultEntryPoint(projectDir);
+        std::string license = "MIT";
+
+        if (!acceptDefaults)
+        {
+            std::cout << "This creates a package.json for a Quantum package.\n"
+                         "Press Enter to keep the value in ( ). `qpm init -y` skips these questions.\n\n";
+            const std::string suggestedName = name;
+            for (;;)
+            {
+                name = ask("package name", suggestedName);
+                std::string problem = nameProblem(name);
+                if (problem.empty())
+                    break;
+                std::cout << "  invalid name: " << problem << "\n";
+            }
+            for (;;)
+            {
+                version = ask("version", "1.0.0");
+                SemVer sv;
+                if (SemVer::tryParse(version, sv))
+                    break;
+                std::cout << "  must be a semver version like 1.0.0\n";
+            }
+            description = ask("description", "");
+            mainFile = ask("entry point", mainFile);
+            keywords = ask("keywords (comma-separated)", "");
+            author = ask("author", "");
+            license = ask("license", license);
+        }
+
+        JsonValue scripts = JsonValue::makeObject();
+        scripts.set("start", "qrun " + mainFile);
+
+        JsonValue keywordList = JsonValue::makeArray();
+        std::istringstream keywordStream(keywords);
+        std::string keyword;
+        while (std::getline(keywordStream, keyword, ','))
+            if (!trim(keyword).empty())
+                keywordList.push(trim(keyword));
+
+        JsonValue pkg = JsonValue::makeObject();
+        pkg.set("name", name);
+        pkg.set("version", version);
+        pkg.set("description", description);
+        pkg.set("main", mainFile);
+        pkg.set("scripts", scripts);
+        pkg.set("keywords", keywordList);
+        pkg.set("author", author);
+        pkg.set("license", license);
+
+        std::string text = pkg.stringify(2) + "\n";
+        std::ofstream out(pkgJsonPath, std::ios::binary | std::ios::trunc);
+        out << text;
+        if (!out)
+        {
+            std::cerr << "[qpm] failed to write " << pkgJsonPath.string() << "\n";
+            return 1;
+        }
+        std::cout << "\nWrote to " << pkgJsonPath.string() << ":\n\n" << text
+                  << "\n[qpm] next: `qpm i <pkg>` to add dependencies, `qpm publish --dry-run` to preview a publish\n";
+        return 0;
+    }
 
     int runPack(const std::string &projectDirStr)
     {

@@ -48,6 +48,9 @@ test_results.txt
 /build_errors.txt
 /build_log.txt
 
+/compiler.txt
+compiler.txt
+
 .claude/
 /memory_profile.txt
 /memory_leak_report.txt

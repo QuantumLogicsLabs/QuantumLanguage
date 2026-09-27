@@ -38,6 +38,8 @@ namespace
             "qpm - Quantum Package Manager\n"
             "\n"
             "Usage:\n"
+            "  qpm init                    creates a package.json (asks for each field)\n"
+            "  qpm init -y                 creates a package.json with defaults, no questions\n"
             "  qpm install                 installs all dependencies from package.json\n"
             "  qpm install <pkg> [...]     adds and installs one or more packages\n"
             "  qpm install --no-dev        skip devDependencies\n"
@@ -138,6 +140,24 @@ int main(int argc, char *argv[])
 
     if (cmd == "start")
         return qpm::runScript(cwd, "start");
+    if (cmd == "init")
+    {
+        bool yes = false;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "-y" || args[i] == "--yes")
+            {
+                yes = true;
+            }
+            else
+            {
+                std::cerr << "[qpm] unknown init option: " << args[i] << "\n"
+                          << "[qpm] usage: qpm init [-y]\n";
+                return 1;
+            }
+        }
+        return qpm::runInit(cwd, yes);
+    }
     if (cmd == "publish")
         return runPublishCommand(args, cwd);
     if (cmd == "pack")

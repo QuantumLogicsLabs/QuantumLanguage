@@ -201,6 +201,7 @@ echo     quantum --check hello.sa    ^<-- parse + type-check only
 echo     quantum --test  examples    ^<-- batch test all .sa files
 echo.
 echo   Package manager:
+echo     qpm init                 ^<-- creates a package.json in the current folder
 echo     qpm install              ^<-- downloads all npm packages from package.json
 echo     qpm install express      ^<-- adds + installs a specific package
 echo     qpm run dev               ^<-- runs a package.json "scripts" entry
