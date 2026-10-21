@@ -56,9 +56,11 @@ int runTestExamples(const std::string &dir);
 // marker line to stdout and returns 2; a clean run returns 0.
 int runSingleFileForTest(const std::string &path);
 
-// ─── Self-hosting support (selfhost/) ─────────────────────────────────────
+// ─── Self-hosting support (src/, the Quantum-written compiler) ─────────────────────────────────────
 // --dump-tokens: the C++ lexer's tokens, one per line (type, line, col, value).
 int dumpTokens(const std::string &path);
+// --dump-ast: the C++ parser's tree, one node per line (src/tools/astdump.sa).
+int dumpAst(const std::string &path);
 // --emit-qbc: compiles a program and writes its serialized bytecode.
 int emitBytecodeFile(const std::string &path, const std::string &outPath);
 // --exec: runs a serialized bytecode file (args after it go to sys.argv).

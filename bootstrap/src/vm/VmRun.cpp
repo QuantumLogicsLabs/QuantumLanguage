@@ -22,6 +22,14 @@ findMethod(QuantumClass *k, const std::string &name)
     return it;
 }
 
+// What a for-in iterator returns once exhausted. A value no program can hold,
+// so a nil element (`for x in [1, nil, 3]`) is still iterated.
+static const std::shared_ptr<QuantumNative> &iterDone()
+{
+    static const auto done = std::make_shared<QuantumNative>();
+    return done;
+}
+
 void VM::runFrame(size_t stopDepth)
 {
     // Outer retry loop: a QuantumError thrown by any opcode (division by
@@ -1104,13 +1112,12 @@ void VM::runFrame(size_t stopDepth)
             state->name = "__iter__";
             state->fn = [cap_src, cap_idx](std::vector<QuantumValue> args) -> QuantumValue
             {
-                // Called with no args: return {done, value} pair
                 if (cap_idx && *cap_idx < cap_src->size())
                 {
                     QuantumValue v = (*cap_src)[(*cap_idx)++];
                     return v; // return next element
                 }
-                return QuantumValue(); // exhausted: nil signals done
+                return QuantumValue(iterDone()); // exhausted
             };
             push(QuantumValue(state));
             break;
@@ -1133,7 +1140,7 @@ void VM::runFrame(size_t stopDepth)
             }
             // Call fn() with no args to get next value
             QuantumValue next = nat->fn({});
-            if (next.isNil())
+            if (next.isNative() && next.asNative() == iterDone())
             {
                 // Exhausted — jump past loop
                 frame.ip += instr.operand;

@@ -468,8 +468,13 @@ void Compiler::compileTry(TryStmt &s, int line)
 {
     size_t handlerJump = emitJump(Op::PUSH_HANDLER, line);
     ++current_->tryDepth;
+    // The body's locals are scoped to it: an exception unwinds the stack to
+    // its height at PUSH_HANDLER, so the handler's variable must take the
+    // first slot past the enclosing locals, as on the normal path.
+    beginScope();
     if (s.body)
         compileNode(*s.body);
+    endScope(line);
     --current_->tryDepth;
     emit(Op::POP_HANDLER, 0, line);
     size_t afterHandlers = emitJump(Op::JUMP, line);
@@ -496,7 +501,11 @@ void Compiler::compileTry(TryStmt &s, int line)
 
     patchJump(afterHandlers);
     if (s.finallyBody)
+    {
+        beginScope();
         compileNode(*s.finallyBody);
+        endScope(line);
+    }
 }
 
 void Compiler::compileRaise(RaiseStmt &s, int line)

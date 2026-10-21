@@ -1,5 +1,5 @@
 # Prints the self-hosted lexer's tokens in the format of `qrun --dump-tokens`:
-#   qrun selfhost/tools/lexdump.sa <file>
+#   qrun src/tools/lexdump.sa <file>
 # @use "../lexer.sa"
 
 let HEX_DIGITS = "0123456789ABCDEF"

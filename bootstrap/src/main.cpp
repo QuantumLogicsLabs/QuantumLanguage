@@ -127,11 +127,13 @@ int main(int argc, char *argv[])
     // Hidden: run one file in this process for the batch runner (child worker).
     if (a1 == "--__runone" && argc >= 3)
         return runSingleFileForTest(argv[2]);
-    // Self-hosting support (selfhost/): the C++ front-end's tokens and
+    // Self-hosting support (src/, the Quantum-written compiler): the C++ front-end's tokens and
     // bytecode, to check the Quantum-written compiler against, and a runner
     // for bytecode files that compiler writes.
     if (a1 == "--dump-tokens" && argc >= 3)
         return dumpTokens(argv[2]);
+    if (a1 == "--dump-ast" && argc >= 3)
+        return dumpAst(argv[2]);
     if (a1 == "--emit-qbc" && argc >= 4)
         return emitBytecodeFile(argv[2], argv[3]);
     if (a1 == "--exec" && argc >= 3)
