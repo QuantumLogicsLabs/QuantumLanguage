@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs a bootstrap subsystem compiled by Quantum's own C/C++ front-end
-# against the g++-built qrun, on every example:
+# against qrun's built-in passes, on every example:
 #   src/tools/compare_selfhost.sh <tokens|ast|qbc|full> [dir] [outdir]
 # tokens: qrun --dump-tokens        vs  qrun src/tools/selfhost/lexdump.sa
 # ast:    qrun --dump-ast           vs  qrun src/tools/selfhost/astdump.sa

@@ -1,6 +1,6 @@
 @echo off
-rem Builds Quantum's tools from src\ with Quantum itself: no C++ compiler, no
-rem CMake, no MSYS2. seed\qrun.exe (qrun compiled to x86-64 by Quantum's own
+rem Builds Quantum's tools from src\ with Quantum itself: no external compiler
+rem or toolchain. seed\qrun.exe (qrun compiled to x86-64 by Quantum's own
 rem native backend) compiles qrun from src\; that compiler compiles itself
 rem again, and the result builds quantum.exe, quantum_stub.exe and qpm.exe.
 rem

@@ -1,6 +1,6 @@
 # SETUP.md — Quantum Language Installation Guide
 
-> **Quantum** v1.0.0 — A dynamically-typed, cybersecurity-ready scripting language written in C++17.
+> **Quantum** v1.0.0 — A dynamically-typed, cybersecurity-ready scripting language written in Quantum itself.
 
 ---
 
@@ -8,9 +8,6 @@
 
 - [Prerequisites](#prerequisites)
 - [Build from Source](#build-from-source)
-  - [Windows](#windows)
-  - [Linux](#linux)
-  - [macOS](#macos)
 - [Adding Quantum to PATH](#adding-quantum-to-path)
 - [Verifying Installation](#verifying-installation)
 - [Running Your First Script](#running-your-first-script)
@@ -22,104 +19,33 @@
 
 ## Prerequisites
 
-Before building Quantum, ensure you have the following tools installed:
+| Tool | Notes |
+|---|---|
+| Windows | x86-64 |
+| Git | For cloning the repository |
 
-| Tool | Minimum Version | Notes |
-|---|---|---|
-| C++ Compiler | C++17 compatible | MSVC 2019+, GCC 9+, or Clang 10+ |
-| CMake | 3.15+ | Required for all platforms |
-| Git | Any recent version | For cloning the repository |
+No compiler, CMake or MSYS2 is needed: Quantum builds itself.
 
 ---
 
 ## Build from Source
 
-### Clone the Repository
-
-```bash
-git clone https://github.com/SENODROOM/Quantum-Language.git
-cd Quantum-Language
-```
-
----
-
-### Windows
-
-#### Option A — CMake (Recommended)
-
 ```powershell
-# Create and enter build directory
-mkdir build
-cd build
-
-# Generate Visual Studio project or MinGW Makefiles
-cmake ..
-
-# Build in Release mode
-cmake --build . --config Release
-```
-
-The binary will be at: `build\Release\quantum.exe`
-
-#### Option B — build.bat (Quick Build)
-
-A convenience batch script is included at the root:
-
-```powershell
-build.bat
-```
-
-This script handles the CMake configuration and build steps automatically on Windows.
-
-#### Option C — MinGW / MSYS2
-
-```bash
-# In MSYS2 MinGW64 terminal
-mkdir build && cd build
-cmake .. -G "MinGW Makefiles"
-cmake --build . --config Release
-```
-
----
-
-### Linux
-
-```bash
-# Install build tools if needed
-sudo apt update
-sudo apt install -y build-essential cmake git   # Ubuntu/Debian
-# sudo dnf install gcc-c++ cmake git            # Fedora/RHEL
-
-# Clone and build
 git clone https://github.com/SENODROOM/Quantum-Language.git
 cd Quantum-Language
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
+build-quantum.bat
 ```
 
-The binary will be at: `build/quantum`
+`seed\qrun.exe`, a prebuilt Quantum compiler checked into the repository, compiles the compiler from `src\`. That new compiler compiles itself once more and then builds the rest of the tools. The binaries land in `build\`:
 
----
-
-### macOS
-
-```bash
-# Install Xcode command-line tools if needed
-xcode-select --install
-
-# Install CMake via Homebrew if needed
-brew install cmake
-
-# Clone and build
-git clone https://github.com/SENODROOM/Quantum-Language.git
-cd Quantum-Language
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
+```
+build\qrun.exe          interpreter
+build\quantum.exe       compiler + bundler
+build\quantum_stub.exe  runtime bundled into produced executables
+build\qpm.exe           package manager
 ```
 
-The binary will be at: `build/quantum`
+`build-quantum.bat --verify` also checks that the new `qrun.exe` rebuilds itself byte for byte.
 
 ---
 
@@ -127,10 +53,8 @@ The binary will be at: `build/quantum`
 
 To use `quantum` from any directory, add the binary to your system PATH.
 
-### Windows (PowerShell)
-
 ```powershell
-$env:PATH += ";C:\path\to\Quantum-Language\build\Release"
+$env:PATH += ";C:\path\to\Quantum-Language\build"
 ```
 
 To make it permanent:
@@ -138,29 +62,16 @@ To make it permanent:
 ```powershell
 [System.Environment]::SetEnvironmentVariable(
     "PATH",
-    $env:PATH + ";C:\path\to\Quantum-Language\build\Release",
+    $env:PATH + ";C:\path\to\Quantum-Language\build",
     [System.EnvironmentVariableTarget]::User
 )
 ```
 
-Alternatively, copy `quantum.exe` to a folder already in your PATH (e.g., `C:\Windows\System32` or a custom `C:\tools\bin`).
+Alternatively, copy `quantum.exe` and `quantum_stub.exe` to a folder already in your PATH (e.g. a custom `C:\tools\bin`).
 
 #### Using quantum.bat
 
 A helper `quantum.bat` is included in the root directory. You can copy it anywhere in your PATH to invoke Quantum without needing the full path to the binary.
-
----
-
-### Linux / macOS
-
-```bash
-# Copy to /usr/local/bin (system-wide)
-sudo cp build/quantum /usr/local/bin/
-
-# Or add the build directory to your shell profile
-echo 'export PATH="$PATH:/path/to/Quantum-Language/build"' >> ~/.bashrc
-source ~/.bashrc
-```
 
 ---
 
@@ -255,39 +166,20 @@ The extension provides:
 
 ## Troubleshooting
 
-### "cmake: command not found"
-Install CMake from [cmake.org/download](https://cmake.org/download/) or via your package manager.
-
-### "No C++ compiler found"
-- **Windows**: Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) or MinGW via MSYS2
-- **Linux**: Run `sudo apt install build-essential`
-- **macOS**: Run `xcode-select --install`
-
-### Build fails with C++17 error
-Ensure your compiler supports C++17. Pass the standard explicitly:
-```bash
-cmake .. -DCMAKE_CXX_STANDARD=17
-```
+### "seed\qrun.exe is missing"
+The seed compiler comes with the repository. Restore it with `git checkout seed/qrun.exe`.
 
 ### `quantum` not found after PATH setup
-Restart your terminal/shell session or run `source ~/.bashrc` on Linux/macOS.
-
-### Permission denied on Linux/macOS
-```bash
-chmod +x build/quantum
-```
-
----
+Restart your terminal session.
 
 ## Summary
 
 ```
 git clone https://github.com/SENODROOM/Quantum-Language.git
-cd Quantum-Language && mkdir build && cd build
-cmake .. && cmake --build . --config Release
-sudo cp quantum /usr/local/bin/   # Linux/macOS
-quantum --version                 # Verify
-quantum script.sa                 # Run your script
+cd Quantum-Language
+build-quantum.bat                 # Build
+build\quantum.exe --version       # Verify
+build\quantum.exe script.sa       # Run your script
 ```
 
 ---

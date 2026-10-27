@@ -41,11 +41,11 @@ git checkout -b fix/your-bug-fix
 #### 5. Test Your Changes
 ```bash
 # Build the project
-.\build.bat
+.\build-quantum.bat --verify
 
 # Test the compiler
-.\quantum.exe --version
-.\quantum.exe examples\hello.sa
+.\build\quantum.exe --version
+.\build\quantum.exe examples\hello.sa
 ```
 
 #### 6. Commit Your Changes

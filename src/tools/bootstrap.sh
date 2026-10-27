@@ -2,7 +2,7 @@
 # The self-compile fixed point: the whole compiler (src/tools/selfhost/quantumc.sa)
 # compiled by itself, generation after generation, must not change.
 #   src/tools/bootstrap.sh [outdir]
-# q1: the g++-built qrun compiles the compiler
+# q1: build/qrun.exe (from build-quantum.bat) compiles the compiler
 # q2: q1, run on qrun, compiles the compiler
 # q3: q2 compiles the compiler
 # Passes when q1 == q2 == q3 byte for byte. Each self-compile runs on the VM
