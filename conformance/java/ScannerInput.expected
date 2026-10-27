@@ -1,8 +1,0 @@
-How many numbers? sum=40 max=25 avg=10.0
-rest of line: [ trailing words here]
-line: SECOND LINE OF TEXT
-token 2.5 9000000001 false
-read 5 more ints, total 15
-next token: stop
-tail: final line one
-tail: final line two

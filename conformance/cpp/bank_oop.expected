@@ -1,6 +1,0 @@
-Error: overdraft limit exceeded
-Error: deposit must be positive
-Error: insufficient funds for Alice
-Savings Alice: 1575.00 [deposit 500, interest]
-Checking Bob: -20.00 [withdraw 120]
-Total: 1555.00

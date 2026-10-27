@@ -1,5 +1,0 @@
-1000000000011
-3
-1000000000000
-3 extra lines: [the END, jumps over the lazy dog!, The quick brown fox.]
-{brown=1, dog=1, end=1, fox=1, jumps=1, lazy=1, over=1, quick=1, the=3}

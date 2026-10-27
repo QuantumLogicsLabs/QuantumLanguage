@@ -1,8 +1,0 @@
-3628800 2432902008176640000
-12586269025 2880067194370816120
-move disk 3 A->B
-move disk 3 B->C
-15 moves
-92 solutions
-abc acb bac bca cab cba 
-abc,acb,bac,bca,cab,cba,
