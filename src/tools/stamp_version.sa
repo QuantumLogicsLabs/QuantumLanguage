@@ -1,0 +1,86 @@
+// quantum: cpp
+// Writes src/generated/VersionData.sa: quantumVersion(), the compiler's version,
+// taken from version.sa (the one place the version is set).
+// Run from compiler/:  qrun src/tools/stamp_version.sa   (build-quantum.bat does)
+// The file is rewritten only when the version changes.
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+namespace fs = std::filesystem;
+
+namespace
+{
+
+std::string readText(const std::string &path)
+{
+    std::ifstream in(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+// version.sa is one line, MAJOR.MINOR.PATCH (surrounding whitespace ignored)
+std::string trim(const std::string &s)
+{
+    size_t b = 0, e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n'))
+        ++b;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
+        --e;
+    return s.substr(b, e - b);
+}
+
+bool validVersion(const std::string &v)
+{
+    int dots = 0;
+    bool digit = false;
+    for (char c : v)
+    {
+        if (c >= '0' && c <= '9')
+            digit = true;
+        else if (c == '.' && digit)
+        {
+            ++dots;
+            digit = false;
+        }
+        else
+            return false;
+    }
+    return dots == 2 && digit;
+}
+
+} // namespace
+
+int main()
+{
+    if (!fs::exists("version.sa") || !fs::exists("src/generated"))
+    {
+        std::cerr << "stamp_version: run from the compiler/ directory\n";
+        return 1;
+    }
+    std::string version = trim(readText("version.sa"));
+    if (!validVersion(version))
+    {
+        std::cerr << "stamp_version: version.sa must hold MAJOR.MINOR.PATCH (e.g. 3.0.0), found \"" << version << "\"\n";
+        return 1;
+    }
+
+    std::string out = "// quantum: cpp\n";
+    out += "// Generated from version.sa by src/tools/stamp_version.sa. Do not edit.\n";
+    out += "#include <string>\n\n";
+    out += "std::string quantumVersion()\n{\n    return \"" + version + "\";\n}\n";
+
+    const std::string path = "src/generated/VersionData.sa";
+    if (fs::exists(path) && readText(path) == out)
+    {
+        std::cout << "stamp_version: " << version << " (unchanged)\n";
+        return 0;
+    }
+    std::ofstream f(path, std::ios::binary);
+    f << out;
+    std::cout << "stamp_version: " << version << "\n";
+    return 0;
+}

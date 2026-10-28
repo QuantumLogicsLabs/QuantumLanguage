@@ -1,0 +1,566 @@
+// quantum: cpp
+// quantum-host: the small server behind https://quantum-compiler.quantumlogicslimited.com.
+// It stores and serves the compiler releases (latest.json, the installer and the
+// compiler programs); `quantum version.sa` publishes to it, `quantum update` and
+// the website read from it.
+//
+// Build:  qrun --native host/server.sa build/quantum-host.exe
+// Run:    quantum-host.exe          (settings come from environment variables)
+//
+//   QUANTUM_HOST_PORT      port to listen on                    (default 8080)
+//   QUANTUM_HOST_BIND      address to listen on                 (default 127.0.0.1)
+//   QUANTUM_HOST_DATA      folder where releases are stored     (default data)
+//   QUANTUM_PUBLISH_TOKEN  password for publishing; unset = publishing disabled
+//
+// It speaks plain HTTP: HTTPS is Caddy's job (see host/README.md). One
+// connection is served at a time, which is plenty for an update server.
+//
+//   GET  /health                           ok
+//   GET  /latest.json                      newest version info
+//   GET  /releases/<version>/<file>        a stored release file
+//   GET  /download/QuantumSetup.exe        the newest installer
+//   PUT  /api/publish/<version>/<file>     store a release file    (needs the token)
+//   PUT  /api/publish/latest.json          make a release current  (needs the token)
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <windows.h>
+
+namespace fs = std::filesystem;
+
+typedef unsigned long long Sock;
+
+// Winsock, imported from ws2_32.dll the way winhttp.h imports winhttp.dll.
+// WSADATA (408 bytes) and sockaddr_in (16 bytes) are passed as raw buffers.
+namespace __dll_ws2_32
+{
+int WSAStartup(WORD version, void *data);
+int WSAGetLastError();
+Sock socket(int af, int type, int protocol);
+int bind(Sock s, const void *name, int len);
+int listen(Sock s, int backlog);
+Sock accept(Sock s, void *addr, int *len);
+int recv(Sock s, char *buf, int len, int flags);
+int send(Sock s, const char *buf, int len, int flags);
+int closesocket(Sock s);
+int setsockopt(Sock s, int level, int name, const char *value, int len);
+unsigned short htons(unsigned short v);
+unsigned inet_addr(const char *text);
+} // namespace __dll_ws2_32
+using namespace __dll_ws2_32;
+
+namespace
+{
+
+const Sock BAD_SOCKET = ~0ULL;
+const size_t MAX_HEADER = 16384;
+const long long MAX_BODY = 150LL * 1024 * 1024;
+const size_t MAX_LATEST = 65536;
+
+struct Config
+{
+    std::string bind = "127.0.0.1";
+    int port = 8080;
+    std::string data = "data";
+    std::string token;
+};
+
+struct Request
+{
+    std::string method;
+    std::string path;
+    std::string auth;
+    long long contentLength = 0;
+    std::string body;
+};
+
+// ─── small helpers ────────────────────────────────────────────────────────────
+
+std::string envOr(const char *name, const std::string &fallback)
+{
+    const char *v = getenv(name);
+    return (v && *v) ? std::string(v) : fallback;
+}
+
+std::string lower(std::string s)
+{
+    for (char &c : s)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return s;
+}
+
+std::string trim(const std::string &s)
+{
+    size_t b = 0, e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n'))
+        ++b;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
+        --e;
+    return s.substr(b, e - b);
+}
+
+bool startsWith(const std::string &s, const std::string &prefix)
+{
+    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+// MAJOR.MINOR.PATCH, digits only: also keeps any ".." or "\" out of a path
+bool validVersion(const std::string &v)
+{
+    if (v.empty() || v.size() > 32)
+        return false;
+    int dots = 0;
+    bool digit = false;
+    for (char c : v)
+    {
+        if (c >= '0' && c <= '9')
+            digit = true;
+        else if (c == '.' && digit)
+        {
+            ++dots;
+            digit = false;
+        }
+        else
+            return false;
+    }
+    return dots == 2 && digit;
+}
+
+// The only files a release holds
+bool releaseFile(const std::string &f)
+{
+    return f == "QuantumSetup.exe" || f == "quantum.exe" || f == "qrun.exe" || f == "quantum_stub.exe" ||
+           f == "qpm.exe";
+}
+
+const char *RELEASE_FILES[] = {"QuantumSetup.exe", "quantum.exe", "qrun.exe", "quantum_stub.exe", "qpm.exe"};
+
+// Same length and same bytes, taking the same time wherever they differ
+bool sameText(const std::string &a, const std::string &b)
+{
+    unsigned diff = static_cast<unsigned>(a.size() ^ b.size());
+    size_t n = a.size() > b.size() ? a.size() : b.size();
+    for (size_t i = 0; i < n; ++i)
+    {
+        unsigned x = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        unsigned y = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff |= x ^ y;
+    }
+    return diff == 0;
+}
+
+bool readFile(const std::string &path, std::string &out)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open())
+        return false;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+// Writes next to the target, then renames over it: a download never sees half a file
+bool writeFileAtomic(const std::string &path, const std::string &data)
+{
+    std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        if (!out.is_open())
+            return false;
+        out.write(data.data(), static_cast<long long>(data.size()));
+        out.close();
+    }
+    if (!fs::exists(tmp))
+        return false;
+    fs::rename(tmp, path);
+    return fs::exists(path) && !fs::exists(tmp);
+}
+
+// The "version" value in latest.json: "version": "3.0.1"
+std::string versionIn(const std::string &json)
+{
+    size_t k = json.find("\"version\"");
+    if (k == std::string::npos)
+        return "";
+    size_t colon = json.find(':', k + 9);
+    if (colon == std::string::npos)
+        return "";
+    size_t q1 = json.find('"', colon + 1);
+    if (q1 == std::string::npos)
+        return "";
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos)
+        return "";
+    return json.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// ─── sockets ──────────────────────────────────────────────────────────────────
+
+bool sendAll(Sock s, const char *p, size_t n)
+{
+    while (n > 0)
+    {
+        int chunk = n > 1048576 ? 1048576 : static_cast<int>(n);
+        int sent = send(s, p, chunk, 0);
+        if (sent <= 0)
+            return false;
+        p += sent;
+        n -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+void respond(Sock c, int status, const char *reason, const std::string &type, const std::string &body, bool head,
+             const std::string &extra = "")
+{
+    std::string h = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
+    h += "Content-Type: " + type + "\r\n";
+    h += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    h += "Access-Control-Allow-Origin: *\r\n";
+    h += "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n";
+    h += "Connection: close\r\n";
+    h += extra;
+    h += "\r\n";
+    if (!sendAll(c, h.data(), h.size()))
+        return;
+    if (!head && !body.empty())
+        sendAll(c, body.data(), body.size());
+}
+
+void text(Sock c, int status, const char *reason, const std::string &msg, bool head = false)
+{
+    respond(c, status, reason, "text/plain; charset=utf-8", msg + "\n", head);
+}
+
+// Reads the request line, the headers and (for a PUT) the body. 0 = ok, else the
+// status to answer with.
+int readRequest(Sock c, Request &req)
+{
+    std::string buf;
+    char chunk[8192];
+    size_t headerEnd = std::string::npos;
+    while (headerEnd == std::string::npos)
+    {
+        int n = recv(c, chunk, sizeof(chunk), 0);
+        if (n <= 0)
+            return 400;
+        buf.append(chunk, static_cast<size_t>(n));
+        headerEnd = buf.find("\r\n\r\n");
+        if (headerEnd == std::string::npos && buf.size() > MAX_HEADER)
+            return 431;
+    }
+
+    std::string head = buf.substr(0, headerEnd);
+    std::string rest = buf.substr(headerEnd + 4);
+
+    size_t lineEnd = head.find("\r\n");
+    std::string first = head.substr(0, lineEnd);
+    size_t sp1 = first.find(' ');
+    size_t sp2 = first.find(' ', sp1 == std::string::npos ? 0 : sp1 + 1);
+    if (sp1 == std::string::npos || sp2 == std::string::npos)
+        return 400;
+    req.method = first.substr(0, sp1);
+    req.path = first.substr(sp1 + 1, sp2 - sp1 - 1);
+    size_t q = req.path.find('?');
+    if (q != std::string::npos)
+        req.path = req.path.substr(0, q);
+
+    size_t pos = lineEnd == std::string::npos ? head.size() : lineEnd + 2;
+    while (pos < head.size())
+    {
+        size_t e = head.find("\r\n", pos);
+        if (e == std::string::npos)
+            e = head.size();
+        std::string line = head.substr(pos, e - pos);
+        pos = e + 2;
+        size_t colon = line.find(':');
+        if (colon == std::string::npos)
+            continue;
+        std::string name = lower(trim(line.substr(0, colon)));
+        std::string value = trim(line.substr(colon + 1));
+        if (name == "content-length")
+        {
+            long long n = 0;
+            for (char ch : value)
+            {
+                if (ch < '0' || ch > '9' || n > MAX_BODY)
+                    return 413;
+                n = n * 10 + (ch - '0');
+            }
+            req.contentLength = n;
+        }
+        else if (name == "authorization")
+            req.auth = value;
+    }
+
+    if (req.contentLength > MAX_BODY)
+        return 413;
+    req.body = rest;
+    while (static_cast<long long>(req.body.size()) < req.contentLength)
+    {
+        int n = recv(c, chunk, sizeof(chunk), 0);
+        if (n <= 0)
+            return 400;
+        req.body.append(chunk, static_cast<size_t>(n));
+    }
+    if (static_cast<long long>(req.body.size()) > req.contentLength)
+        req.body.resize(static_cast<size_t>(req.contentLength));
+    return 0;
+}
+
+// ─── routes ───────────────────────────────────────────────────────────────────
+
+std::string releasePath(const Config &cfg, const std::string &version, const std::string &file)
+{
+    return cfg.data + "/releases/" + version + "/" + file;
+}
+
+// Returns the status it answered with
+int serveFile(Sock c, const std::string &path, const std::string &name, bool head)
+{
+    std::string data;
+    if (!readFile(path, data))
+    {
+        text(c, 404, "Not Found", "not found", head);
+        return 404;
+    }
+    std::string extra;
+    if (name == "QuantumSetup.exe")
+        extra = "Content-Disposition: attachment; filename=\"QuantumSetup.exe\"\r\n";
+    respond(c, 200, "OK", "application/octet-stream", data, head, extra);
+    return 200;
+}
+
+int publish(Sock c, const Config &cfg, const Request &req)
+{
+    if (cfg.token.empty())
+    {
+        text(c, 403, "Forbidden", "publishing is disabled: QUANTUM_PUBLISH_TOKEN is not set on the host");
+        return 403;
+    }
+    if (!startsWith(req.auth, "Bearer ") || !sameText(req.auth.substr(7), cfg.token))
+    {
+        text(c, 401, "Unauthorized", "unauthorized");
+        return 401;
+    }
+
+    std::string rest = req.path.substr(std::string("/api/publish/").size());
+
+    if (rest == "latest.json")
+    {
+        if (req.body.size() > MAX_LATEST)
+        {
+            text(c, 413, "Payload Too Large", "latest.json is too large");
+            return 413;
+        }
+        std::string version = versionIn(req.body);
+        if (!validVersion(version))
+        {
+            text(c, 400, "Bad Request", "latest.json has no valid \"version\"");
+            return 400;
+        }
+        for (const char *f : RELEASE_FILES)
+            if (!fs::exists(releasePath(cfg, version, f)))
+            {
+                text(c, 409, "Conflict", std::string("release ") + version + " is missing " + f);
+                return 409;
+            }
+        if (!writeFileAtomic(cfg.data + "/latest.json", req.body))
+        {
+            text(c, 500, "Internal Server Error", "could not store latest.json");
+            return 500;
+        }
+        text(c, 200, "OK", "latest is now " + version);
+        return 200;
+    }
+
+    size_t slash = rest.find('/');
+    if (slash == std::string::npos)
+    {
+        text(c, 404, "Not Found", "not found");
+        return 404;
+    }
+    std::string version = rest.substr(0, slash);
+    std::string file = rest.substr(slash + 1);
+    if (!validVersion(version) || !releaseFile(file))
+    {
+        text(c, 400, "Bad Request", "bad version or file name");
+        return 400;
+    }
+    if (req.body.empty())
+    {
+        text(c, 400, "Bad Request", "empty upload");
+        return 400;
+    }
+    std::error_code ec;
+    fs::create_directories(cfg.data + "/releases/" + version, ec);
+    if (!writeFileAtomic(releasePath(cfg, version, file), req.body))
+    {
+        text(c, 500, "Internal Server Error", "could not store " + file);
+        return 500;
+    }
+    text(c, 200, "OK", "stored " + version + "/" + file + " (" + std::to_string(req.body.size()) + " bytes)");
+    return 200;
+}
+
+// Answers the request; returns the status for the log
+int handle(Sock c, const Config &cfg, const Request &req)
+{
+    bool head = req.method == "HEAD";
+    bool get = req.method == "GET" || head;
+
+    if (req.method == "OPTIONS")
+    {
+        respond(c, 204, "No Content", "text/plain", "", true, "Access-Control-Allow-Headers: Authorization\r\n");
+        return 204;
+    }
+
+    if (startsWith(req.path, "/api/publish/"))
+    {
+        if (req.method != "PUT")
+        {
+            text(c, 405, "Method Not Allowed", "use PUT");
+            return 405;
+        }
+        return publish(c, cfg, req);
+    }
+
+    if (!get)
+    {
+        text(c, 405, "Method Not Allowed", "method not allowed");
+        return 405;
+    }
+
+    if (req.path == "/health")
+    {
+        text(c, 200, "OK", "ok", head);
+        return 200;
+    }
+
+    if (req.path == "/latest.json")
+    {
+        std::string data;
+        if (!readFile(cfg.data + "/latest.json", data))
+        {
+            text(c, 404, "Not Found", "nothing has been published yet", head);
+            return 404;
+        }
+        respond(c, 200, "OK", "application/json", data, head, "Cache-Control: no-cache\r\n");
+        return 200;
+    }
+
+    if (req.path == "/download/QuantumSetup.exe")
+    {
+        std::string latest;
+        std::string version;
+        if (readFile(cfg.data + "/latest.json", latest))
+            version = versionIn(latest);
+        if (!validVersion(version))
+        {
+            text(c, 404, "Not Found", "nothing has been published yet", head);
+            return 404;
+        }
+        return serveFile(c, releasePath(cfg, version, "QuantumSetup.exe"), "QuantumSetup.exe", head);
+    }
+
+    if (startsWith(req.path, "/releases/"))
+    {
+        std::string rest = req.path.substr(std::string("/releases/").size());
+        size_t slash = rest.find('/');
+        std::string version = slash == std::string::npos ? "" : rest.substr(0, slash);
+        std::string file = slash == std::string::npos ? "" : rest.substr(slash + 1);
+        if (!validVersion(version) || !releaseFile(file))
+        {
+            text(c, 404, "Not Found", "not found", head);
+            return 404;
+        }
+        return serveFile(c, releasePath(cfg, version, file), file, head);
+    }
+
+    text(c, 404, "Not Found", "not found", head);
+    return 404;
+}
+
+} // namespace
+
+int main()
+{
+    Config cfg;
+    cfg.bind = envOr("QUANTUM_HOST_BIND", "127.0.0.1");
+    cfg.port = std::atoi(envOr("QUANTUM_HOST_PORT", "8080").c_str());
+    cfg.data = envOr("QUANTUM_HOST_DATA", "data");
+    cfg.token = envOr("QUANTUM_PUBLISH_TOKEN", "");
+
+    std::error_code ec;
+    fs::create_directories(cfg.data + "/releases", ec);
+
+    char wsa[512];
+    if (WSAStartup(0x0202, wsa) != 0)
+    {
+        std::cerr << "quantum-host: WSAStartup failed\n";
+        return 1;
+    }
+    Sock listener = socket(2, 1, 6); // AF_INET, SOCK_STREAM, IPPROTO_TCP
+    if (listener == BAD_SOCKET)
+    {
+        std::cerr << "quantum-host: socket failed (" << WSAGetLastError() << ")\n";
+        return 1;
+    }
+    int yes = 1;
+    setsockopt(listener, 0xFFFF, 4, reinterpret_cast<const char *>(&yes), 4); // SO_REUSEADDR
+
+    // sockaddr_in: family (2), port (2, big-endian), address (4), 8 zero bytes
+    unsigned char addr[16] = {0};
+    addr[0] = 2;
+    unsigned short port = htons(static_cast<unsigned short>(cfg.port));
+    addr[2] = static_cast<unsigned char>(port & 0xFF);
+    addr[3] = static_cast<unsigned char>((port >> 8) & 0xFF);
+    unsigned ip = inet_addr(cfg.bind.c_str());
+    addr[4] = static_cast<unsigned char>(ip & 0xFF);
+    addr[5] = static_cast<unsigned char>((ip >> 8) & 0xFF);
+    addr[6] = static_cast<unsigned char>((ip >> 16) & 0xFF);
+    addr[7] = static_cast<unsigned char>((ip >> 24) & 0xFF);
+
+    if (bind(listener, addr, 16) != 0 || listen(listener, 16) != 0)
+    {
+        std::cerr << "quantum-host: cannot listen on " << cfg.bind << ":" << cfg.port << " (" << WSAGetLastError()
+                  << ")\n";
+        return 1;
+    }
+    std::cout << "quantum-host: listening on " << cfg.bind << ":" << cfg.port << ", data in " << cfg.data
+              << (cfg.token.empty() ? ", publishing DISABLED" : ", publishing enabled") << std::endl;
+
+    for (;;)
+    {
+        Sock c = accept(listener, nullptr, nullptr);
+        if (c == BAD_SOCKET)
+            continue;
+        int rcv = 15000; // ms: a client that goes quiet cannot hold the server
+        int snd = 60000;
+        setsockopt(c, 0xFFFF, 0x1006, reinterpret_cast<const char *>(&rcv), 4); // SO_RCVTIMEO
+        setsockopt(c, 0xFFFF, 0x1005, reinterpret_cast<const char *>(&snd), 4); // SO_SNDTIMEO
+
+        Request req;
+        int bad = readRequest(c, req);
+        if (bad != 0)
+        {
+            text(c, bad, bad == 413 ? "Payload Too Large" : bad == 431 ? "Header Too Large" : "Bad Request",
+                 "bad request");
+            std::cout << "- " << bad << " (unreadable request)" << std::endl;
+        }
+        else
+        {
+            int status = handle(c, cfg, req);
+            std::cout << req.method << " " << req.path << " " << status << std::endl;
+        }
+        closesocket(c);
+    }
+}

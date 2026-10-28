@@ -1,0 +1,55 @@
+// quantum: cpp
+#pragma once
+// Releasing and updating the compiler:
+//   quantum version.sa   builds a release and publishes it to the compiler host
+//   quantum update       installs the newest published release
+// Both talk to the host (host/server.sa), whose address is releaseHostUrl().
+
+#include <string>
+#include <vector>
+
+// A file of a published release, as latest.json lists it
+struct ReleaseEntry
+{
+    std::string name;   // quantum.exe
+    std::string path;   // releases/3.0.1/quantum.exe, relative to the host
+    std::string sha256; // lowercase hex
+};
+
+// What latest.json says is current
+struct ReleaseInfo
+{
+    std::string version;
+    std::vector<ReleaseEntry> files;
+};
+
+// The compiler programs a release holds and `quantum update` replaces
+const std::vector<std::string> &releaseProgramNames();
+
+// QUANTUM_HOST_URL, else https://quantum-compiler.quantumlogicslimited.com (no trailing "/")
+std::string releaseHostUrl();
+// https:// anywhere, plain http:// only for localhost (testing)
+bool releaseHostAllowed(const std::string &host);
+
+// Asks the host for latest.json. Returns false with `error` set when the host cannot be
+// reached or answers badly; true with found == false when nothing is published yet.
+bool fetchLatestRelease(const std::string &host, ReleaseInfo &out, bool &found, std::string &error);
+const ReleaseEntry *findReleaseEntry(const ReleaseInfo &info, const std::string &name);
+
+// Whole-file helpers (binary) and SHA-256 as 64 lowercase hex digits
+bool releaseReadFile(const std::string &path, std::string &out);
+bool releaseWriteFile(const std::string &path, const std::string &data);
+std::string sha256Hex(const std::string &data);
+
+// 0 = the first version is older, 1 = equal, 2 = newer; -1 if either is not MAJOR.MINOR.PATCH
+int compareVersions(const std::string &a, const std::string &b);
+
+// `quantum version.sa`: true only for the compiler's own version.sa (next to
+// build-quantum.bat and installer\Quantum.iss), so any other version.sa still runs.
+bool isCompilerVersionFile(const std::string &path);
+// Builds the installer and compiler programs for the version in `path` and publishes them.
+// flags: --no-publish  --force  --skip-build
+int runVersionRelease(const std::string &path, const std::vector<std::string> &flags);
+
+// `quantum update [--check]`: replaces the compiler programs next to `exePath`.
+int runUpdate(const std::vector<std::string> &flags, const std::string &exePath);

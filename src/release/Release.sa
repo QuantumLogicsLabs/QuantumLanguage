@@ -1,0 +1,302 @@
+// quantum: cpp
+// `quantum version.sa`: builds the compiler and its installer for the version in
+// version.sa and publishes them to the compiler host (host/server.sa).
+#include "Release.h.sa"
+#include "../qpm/QpmHttp.h.sa"
+#include "../qpm/QpmJson.h.sa"
+#include "../qpm/QpmSemver.h.sa"
+#include "Error.h.sa"
+
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+namespace fs = std::filesystem;
+
+namespace
+{
+    std::string trimText(const std::string &s)
+    {
+        size_t b = 0, e = s.size();
+        while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n'))
+            ++b;
+        while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
+            --e;
+        return s.substr(b, e - b);
+    }
+
+    void say(const std::string &msg)
+    {
+        std::cout << Colors::CYAN << "[Release] " << Colors::RESET << msg << "\n";
+        std::cout.flush();
+    }
+
+    int fail(const std::string &msg)
+    {
+        std::cerr << Colors::RED << "[Release] " << Colors::RESET << msg << "\n";
+        return 1;
+    }
+
+    // Runs a command line in `cwd` on this console and waits; its exit code, or -1 if it did not start
+    int runCommand(const std::string &cmd, const std::string &cwd)
+    {
+        STARTUPINFOA si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        std::vector<char> buf(cmd.begin(), cmd.end());
+        buf.push_back('\0');
+        std::cout.flush();
+        if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, 0, nullptr, cwd.empty() ? nullptr : cwd.c_str(),
+                            &si, &pi))
+            return -1;
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return static_cast<int>(code);
+    }
+
+    // QUANTUM_PUBLISH_TOKEN, else the first line of %USERPROFILE%\.quantum\publish_token
+    std::string readPublishToken()
+    {
+        const char *env = getenv("QUANTUM_PUBLISH_TOKEN");
+        if (env && *env)
+            return trimText(env);
+        const char *home = getenv("USERPROFILE");
+        if (!home || !*home)
+            return "";
+        std::string data;
+        if (!releaseReadFile((fs::path(home) / ".quantum" / "publish_token").string(), data))
+            return "";
+        return trimText(data);
+    }
+
+    std::string findIscc()
+    {
+        std::vector<std::string> candidates;
+        const char *custom = getenv("QUANTUM_ISCC");
+        if (custom && *custom)
+            candidates.push_back(custom);
+        candidates.push_back("C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe");
+        candidates.push_back("C:\\Program Files\\Inno Setup 6\\ISCC.exe");
+        const char *local = getenv("LOCALAPPDATA");
+        if (local && *local)
+            candidates.push_back(std::string(local) + "\\Programs\\Inno Setup 6\\ISCC.exe");
+        std::error_code ec;
+        for (const std::string &c : candidates)
+            if (fs::is_regular_file(c, ec))
+                return c;
+        return "";
+    }
+
+    std::string utcNow()
+    {
+        std::time_t t = std::time(nullptr);
+        std::tm *g = std::gmtime(&t);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", g);
+        return buf;
+    }
+
+    // One file of the release, read into memory
+    struct Piece
+    {
+        std::string name;
+        std::string data;
+        std::string sha256;
+    };
+
+    bool upload(const std::string &host, const std::string &token, const std::string &urlPath, const std::string &label,
+                const std::string &data)
+    {
+        std::vector<std::string> headers = {"Authorization: Bearer " + token, "Content-Type: application/octet-stream"};
+        say("uploading " + label + " (" + std::to_string(data.size() / 1024) + " KB)");
+        qpm::HttpResponse r = qpm::httpRequest("PUT", host + urlPath, data, headers);
+        if (!r.ok())
+        {
+            std::string why = qpm::describeFailure(r);
+            if (r.error.empty() && !r.body.empty())
+                why += " - " + trimText(r.body);
+            fail("upload of " + label + " failed: " + why);
+            return false;
+        }
+        return true;
+    }
+} // namespace
+
+bool isCompilerVersionFile(const std::string &path)
+{
+    fs::path p(path);
+    if (p.filename().string() != "version.sa")
+        return false;
+    fs::path dir = p.parent_path();
+    if (dir.empty())
+        dir = ".";
+    std::error_code ec;
+    return fs::is_regular_file(dir / "build-quantum.bat", ec) && fs::is_regular_file(dir / "installer" / "Quantum.iss", ec);
+}
+
+int runVersionRelease(const std::string &path, const std::vector<std::string> &flags)
+{
+    bool noPublish = false, force = false, skipBuild = false;
+    for (const std::string &f : flags)
+    {
+        if (f == "--no-publish")
+            noPublish = true;
+        else if (f == "--force")
+            force = true;
+        else if (f == "--skip-build")
+            skipBuild = true;
+        else
+            return fail("unknown option " + f + " (use --no-publish, --force or --skip-build)");
+    }
+
+    std::error_code ec;
+    fs::path versionFile = fs::absolute(fs::path(path), ec);
+    fs::path root = versionFile.parent_path();
+
+    std::string raw;
+    if (!releaseReadFile(versionFile.string(), raw))
+        return fail("cannot read " + versionFile.string());
+    std::string version = trimText(raw);
+    qpm::SemVer parsed;
+    if (!qpm::SemVer::tryParse(version, parsed) || parsed.hasPrerelease() || parsed.toString() != version)
+        return fail("version.sa must hold MAJOR.MINOR.PATCH (e.g. 3.0.1), found \"" + version + "\"");
+    say("version.sa says " + version);
+
+    // Publishing needs the host and the password: find out before the long build
+    std::string host = releaseHostUrl();
+    std::string token;
+    if (!noPublish)
+    {
+        if (!releaseHostAllowed(host))
+            return fail("the host must be https:// (http:// only for localhost): " + host);
+        token = readPublishToken();
+        if (token.empty())
+            return fail("no publish password. Set QUANTUM_PUBLISH_TOKEN, or put it in " +
+                        std::string("%USERPROFILE%\\.quantum\\publish_token (or use --no-publish)."));
+
+        ReleaseInfo current;
+        bool found = false;
+        std::string error;
+        if (!fetchLatestRelease(host, current, found, error))
+            return fail(error);
+        if (found)
+        {
+            int cmp = compareVersions(version, current.version);
+            if (cmp == 1 && !force)
+            {
+                say("version " + version + " is already published on " + host + ". Bump version.sa to release a new one.");
+                return 0;
+            }
+            if (cmp == 0 && !force)
+                return fail("the host already has the newer version " + current.version + " (version.sa says " + version +
+                            "). Use --force to publish anyway.");
+            say("the host has " + current.version + "; releasing " + version);
+        }
+        else
+            say("nothing is published on " + host + " yet");
+    }
+
+    fs::path releaseDir = root / "release" / version;
+    fs::path buildDir = root / "build-release";
+    fs::create_directories(releaseDir, ec);
+
+    if (!skipBuild)
+    {
+        // build\quantum.exe is this very program, so a release builds into build-release
+        say("building the compiler into build-release (a few minutes)");
+        SetEnvironmentVariableA("QUANTUM_BUILD_OUT", "build-release");
+        // ".\" because cmd does not look in the current folder when NoDefaultCurrentDirectoryInExePath is set
+        int rc = runCommand("cmd.exe /c .\\build-quantum.bat", root.string());
+        if (rc != 0)
+            return fail("build-quantum.bat failed (exit " + std::to_string(rc) + ")");
+
+        for (const std::string &name : releaseProgramNames())
+        {
+            std::string data;
+            if (!releaseReadFile((buildDir / name).string(), data))
+                return fail("the build did not produce " + (buildDir / name).string());
+            if (!releaseWriteFile((releaseDir / name).string(), data))
+                return fail("cannot write " + (releaseDir / name).string());
+        }
+
+        std::string iscc = findIscc();
+        if (iscc.empty())
+            return fail("Inno Setup 6 (ISCC.exe) not found. Install it from jrsoftware.org, or set QUANTUM_ISCC to ISCC.exe.");
+        say("building the installer with Inno Setup");
+        std::string cmd = "\"" + iscc + "\" /Q /DMyAppVersion=" + version + " /DBuildDir=..\\build-release \"/O" +
+                          releaseDir.string() + "\" /FQuantumSetup installer\\Quantum.iss";
+        rc = runCommand(cmd, root.string());
+        if (rc != 0)
+            return fail("Inno Setup failed (exit " + std::to_string(rc) + ")");
+    }
+
+    // The five files of the release, with their checksums
+    std::vector<std::string> names = releaseProgramNames();
+    names.push_back("QuantumSetup.exe");
+    std::vector<Piece> pieces;
+    for (const std::string &name : names)
+    {
+        Piece p;
+        p.name = name;
+        if (!releaseReadFile((releaseDir / name).string(), p.data) || p.data.empty())
+            return fail("missing " + (releaseDir / name).string() + (skipBuild ? " (--skip-build needs a finished build)" : ""));
+        p.sha256 = sha256Hex(p.data);
+        pieces.push_back(p);
+    }
+
+    qpm::JsonValue files = qpm::JsonValue::makeObject();
+    for (const Piece &p : pieces)
+    {
+        qpm::JsonValue entry = qpm::JsonValue::makeObject();
+        entry.set("path", "releases/" + version + "/" + p.name);
+        entry.set("sha256", p.sha256);
+        entry.set("size", static_cast<double>(p.data.size()));
+        files.set(p.name, entry);
+    }
+    qpm::JsonValue latest = qpm::JsonValue::makeObject();
+    latest.set("version", version);
+    latest.set("released", utcNow());
+    latest.set("files", files);
+    std::string latestText = latest.stringify(2) + "\n";
+    releaseWriteFile((releaseDir / "latest.json").string(), latestText);
+
+    say("release " + version + " is ready in " + releaseDir.string());
+    for (const Piece &p : pieces)
+        std::cout << "         " << p.sha256.substr(0, 16) << "...  " << p.name << "\n";
+
+    if (noPublish)
+    {
+        say("--no-publish: not uploading");
+        return 0;
+    }
+
+    for (const Piece &p : pieces)
+        if (!upload(host, token, "/api/publish/" + version + "/" + p.name, p.name, p.data))
+            return 1;
+    // latest.json goes last: until then nobody sees the new version
+    if (!upload(host, token, "/api/publish/latest.json", "latest.json", latestText))
+        return 1;
+
+    ReleaseInfo check;
+    bool found = false;
+    std::string error;
+    if (!fetchLatestRelease(host, check, found, error) || !found || check.version != version)
+        return fail("uploaded, but the host does not list " + version + " as current" +
+                    (error.empty() ? std::string() : " (" + error + ")"));
+    std::cout << Colors::GREEN << "[Release] " << Colors::RESET << "published " << version << " on " << host << "\n";
+    return 0;
+}

@@ -105,7 +105,8 @@ namespace qpm
         // An upload waits on the registry storing the tarball before it
         // answers, so give requests that carry a body a longer read timeout.
         int receiveTimeout = body.empty() ? 30000 : 120000;
-        WinHttpSetTimeouts(hSession, 15000, 15000, 30000, receiveTimeout);
+        int sendTimeout = body.empty() ? 30000 : 120000; // a multi-megabyte upload over a slow link
+        WinHttpSetTimeouts(hSession, 15000, 15000, sendTimeout, receiveTimeout);
 
         HINTERNET hConnect = WinHttpConnect(hSession, host, port, 0);
         if (!hConnect)
