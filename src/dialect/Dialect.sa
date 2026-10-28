@@ -71,6 +71,15 @@ std::string applyDialect(std::string source, const std::string &path)
             std::cerr << "----- C++ structure pass -----\n" << source << "----- end -----\n";
     }
 
+    // Java-style code before the Ruby pass, which would read `@Override` as
+    // an instance variable
+    if (ext == ".sa")
+    {
+        source = applyJavaDialect(source);
+        if (std::getenv("QUANTUM_DEBUG_JAVA"))
+            std::cerr << "----- Java-style pass -----\n" << source << "----- end -----\n";
+    }
+
     if (ext == ".rb")
         source = applyRubyDialect(source, /*strict=*/true);
     else if (ext == ".sa")

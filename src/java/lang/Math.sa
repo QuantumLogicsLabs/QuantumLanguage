@@ -1,0 +1,263 @@
+package java.lang;
+
+// ─── Math ───────────────────────────────────────────────────────────────────
+
+public final class Math {
+    public static final double E = 2.718281828459045;
+    public static final double PI = 3.141592653589793;
+    public static final double TAU = 6.283185307179586;
+
+    private Math() {}
+
+    public static native double sqrt(double a);
+    public static native double cbrt(double a);
+    public static native double pow(double a, double b);
+    public static native double exp(double a);
+    public static native double expm1(double x);
+    public static native double log(double a);
+    public static native double log10(double a);
+    public static native double log1p(double x);
+    public static native double sin(double a);
+    public static native double cos(double a);
+    public static native double tan(double a);
+    public static native double asin(double a);
+    public static native double acos(double a);
+    public static native double atan(double a);
+    public static native double atan2(double y, double x);
+    public static native double sinh(double x);
+    public static native double cosh(double x);
+    public static native double tanh(double x);
+    public static native double hypot(double x, double y);
+    public static native double floor(double a);
+    public static native double ceil(double a);
+    public static native double rint(double a);
+    public static native double signum(double d);
+    public static float signum(float f) { return (float) signum((double) f); }
+    public static native double toRadians(double angdeg);
+    public static native double toDegrees(double angrad);
+    public static native double ulp(double d);
+    public static native double random();
+    public static long round(double a) { return roundD(a); }
+    public static int round(float a) { return roundF(a); }
+    private static native long roundD(double a);
+    private static native int roundF(float a);
+
+    public static int abs(int a) { return (a < 0) ? -a : a; }
+    public static long abs(long a) { return (a < 0) ? -a : a; }
+    public static float abs(float a) { return (a <= 0.0f) ? 0.0f - a : a; }
+    public static double abs(double a) { return (a <= 0.0d) ? 0.0d - a : a; }
+
+    public static int absExact(int a) {
+        if (a == Integer.MIN_VALUE)
+            throw new ArithmeticException("Overflow to represent absolute value of Integer.MIN_VALUE");
+        return abs(a);
+    }
+
+    public static long absExact(long a) {
+        if (a == Long.MIN_VALUE)
+            throw new ArithmeticException("Overflow to represent absolute value of Long.MIN_VALUE");
+        return abs(a);
+    }
+
+    public static int max(int a, int b) { return (a >= b) ? a : b; }
+    public static long max(long a, long b) { return (a >= b) ? a : b; }
+    public static int min(int a, int b) { return (a <= b) ? a : b; }
+    public static long min(long a, long b) { return (a <= b) ? a : b; }
+
+    public static float max(float a, float b) { return (float) max((double) a, (double) b); }
+    public static float min(float a, float b) { return (float) min((double) a, (double) b); }
+
+    public static double max(double a, double b) {
+        if (a != a)
+            return a;
+        if (a == 0.0d && b == 0.0d && Double.doubleToRawLongBits(a) < 0)
+            return b;
+        return (a >= b) ? a : b;
+    }
+
+    public static double min(double a, double b) {
+        if (a != a)
+            return a;
+        if (a == 0.0d && b == 0.0d && Double.doubleToRawLongBits(b) < 0)
+            return b;
+        return (a <= b) ? a : b;
+    }
+
+    public static int clamp(long value, int min, int max) {
+        if (min > max)
+            throw new IllegalArgumentException(min + " > " + max);
+        return (int) Math.min(max, Math.max(value, min));
+    }
+
+    public static long clamp(long value, long min, long max) {
+        if (min > max)
+            throw new IllegalArgumentException(min + " > " + max);
+        return Math.min(max, Math.max(value, min));
+    }
+
+    public static double clamp(double value, double min, double max) {
+        if (min > max)
+            throw new IllegalArgumentException(min + " > " + max);
+        return Math.min(max, Math.max(value, min));
+    }
+
+    public static int addExact(int x, int y) {
+        int r = x + y;
+        if (((x ^ r) & (y ^ r)) < 0)
+            throw new ArithmeticException("integer overflow");
+        return r;
+    }
+
+    public static long addExact(long x, long y) {
+        long r = x + y;
+        if (((x ^ r) & (y ^ r)) < 0)
+            throw new ArithmeticException("long overflow");
+        return r;
+    }
+
+    public static int subtractExact(int x, int y) {
+        int r = x - y;
+        if (((x ^ y) & (x ^ r)) < 0)
+            throw new ArithmeticException("integer overflow");
+        return r;
+    }
+
+    public static long subtractExact(long x, long y) {
+        long r = x - y;
+        if (((x ^ y) & (x ^ r)) < 0)
+            throw new ArithmeticException("long overflow");
+        return r;
+    }
+
+    public static int multiplyExact(int x, int y) {
+        long r = (long) x * (long) y;
+        if ((int) r != r)
+            throw new ArithmeticException("integer overflow");
+        return (int) r;
+    }
+
+    public static long multiplyExact(long x, int y) { return multiplyExact(x, (long) y); }
+
+    public static long multiplyExact(long x, long y) {
+        long r = x * y;
+        long ax = Math.abs(x);
+        long ay = Math.abs(y);
+        if (((ax | ay) >>> 31 != 0)) {
+            if (((y != 0) && (r / y != x)) || (x == Long.MIN_VALUE && y == -1))
+                throw new ArithmeticException("long overflow");
+        }
+        return r;
+    }
+
+    public static int incrementExact(int a) {
+        if (a == Integer.MAX_VALUE)
+            throw new ArithmeticException("integer overflow");
+        return a + 1;
+    }
+
+    public static long incrementExact(long a) {
+        if (a == Long.MAX_VALUE)
+            throw new ArithmeticException("long overflow");
+        return a + 1L;
+    }
+
+    public static int decrementExact(int a) {
+        if (a == Integer.MIN_VALUE)
+            throw new ArithmeticException("integer overflow");
+        return a - 1;
+    }
+
+    public static long decrementExact(long a) {
+        if (a == Long.MIN_VALUE)
+            throw new ArithmeticException("long overflow");
+        return a - 1L;
+    }
+
+    public static int negateExact(int a) {
+        if (a == Integer.MIN_VALUE)
+            throw new ArithmeticException("integer overflow");
+        return -a;
+    }
+
+    public static long negateExact(long a) {
+        if (a == Long.MIN_VALUE)
+            throw new ArithmeticException("long overflow");
+        return -a;
+    }
+
+    public static int toIntExact(long value) {
+        if ((int) value != value)
+            throw new ArithmeticException("integer overflow");
+        return (int) value;
+    }
+
+    public static int floorDiv(int x, int y) {
+        int q = x / y;
+        if ((x ^ y) < 0 && (q * y != x))
+            q--;
+        return q;
+    }
+
+    public static long floorDiv(long x, int y) { return floorDiv(x, (long) y); }
+
+    public static long floorDiv(long x, long y) {
+        long q = x / y;
+        if ((x ^ y) < 0 && (q * y != x))
+            q--;
+        return q;
+    }
+
+    public static int floorMod(int x, int y) {
+        int m = x % y;
+        if ((m ^ y) < 0 && m != 0)
+            m += y;
+        return m;
+    }
+
+    public static int floorMod(long x, int y) { return (int) floorMod(x, (long) y); }
+
+    public static long floorMod(long x, long y) {
+        long m = x % y;
+        if ((m ^ y) < 0 && m != 0)
+            m += y;
+        return m;
+    }
+
+    public static int ceilDiv(int x, int y) {
+        int q = x / y;
+        if ((x ^ y) >= 0 && (q * y != x))
+            q++;
+        return q;
+    }
+
+    public static long ceilDiv(long x, long y) {
+        long q = x / y;
+        if ((x ^ y) >= 0 && (q * y != x))
+            q++;
+        return q;
+    }
+
+    public static long multiplyHigh(long x, long y) {
+        if (x < 0 || y < 0) {
+            long x1 = x >> 32, x2 = x & 0xFFFFFFFFL;
+            long y1 = y >> 32, y2 = y & 0xFFFFFFFFL;
+            long z2 = x2 * y2;
+            long t = x1 * y2 + (z2 >>> 32);
+            long z1 = t & 0xFFFFFFFFL;
+            long z0 = t >> 32;
+            z1 += x2 * y1;
+            return x1 * y1 + z0 + (z1 >> 32);
+        }
+        long x1 = x >>> 32, y1 = y >>> 32;
+        long x2 = x & 0xFFFFFFFFL, y2 = y & 0xFFFFFFFFL;
+        long a = x1 * y1, b = x2 * y2, c = (x1 + x2) * (y1 + y2);
+        long k = c - a - b;
+        return (((b >>> 32) + k) >>> 32) + a;
+    }
+
+    public static double fma(double a, double b, double c) { return a * b + c; }
+    public static double nextUp(double d) { return d + ulp(d); }
+    public static double nextDown(double d) { return d - ulp(d); }
+    public static double scalb(double d, int scaleFactor) { return d * pow(2, scaleFactor); }
+    public static int getExponent(double d) { return (int) (((Double.doubleToRawLongBits(d) & 0x7ff0000000000000L) >> 52) - 1023); }
+}

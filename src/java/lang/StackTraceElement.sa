@@ -1,0 +1,44 @@
+package java.lang;
+
+public final class StackTraceElement {
+    private final String declaringClass, methodName, fileName;
+    private final int lineNumber;
+
+    public StackTraceElement(String declaringClass, String methodName, String fileName, int lineNumber) {
+        this.declaringClass = declaringClass;
+        this.methodName = methodName;
+        this.fileName = fileName;
+        this.lineNumber = lineNumber;
+    }
+
+    // "Main.f(Main.java:3)"
+    static StackTraceElement $parse(String frame) {
+        int paren = frame.indexOf('(');
+        String qualified = paren < 0 ? frame : frame.substring(0, paren);
+        int dot = qualified.lastIndexOf('.');
+        String cls = dot < 0 ? "" : qualified.substring(0, dot);
+        String method = dot < 0 ? qualified : qualified.substring(dot + 1);
+        String file = null;
+        int line = -1;
+        if (paren >= 0) {
+            String where = frame.substring(paren + 1, frame.length() - 1);
+            int colon = where.lastIndexOf(':');
+            if (colon >= 0) {
+                file = where.substring(0, colon);
+                line = Integer.parseInt(where.substring(colon + 1));
+            } else
+                file = where;
+        }
+        return new StackTraceElement(cls, method, file, line);
+    }
+
+    public String getClassName() { return declaringClass; }
+    public String getMethodName() { return methodName; }
+    public String getFileName() { return fileName; }
+    public int getLineNumber() { return lineNumber; }
+
+    public String toString() {
+        return declaringClass + "." + methodName + "(" + (fileName == null ? "Unknown Source" : fileName)
+                + (lineNumber >= 0 ? ":" + lineNumber : "") + ")";
+    }
+}

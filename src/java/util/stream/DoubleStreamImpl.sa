@@ -1,0 +1,133 @@
+package java.util.stream;
+
+import java.util.*;
+import java.util.function.*;
+
+final class DoubleStreamImpl extends AbstractPipeline<Double> implements DoubleStream {
+    DoubleStreamImpl(Iterator<Double> source) { super(source); }
+
+    public Iterator<Double> iterator() { return take(); }
+    public DoubleStream sequential() { return this; }
+    public DoubleStream parallel() { return this; }
+    public DoubleStream unordered() { return this; }
+    public DoubleStream onClose(Runnable closeHandler) { return this; }
+
+    public DoubleStream filter(DoublePredicate predicate) { return new DoubleStreamImpl(new StreamSupport.Filter<Double>(take(), x -> predicate.test(x))); }
+    public DoubleStream map(DoubleUnaryOperator mapper) { return new DoubleStreamImpl(new StreamSupport.Map<Double, Double>(take(), x -> mapper.applyAsDouble(x))); }
+    public <U> Stream<U> mapToObj(DoubleFunction<? extends U> mapper) { return new RefStream<U>(new StreamSupport.Map<Double, U>(take(), x -> mapper.apply(x))); }
+    public IntStream mapToInt(DoubleToIntFunction mapper) { return new IntStreamImpl(new StreamSupport.Map<Double, Integer>(take(), x -> mapper.applyAsInt(x))); }
+    public LongStream mapToLong(DoubleToLongFunction mapper) { return new LongStreamImpl(new StreamSupport.Map<Double, Long>(take(), x -> mapper.applyAsLong(x))); }
+    public DoubleStream distinct() { return new DoubleStreamImpl(new StreamSupport.Distinct<Double>(take())); }
+
+    public DoubleStream sorted() {
+        ArrayList<Double> all = StreamSupport.drain(take());
+        double[] a = new double[all.size()];
+        for (int k = 0; k < a.length; k++)
+            a[k] = all.get(k);
+        Arrays.sort(a);
+        return DoubleStream.of(a);
+    }
+
+    public DoubleStream peek(DoubleConsumer action) { return new DoubleStreamImpl(new StreamSupport.Peek<Double>(take(), x -> action.accept(x))); }
+    public DoubleStream limit(long maxSize) { return new DoubleStreamImpl(new StreamSupport.Limit<Double>(take(), maxSize)); }
+    public DoubleStream skip(long n) { return new DoubleStreamImpl(new StreamSupport.Skip<Double>(take(), n)); }
+
+    public void forEach(DoubleConsumer action) {
+        Iterator<Double> it = take();
+        while (it.hasNext())
+            action.accept(it.next());
+    }
+
+    public double[] toArray() {
+        ArrayList<Double> all = StreamSupport.drain(take());
+        double[] a = new double[all.size()];
+        for (int i = 0; i < a.length; i++)
+            a[i] = all.get(i);
+        return a;
+    }
+
+    public double reduce(double identity, DoubleBinaryOperator op) {
+        double result = identity;
+        Iterator<Double> it = take();
+        while (it.hasNext())
+            result = op.applyAsDouble(result, it.next());
+        return result;
+    }
+
+    public OptionalDouble reduce(DoubleBinaryOperator op) {
+        Iterator<Double> it = take();
+        if (!it.hasNext())
+            return OptionalDouble.empty();
+        double result = it.next();
+        while (it.hasNext())
+            result = op.applyAsDouble(result, it.next());
+        return OptionalDouble.of(result);
+    }
+
+    public double sum() {
+        double[] summation = new double[3];
+        Iterator<Double> it = take();
+        while (it.hasNext()) {
+            double d = it.next();
+            StreamSupport.sumWithCompensation(summation, d);
+            summation[2] += d;
+        }
+        return StreamSupport.computeFinalSum(summation);
+    }
+
+    public OptionalDouble min() { return reduce((a, b) -> Math.min(a, b)); }
+    public OptionalDouble max() { return reduce((a, b) -> Math.max(a, b)); }
+
+    public long count() {
+        long n = 0;
+        Iterator<Double> it = take();
+        while (it.hasNext()) {
+            it.next();
+            n++;
+        }
+        return n;
+    }
+
+    public OptionalDouble average() {
+        double[] avg = new double[4];
+        Iterator<Double> it = take();
+        while (it.hasNext()) {
+            double d = it.next();
+            avg[2]++;
+            StreamSupport.sumWithCompensation(avg, d);
+            avg[3] += d;
+        }
+        return avg[2] > 0 ? OptionalDouble.of(StreamSupport.computeFinalSum(avg) / avg[2]) : OptionalDouble.empty();
+    }
+
+    public DoubleSummaryStatistics summaryStatistics() {
+        DoubleSummaryStatistics s = new DoubleSummaryStatistics();
+        forEach(s);
+        return s;
+    }
+
+    public boolean anyMatch(DoublePredicate predicate) {
+        Iterator<Double> it = take();
+        while (it.hasNext())
+            if (predicate.test(it.next()))
+                return true;
+        return false;
+    }
+
+    public boolean allMatch(DoublePredicate predicate) {
+        Iterator<Double> it = take();
+        while (it.hasNext())
+            if (!predicate.test(it.next()))
+                return false;
+        return true;
+    }
+
+    public boolean noneMatch(DoublePredicate predicate) { return !anyMatch(predicate); }
+
+    public OptionalDouble findFirst() {
+        Iterator<Double> it = take();
+        return it.hasNext() ? OptionalDouble.of(it.next()) : OptionalDouble.empty();
+    }
+
+    public Stream<Double> boxed() { return new RefStream<Double>(take()); }
+}

@@ -1,0 +1,16 @@
+package java.util.function;
+
+import java.util.Comparator;
+import java.util.Objects;
+
+@FunctionalInterface
+public interface LongConsumer {
+    void accept(long value);
+
+    default LongConsumer andThen(LongConsumer after) {
+        return (long t) -> {
+            accept(t);
+            after.accept(t);
+        };
+    }
+}

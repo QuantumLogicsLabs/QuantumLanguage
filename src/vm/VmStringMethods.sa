@@ -167,13 +167,20 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
         std::transform(r.begin(), r.end(), r.begin(), ::tolower);
         return QuantumValue(r);
     }
-    if (m == "trim" || m == "strip")
+    if (m == "trim" || m == "strip" || m == "lstrip" || m == "rstrip")
     {
+        // Python's strip(chars): those characters instead of whitespace
+        bool chars = m != "trim" && !args.empty() && args[0].isString();
+        std::string set = chars ? args[0].asString() : std::string();
+        auto strip = [&](char c)
+        { return chars ? set.find(c) != std::string::npos : std::isspace((unsigned char)c) != 0; };
         std::string r = str;
-        while (!r.empty() && std::isspace((unsigned char)r.front()))
-            r.erase(r.begin());
-        while (!r.empty() && std::isspace((unsigned char)r.back()))
-            r.pop_back();
+        if (m != "rstrip")
+            while (!r.empty() && strip(r.front()))
+                r.erase(r.begin());
+        if (m != "lstrip")
+            while (!r.empty() && strip(r.back()))
+                r.pop_back();
         return QuantumValue(r);
     }
     // Ruby String#chomp — strips one trailing line ending only (not all whitespace).

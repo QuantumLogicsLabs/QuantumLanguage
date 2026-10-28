@@ -1,0 +1,9 @@
+package java.util.concurrent;
+
+import java.util.*;
+import java.util.function.*;
+
+public class ConcurrentSkipListMap<K, V> extends TreeMap<K, V> {
+    public ConcurrentSkipListMap() { super(); }
+    public ConcurrentSkipListMap(Comparator<? super K> comparator) { super(comparator); }
+}

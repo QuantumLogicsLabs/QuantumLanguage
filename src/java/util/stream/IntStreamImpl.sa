@@ -1,0 +1,167 @@
+package java.util.stream;
+
+import java.util.*;
+import java.util.function.*;
+
+final class IntStreamImpl extends AbstractPipeline<Integer> implements IntStream {
+    IntStreamImpl(Iterator<Integer> source) { super(source); }
+
+    public PrimitiveIterator.OfInt iterator() {
+        Iterator<Integer> it = take();
+        return new PrimitiveIterator.OfInt() {
+            public boolean hasNext() { return it.hasNext(); }
+            public Integer next() { return it.next(); }
+        };
+    }
+
+    public IntStream sequential() { return this; }
+    public IntStream parallel() { return this; }
+    public IntStream unordered() { return this; }
+    public IntStream onClose(Runnable closeHandler) { return this; }
+
+    public IntStream filter(IntPredicate predicate) { return new IntStreamImpl(new StreamSupport.Filter<Integer>(take(), x -> predicate.test(x))); }
+    public IntStream map(IntUnaryOperator mapper) { return new IntStreamImpl(new StreamSupport.Map<Integer, Integer>(take(), x -> mapper.applyAsInt(x))); }
+    public <U> Stream<U> mapToObj(IntFunction<? extends U> mapper) { return new RefStream<U>(new StreamSupport.Map<Integer, U>(take(), x -> mapper.apply(x))); }
+    public LongStream mapToLong(IntToLongFunction mapper) { return new LongStreamImpl(new StreamSupport.Map<Integer, Long>(take(), x -> mapper.applyAsLong(x))); }
+    public DoubleStream mapToDouble(IntToDoubleFunction mapper) { return new DoubleStreamImpl(new StreamSupport.Map<Integer, Double>(take(), x -> mapper.applyAsDouble(x))); }
+
+    public IntStream flatMap(IntFunction<? extends IntStream> mapper) {
+        return new IntStreamImpl(new StreamSupport.FlatMap<Integer, Integer>(take(), x -> {
+            IntStream s = mapper.apply(x);
+            return s == null ? Collections.<Integer>emptyIterator() : s.boxed().iterator();
+        }));
+    }
+
+    public IntStream distinct() { return new IntStreamImpl(new StreamSupport.Distinct<Integer>(take())); }
+
+    public IntStream sorted() {
+        Iterator<Integer> src = take();
+        return new IntStreamImpl(new Iterator<Integer>() {
+            int[] a;
+            int i;
+            private void fill() {
+                if (a == null) {
+                    ArrayList<Integer> all = StreamSupport.drain(src);
+                    a = new int[all.size()];
+                    for (int k = 0; k < a.length; k++)
+                        a[k] = all.get(k);
+                    Arrays.sort(a);
+                }
+            }
+            public boolean hasNext() {
+                fill();
+                return i < a.length;
+            }
+            public Integer next() {
+                fill();
+                return a[i++];
+            }
+        });
+    }
+
+    public IntStream peek(IntConsumer action) { return new IntStreamImpl(new StreamSupport.Peek<Integer>(take(), x -> action.accept(x))); }
+    public IntStream limit(long maxSize) { return new IntStreamImpl(new StreamSupport.Limit<Integer>(take(), maxSize)); }
+    public IntStream skip(long n) { return new IntStreamImpl(new StreamSupport.Skip<Integer>(take(), n)); }
+    public IntStream takeWhile(IntPredicate predicate) { return new IntStreamImpl(new StreamSupport.TakeWhile<Integer>(take(), x -> predicate.test(x))); }
+    public IntStream dropWhile(IntPredicate predicate) { return new IntStreamImpl(new StreamSupport.DropWhile<Integer>(take(), x -> predicate.test(x))); }
+
+    public void forEach(IntConsumer action) {
+        Iterator<Integer> it = take();
+        while (it.hasNext())
+            action.accept(it.next());
+    }
+
+    public void forEachOrdered(IntConsumer action) { forEach(action); }
+
+    public int[] toArray() {
+        ArrayList<Integer> all = StreamSupport.drain(take());
+        int[] a = new int[all.size()];
+        for (int i = 0; i < a.length; i++)
+            a[i] = all.get(i);
+        return a;
+    }
+
+    public int reduce(int identity, IntBinaryOperator op) {
+        int result = identity;
+        Iterator<Integer> it = take();
+        while (it.hasNext())
+            result = op.applyAsInt(result, it.next());
+        return result;
+    }
+
+    public OptionalInt reduce(IntBinaryOperator op) {
+        Iterator<Integer> it = take();
+        if (!it.hasNext())
+            return OptionalInt.empty();
+        int result = it.next();
+        while (it.hasNext())
+            result = op.applyAsInt(result, it.next());
+        return OptionalInt.of(result);
+    }
+
+    public <R> R collect(Supplier<R> supplier, ObjIntConsumer<R> accumulator, BiConsumer<R, R> combiner) {
+        R container = supplier.get();
+        Iterator<Integer> it = take();
+        while (it.hasNext())
+            accumulator.accept(container, it.next());
+        return container;
+    }
+
+    public int sum() { return reduce(0, (a, b) -> a + b); }
+    public OptionalInt min() { return reduce((a, b) -> Math.min(a, b)); }
+    public OptionalInt max() { return reduce((a, b) -> Math.max(a, b)); }
+
+    public long count() {
+        long n = 0;
+        Iterator<Integer> it = take();
+        while (it.hasNext()) {
+            it.next();
+            n++;
+        }
+        return n;
+    }
+
+    public OptionalDouble average() {
+        long count = 0, sum = 0;
+        Iterator<Integer> it = take();
+        while (it.hasNext()) {
+            count++;
+            sum += it.next();
+        }
+        return count > 0 ? OptionalDouble.of((double) sum / count) : OptionalDouble.empty();
+    }
+
+    public IntSummaryStatistics summaryStatistics() {
+        IntSummaryStatistics s = new IntSummaryStatistics();
+        forEach(s);
+        return s;
+    }
+
+    public boolean anyMatch(IntPredicate predicate) {
+        Iterator<Integer> it = take();
+        while (it.hasNext())
+            if (predicate.test(it.next()))
+                return true;
+        return false;
+    }
+
+    public boolean allMatch(IntPredicate predicate) {
+        Iterator<Integer> it = take();
+        while (it.hasNext())
+            if (!predicate.test(it.next()))
+                return false;
+        return true;
+    }
+
+    public boolean noneMatch(IntPredicate predicate) { return !anyMatch(predicate); }
+
+    public OptionalInt findFirst() {
+        Iterator<Integer> it = take();
+        return it.hasNext() ? OptionalInt.of(it.next()) : OptionalInt.empty();
+    }
+
+    public OptionalInt findAny() { return findFirst(); }
+    public LongStream asLongStream() { return new LongStreamImpl(new StreamSupport.Map<Integer, Long>(take(), x -> (long) (int) x)); }
+    public DoubleStream asDoubleStream() { return new DoubleStreamImpl(new StreamSupport.Map<Integer, Double>(take(), x -> (double) (int) x)); }
+    public Stream<Integer> boxed() { return new RefStream<Integer>(take()); }
+}

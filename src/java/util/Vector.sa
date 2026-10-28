@@ -1,0 +1,157 @@
+package java.util;
+
+import java.util.function.*;
+
+public class Vector<E> extends AbstractList<E> implements List<E>, RandomAccess, Cloneable, java.io.Serializable {
+    protected Object[] elementData;
+    protected int elementCount;
+    protected int capacityIncrement;
+
+    public Vector(int initialCapacity, int capacityIncrement) {
+        if (initialCapacity < 0)
+            throw new IllegalArgumentException("Illegal Capacity: " + initialCapacity);
+        this.elementData = new Object[initialCapacity];
+        this.capacityIncrement = capacityIncrement;
+    }
+
+    public Vector(int initialCapacity) { this(initialCapacity, 0); }
+    public Vector() { this(10); }
+
+    public Vector(Collection<? extends E> c) {
+        Object[] a = c.toArray();
+        elementCount = a.length;
+        elementData = java.util.Arrays.copyOf(a, Math.max(a.length, 1));
+    }
+
+    private void grow(int minCapacity) {
+        int oldCapacity = elementData.length;
+        int newCapacity = Math.max(minCapacity, oldCapacity + (capacityIncrement > 0 ? capacityIncrement : Math.max(oldCapacity, 1)));
+        elementData = java.util.Arrays.copyOf(elementData, newCapacity);
+    }
+
+    public int size() { return elementCount; }
+    public boolean isEmpty() { return elementCount == 0; }
+    public int capacity() { return elementData.length; }
+
+    @SuppressWarnings("unchecked")
+    E elementData(int index) { return (E) elementData[index]; }
+
+    public E get(int index) {
+        if (index >= elementCount)
+            throw new ArrayIndexOutOfBoundsException(index + " >= " + elementCount);
+        return elementData(index);
+    }
+
+    public E set(int index, E element) {
+        if (index >= elementCount)
+            throw new ArrayIndexOutOfBoundsException(index + " >= " + elementCount);
+        E oldValue = elementData(index);
+        elementData[index] = element;
+        return oldValue;
+    }
+
+    public boolean add(E e) {
+        modCount++;
+        if (elementCount == elementData.length)
+            grow(elementCount + 1);
+        elementData[elementCount++] = e;
+        return true;
+    }
+
+    public void add(int index, E element) { insertElementAt(element, index); }
+
+    public void insertElementAt(E obj, int index) {
+        if (index > elementCount)
+            throw new ArrayIndexOutOfBoundsException(index + " > " + elementCount);
+        modCount++;
+        if (elementCount == elementData.length)
+            grow(elementCount + 1);
+        System.arraycopy(elementData, index, elementData, index + 1, elementCount - index);
+        elementData[index] = obj;
+        elementCount++;
+    }
+
+    public void addElement(E obj) { add(obj); }
+
+    public E remove(int index) {
+        if (index >= elementCount)
+            throw new ArrayIndexOutOfBoundsException(index);
+        modCount++;
+        E oldValue = elementData(index);
+        int numMoved = elementCount - index - 1;
+        if (numMoved > 0)
+            System.arraycopy(elementData, index + 1, elementData, index, numMoved);
+        elementData[--elementCount] = null;
+        return oldValue;
+    }
+
+    public void removeElementAt(int index) { remove(index); }
+
+    public boolean removeElement(Object obj) {
+        int i = indexOf(obj);
+        if (i >= 0) {
+            remove(i);
+            return true;
+        }
+        return false;
+    }
+
+    public int indexOf(Object o) { return indexOf(o, 0); }
+
+    public int indexOf(Object o, int index) {
+        for (int i = index; i < elementCount; i++)
+            if (Objects.equals(o, elementData[i]))
+                return i;
+        return -1;
+    }
+
+    public int lastIndexOf(Object o) {
+        for (int i = elementCount - 1; i >= 0; i--)
+            if (Objects.equals(o, elementData[i]))
+                return i;
+        return -1;
+    }
+
+    public boolean contains(Object o) { return indexOf(o, 0) >= 0; }
+
+    public E elementAt(int index) { return get(index); }
+
+    public E firstElement() {
+        if (elementCount == 0)
+            throw new NoSuchElementException();
+        return elementData(0);
+    }
+
+    public E lastElement() {
+        if (elementCount == 0)
+            throw new NoSuchElementException();
+        return elementData(elementCount - 1);
+    }
+
+    public void setElementAt(E obj, int index) { set(index, obj); }
+
+    public void removeAllElements() { clear(); }
+
+    public void clear() {
+        modCount++;
+        for (int i = 0; i < elementCount; i++)
+            elementData[i] = null;
+        elementCount = 0;
+    }
+
+    public Object[] toArray() { return java.util.Arrays.copyOf(elementData, elementCount); }
+
+    public Object clone() { return new Vector<>(this); }
+
+    public Enumeration<E> elements() {
+        return new Enumeration<E>() {
+            int count = 0;
+            public boolean hasMoreElements() { return count < elementCount; }
+            public E nextElement() {
+                if (count < elementCount)
+                    return elementData(count++);
+                throw new NoSuchElementException("Vector Enumeration");
+            }
+        };
+    }
+}

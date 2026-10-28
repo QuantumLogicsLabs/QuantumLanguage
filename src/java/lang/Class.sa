@@ -1,0 +1,64 @@
+package java.lang;
+
+public final class Class<T> {
+    private final String name;
+    private final String simple;
+    private static Class<?>[] cache = new Class<?>[16];
+    private static int cached;
+
+    private Class(String name, String simple) {
+        this.name = name;
+        this.simple = simple;
+    }
+
+    static Class<?> $of(Object o) {
+        if (o == null)
+            throw new NullPointerException();
+        return $named($className(o), $simpleName(o));
+    }
+
+    static Class<?> $named(String name, String simple) {
+        for (int i = 0; i < cached; i++)
+            if (cache[i].name.equals(name))
+                return cache[i];
+        if (cached == cache.length) {
+            Class<?>[] bigger = new Class<?>[cached * 2];
+            for (int i = 0; i < cached; i++)
+                bigger[i] = cache[i];
+            cache = bigger;
+        }
+        Class<?> c = new Class<>(name, simple);
+        cache[cached++] = c;
+        return c;
+    }
+
+    private static native String $className(Object o);
+    private static native String $simpleName(Object o);
+    private static native boolean $isInstance(Object o, String descriptor);
+
+    public String getName() { return name; }
+    public String getSimpleName() { return simple; }
+    public String getTypeName() { return name.replace('$', '.'); }
+    public String getCanonicalName() { return name.replace('$', '.'); }
+
+    public boolean isPrimitive() {
+        switch (name) {
+            case "int": case "long": case "short": case "byte": case "char":
+            case "float": case "double": case "boolean": case "void":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    public boolean isArray() { return name.startsWith("["); }
+
+    public boolean isInstance(Object obj) { return obj != null && $isInstance(obj, "C:" + name); }
+
+    @SuppressWarnings("unchecked")
+    public T cast(Object obj) { return (T) obj; }
+
+    public String toString() { return (isPrimitive() ? "" : "class ") + name; }
+
+    public int hashCode() { return name.hashCode(); }
+}

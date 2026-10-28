@@ -3,7 +3,10 @@
 // as source files defining functions that return them.
 //   lib/cpp/*                -> CppLibData.sa        cpp::libraryHeaders()
 //   lib/native/*             -> NativeLibData.sa     native::libraryHeaders()
-//   src/java/prelude/**.jpl  -> JavaPreludeData.sa   java::preludeSources()
+//   src/java/<package>/**.sa -> JavaPreludeData.sa java::preludeSources()
+//     (the Java library: the .sa files in src/java's folders, not the
+//     front-end's own files directly in src/java)
+//   src/dialect/javastyle/*.sa -> JavaStyleData.sa  javastyle::librarySources()
 // Run from compiler/:  quantum src/tools/embed.sa   (or qrun)
 // A file is rewritten only when its text changes.
 #include <algorithm>
@@ -73,7 +76,7 @@ bool writeIfChanged(const std::string &path, const std::string &text)
 
 int main()
 {
-    if (!fs::exists("lib/cpp") || !fs::exists("src/java/prelude"))
+    if (!fs::exists("src/java/lang") || !fs::exists("src/dialect/javastyle"))
     {
         std::cerr << "embed: run from the compiler/ directory\n";
         return 1;
@@ -82,26 +85,41 @@ int main()
     int changed = 0;
 
     std::vector<std::pair<std::string, std::string>> items;
-    for (const std::string &f : listFiles("lib/cpp", ""))
-        items.push_back({f, readText("lib/cpp/" + f)});
-    changed += writeIfChanged("src/generated/CppLibData.sa",
-                              generate("lib/cpp", "cpp", "libraryHeaders", items, "QCPPLIB"));
-
-    items.clear();
+    // The C++ and native library headers (lib/) are regenerated only where the
+    // folder exists: without it the checked-in CppLibData.sa / NativeLibData.sa
+    // stay as they are.
+    if (fs::exists("lib/cpp"))
+    {
+        for (const std::string &f : listFiles("lib/cpp", ""))
+            items.push_back({f, readText("lib/cpp/" + f)});
+        changed += writeIfChanged("src/generated/CppLibData.sa",
+                                  generate("lib/cpp", "cpp", "libraryHeaders", items, "QCPPLIB"));
+        items.clear();
+    }
     if (fs::exists("lib/native"))
+    {
         for (const std::string &f : listFiles("lib/native", ""))
             items.push_back({f, readText("lib/native/" + f)});
-    changed += writeIfChanged("src/generated/NativeLibData.sa",
-                              generate("lib/native", "native", "libraryHeaders", items, "QNATIVELIB"));
+        changed += writeIfChanged("src/generated/NativeLibData.sa",
+                                  generate("lib/native", "native", "libraryHeaders", items, "QNATIVELIB"));
+        items.clear();
+    }
 
-    items.clear();
-    for (const std::string &f : listFiles("src/java/prelude", ".jpl"))
+    for (const std::string &f : listFiles("src/java", ".sa"))
     {
+        if (f.find('/') == std::string::npos)
+            continue; // a file of the front-end itself
         std::string name = fs::path(f).stem().string() + ".java";
-        items.push_back({name, readText("src/java/prelude/" + f)});
+        items.push_back({name, readText("src/java/" + f)});
     }
     changed += writeIfChanged("src/generated/JavaPreludeData.sa",
-                              generate("src/java/prelude", "java", "preludeSources", items, "JAVA"));
+                              generate("src/java", "java", "preludeSources", items, "JAVA"));
+
+    items.clear();
+    for (const std::string &f : listFiles("src/dialect/javastyle", ".sa"))
+        items.push_back({f, readText("src/dialect/javastyle/" + f)});
+    changed += writeIfChanged("src/generated/JavaStyleData.sa",
+                              generate("src/dialect/javastyle", "javastyle", "librarySources", items, "QJAVASTYLE"));
 
     std::cout << "embed: " << changed << " file(s) updated in src/generated\n";
     return 0;

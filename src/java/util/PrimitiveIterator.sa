@@ -1,0 +1,22 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public interface PrimitiveIterator<T, T_CONS> extends Iterator<T> {
+    public static interface OfInt extends PrimitiveIterator<Integer, IntConsumer> {
+        default int nextInt() { return next(); }
+        default void forEachRemaining(IntConsumer action) {
+            while (hasNext())
+                action.accept(nextInt());
+        }
+    }
+
+    public static interface OfLong extends PrimitiveIterator<Long, LongConsumer> {
+        default long nextLong() { return next(); }
+    }
+
+    public static interface OfDouble extends PrimitiveIterator<Double, DoubleConsumer> {
+        default double nextDouble() { return next(); }
+    }
+}

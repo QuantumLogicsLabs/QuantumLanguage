@@ -1,0 +1,403 @@
+package java.util;
+
+import java.util.function.*;
+
+public class ArrayList<E> extends AbstractList<E> implements List<E>, RandomAccess, Cloneable, java.io.Serializable {
+    private static final int DEFAULT_CAPACITY = 10;
+    transient Object[] elementData;
+    private int size;
+
+    public ArrayList(int initialCapacity) {
+        if (initialCapacity < 0)
+            throw new IllegalArgumentException("Illegal Capacity: " + initialCapacity);
+        this.elementData = new Object[initialCapacity];
+    }
+
+    public ArrayList() { this.elementData = new Object[0]; }
+
+    public ArrayList(Collection<? extends E> c) {
+        Object[] a = c.toArray();
+        size = a.length;
+        elementData = a.length > 0 ? java.util.Arrays.copyOf(a, a.length) : new Object[0];
+    }
+
+    public void trimToSize() {
+        modCount++;
+        if (size < elementData.length)
+            elementData = java.util.Arrays.copyOf(elementData, size);
+    }
+
+    public void ensureCapacity(int minCapacity) {
+        if (minCapacity > elementData.length) {
+            modCount++;
+            grow(minCapacity);
+        }
+    }
+
+    private Object[] grow(int minCapacity) {
+        int oldCapacity = elementData.length;
+        int newCapacity = Math.max(minCapacity, oldCapacity == 0 ? DEFAULT_CAPACITY : oldCapacity + (oldCapacity >> 1));
+        return elementData = java.util.Arrays.copyOf(elementData, newCapacity);
+    }
+
+    private Object[] grow() { return grow(size + 1); }
+
+    public int size() { return size; }
+    public boolean isEmpty() { return size == 0; }
+    public boolean contains(Object o) { return indexOf(o) >= 0; }
+
+    public int indexOf(Object o) {
+        Object[] es = elementData;
+        if (o == null) {
+            for (int i = 0; i < size; i++)
+                if (es[i] == null)
+                    return i;
+        } else {
+            for (int i = 0; i < size; i++)
+                if (o.equals(es[i]))
+                    return i;
+        }
+        return -1;
+    }
+
+    public int lastIndexOf(Object o) {
+        Object[] es = elementData;
+        if (o == null) {
+            for (int i = size - 1; i >= 0; i--)
+                if (es[i] == null)
+                    return i;
+        } else {
+            for (int i = size - 1; i >= 0; i--)
+                if (o.equals(es[i]))
+                    return i;
+        }
+        return -1;
+    }
+
+    public Object clone() {
+        ArrayList<E> v = new ArrayList<>(this);
+        return v;
+    }
+
+    public Object[] toArray() { return java.util.Arrays.copyOf(elementData, size); }
+
+    @SuppressWarnings("unchecked")
+    public <T> T[] toArray(T[] a) {
+        if (a.length < size)
+            return (T[]) java.util.Arrays.copyOf(elementData, size);
+        System.arraycopy(elementData, 0, a, 0, size);
+        if (a.length > size)
+            a[size] = null;
+        return a;
+    }
+
+    @SuppressWarnings("unchecked")
+    E elementData(int index) { return (E) elementData[index]; }
+
+    public E get(int index) {
+        Objects.checkIndex(index, size);
+        return elementData(index);
+    }
+
+    public E getFirst() {
+        if (size == 0)
+            throw new NoSuchElementException();
+        return elementData(0);
+    }
+
+    public E getLast() {
+        int last = size - 1;
+        if (last < 0)
+            throw new NoSuchElementException();
+        return elementData(last);
+    }
+
+    public E set(int index, E element) {
+        Objects.checkIndex(index, size);
+        E oldValue = elementData(index);
+        elementData[index] = element;
+        return oldValue;
+    }
+
+    public boolean add(E e) {
+        modCount++;
+        if (size == elementData.length)
+            grow();
+        elementData[size] = e;
+        size = size + 1;
+        return true;
+    }
+
+    public void add(int index, E element) {
+        rangeCheckForAdd(index);
+        modCount++;
+        if (size == elementData.length)
+            grow();
+        System.arraycopy(elementData, index, elementData, index + 1, size - index);
+        elementData[index] = element;
+        size = size + 1;
+    }
+
+    public void addFirst(E element) { add(0, element); }
+    public void addLast(E element) { add(element); }
+
+    public E remove(int index) {
+        Objects.checkIndex(index, size);
+        E oldValue = elementData(index);
+        fastRemove(index);
+        return oldValue;
+    }
+
+    public E removeFirst() {
+        if (size == 0)
+            throw new NoSuchElementException();
+        E oldValue = elementData(0);
+        fastRemove(0);
+        return oldValue;
+    }
+
+    public E removeLast() {
+        int last = size - 1;
+        if (last < 0)
+            throw new NoSuchElementException();
+        E oldValue = elementData(last);
+        fastRemove(last);
+        return oldValue;
+    }
+
+    public boolean equals(Object o) {
+        if (o == this)
+            return true;
+        if (!(o instanceof List))
+            return false;
+        final int expectedModCount = modCount;
+        boolean equal = super.equals(o);
+        checkForComodification(expectedModCount);
+        return equal;
+    }
+
+    public int hashCode() {
+        int expectedModCount = modCount;
+        int hash = 1;
+        for (int i = 0; i < size; i++) {
+            Object e = elementData[i];
+            hash = 31 * hash + (e == null ? 0 : e.hashCode());
+        }
+        checkForComodification(expectedModCount);
+        return hash;
+    }
+
+    public boolean remove(Object o) {
+        final Object[] es = elementData;
+        final int size = this.size;
+        int i = 0;
+        found: {
+            if (o == null) {
+                for (; i < size; i++)
+                    if (es[i] == null)
+                        break found;
+            } else {
+                for (; i < size; i++)
+                    if (o.equals(es[i]))
+                        break found;
+            }
+            return false;
+        }
+        fastRemove(i);
+        return true;
+    }
+
+    private void fastRemove(int i) {
+        modCount++;
+        final int newSize = size - 1;
+        if (newSize > i)
+            System.arraycopy(elementData, i + 1, elementData, i, newSize - i);
+        elementData[size = newSize] = null;
+    }
+
+    public void clear() {
+        modCount++;
+        final Object[] es = elementData;
+        for (int to = size, i = size = 0; i < to; i++)
+            es[i] = null;
+    }
+
+    public boolean addAll(Collection<? extends E> c) {
+        Object[] a = c.toArray();
+        modCount++;
+        int numNew = a.length;
+        if (numNew == 0)
+            return false;
+        Object[] es = elementData;
+        final int s = size;
+        if (numNew > es.length - s)
+            es = grow(s + numNew);
+        System.arraycopy(a, 0, es, s, numNew);
+        size = s + numNew;
+        return true;
+    }
+
+    public boolean addAll(int index, Collection<? extends E> c) {
+        rangeCheckForAdd(index);
+        Object[] a = c.toArray();
+        modCount++;
+        int numNew = a.length;
+        if (numNew == 0)
+            return false;
+        Object[] es = elementData;
+        final int s = size;
+        if (numNew > es.length - s)
+            es = grow(s + numNew);
+        int numMoved = s - index;
+        if (numMoved > 0)
+            System.arraycopy(es, index, es, index + numNew, numMoved);
+        System.arraycopy(a, 0, es, index, numNew);
+        size = s + numNew;
+        return true;
+    }
+
+    protected void removeRange(int fromIndex, int toIndex) {
+        if (fromIndex > toIndex)
+            throw new IndexOutOfBoundsException("From Index: " + fromIndex + " > To Index: " + toIndex);
+        modCount++;
+        shiftTailOverGap(elementData, fromIndex, toIndex);
+    }
+
+    private void shiftTailOverGap(Object[] es, int lo, int hi) {
+        System.arraycopy(es, hi, es, lo, size - hi);
+        for (int to = size, i = (size -= hi - lo); i < to; i++)
+            es[i] = null;
+    }
+
+    private void rangeCheckForAdd(int index) {
+        if (index > size || index < 0)
+            throw new IndexOutOfBoundsException("Index: " + index + ", Size: " + size);
+    }
+
+    public boolean removeAll(Collection<?> c) { return batchRemove(c, false, 0, size); }
+    public boolean retainAll(Collection<?> c) { return batchRemove(c, true, 0, size); }
+
+    boolean batchRemove(Collection<?> c, boolean complement, final int from, final int end) {
+        Objects.requireNonNull(c);
+        final Object[] es = elementData;
+        int r;
+        for (r = from;; r++) {
+            if (r == end)
+                return false;
+            if (c.contains(es[r]) != complement)
+                break;
+        }
+        int w = r++;
+        for (Object e; r < end; r++)
+            if (c.contains(e = es[r]) == complement)
+                es[w++] = e;
+        modCount += end - w;
+        shiftTailOverGap(es, w, end);
+        return true;
+    }
+
+    public boolean removeIf(Predicate<? super E> filter) {
+        Objects.requireNonNull(filter);
+        int expectedModCount = modCount;
+        final Object[] es = elementData;
+        int w = 0;
+        boolean removed = false;
+        for (int r = 0; r < size; r++) {
+            @SuppressWarnings("unchecked")
+            E e = (E) es[r];
+            if (!filter.test(e))
+                es[w++] = e;
+            else
+                removed = true;
+        }
+        checkForComodification(expectedModCount);
+        if (removed) {
+            modCount++;
+            for (int i = w; i < size; i++)
+                es[i] = null;
+            size = w;
+        }
+        return removed;
+    }
+
+    public void forEach(Consumer<? super E> action) {
+        Objects.requireNonNull(action);
+        final int expectedModCount = modCount;
+        final Object[] es = elementData;
+        final int size = this.size;
+        for (int i = 0; modCount == expectedModCount && i < size; i++)
+            action.accept(elementAt(es, i));
+        if (modCount != expectedModCount)
+            throw new ConcurrentModificationException();
+    }
+
+    @SuppressWarnings("unchecked")
+    static <E> E elementAt(Object[] es, int index) { return (E) es[index]; }
+
+    public void replaceAll(UnaryOperator<E> operator) {
+        Objects.requireNonNull(operator);
+        final int expectedModCount = modCount;
+        final Object[] es = elementData;
+        for (int i = 0; modCount == expectedModCount && i < size; i++)
+            es[i] = operator.apply(elementAt(es, i));
+        if (modCount != expectedModCount)
+            throw new ConcurrentModificationException();
+        modCount++;
+    }
+
+    @SuppressWarnings("unchecked")
+    public void sort(Comparator<? super E> c) {
+        final int expectedModCount = modCount;
+        java.util.Arrays.sort((E[]) elementData, 0, size, c);
+        if (modCount != expectedModCount)
+            throw new ConcurrentModificationException();
+        modCount++;
+    }
+
+    private void checkForComodification(final int expectedModCount) {
+        if (modCount != expectedModCount)
+            throw new ConcurrentModificationException();
+    }
+
+    public Iterator<E> iterator() { return new Itr(); }
+
+    private class Itr implements Iterator<E> {
+        int cursor;
+        int lastRet = -1;
+        int expectedModCount = modCount;
+
+        public boolean hasNext() { return cursor != size; }
+
+        @SuppressWarnings("unchecked")
+        public E next() {
+            checkForComodification();
+            int i = cursor;
+            if (i >= size)
+                throw new NoSuchElementException();
+            Object[] elementData = ArrayList.this.elementData;
+            if (i >= elementData.length)
+                throw new ConcurrentModificationException();
+            cursor = i + 1;
+            return (E) elementData[lastRet = i];
+        }
+
+        public void remove() {
+            if (lastRet < 0)
+                throw new IllegalStateException();
+            checkForComodification();
+            try {
+                ArrayList.this.remove(lastRet);
+                cursor = lastRet;
+                lastRet = -1;
+                expectedModCount = modCount;
+            } catch (IndexOutOfBoundsException ex) {
+                throw new ConcurrentModificationException();
+            }
+        }
+
+        final void checkForComodification() {
+            if (modCount != expectedModCount)
+                throw new ConcurrentModificationException();
+        }
+    }
+}

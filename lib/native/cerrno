@@ -1,8 +1,0 @@
-// <cerrno> for Quantum's native backend: errno is a plain global (the
-// programs are single-threaded); strtol and friends set ERANGE.
-#pragma once
-inline int errno = 0;
-#define EDOM 33
-#define ERANGE 34
-#define EINVAL 22
-#define ENOENT 2

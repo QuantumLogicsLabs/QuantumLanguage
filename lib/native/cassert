@@ -1,9 +1,0 @@
-// <cassert> for Quantum's native backend.
-#pragma once
-#include <cstdio>
-#include <cstdlib>
-#ifdef NDEBUG
-#define assert(x) ((void)0)
-#else
-#define assert(x) ((x) ? (void)0 : (fprintf(stderr, "Assertion failed: %s, file %s, line %d\n", #x, __FILE__, __LINE__), abort()))
-#endif

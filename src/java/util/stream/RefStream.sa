@@ -1,0 +1,208 @@
+package java.util.stream;
+
+import java.util.*;
+import java.util.function.*;
+
+final class RefStream<T> extends AbstractPipeline<T> implements Stream<T> {
+    RefStream(Iterator<T> source) { super(source); }
+
+    public Iterator<T> iterator() { return take(); }
+    public Stream<T> sequential() { return this; }
+    public Stream<T> parallel() { return this; }
+    public Stream<T> unordered() { return this; }
+    public Stream<T> onClose(Runnable closeHandler) { return this; }
+
+    public Stream<T> filter(Predicate<? super T> predicate) {
+        Objects.requireNonNull(predicate);
+        return new RefStream<T>(new StreamSupport.Filter<T>(take(), predicate));
+    }
+
+    public <R> Stream<R> map(Function<? super T, ? extends R> mapper) {
+        Objects.requireNonNull(mapper);
+        return new RefStream<R>(new StreamSupport.Map<T, R>(take(), mapper));
+    }
+
+    public IntStream mapToInt(ToIntFunction<? super T> mapper) {
+        Objects.requireNonNull(mapper);
+        return new IntStreamImpl(new StreamSupport.Map<T, Integer>(take(), t -> mapper.applyAsInt(t)));
+    }
+
+    public LongStream mapToLong(ToLongFunction<? super T> mapper) {
+        Objects.requireNonNull(mapper);
+        return new LongStreamImpl(new StreamSupport.Map<T, Long>(take(), t -> mapper.applyAsLong(t)));
+    }
+
+    public DoubleStream mapToDouble(ToDoubleFunction<? super T> mapper) {
+        Objects.requireNonNull(mapper);
+        return new DoubleStreamImpl(new StreamSupport.Map<T, Double>(take(), t -> mapper.applyAsDouble(t)));
+    }
+
+    public <R> Stream<R> flatMap(Function<? super T, ? extends Stream<? extends R>> mapper) {
+        Objects.requireNonNull(mapper);
+        return new RefStream<R>(new StreamSupport.FlatMap<T, R>(take(), t -> {
+            Stream<? extends R> s = mapper.apply(t);
+            return s == null ? Collections.<R>emptyIterator() : s.iterator();
+        }));
+    }
+
+    public IntStream flatMapToInt(Function<? super T, ? extends IntStream> mapper) {
+        Objects.requireNonNull(mapper);
+        return new IntStreamImpl(new StreamSupport.FlatMap<T, Integer>(take(), t -> {
+            IntStream s = mapper.apply(t);
+            return s == null ? Collections.<Integer>emptyIterator() : s.boxed().iterator();
+        }));
+    }
+
+    public <R> Stream<R> mapMulti(BiConsumer<? super T, ? super Consumer<R>> mapper) {
+        Objects.requireNonNull(mapper);
+        return new RefStream<R>(new StreamSupport.FlatMap<T, R>(take(), t -> {
+            ArrayList<R> buffer = new ArrayList<>();
+            Consumer<R> sink = buffer::add;
+            mapper.accept(t, sink);
+            return buffer.iterator();
+        }));
+    }
+
+    public Stream<T> distinct() { return new RefStream<T>(new StreamSupport.Distinct<T>(take())); }
+
+    public Stream<T> sorted() { return sorted(null); }
+
+    public Stream<T> sorted(Comparator<? super T> comparator) {
+        Iterator<T> src = take();
+        return new RefStream<T>(new Iterator<T>() {
+            Iterator<T> sortedIt;
+            private Iterator<T> it() {
+                if (sortedIt == null) {
+                    ArrayList<T> all = StreamSupport.drain(src);
+                    all.sort(comparator);
+                    sortedIt = all.iterator();
+                }
+                return sortedIt;
+            }
+            public boolean hasNext() { return it().hasNext(); }
+            public T next() { return it().next(); }
+        });
+    }
+
+    public Stream<T> peek(Consumer<? super T> action) {
+        Objects.requireNonNull(action);
+        return new RefStream<T>(new StreamSupport.Peek<T>(take(), action));
+    }
+
+    public Stream<T> limit(long maxSize) { return new RefStream<T>(new StreamSupport.Limit<T>(take(), maxSize)); }
+    public Stream<T> skip(long n) { return new RefStream<T>(new StreamSupport.Skip<T>(take(), n)); }
+    public Stream<T> takeWhile(Predicate<? super T> predicate) { return new RefStream<T>(new StreamSupport.TakeWhile<T>(take(), predicate)); }
+    public Stream<T> dropWhile(Predicate<? super T> predicate) { return new RefStream<T>(new StreamSupport.DropWhile<T>(take(), predicate)); }
+
+    public void forEach(Consumer<? super T> action) {
+        Objects.requireNonNull(action);
+        Iterator<T> it = take();
+        while (it.hasNext())
+            action.accept(it.next());
+    }
+
+    public void forEachOrdered(Consumer<? super T> action) { forEach(action); }
+
+    public Object[] toArray() { return StreamSupport.drain(take()).toArray(); }
+
+    public <A> A[] toArray(IntFunction<A[]> generator) {
+        ArrayList<T> all = StreamSupport.drain(take());
+        A[] arr = generator.apply(all.size());
+        if (arr.length != all.size())
+            throw new IllegalStateException("Begin size " + all.size() + " is not equal to fixed size " + arr.length);
+        for (int i = 0; i < arr.length; i++) {
+            @SuppressWarnings("unchecked")
+            A a = (A) all.get(i);
+            arr[i] = a;
+        }
+        return arr;
+    }
+
+    public T reduce(T identity, BinaryOperator<T> accumulator) {
+        T result = identity;
+        Iterator<T> it = take();
+        while (it.hasNext())
+            result = accumulator.apply(result, it.next());
+        return result;
+    }
+
+    public Optional<T> reduce(BinaryOperator<T> accumulator) {
+        Iterator<T> it = take();
+        if (!it.hasNext())
+            return Optional.empty();
+        T result = it.next();
+        while (it.hasNext())
+            result = accumulator.apply(result, it.next());
+        return Optional.of(result);
+    }
+
+    public <U> U reduce(U identity, BiFunction<U, ? super T, U> accumulator, BinaryOperator<U> combiner) {
+        U result = identity;
+        Iterator<T> it = take();
+        while (it.hasNext())
+            result = accumulator.apply(result, it.next());
+        return result;
+    }
+
+    public <R> R collect(Supplier<R> supplier, BiConsumer<R, ? super T> accumulator, BiConsumer<R, R> combiner) {
+        R container = supplier.get();
+        Iterator<T> it = take();
+        while (it.hasNext())
+            accumulator.accept(container, it.next());
+        return container;
+    }
+
+    public <R, A> R collect(Collector<? super T, A, R> collector) {
+        A container = collector.supplier().get();
+        BiConsumer<A, ? super T> accumulator = collector.accumulator();
+        Iterator<T> it = take();
+        while (it.hasNext())
+            accumulator.accept(container, it.next());
+        return collector.finisher().apply(container);
+    }
+
+    public List<T> toList() { return Collections.unmodifiableList(StreamSupport.drain(take())); }
+
+    public Optional<T> min(Comparator<? super T> comparator) {
+        return reduce((a, b) -> comparator.compare(a, b) <= 0 ? a : b);
+    }
+
+    public Optional<T> max(Comparator<? super T> comparator) {
+        return reduce((a, b) -> comparator.compare(a, b) >= 0 ? a : b);
+    }
+
+    public long count() {
+        long n = 0;
+        Iterator<T> it = take();
+        while (it.hasNext()) {
+            it.next();
+            n++;
+        }
+        return n;
+    }
+
+    public boolean anyMatch(Predicate<? super T> predicate) {
+        Iterator<T> it = take();
+        while (it.hasNext())
+            if (predicate.test(it.next()))
+                return true;
+        return false;
+    }
+
+    public boolean allMatch(Predicate<? super T> predicate) {
+        Iterator<T> it = take();
+        while (it.hasNext())
+            if (!predicate.test(it.next()))
+                return false;
+        return true;
+    }
+
+    public boolean noneMatch(Predicate<? super T> predicate) { return !anyMatch(predicate); }
+
+    public Optional<T> findFirst() {
+        Iterator<T> it = take();
+        return it.hasNext() ? Optional.of(it.next()) : Optional.empty();
+    }
+
+    public Optional<T> findAny() { return findFirst(); }
+}

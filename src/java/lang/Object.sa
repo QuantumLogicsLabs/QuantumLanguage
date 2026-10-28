@@ -1,0 +1,26 @@
+package java.lang;
+
+public class Object {
+    public Object() {}
+
+    public boolean equals(Object obj) { return this == obj; }
+
+    public int hashCode() { return System.identityHashCode(this); }
+
+    public String toString() { return getClass().getName() + "@" + Integer.toHexString(hashCode()); }
+
+    public final Class<?> getClass() { return Class.$of(this); }
+
+    protected Object clone() throws CloneNotSupportedException {
+        if (!(this instanceof Cloneable))
+            throw new CloneNotSupportedException(getClass().getName());
+        return $clone(this);
+    }
+
+    private static native Object $clone(Object o);
+
+    public final void notify() {}
+    public final void notifyAll() {}
+    public final void wait() throws InterruptedException {}
+    public final void wait(long timeoutMillis) throws InterruptedException {}
+}

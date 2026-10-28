@@ -1,0 +1,60 @@
+package java.lang;
+
+// ─── System, threads, runtime ───────────────────────────────────────────────
+
+public final class System {
+    public static final java.io.InputStream in = new java.io.$StdIn();
+    public static final java.io.PrintStream out = java.io.PrintStream.$console(false);
+    public static final java.io.PrintStream err = java.io.PrintStream.$console(true);
+
+    private System() {}
+
+    public static native long currentTimeMillis();
+    public static native long nanoTime();
+    public static native void arraycopy(Object src, int srcPos, Object dest, int destPos, int length);
+    public static native int identityHashCode(Object x);
+    private static native void $exit(int status);
+
+    public static void exit(int status) {
+        System.out.flush();
+        $exit(status);
+    }
+
+    public static String lineSeparator() { return "\n"; }
+
+    public static String getProperty(String key) {
+        switch (key) {
+            case "line.separator": return "\n";
+            case "file.separator": return "/";
+            case "path.separator": return ":";
+            case "java.version": return "21";
+            case "java.vendor": return "Quantum";
+            case "os.name": return "Quantum VM";
+            case "user.dir": return ".";
+            default: return null;
+        }
+    }
+
+    public static String getProperty(String key, String def) {
+        String v = getProperty(key);
+        return v == null ? def : v;
+    }
+
+    public static String getenv(String name) { return null; }
+    public static void gc() {}
+    public static void setOut(java.io.PrintStream out) {}
+    public static void setErr(java.io.PrintStream err) {}
+}
+
+// ─── Standard input ─────────────────────────────────────────────────────────
+// One buffer (filled a line at a time) behind Scanner, BufferedReader and System.in.
+
+public final class $In {
+    private $In() {}
+    public static native String token();    // the next whitespace-separated token, or null at the end
+    public static native String peek();     // the next token without consuming it, or null
+    public static native String line();     // the rest of the current line, or null at the end
+    public static native boolean hasLine();
+    public static native int read();        // the next byte, or -1
+    public static native int available();   // bytes buffered
+}

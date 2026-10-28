@@ -1,0 +1,24 @@
+package java.util.stream;
+
+import java.util.*;
+import java.util.function.*;
+
+abstract class AbstractPipeline<T> {
+    private Iterator<T> source;
+    private boolean linked;
+
+    AbstractPipeline(Iterator<T> source) { this.source = source; }
+
+    // the iterator for the next stage; a stream is used once
+    final Iterator<T> take() {
+        if (linked)
+            throw new IllegalStateException("stream has already been operated upon or closed");
+        linked = true;
+        Iterator<T> s = source;
+        source = null;
+        return s;
+    }
+
+    public boolean isParallel() { return false; }
+    public void close() {}
+}

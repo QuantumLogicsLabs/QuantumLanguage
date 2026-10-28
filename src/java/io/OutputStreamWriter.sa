@@ -1,0 +1,22 @@
+package java.io;
+
+public class OutputStreamWriter extends Writer {
+    private final OutputStream out;
+
+    public OutputStreamWriter(OutputStream out) { this.out = java.util.Objects.requireNonNull(out); }
+    public OutputStreamWriter(OutputStream out, String charsetName) { this(out); }
+
+    public void write(char[] cbuf, int off, int len) throws IOException { write(new String(cbuf, off, len)); }
+
+    public void write(String str, int off, int len) throws IOException {
+        String s = str.substring(off, off + len);
+        if (out instanceof PrintStream ps)
+            ps.print(s);
+        else
+            out.$text(s);
+    }
+
+    public void write(int c) throws IOException { write(String.valueOf((char) c)); }
+    public void flush() throws IOException { out.flush(); }
+    public void close() throws IOException { out.close(); }
+}

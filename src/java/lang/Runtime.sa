@@ -1,0 +1,13 @@
+package java.lang;
+
+public final class Runtime {
+    private static final Runtime current = new Runtime();
+    private Runtime() {}
+    public static Runtime getRuntime() { return current; }
+    public int availableProcessors() { return 1; }
+    public long totalMemory() { return 256L * 1024 * 1024; }
+    public long freeMemory() { return 128L * 1024 * 1024; }
+    public long maxMemory() { return 1024L * 1024 * 1024; }
+    public void gc() {}
+    public void exit(int status) { System.exit(status); }
+}

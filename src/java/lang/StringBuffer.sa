@@ -1,0 +1,58 @@
+package java.lang;
+
+public final class StringBuffer implements CharSequence, Comparable<StringBuffer>, java.io.Serializable {
+    private String $s = "";
+
+    public StringBuffer() {}
+
+    public StringBuffer(int capacity) {
+        if (capacity < 0)
+            throw new NegativeArraySizeException(String.valueOf(capacity));
+    }
+
+    public StringBuffer(String str) { $s = str.toString(); }
+    public StringBuffer(CharSequence seq) { $s = seq.toString(); }
+
+    public native StringBuffer append(String str);
+    public StringBuffer append(Object obj) { return append(String.valueOf(obj)); }
+    public StringBuffer append(StringBuffer sb) { return append(String.valueOf(sb)); }
+    public StringBuffer append(CharSequence s) { return append(String.valueOf(s)); }
+    public StringBuffer append(CharSequence s, int start, int end) {
+        return append((s == null ? "null" : s).subSequence(start, end).toString());
+    }
+    public StringBuffer append(char[] str) { return append(new String(str)); }
+    public StringBuffer append(char[] str, int offset, int len) { return append(new String(str, offset, len)); }
+    public StringBuffer append(boolean b) { return append(String.valueOf(b)); }
+    public StringBuffer append(char c) { return append(String.valueOf(c)); }
+    public StringBuffer append(int i) { return append(String.valueOf(i)); }
+    public StringBuffer append(long lng) { return append(String.valueOf(lng)); }
+    public StringBuffer append(float f) { return append(String.valueOf(f)); }
+    public StringBuffer append(double d) { return append(String.valueOf(d)); }
+
+    public native int length();
+    public native char charAt(int index);
+    public native String toString();
+    public native StringBuffer reverse();
+    public native StringBuffer insert(int offset, String str);
+    public StringBuffer insert(int offset, Object obj) { return insert(offset, String.valueOf(obj)); }
+    public StringBuffer insert(int offset, char c) { return insert(offset, String.valueOf(c)); }
+    public StringBuffer insert(int offset, int i) { return insert(offset, String.valueOf(i)); }
+    public StringBuffer insert(int offset, long l) { return insert(offset, String.valueOf(l)); }
+    public StringBuffer insert(int offset, double d) { return insert(offset, String.valueOf(d)); }
+    public StringBuffer insert(int offset, boolean b) { return insert(offset, String.valueOf(b)); }
+    public native StringBuffer delete(int start, int end);
+    public native StringBuffer deleteCharAt(int index);
+    public native void setCharAt(int index, char ch);
+    public native void setLength(int newLength);
+    public native StringBuffer replace(int start, int end, String str);
+
+    public int indexOf(String str) { return toString().indexOf(str); }
+    public int indexOf(String str, int fromIndex) { return toString().indexOf(str, fromIndex); }
+    public int lastIndexOf(String str) { return toString().lastIndexOf(str); }
+    public String substring(int start) { return toString().substring(start); }
+    public String substring(int start, int end) { return toString().substring(start, end); }
+    public CharSequence subSequence(int start, int end) { return substring(start, end); }
+    public boolean isEmpty() { return length() == 0; }
+    public int capacity() { return Math.max(16, length()); }
+    public int compareTo(StringBuffer another) { return toString().compareTo(another.toString()); }
+}

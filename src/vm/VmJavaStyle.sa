@@ -1,0 +1,820 @@
+// quantum: cpp
+// Runtime support for Java-style code in .sa files (src/dialect/JavaDialect.sa
+// rewrites it; src/dialect/javastyle/ is its library). Java method names on
+// Quantum's own strings, arrays and numbers (s.equals(t), list.get(i),
+// stack.peek(), ...), functional-interface calls on functions (f.apply(x),
+// p.test(x), cmp.reversed()), and Java's string conversion. The methods are
+// switched on by __java_style__(), which the library calls first, so other
+// programs keep the existing meanings of these names.
+#include "Vm.h.sa"
+#include "Error.h.sa"
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+#include <memory>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace
+{
+using QV = QuantumValue;
+
+bool callable(const QV &v) { return v.isFunction() || v.isBoundMethod(); }
+
+// A closure's parameter count (-1: unknown, e.g. a native)
+int arity(const QV &v)
+{
+    if (v.isClosure())
+        return (int)v.asFunction()->chunk->params.size();
+    if (v.isBoundMethod())
+        return (int)v.asBoundMethod()->method->chunk->params.size() - 1;
+    return -1;
+}
+
+QV native(const std::string &name, QuantumNativeFunc fn)
+{
+    auto n = std::make_shared<QuantumNative>();
+    n->name = name;
+    n->fn = std::move(fn);
+    return QV(n);
+}
+
+std::string lower(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+// The characters of a UTF-8 string, one string each
+std::vector<std::string> chars(const std::string &s)
+{
+    std::vector<std::string> out;
+    for (size_t i = 0; i < s.size();)
+    {
+        unsigned char c = (unsigned char)s[i];
+        size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        out.push_back(s.substr(i, n));
+        i += n;
+    }
+    return out;
+}
+
+double num(const QV &v) { return v.isNumber() ? v.asNumber() : v.isLong() ? (double)v.asLong() : 0.0; }
+} // namespace
+
+std::string VM::displayString(const QuantumValue &v)
+{
+    if (v.isInstance())
+    {
+        QuantumValue out;
+        if (invokeMagic(v, "toString", {}, out) || invokeMagic(v, "__str__", {}, out))
+            return out.isString() ? out.asString() : out.toString();
+    }
+    return v.toString();
+}
+
+std::string VM::javaString(const QuantumValue &v)
+{
+    if (v.isNil())
+        return "null";
+    if (v.isBool())
+        return v.asBool() ? "true" : "false";
+    if (v.isString())
+        return v.asString();
+    if (v.isNumber())
+    {
+        double d = v.asNumber();
+        if (std::isnan(d))
+            return "NaN";
+        if (std::isinf(d))
+            return d > 0 ? "Infinity" : "-Infinity";
+        if (d == std::floor(d) && std::fabs(d) < 1e15)
+            return std::to_string((long long)d);
+        return v.toString();
+    }
+    if (v.isArray())
+    {
+        std::string out = "[";
+        bool first = true;
+        for (const auto &e : *v.asArray())
+        {
+            out += (first ? "" : ", ") + javaString(e);
+            first = false;
+        }
+        return out + "]";
+    }
+    if (v.isDict())
+    {
+        std::string out = "{";
+        bool first = true;
+        for (const auto &kv : *v.asDict())
+        {
+            out += (first ? "" : ", ") + kv.first + "=" + javaString(kv.second);
+            first = false;
+        }
+        return out + "}";
+    }
+    if (v.isInstance())
+    {
+        QuantumValue out;
+        if (invokeMagic(v, "toString", {}, out) || invokeMagic(v, "__str__", {}, out))
+            return javaString(out);
+        char hex[32];
+        std::snprintf(hex, sizeof hex, "%x", (unsigned)((uintptr_t)v.asInstance().get() >> 4));
+        return v.asInstance()->klass->name + "@" + hex;
+    }
+    return v.toString();
+}
+
+QuantumValue VM::javaObjectMember(const QuantumValue &obj, const std::string &name)
+{
+    VM *vm = this;
+    QV self = obj;
+    if (name == "getClass")
+        return native("getClass", [self](std::vector<QV>) -> QV
+                      {
+            // a Class object: getSimpleName() / getName()
+            auto d = std::make_shared<Dict>();
+            std::string n = self.asInstance()->klass->name;
+            (*d)["getSimpleName"] = native("getSimpleName", [n](std::vector<QV>) -> QV { return QV(n); });
+            (*d)["getName"] = native("getName", [n](std::vector<QV>) -> QV { return QV(n); });
+            (*d)["toString"] = native("toString", [n](std::vector<QV>) -> QV { return QV("class " + n); });
+            return QV(d); });
+    if (name == "equals")
+        return native("equals", [self](std::vector<QV> a) -> QV { return QV(!a.empty() && VM::valuesEqual(self, a[0])); });
+    if (name == "hashCode")
+        return native("hashCode", [self](std::vector<QV>) -> QV
+                      { return QV((double)(int32_t)((uintptr_t)self.asInstance().get() >> 4)); });
+    if (name == "toString")
+        return native("toString", [vm, self](std::vector<QV>) -> QV { return QV(vm->javaString(self)); });
+    return QV();
+}
+
+bool VM::declaredSelfField(const CallFrame &frame, const std::string &name, QuantumValue &out)
+{
+    auto &params = frame.closure->chunk->params;
+    if (params.empty() || params[0] != "self" || frame.stackBase >= stack_.size() ||
+        !stack_[frame.stackBase].isInstance())
+        return false;
+    auto inst = stack_[frame.stackBase].asInstance();
+    for (auto *k = inst->klass.get(); k; k = k->base.get())
+    {
+        bool declared = k->staticFields.count(name) > 0;
+        for (const auto &fi : k->fieldInits)
+            if (fi.first == name)
+                declared = true;
+        if (!declared)
+            continue;
+        auto fit = inst->fields.find(name);
+        if (fit != inst->fields.end())
+            out = fit->second;
+        else
+            out = k->staticFields.count(name) ? k->staticFields.at(name) : QuantumValue();
+        return true;
+    }
+    return false;
+}
+
+void VM::registerJavaStyleNatives()
+{
+    auto reg = [this](const std::string &name, QuantumNativeFunc fn) { globals->define(name, native(name, std::move(fn))); };
+    auto arg = [](const std::vector<QV> &a, size_t i) -> QV { return i < a.size() ? a[i] : QV(); };
+
+    // Called first by the Java-style library
+    reg("__java_style__", [this](std::vector<QV>) -> QV
+        {
+        javaStyle_ = true;
+        return QV(); });
+    reg("__jstr", [this, arg](std::vector<QV> a) -> QV { return QV(javaString(arg(a, 0))); });
+    // The names of an instance's class and its superclasses, innermost first
+    reg("__jclassChain", [arg](std::vector<QV> a) -> QV
+        {
+        auto out = std::make_shared<Array>();
+        QV v = arg(a, 0);
+        if (v.isInstance())
+            for (auto *k = v.asInstance()->klass.get(); k; k = k->base.get())
+                out->push_back(QV(k->name));
+        return QV(out); });
+    // Whether the instance's class (or a superclass) has the method / field
+    reg("__jhas", [arg](std::vector<QV> a) -> QV
+        {
+        QV v = arg(a, 0);
+        std::string name = arg(a, 1).toString();
+        if (!v.isInstance())
+            return QV(false);
+        if (v.asInstance()->fields.count(name))
+            return QV(true);
+        for (auto *k = v.asInstance()->klass.get(); k; k = k->base.get())
+            if (k->methods.count(name))
+                return QV(true);
+        return QV(false); });
+    // The kind of the error last caught (RuntimeError, IndexError, ...)
+    reg("__jerrorKind", [this](std::vector<QV>) -> QV { return QV(lastErrorKind_); });
+    // A line of standard input without its line break; null at the end
+    reg("__jreadline", [](std::vector<QV>) -> QV
+        {
+        std::cout.flush();
+        std::string line;
+        if (!std::getline(std::cin, line))
+            return QV();
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        return QV(line); });
+    reg("__jflush", [](std::vector<QV>) -> QV
+        {
+        std::cout.flush();
+        return QV(); });
+    reg("__jeprint", [arg](std::vector<QV> a) -> QV
+        {
+        std::cout.flush();
+        std::cerr << arg(a, 0).toString();
+        return QV(); });
+    reg("__jexit", [arg](std::vector<QV> a) -> QV
+        {
+        std::cout.flush();
+        std::exit((int)num(arg(a, 0)));
+        return QV(); });
+}
+
+QuantumValue VM::javaStyleMethod(QuantumValue &obj, const std::string &m, std::vector<QuantumValue> &args, bool &handled)
+{
+    handled = true;
+    auto at = [&](size_t i) -> QV { return i < args.size() ? args[i] : QV(); };
+
+    // ── functions as functional-interface objects ──
+    if (callable(obj))
+    {
+        QV f = obj;
+        VM *vm = this;
+        if (m == "andThen" && callable(at(0)))
+        {
+            // Function: g(f(x)); Consumer (f returns nothing): f(x), then g(x)
+            QV g = at(0);
+            return native("andThen", [vm, f, g](std::vector<QV> a) -> QV
+                          {
+                QV r = vm->invokeCallable(f, a);
+                return r.isNil() ? vm->invokeCallable(g, a) : vm->invokeCallable(g, {r}); });
+        }
+        if (m == "compose" && callable(at(0)))
+        {
+            QV g = at(0);
+            return native("compose", [vm, f, g](std::vector<QV> a) -> QV
+                          { return vm->invokeCallable(f, {vm->invokeCallable(g, a)}); });
+        }
+        if (m == "negate")
+            return native("negate", [vm, f](std::vector<QV> a) -> QV
+                          { return QV(!vm->invokeCallable(f, a).isTruthy()); });
+        if ((m == "and" || m == "or") && callable(at(0)))
+        {
+            QV g = at(0);
+            bool isAnd = m == "and";
+            return native(m, [vm, f, g, isAnd](std::vector<QV> a) -> QV
+                          {
+                bool x = vm->invokeCallable(f, a).isTruthy();
+                if (isAnd ? !x : x)
+                    return QV(x);
+                return QV(vm->invokeCallable(g, a).isTruthy()); });
+        }
+        if (m == "reversed")
+            return native("reversed", [vm, f](std::vector<QV> a) -> QV
+                          {
+                std::vector<QV> b = a;
+                if (b.size() >= 2)
+                    std::swap(b[0], b[1]);
+                return vm->invokeCallable(f, b); });
+        if ((m == "thenComparing" || m == "thenComparingInt" || m == "thenComparingDouble" ||
+             m == "thenComparingLong") &&
+            callable(at(0)))
+        {
+            // a second comparator, or a key to compare by (then an optional key comparator)
+            QV g = at(0), keyCmp = at(1);
+            bool comparator = arity(g) == 2;
+            return native(m, [vm, f, g, keyCmp, comparator](std::vector<QV> a) -> QV
+                          {
+                QV r = vm->invokeCallable(f, a);
+                if (num(r) != 0 || a.size() < 2)
+                    return r;
+                if (comparator)
+                    return vm->invokeCallable(g, a);
+                QV x = vm->invokeCallable(g, {a[0]}), y = vm->invokeCallable(g, {a[1]});
+                if (callable(keyCmp))
+                    return vm->invokeCallable(keyCmp, {x, y});
+                return vm->invokeCallable(vm->globals->get("__jcompare"), {x, y}); });
+        }
+        if (m == "equals")
+            return QV(valuesEqual(obj, at(0)));
+        // apply / test / accept / get / run / compare / applyAsInt / ... : call it
+        return invokeCallable(obj, args);
+    }
+
+    // ── strings ──
+    if (obj.isString())
+    {
+        const std::string &s = obj.asString();
+        if (m == "equals")
+            return QV(at(0).isString() && at(0).asString() == s);
+        if (m == "equalsIgnoreCase")
+            return QV(at(0).isString() && lower(at(0).asString()) == lower(s));
+        if (m == "compareTo" || m == "compareToIgnoreCase")
+        {
+            std::string a = s, b = at(0).toString();
+            if (m == "compareToIgnoreCase")
+                a = lower(a), b = lower(b);
+            size_t n = std::min(a.size(), b.size());
+            for (size_t i = 0; i < n; ++i)
+                if (a[i] != b[i])
+                    return QV((double)((unsigned char)a[i] - (unsigned char)b[i]));
+            return QV((double)a.size() - (double)b.size());
+        }
+        if (m == "isEmpty")
+            return QV(s.empty());
+        if (m == "isBlank")
+            return QV(std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); }));
+        if (m == "toCharArray")
+        {
+            auto out = std::make_shared<Array>();
+            for (auto &c : chars(s))
+                out->push_back(QV(c));
+            return QV(out);
+        }
+        if (m == "chars")
+        {
+            auto out = std::make_shared<Array>();
+            for (unsigned char c : s)
+                out->push_back(QV((double)c));
+            return QV(out);
+        }
+        if (m == "lastIndexOf")
+        {
+            size_t p = s.rfind(at(0).toString());
+            return QV(p == std::string::npos ? -1.0 : (double)p);
+        }
+        if (m == "hashCode")
+        {
+            int32_t h = 0;
+            for (unsigned char c : s)
+                h = (int32_t)((uint32_t)h * 31u + c);
+            return QV((double)h);
+        }
+        if (m == "matches")
+        {
+            try
+            {
+                return QV(std::regex_match(s, std::regex(at(0).toString())));
+            }
+            catch (const std::regex_error &)
+            {
+                throw RuntimeError("PatternSyntaxException: " + at(0).toString());
+            }
+        }
+        // Java's split takes a regex; a literal separator (and Python's
+        // split()) keeps the existing meaning, so Python / JavaScript code in
+        // the same file splits as before (a JavaScript /regex/ literal too:
+        // Python's split() becomes trim().split("/\s+/") in the parser)
+        if (m == "split" && !args.empty() && args[0].isString() && args[0].asString().size() > 1 &&
+            args[0].asString()[0] != '/' &&
+            args[0].asString().find_first_of("\\[]()*+?.^$|{}") != std::string::npos)
+        {
+            // Java: a regex; trailing empty strings are dropped
+            auto out = std::make_shared<Array>();
+            std::regex re(at(0).toString());
+            std::sregex_token_iterator it(s.begin(), s.end(), re, -1), end;
+            for (; it != end; ++it)
+                out->push_back(QV(it->str()));
+            while (!out->empty() && out->back().isString() && out->back().asString().empty())
+                out->pop_back();
+            if (out->empty() && s.empty())
+                out->push_back(QV(std::string()));
+            return QV(out);
+        }
+        if (m == "replaceAll" || m == "replaceFirst")
+            return QV(std::regex_replace(s, std::regex(at(0).toString()), at(1).toString(),
+                                         m == "replaceAll" ? std::regex_constants::format_default
+                                                           : std::regex_constants::format_first_only));
+        if (m == "concat")
+            return QV(s + at(0).toString());
+        if (m == "toString" || m == "intern")
+            return obj;
+        // Java's strip() takes no argument; Python's strip(chars) is the core's
+        if (m == "strip" && args.empty())
+            return callStringMethod(s, "trim", {});
+        if (m == "charAt")
+        {
+            auto cs = chars(s);
+            size_t i = (size_t)num(at(0));
+            if (num(at(0)) < 0 || i >= cs.size())
+                throw IndexError("Index " + at(0).toString() + " out of bounds for length " + std::to_string(cs.size()));
+            return QV(cs[i]);
+        }
+        handled = false;
+        return QV();
+    }
+
+    // ── arrays: Java lists, stacks, queues and streams ──
+    if (obj.isArray())
+    {
+        auto a = obj.asArray();
+        auto index = [&](const QV &v, size_t limit) -> size_t
+        {
+            double d = num(v);
+            if (d < 0 || d >= (double)limit || d != std::floor(d))
+                throw IndexError("Index " + javaString(v) + " out of bounds for length " + std::to_string(a->size()));
+            return (size_t)d;
+        };
+        auto optional = [&](const QV &v) -> QV { return invokeCallable(globals->get("__jopt"), {v}); };
+        auto compareWith = [&](const QV &cmp, const QV &x, const QV &y) -> double
+        {
+            return num(invokeCallable(callable(cmp) ? cmp : globals->get("__jcompare"), {x, y}));
+        };
+        if (m == "add" || m == "offer" || m == "addLast" || m == "offerLast")
+        {
+            if (m == "add" && args.size() == 2)
+            {
+                size_t i = index(args[0], a->size() + 1);
+                a->insert(a->begin() + (std::ptrdiff_t)i, args[1]);
+                return QV();
+            }
+            a->push_back(at(0));
+            return QV(true);
+        }
+        if (m == "addFirst" || m == "offerFirst")
+        {
+            a->insert(a->begin(), at(0));
+            return QV();
+        }
+        if (m == "get")
+            return (*a)[index(at(0), a->size())];
+        if (m == "set")
+        {
+            size_t i = index(at(0), a->size());
+            QV old = (*a)[i];
+            (*a)[i] = at(1);
+            return old;
+        }
+        if (m == "size")
+            return QV((double)a->size());
+        if (m == "isEmpty")
+            return QV(a->empty());
+        if (m == "remove" || m == "removeFirst" || m == "poll" || m == "pollFirst" || m == "removeLast" ||
+            m == "pollLast")
+        {
+            if (m == "remove" && !args.empty())
+            {
+                if (args[0].isNumber())
+                {
+                    size_t i = index(args[0], a->size());
+                    QV old = (*a)[i];
+                    a->erase(a->begin() + (std::ptrdiff_t)i);
+                    return old;
+                }
+                for (size_t i = 0; i < a->size(); ++i)
+                    if (valuesEqual((*a)[i], args[0]))
+                    {
+                        a->erase(a->begin() + (std::ptrdiff_t)i);
+                        return QV(true);
+                    }
+                return QV(false);
+            }
+            if (a->empty())
+            {
+                if (m == "poll" || m == "pollFirst" || m == "pollLast")
+                    return QV();
+                throw RuntimeError("NoSuchElementException");
+            }
+            bool last = m == "removeLast" || m == "pollLast";
+            QV v = last ? a->back() : a->front();
+            if (last)
+                a->pop_back();
+            else
+                a->erase(a->begin());
+            return v;
+        }
+        if (m == "peek" || m == "peekLast" || m == "getLast" || m == "lastElement")
+        {
+            if (a->empty())
+            {
+                if (m == "getLast" || m == "lastElement")
+                    throw RuntimeError("NoSuchElementException");
+                return QV();
+            }
+            return a->back();
+        }
+        if (m == "peekFirst" || m == "getFirst" || m == "element" || m == "firstElement")
+        {
+            if (a->empty())
+            {
+                if (m == "peekFirst")
+                    return QV();
+                throw RuntimeError("NoSuchElementException");
+            }
+            return a->front();
+        }
+        if (m == "search")
+        {
+            for (size_t i = a->size(); i-- > 0;)
+                if (valuesEqual((*a)[i], at(0)))
+                    return QV((double)(a->size() - i));
+            return QV(-1.0);
+        }
+        if (m == "addAll")
+        {
+            QV src = at(0);
+            if (src.isInstance())
+                src = invokeCallable(globals->get("__jit"), {src});
+            if (src.isArray())
+            {
+                auto copy = *src.asArray();
+                a->insert(a->end(), copy.begin(), copy.end());
+            }
+            return QV(true);
+        }
+        if (m == "removeIf")
+        {
+            QV pred = at(0);
+            bool any = false;
+            auto out = std::make_shared<Array>();
+            for (auto &v : *a)
+            {
+                if (invokeCallable(pred, {v}).isTruthy())
+                    any = true;
+                else
+                    out->push_back(v);
+            }
+            *a = *out;
+            return QV(any);
+        }
+        if (m == "lastIndexOf")
+        {
+            for (size_t i = a->size(); i-- > 0;)
+                if (valuesEqual((*a)[i], at(0)))
+                    return QV((double)i);
+            return QV(-1.0);
+        }
+        if (m == "subList")
+            return QV(std::make_shared<Array>(a->begin() + (std::ptrdiff_t)index(at(0), a->size() + 1),
+                                              a->begin() + (std::ptrdiff_t)index(at(1), a->size() + 1)));
+        if (m == "toArray" || m == "stream" || m == "boxed" || m == "parallelStream" || m == "toList" ||
+            m == "asList")
+            return QV(std::make_shared<Array>(*a));
+        if (m == "equals")
+            return QV(valuesEqual(obj, at(0)));
+        if (m == "toString")
+            return QV(javaString(obj));
+        if (m == "iterator")
+            return invokeCallable(globals->get("__jiterator"), {obj});
+        if (m == "getKey" || m == "getValue")
+            return a->size() > (m == "getKey" ? 0u : 1u) ? (*a)[m == "getKey" ? 0 : 1] : QV();
+        if (m == "setValue")
+        {
+            if (a->size() < 2)
+                a->resize(2);
+            QV old = (*a)[1];
+            (*a)[1] = at(0);
+            return old;
+        }
+        if (m == "sort" || m == "sorted")
+        {
+            auto out = m == "sort" ? a : std::make_shared<Array>(*a);
+            QV cmp = at(0);
+            std::stable_sort(out->begin(), out->end(),
+                             [&](const QV &x, const QV &y) { return compareWith(cmp, x, y) < 0; });
+            return QV(out); // JavaScript's sort returns the array
+        }
+        // streams
+        if (m == "mapToInt" || m == "mapToObj" || m == "mapToDouble" || m == "mapToLong" || m == "map")
+        {
+            // (value, index): a JavaScript callback in the same file may use the index
+            auto out = std::make_shared<Array>();
+            for (size_t i = 0; i < a->size(); ++i)
+                out->push_back(invokeCallable(at(0), {(*a)[i], QV((double)i)}));
+            return QV(out);
+        }
+        if (m == "filter")
+        {
+            auto out = std::make_shared<Array>();
+            for (size_t i = 0; i < a->size(); ++i)
+                if (invokeCallable(at(0), {(*a)[i], QV((double)i)}).isTruthy())
+                    out->push_back((*a)[i]);
+            return QV(out);
+        }
+        if (m == "flatMap")
+        {
+            auto out = std::make_shared<Array>();
+            for (auto &v : *a)
+            {
+                QV r = invokeCallable(at(0), {v});
+                if (r.isInstance())
+                    r = invokeCallable(globals->get("__jit"), {r});
+                if (r.isArray())
+                    out->insert(out->end(), r.asArray()->begin(), r.asArray()->end());
+            }
+            return QV(out);
+        }
+        if (m == "forEach")
+        {
+            for (size_t i = 0; i < a->size(); ++i)
+                invokeCallable(at(0), {(*a)[i], QV((double)i)});
+            return QV();
+        }
+        if (m == "collect")
+            return invokeCallable(at(0), {obj});
+        if (m == "distinct")
+        {
+            auto out = std::make_shared<Array>();
+            for (auto &v : *a)
+            {
+                bool seen = false;
+                for (auto &w : *out)
+                    seen = seen || valuesEqual(v, w);
+                if (!seen)
+                    out->push_back(v);
+            }
+            return QV(out);
+        }
+        if (m == "limit" || m == "skip")
+        {
+            size_t n = std::min(a->size(), (size_t)std::max(0.0, num(at(0))));
+            return m == "limit" ? QV(std::make_shared<Array>(a->begin(), a->begin() + (std::ptrdiff_t)n))
+                                : QV(std::make_shared<Array>(a->begin() + (std::ptrdiff_t)n, a->end()));
+        }
+        if (m == "count" && args.empty())
+            return QV((double)a->size());
+        if (m == "sum")
+        {
+            double s = 0;
+            for (auto &v : *a)
+                s += num(v);
+            return QV(s);
+        }
+        if (m == "average")
+        {
+            if (a->empty())
+                return optional(QV());
+            double s = 0;
+            for (auto &v : *a)
+                s += num(v);
+            return optional(QV(s / (double)a->size()));
+        }
+        if (m == "anyMatch" || m == "allMatch" || m == "noneMatch")
+        {
+            for (auto &v : *a)
+            {
+                bool r = invokeCallable(at(0), {v}).isTruthy();
+                if (m == "anyMatch" && r)
+                    return QV(true);
+                if (m == "allMatch" && !r)
+                    return QV(false);
+                if (m == "noneMatch" && r)
+                    return QV(false);
+            }
+            return QV(m != "anyMatch");
+        }
+        if (m == "findFirst" || m == "findAny")
+            return optional(a->empty() ? QV() : a->front());
+        if (m == "max" || m == "min")
+        {
+            if (a->empty())
+                return optional(QV());
+            QV best = a->front();
+            for (auto &v : *a)
+            {
+                double c = compareWith(at(0), v, best);
+                if (m == "max" ? c > 0 : c < 0)
+                    best = v;
+            }
+            return optional(best);
+        }
+        if (m == "reduce")
+        {
+            // JavaScript reduce(op, initial); Java reduce(identity, op), or reduce(op) -> Optional
+            if (args.size() >= 2 && callable(args[0]) && !callable(args[1]))
+            {
+                QV acc = args[1];
+                for (size_t i = 0; i < a->size(); ++i)
+                    acc = invokeCallable(args[0], {acc, (*a)[i], QV((double)i), obj});
+                return acc;
+            }
+            bool seeded = args.size() >= 2;
+            QV op = seeded ? args[1] : at(0);
+            if (!seeded && a->empty())
+                return optional(QV());
+            QV acc = seeded ? args[0] : a->front();
+            for (size_t i = seeded ? 0 : 1; i < a->size(); ++i)
+                acc = invokeCallable(op, {acc, (*a)[i]});
+            return seeded ? acc : optional(acc);
+        }
+        handled = false;
+        return QV();
+    }
+
+    // ── dicts (a JavaScript object, a Python dict) used as a java.util.Map ──
+    if (obj.isDict())
+    {
+        auto d = obj.asDict();
+        std::string k = at(0).toString();
+        auto it = d->find(k);
+        if (m == "containsKey")
+            return QV(it != d->end());
+        if (m == "containsValue")
+        {
+            for (auto &kv : *d)
+                if (valuesEqual(kv.second, at(0)))
+                    return QV(true);
+            return QV(false);
+        }
+        if (m == "get" || m == "getOrDefault")
+            return it != d->end() ? it->second : (m == "get" ? QV() : at(1));
+        if (m == "put" || m == "putIfAbsent")
+        {
+            QV old = it != d->end() ? it->second : QV();
+            if (m == "put" || old.isNil())
+                (*d)[k] = at(1);
+            return old;
+        }
+        if (m == "remove")
+        {
+            QV old = it != d->end() ? it->second : QV();
+            if (it != d->end())
+                d->erase(it);
+            return old;
+        }
+        if (m == "merge")
+        {
+            QV v = it == d->end() ? at(1) : invokeCallable(at(2), {it->second, at(1)});
+            (*d)[k] = v;
+            return v;
+        }
+        if (m == "computeIfAbsent")
+        {
+            if (it != d->end())
+                return it->second;
+            QV v = invokeCallable(at(1), {at(0)});
+            (*d)[k] = v;
+            return v;
+        }
+        if (m == "size")
+            return QV((double)d->size());
+        if (m == "isEmpty")
+            return QV(d->empty());
+        if (m == "keySet" || m == "values" || m == "entrySet")
+        {
+            auto out = std::make_shared<Array>();
+            for (auto &kv : *d)
+            {
+                if (m == "keySet")
+                    out->push_back(QV(kv.first));
+                else if (m == "values")
+                    out->push_back(kv.second);
+                else
+                    out->push_back(QV(std::make_shared<Array>(Array{QV(kv.first), kv.second})));
+            }
+            return QV(out);
+        }
+        if (m == "forEach" && callable(at(0)))
+        {
+            for (auto &kv : *d)
+                invokeCallable(at(0), {QV(kv.first), kv.second});
+            return QV();
+        }
+        handled = false;
+        return QV();
+    }
+
+    // ── numbers and booleans as boxes ──
+    if (obj.isNumber() || obj.isLong())
+    {
+        double d = num(obj);
+        if (m == "intValue" || m == "longValue" || m == "shortValue" || m == "byteValue")
+            return QV(std::trunc(d));
+        if (m == "doubleValue" || m == "floatValue")
+            return QV(d);
+        if (m == "compareTo")
+            return QV(d < num(at(0)) ? -1.0 : d > num(at(0)) ? 1.0 : 0.0);
+        if (m == "equals")
+            return QV((at(0).isNumber() || at(0).isLong()) && num(at(0)) == d);
+        if (m == "hashCode")
+            return QV(std::trunc(d));
+        if (m == "toString")
+            return QV(javaString(obj));
+        if (m == "isNaN")
+            return QV(std::isnan(d));
+    }
+    if (obj.isBool())
+    {
+        if (m == "booleanValue")
+            return obj;
+        if (m == "equals")
+            return QV(at(0).isBool() && at(0).asBool() == obj.asBool());
+        if (m == "toString")
+            return QV(javaString(obj));
+        if (m == "compareTo")
+            return QV(obj.asBool() == at(0).isTruthy() ? 0.0 : obj.asBool() ? 1.0 : -1.0);
+    }
+    handled = false;
+    return QV();
+}

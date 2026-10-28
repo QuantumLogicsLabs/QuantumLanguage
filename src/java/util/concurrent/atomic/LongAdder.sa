@@ -1,0 +1,24 @@
+package java.util.concurrent.atomic;
+
+import java.util.function.*;
+
+public class LongAdder extends Number implements java.io.Serializable {
+    private long value;
+
+    public LongAdder() {}
+    public void add(long x) { value += x; }
+    public void increment() { value++; }
+    public void decrement() { value--; }
+    public long sum() { return value; }
+    public void reset() { value = 0; }
+    public long sumThenReset() {
+        long v = value;
+        value = 0;
+        return v;
+    }
+    public String toString() { return Long.toString(value); }
+    public long longValue() { return value; }
+    public int intValue() { return (int) value; }
+    public float floatValue() { return (float) value; }
+    public double doubleValue() { return (double) value; }
+}

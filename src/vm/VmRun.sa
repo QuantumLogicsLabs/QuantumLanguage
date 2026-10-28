@@ -163,6 +163,7 @@ void VM::runFrame(size_t stopDepth)
             const std::string &name = consts[instr.operand].asString();
             globals->define(name, pop());
             weakGlobals_.erase(name); // a user definition replaces a weak builtin
+            builtinNames_.erase(name);
             if (name.compare(0, 6, "__op__") == 0)
                 freeOperators_ = true; // a C++ free operator (see VM::execBinary)
             break;
@@ -172,6 +173,7 @@ void VM::runFrame(size_t stopDepth)
             const std::string &name = consts[instr.operand].asString();
             globals->define(name, pop(), true);
             weakGlobals_.erase(name);
+            builtinNames_.erase(name);
             break;
         }
         case Op::LOAD_GLOBAL:
@@ -193,6 +195,17 @@ void VM::runFrame(size_t stopDepth)
                 }
             }
             const std::string &name = consts[instr.operand].asString();
+            // A builtin yields to a field the method's class declares: a
+            // Java / C++ class's `int max;` or `List log;`
+            if (builtinNames_.count(name))
+            {
+                QuantumValue field;
+                if (declaredSelfField(frame, name, field))
+                {
+                    push(field);
+                    break;
+                }
+            }
             // A weak builtin (e.g. the STL `next`) yields to a same-named
             // member of `this` inside a method: a node's own `next` field.
             if (!weakGlobals_.empty() && weakGlobals_.count(name))
@@ -312,7 +325,9 @@ void VM::runFrame(size_t stopDepth)
             bool inMethod = !params.empty() && params[0] == "self" &&
                             frame.stackBase < stack_.size() &&
                             stack_[frame.stackBase].isInstance();
-            bool notGlobal = !globals->has(name) || weakGlobals_.count(name);
+            QuantumValue declared;
+            bool notGlobal = !globals->has(name) || weakGlobals_.count(name) ||
+                             (builtinNames_.count(name) && declaredSelfField(frame, name, declared));
             // A C++ static data member (or `Cls::member = v`): held by the class
             if (notGlobal && (staticDataMembers_ || name.find("::") != std::string::npos) &&
                 storeCppStaticMember(name, frame, peek(0)))
@@ -1025,6 +1040,17 @@ void VM::runFrame(size_t stopDepth)
                 if (pushStaticMember(inst->klass, name))
                     break;
 
+                // java.lang.Object's methods, for Java-style code
+                if (javaStyle_)
+                {
+                    QuantumValue m = javaObjectMember(obj, name);
+                    if (!m.isNil())
+                    {
+                        push(m);
+                        break;
+                    }
+                }
+
                 // 4. Unknown name on an instance -> nil, matching Ruby's
                 // (and Python's) "unset attribute reads as nil" semantics.
                 // Falling through to the builtin-method wrapper below would
@@ -1554,6 +1580,7 @@ void VM::runFrame(size_t stopDepth)
             QuantumValue javaCaught;
             if (javaMode_ && !dynamic_cast<CppThrow *>(&e))
                 javaCaught = javaErrorDescriptor(e, javaStackTrace());
+            lastErrorKind_ = e.kind; // what a Java-style catch maps to an exception class
             if (!dynamic_cast<CppThrow *>(&e) && std::getenv("QUANTUM_DEBUG_FRAMES"))
             {
                 // where a VM error started: the functions on the stack, innermost first

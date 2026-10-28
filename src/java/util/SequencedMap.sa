@@ -1,0 +1,37 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public interface SequencedMap<K, V> extends Map<K, V> {
+    default Map.Entry<K, V> firstEntry() {
+        var it = entrySet().iterator();
+        return it.hasNext() ? new KeyValueHolder<>(it.next()) : null;
+    }
+
+    default Map.Entry<K, V> lastEntry() {
+        Map.Entry<K, V> last = null;
+        for (Map.Entry<K, V> e : entrySet())
+            last = e;
+        return last == null ? null : new KeyValueHolder<>(last);
+    }
+
+    default Map.Entry<K, V> pollFirstEntry() {
+        var it = entrySet().iterator();
+        if (!it.hasNext())
+            return null;
+        var entry = new KeyValueHolder<>(it.next());
+        it.remove();
+        return entry;
+    }
+
+    default Map.Entry<K, V> pollLastEntry() {
+        Map.Entry<K, V> last = lastEntry();
+        if (last != null)
+            remove(last.getKey());
+        return last;
+    }
+
+    default V putFirst(K k, V v) { throw new UnsupportedOperationException(); }
+    default V putLast(K k, V v) { throw new UnsupportedOperationException(); }
+}

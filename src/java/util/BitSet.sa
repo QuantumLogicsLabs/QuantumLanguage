@@ -1,0 +1,178 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public class BitSet implements Cloneable, java.io.Serializable {
+    private long[] words;
+
+    public BitSet() { words = new long[1]; }
+
+    public BitSet(int nbits) {
+        if (nbits < 0)
+            throw new NegativeArraySizeException("nbits < 0: " + nbits);
+        words = new long[Math.max(1, (nbits + 63) >> 6)];
+    }
+
+    private void ensure(int wordIndex) {
+        if (wordIndex >= words.length)
+            words = Arrays.copyOf(words, Math.max(2 * words.length, wordIndex + 1));
+    }
+
+    private static void checkIndex(int bitIndex) {
+        if (bitIndex < 0)
+            throw new IndexOutOfBoundsException("bitIndex < 0: " + bitIndex);
+    }
+
+    public void set(int bitIndex) {
+        checkIndex(bitIndex);
+        int w = bitIndex >> 6;
+        ensure(w);
+        words[w] |= (1L << bitIndex);
+    }
+
+    public void set(int bitIndex, boolean value) {
+        if (value)
+            set(bitIndex);
+        else
+            clear(bitIndex);
+    }
+
+    public void set(int fromIndex, int toIndex) {
+        for (int i = fromIndex; i < toIndex; i++)
+            set(i);
+    }
+
+    public void clear(int bitIndex) {
+        checkIndex(bitIndex);
+        int w = bitIndex >> 6;
+        if (w < words.length)
+            words[w] &= ~(1L << bitIndex);
+    }
+
+    public void clear() {
+        for (int i = 0; i < words.length; i++)
+            words[i] = 0;
+    }
+
+    public void flip(int bitIndex) {
+        checkIndex(bitIndex);
+        int w = bitIndex >> 6;
+        ensure(w);
+        words[w] ^= (1L << bitIndex);
+    }
+
+    public boolean get(int bitIndex) {
+        checkIndex(bitIndex);
+        int w = bitIndex >> 6;
+        return w < words.length && (words[w] & (1L << bitIndex)) != 0;
+    }
+
+    public int cardinality() {
+        int sum = 0;
+        for (long w : words)
+            sum += Long.bitCount(w);
+        return sum;
+    }
+
+    public int length() {
+        for (int i = words.length - 1; i >= 0; i--)
+            if (words[i] != 0)
+                return 64 * i + (64 - Long.numberOfLeadingZeros(words[i]));
+        return 0;
+    }
+
+    public int size() { return words.length * 64; }
+    public boolean isEmpty() { return length() == 0; }
+
+    public int nextSetBit(int fromIndex) {
+        if (fromIndex < 0)
+            throw new IndexOutOfBoundsException("fromIndex < 0: " + fromIndex);
+        for (int i = fromIndex, n = words.length * 64; i < n; i++)
+            if (get(i))
+                return i;
+        return -1;
+    }
+
+    public int nextClearBit(int fromIndex) {
+        int i = fromIndex;
+        while (get(i))
+            i++;
+        return i;
+    }
+
+    public int previousSetBit(int fromIndex) {
+        for (int i = fromIndex; i >= 0; i--)
+            if (get(i))
+                return i;
+        return -1;
+    }
+
+    public void and(BitSet set) {
+        for (int i = 0; i < words.length; i++)
+            words[i] &= i < set.words.length ? set.words[i] : 0;
+    }
+
+    public void or(BitSet set) {
+        ensure(set.words.length - 1);
+        for (int i = 0; i < set.words.length; i++)
+            words[i] |= set.words[i];
+    }
+
+    public void xor(BitSet set) {
+        ensure(set.words.length - 1);
+        for (int i = 0; i < set.words.length; i++)
+            words[i] ^= set.words[i];
+    }
+
+    public void andNot(BitSet set) {
+        for (int i = 0; i < Math.min(words.length, set.words.length); i++)
+            words[i] &= ~set.words[i];
+    }
+
+    public boolean intersects(BitSet set) {
+        for (int i = Math.min(words.length, set.words.length) - 1; i >= 0; i--)
+            if ((words[i] & set.words[i]) != 0)
+                return true;
+        return false;
+    }
+
+    public IntStream stream() {
+        ArrayList<Integer> l = new ArrayList<>();
+        for (int i = nextSetBit(0); i >= 0; i = nextSetBit(i + 1))
+            l.add(i);
+        return l.stream().mapToInt(x -> x);
+    }
+
+    public Object clone() {
+        BitSet b = new BitSet();
+        b.words = Arrays.copyOf(words, words.length);
+        return b;
+    }
+
+    public boolean equals(Object obj) {
+        if (!(obj instanceof BitSet set))
+            return false;
+        int n = Math.max(words.length, set.words.length);
+        for (int i = 0; i < n; i++) {
+            long a = i < words.length ? words[i] : 0, b = i < set.words.length ? set.words[i] : 0;
+            if (a != b)
+                return false;
+        }
+        return true;
+    }
+
+    public int hashCode() {
+        long h = 1234;
+        for (int i = words.length; --i >= 0; )
+            h ^= words[i] * (i + 1);
+        return (int) ((h >> 32) ^ h);
+    }
+
+    public String toString() {
+        StringJoiner j = new StringJoiner(", ", "{", "}");
+        for (int i = nextSetBit(0); i >= 0; i = nextSetBit(i + 1))
+            j.add(String.valueOf(i));
+        return j.toString();
+    }
+}

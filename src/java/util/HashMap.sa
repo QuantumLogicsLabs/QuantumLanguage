@@ -1,0 +1,682 @@
+package java.util;
+
+import java.util.function.*;
+
+public class HashMap<K, V> extends AbstractMap<K, V> implements Map<K, V>, Cloneable, java.io.Serializable {
+    static final int DEFAULT_INITIAL_CAPACITY = 1 << 4;
+    static final int MAXIMUM_CAPACITY = 1 << 30;
+    static final float DEFAULT_LOAD_FACTOR = 0.75f;
+
+    static class Node<K, V> implements Map.Entry<K, V> {
+        final int hash;
+        final K key;
+        V value;
+        Node<K, V> next;
+
+        Node(int hash, K key, V value, Node<K, V> next) {
+            this.hash = hash;
+            this.key = key;
+            this.value = value;
+            this.next = next;
+        }
+
+        public final K getKey() { return key; }
+        public final V getValue() { return value; }
+        public final String toString() { return key + "=" + value; }
+        public final int hashCode() { return Objects.hashCode(key) ^ Objects.hashCode(value); }
+
+        public final V setValue(V newValue) {
+            V oldValue = value;
+            value = newValue;
+            return oldValue;
+        }
+
+        public final boolean equals(Object o) {
+            if (o == this)
+                return true;
+            return o instanceof Map.Entry<?, ?> e && Objects.equals(key, e.getKey()) && Objects.equals(value, e.getValue());
+        }
+    }
+
+    static final int hash(Object key) {
+        int h;
+        return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
+    }
+
+    static final int tableSizeFor(int cap) {
+        int n = -1 >>> Integer.numberOfLeadingZeros(cap - 1);
+        return (n < 0) ? 1 : (n >= MAXIMUM_CAPACITY) ? MAXIMUM_CAPACITY : n + 1;
+    }
+
+    transient Node<K, V>[] table;
+    transient Set<Map.Entry<K, V>> entrySet;
+    transient Set<K> keySetView;
+    transient Collection<V> valuesView;
+    transient int size;
+    transient int modCount;
+    int threshold;
+    final float loadFactor;
+
+    public HashMap(int initialCapacity, float loadFactor) {
+        if (initialCapacity < 0)
+            throw new IllegalArgumentException("Illegal initial capacity: " + initialCapacity);
+        if (initialCapacity > MAXIMUM_CAPACITY)
+            initialCapacity = MAXIMUM_CAPACITY;
+        if (loadFactor <= 0 || Float.isNaN(loadFactor))
+            throw new IllegalArgumentException("Illegal load factor: " + loadFactor);
+        this.loadFactor = loadFactor;
+        this.threshold = tableSizeFor(initialCapacity);
+    }
+
+    public HashMap(int initialCapacity) { this(initialCapacity, DEFAULT_LOAD_FACTOR); }
+
+    public HashMap() { this.loadFactor = DEFAULT_LOAD_FACTOR; }
+
+    public HashMap(Map<? extends K, ? extends V> m) {
+        this.loadFactor = DEFAULT_LOAD_FACTOR;
+        putMapEntries(m, false);
+    }
+
+    static int calculateHashMapCapacity(int numMappings) {
+        return (int) Math.ceil(numMappings / (double) DEFAULT_LOAD_FACTOR);
+    }
+
+    public static <K, V> HashMap<K, V> newHashMap(int numMappings) {
+        if (numMappings < 0)
+            throw new IllegalArgumentException("Negative number of mappings: " + numMappings);
+        return new HashMap<>(calculateHashMapCapacity(numMappings));
+    }
+
+    final void putMapEntries(Map<? extends K, ? extends V> m, boolean evict) {
+        int s = m.size();
+        if (s > 0) {
+            if (table == null) {
+                double dt = Math.ceil(s / (double) loadFactor);
+                int t = ((dt < (double) MAXIMUM_CAPACITY) ? (int) dt : MAXIMUM_CAPACITY);
+                if (t > threshold)
+                    threshold = tableSizeFor(t);
+            } else {
+                while (s > threshold && table.length < MAXIMUM_CAPACITY)
+                    resize();
+            }
+            for (Map.Entry<? extends K, ? extends V> e : m.entrySet()) {
+                K key = e.getKey();
+                V value = e.getValue();
+                putVal(hash(key), key, value, false, evict);
+            }
+        }
+    }
+
+    public int size() { return size; }
+    public boolean isEmpty() { return size == 0; }
+
+    public V get(Object key) {
+        Node<K, V> e = getNode(key);
+        return e == null ? null : e.value;
+    }
+
+    final Node<K, V> getNode(Object key) {
+        Node<K, V>[] tab = table;
+        if (tab == null || tab.length == 0)
+            return null;
+        int hash = hash(key);
+        for (Node<K, V> e = tab[(tab.length - 1) & hash]; e != null; e = e.next) {
+            K k = e.key;
+            if (e.hash == hash && (k == key || (key != null && key.equals(k))))
+                return e;
+        }
+        return null;
+    }
+
+    public boolean containsKey(Object key) { return getNode(key) != null; }
+
+    public V put(K key, V value) { return putVal(hash(key), key, value, false, true); }
+
+    final V putVal(int hash, K key, V value, boolean onlyIfAbsent, boolean evict) {
+        Node<K, V>[] tab = table;
+        if (tab == null || tab.length == 0)
+            tab = resize();
+        int n = tab.length;
+        int i = (n - 1) & hash;
+        Node<K, V> p = tab[i];
+        if (p == null)
+            tab[i] = newNode(hash, key, value, null);
+        else {
+            Node<K, V> e = null;
+            K k = p.key;
+            if (p.hash == hash && (k == key || (key != null && key.equals(k))))
+                e = p;
+            else {
+                while (true) {
+                    e = p.next;
+                    if (e == null) {
+                        p.next = newNode(hash, key, value, null);
+                        break;
+                    }
+                    k = e.key;
+                    if (e.hash == hash && (k == key || (key != null && key.equals(k))))
+                        break;
+                    p = e;
+                }
+            }
+            if (e != null) {
+                V oldValue = e.value;
+                if (!onlyIfAbsent || oldValue == null)
+                    e.value = value;
+                afterNodeAccess(e);
+                return oldValue;
+            }
+        }
+        ++modCount;
+        if (++size > threshold)
+            resize();
+        afterNodeInsertion(evict);
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    final Node<K, V>[] resize() {
+        Node<K, V>[] oldTab = table;
+        int oldCap = (oldTab == null) ? 0 : oldTab.length;
+        int oldThr = threshold;
+        int newCap = 0, newThr = 0;
+        if (oldCap > 0) {
+            if (oldCap >= MAXIMUM_CAPACITY) {
+                threshold = Integer.MAX_VALUE;
+                return oldTab;
+            }
+            newCap = oldCap << 1;
+            if (newCap < MAXIMUM_CAPACITY && oldCap >= DEFAULT_INITIAL_CAPACITY)
+                newThr = oldThr << 1;
+        } else if (oldThr > 0)
+            newCap = oldThr;
+        else {
+            newCap = DEFAULT_INITIAL_CAPACITY;
+            newThr = (int) (DEFAULT_LOAD_FACTOR * DEFAULT_INITIAL_CAPACITY);
+        }
+        if (newThr == 0) {
+            float ft = (float) newCap * loadFactor;
+            newThr = (newCap < MAXIMUM_CAPACITY && ft < (float) MAXIMUM_CAPACITY ? (int) ft : Integer.MAX_VALUE);
+        }
+        threshold = newThr;
+        Node<K, V>[] newTab = (Node<K, V>[]) new Node[newCap];
+        table = newTab;
+        if (oldTab != null) {
+            for (int j = 0; j < oldCap; ++j) {
+                Node<K, V> e = oldTab[j];
+                if (e == null)
+                    continue;
+                oldTab[j] = null;
+                if (e.next == null)
+                    newTab[e.hash & (newCap - 1)] = e;
+                else {
+                    // split the bin, keeping relative order
+                    Node<K, V> loHead = null, loTail = null, hiHead = null, hiTail = null;
+                    while (e != null) {
+                        Node<K, V> next = e.next;
+                        if ((e.hash & oldCap) == 0) {
+                            if (loTail == null)
+                                loHead = e;
+                            else
+                                loTail.next = e;
+                            loTail = e;
+                        } else {
+                            if (hiTail == null)
+                                hiHead = e;
+                            else
+                                hiTail.next = e;
+                            hiTail = e;
+                        }
+                        e = next;
+                    }
+                    if (loTail != null) {
+                        loTail.next = null;
+                        newTab[j] = loHead;
+                    }
+                    if (hiTail != null) {
+                        hiTail.next = null;
+                        newTab[j + oldCap] = hiHead;
+                    }
+                }
+            }
+        }
+        return newTab;
+    }
+
+    public void putAll(Map<? extends K, ? extends V> m) { putMapEntries(m, true); }
+
+    public V remove(Object key) {
+        Node<K, V> e = removeNode(hash(key), key, null, false, true);
+        return e == null ? null : e.value;
+    }
+
+    final Node<K, V> removeNode(int hash, Object key, Object value, boolean matchValue, boolean movable) {
+        Node<K, V>[] tab = table;
+        if (tab == null || tab.length == 0)
+            return null;
+        int index = (tab.length - 1) & hash;
+        Node<K, V> p = tab[index];
+        if (p == null)
+            return null;
+        Node<K, V> node = null;
+        K k = p.key;
+        if (p.hash == hash && (k == key || (key != null && key.equals(k))))
+            node = p;
+        else {
+            for (Node<K, V> e = p.next; e != null; e = e.next) {
+                k = e.key;
+                if (e.hash == hash && (k == key || (key != null && key.equals(k)))) {
+                    node = e;
+                    break;
+                }
+                p = e;
+            }
+        }
+        if (node != null) {
+            V v = node.value;
+            if (!matchValue || v == value || (value != null && value.equals(v))) {
+                if (node == p)
+                    tab[index] = node.next;
+                else
+                    p.next = node.next;
+                ++modCount;
+                --size;
+                afterNodeRemoval(node);
+                return node;
+            }
+        }
+        return null;
+    }
+
+    public void clear() {
+        Node<K, V>[] tab = table;
+        modCount++;
+        if (tab != null && size > 0) {
+            size = 0;
+            for (int i = 0; i < tab.length; ++i)
+                tab[i] = null;
+        }
+    }
+
+    public boolean containsValue(Object value) {
+        Node<K, V>[] tab = table;
+        if (tab != null && size > 0) {
+            for (Node<K, V> e : tab) {
+                for (; e != null; e = e.next) {
+                    V v = e.value;
+                    if (v == value || (value != null && value.equals(v)))
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public Set<K> keySet() {
+        Set<K> ks = keySetView;
+        if (ks == null) {
+            ks = new KeySet();
+            keySetView = ks;
+        }
+        return ks;
+    }
+
+    final class KeySet extends AbstractSet<K> {
+        public final int size() { return size; }
+        public final void clear() { HashMap.this.clear(); }
+        public final Iterator<K> iterator() { return new KeyIterator(); }
+        public final boolean contains(Object o) { return containsKey(o); }
+        public final boolean remove(Object key) { return removeNode(hash(key), key, null, false, true) != null; }
+
+        public final void forEach(Consumer<? super K> action) {
+            if (action == null)
+                throw new NullPointerException();
+            Node<K, V>[] tab = table;
+            if (size > 0 && tab != null) {
+                int mc = modCount;
+                for (Node<K, V> e : tab)
+                    for (; e != null; e = e.next)
+                        action.accept(e.key);
+                if (modCount != mc)
+                    throw new ConcurrentModificationException();
+            }
+        }
+    }
+
+    public Collection<V> values() {
+        Collection<V> vs = valuesView;
+        if (vs == null) {
+            vs = new Values();
+            valuesView = vs;
+        }
+        return vs;
+    }
+
+    final class Values extends AbstractCollection<V> {
+        public final int size() { return size; }
+        public final void clear() { HashMap.this.clear(); }
+        public final Iterator<V> iterator() { return new ValueIterator(); }
+        public final boolean contains(Object o) { return containsValue(o); }
+
+        public final void forEach(Consumer<? super V> action) {
+            if (action == null)
+                throw new NullPointerException();
+            Node<K, V>[] tab = table;
+            if (size > 0 && tab != null) {
+                int mc = modCount;
+                for (Node<K, V> e : tab)
+                    for (; e != null; e = e.next)
+                        action.accept(e.value);
+                if (modCount != mc)
+                    throw new ConcurrentModificationException();
+            }
+        }
+    }
+
+    public Set<Map.Entry<K, V>> entrySet() {
+        Set<Map.Entry<K, V>> es = entrySet;
+        if (es == null) {
+            es = new EntrySet();
+            entrySet = es;
+        }
+        return es;
+    }
+
+    final class EntrySet extends AbstractSet<Map.Entry<K, V>> {
+        public final int size() { return size; }
+        public final void clear() { HashMap.this.clear(); }
+        public final Iterator<Map.Entry<K, V>> iterator() { return new EntryIterator(); }
+
+        public final boolean contains(Object o) {
+            if (!(o instanceof Map.Entry<?, ?> e))
+                return false;
+            Object key = e.getKey();
+            Node<K, V> candidate = getNode(key);
+            return candidate != null && candidate.equals(e);
+        }
+
+        public final boolean remove(Object o) {
+            if (o instanceof Map.Entry<?, ?> e) {
+                Object key = e.getKey();
+                Object value = e.getValue();
+                return removeNode(hash(key), key, value, true, true) != null;
+            }
+            return false;
+        }
+
+        public final void forEach(Consumer<? super Map.Entry<K, V>> action) {
+            if (action == null)
+                throw new NullPointerException();
+            Node<K, V>[] tab = table;
+            if (size > 0 && tab != null) {
+                int mc = modCount;
+                for (Node<K, V> e : tab)
+                    for (; e != null; e = e.next)
+                        action.accept(e);
+                if (modCount != mc)
+                    throw new ConcurrentModificationException();
+            }
+        }
+    }
+
+    public V getOrDefault(Object key, V defaultValue) {
+        Node<K, V> e = getNode(key);
+        return e == null ? defaultValue : e.value;
+    }
+
+    public V putIfAbsent(K key, V value) { return putVal(hash(key), key, value, true, true); }
+
+    public boolean remove(Object key, Object value) { return removeNode(hash(key), key, value, true, true) != null; }
+
+    public boolean replace(K key, V oldValue, V newValue) {
+        Node<K, V> e = getNode(key);
+        if (e != null) {
+            V v = e.value;
+            if (v == oldValue || (v != null && v.equals(oldValue))) {
+                e.value = newValue;
+                afterNodeAccess(e);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public V replace(K key, V value) {
+        Node<K, V> e = getNode(key);
+        if (e != null) {
+            V oldValue = e.value;
+            e.value = value;
+            afterNodeAccess(e);
+            return oldValue;
+        }
+        return null;
+    }
+
+    // computeIfAbsent / compute / merge resize before inserting and insert at
+    // the head of the bin, as the JDK does
+    private Node<K, V>[] tableForInsert() {
+        Node<K, V>[] tab = table;
+        if (size > threshold || tab == null || tab.length == 0)
+            tab = resize();
+        return tab;
+    }
+
+    private Node<K, V> findInBin(Node<K, V> first, int hash, Object key) {
+        for (Node<K, V> e = first; e != null; e = e.next) {
+            K k = e.key;
+            if (e.hash == hash && (k == key || (key != null && key.equals(k))))
+                return e;
+        }
+        return null;
+    }
+
+    public V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction) {
+        if (mappingFunction == null)
+            throw new NullPointerException();
+        int hash = hash(key);
+        Node<K, V>[] tab = tableForInsert();
+        int i = (tab.length - 1) & hash;
+        Node<K, V> first = tab[i];
+        Node<K, V> old = findInBin(first, hash, key);
+        if (old != null && old.value != null) {
+            afterNodeAccess(old);
+            return old.value;
+        }
+        int mc = modCount;
+        V v = mappingFunction.apply(key);
+        if (mc != modCount)
+            throw new ConcurrentModificationException();
+        if (v == null)
+            return null;
+        if (old != null) {
+            old.value = v;
+            afterNodeAccess(old);
+            return v;
+        }
+        tab[i] = newNode(hash, key, v, first);
+        modCount = mc + 1;
+        ++size;
+        afterNodeInsertion(true);
+        return v;
+    }
+
+    public V computeIfPresent(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+        if (remappingFunction == null)
+            throw new NullPointerException();
+        Node<K, V> e = getNode(key);
+        if (e != null && e.value != null) {
+            V oldValue = e.value;
+            int mc = modCount;
+            V v = remappingFunction.apply(key, oldValue);
+            if (mc != modCount)
+                throw new ConcurrentModificationException();
+            if (v != null) {
+                e.value = v;
+                afterNodeAccess(e);
+                return v;
+            }
+            removeNode(hash(key), key, null, false, true);
+        }
+        return null;
+    }
+
+    public V compute(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+        if (remappingFunction == null)
+            throw new NullPointerException();
+        int hash = hash(key);
+        Node<K, V>[] tab = tableForInsert();
+        int i = (tab.length - 1) & hash;
+        Node<K, V> first = tab[i];
+        Node<K, V> old = findInBin(first, hash, key);
+        V oldValue = (old == null) ? null : old.value;
+        int mc = modCount;
+        V v = remappingFunction.apply(key, oldValue);
+        if (mc != modCount)
+            throw new ConcurrentModificationException();
+        if (old != null) {
+            if (v != null) {
+                old.value = v;
+                afterNodeAccess(old);
+            } else
+                removeNode(hash, key, null, false, true);
+        } else if (v != null) {
+            tab[i] = newNode(hash, key, v, first);
+            modCount = mc + 1;
+            ++size;
+            afterNodeInsertion(true);
+        }
+        return v;
+    }
+
+    public V merge(K key, V value, BiFunction<? super V, ? super V, ? extends V> remappingFunction) {
+        if (value == null || remappingFunction == null)
+            throw new NullPointerException();
+        int hash = hash(key);
+        Node<K, V>[] tab = tableForInsert();
+        int i = (tab.length - 1) & hash;
+        Node<K, V> first = tab[i];
+        Node<K, V> old = findInBin(first, hash, key);
+        if (old != null) {
+            V v;
+            if (old.value != null) {
+                int mc = modCount;
+                v = remappingFunction.apply(old.value, value);
+                if (mc != modCount)
+                    throw new ConcurrentModificationException();
+            } else
+                v = value;
+            if (v != null) {
+                old.value = v;
+                afterNodeAccess(old);
+            } else
+                removeNode(hash, key, null, false, true);
+            return v;
+        }
+        tab[i] = newNode(hash, key, value, first);
+        ++modCount;
+        ++size;
+        afterNodeInsertion(true);
+        return value;
+    }
+
+    public void forEach(BiConsumer<? super K, ? super V> action) {
+        if (action == null)
+            throw new NullPointerException();
+        Node<K, V>[] tab = table;
+        if (size > 0 && tab != null) {
+            int mc = modCount;
+            for (Node<K, V> e : tab)
+                for (; e != null; e = e.next)
+                    action.accept(e.key, e.value);
+            if (modCount != mc)
+                throw new ConcurrentModificationException();
+        }
+    }
+
+    public void replaceAll(BiFunction<? super K, ? super V, ? extends V> function) {
+        if (function == null)
+            throw new NullPointerException();
+        Node<K, V>[] tab = table;
+        if (size > 0 && tab != null) {
+            int mc = modCount;
+            for (Node<K, V> e : tab)
+                for (; e != null; e = e.next)
+                    e.value = function.apply(e.key, e.value);
+            if (modCount != mc)
+                throw new ConcurrentModificationException();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public Object clone() {
+        HashMap<K, V> result = new HashMap<>(Math.max(size, 1));
+        result.putMapEntries(this, false);
+        return result;
+    }
+
+    // hooks for LinkedHashMap
+    Node<K, V> newNode(int hash, K key, V value, Node<K, V> next) { return new Node<>(hash, key, value, next); }
+    void afterNodeAccess(Node<K, V> p) {}
+    void afterNodeInsertion(boolean evict) {}
+    void afterNodeRemoval(Node<K, V> p) {}
+
+    abstract class HashIterator {
+        Node<K, V> next;
+        Node<K, V> current;
+        int expectedModCount;
+        int index;
+
+        HashIterator() {
+            expectedModCount = modCount;
+            Node<K, V>[] t = table;
+            current = next = null;
+            index = 0;
+            if (t != null && size > 0)
+                advance(t);
+        }
+
+        private void advance(Node<K, V>[] t) {
+            while (index < t.length && (next = t[index++]) == null)
+                ;
+        }
+
+        public final boolean hasNext() { return next != null; }
+
+        final Node<K, V> nextNode() {
+            Node<K, V> e = next;
+            if (modCount != expectedModCount)
+                throw new ConcurrentModificationException();
+            if (e == null)
+                throw new NoSuchElementException();
+            current = e;
+            next = e.next;
+            Node<K, V>[] t = table;
+            if (next == null && t != null)
+                advance(t);
+            return e;
+        }
+
+        public final void remove() {
+            Node<K, V> p = current;
+            if (p == null)
+                throw new IllegalStateException();
+            if (modCount != expectedModCount)
+                throw new ConcurrentModificationException();
+            current = null;
+            removeNode(p.hash, p.key, null, false, false);
+            expectedModCount = modCount;
+        }
+    }
+
+    final class KeyIterator extends HashIterator implements Iterator<K> {
+        public final K next() { return nextNode().key; }
+    }
+
+    final class ValueIterator extends HashIterator implements Iterator<V> {
+        public final V next() { return nextNode().value; }
+    }
+
+    final class EntryIterator extends HashIterator implements Iterator<Map.Entry<K, V>> {
+        public final Map.Entry<K, V> next() { return nextNode(); }
+    }
+}

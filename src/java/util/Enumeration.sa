@@ -1,0 +1,17 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public interface Enumeration<E> {
+    boolean hasMoreElements();
+    E nextElement();
+
+    default Iterator<E> asIterator() {
+        Enumeration<E> self = this;
+        return new Iterator<E>() {
+            public boolean hasNext() { return self.hasMoreElements(); }
+            public E next() { return self.nextElement(); }
+        };
+    }
+}

@@ -180,6 +180,25 @@ private:
     void registerCppLibNatives(); // the __q_* natives behind lib/cpp headers (VmCppLib.cpp)
     void registerJsRuntimeNatives(); // URL, window, encodeURIComponent (VmJsRuntime.cpp)
     void registerJavaNatives();      // runtime of the Java front-end (VmJava*.cpp)
+    void registerJavaStyleNatives(); // Java-style code in .sa files (VmJavaStyle.cpp)
+
+    // ── Java-style .sa code (VmJavaStyle.cpp) ─────────────────────────────────
+    // Set by __java_style__(), which the Java-style library calls first: Java
+    // method names on strings / arrays / numbers, functional-interface calls
+    // on functions, and Java's string conversion in `+`.
+    bool javaStyle_ = false;
+    // The kind of the error a catch block last received (RuntimeError, ...)
+    std::string lastErrorKind_;
+    // The method `m` of a Java-style value; `handled` false when it has none.
+    QuantumValue javaStyleMethod(QuantumValue &obj, const std::string &m, std::vector<QuantumValue> &args,
+                                 bool &handled);
+    // java.lang.Object's getClass / equals / hashCode / toString for an
+    // instance whose class has none (nil for another name)
+    QuantumValue javaObjectMember(const QuantumValue &obj, const std::string &name);
+    // An instance's toString() / __str__(), or the value's own text
+    std::string displayString(const QuantumValue &v);
+    // String.valueOf: null, [a, b], {k=v}, toString() of an instance
+    std::string javaString(const QuantumValue &v);
 
     // ── Java (VmJava.cpp) ─────────────────────────────────────────────────────
     // Set by __j_runtime() at the start of a Java program: errors raised by
@@ -213,6 +232,13 @@ private:
     // must not shadow a C++ class's own `next` field or `find()` method under
     // implicit `this`. A user definition of the name removes it from the set.
     std::unordered_set<std::string> weakGlobals_;
+    // The VM's own native functions (print, max, log, ...), until a program
+    // defines a global of the same name. Inside a method, a field the class
+    // declares (`int max = 7;`, `List log;`) wins over one of them.
+    std::unordered_set<std::string> builtinNames_;
+    // The field `name` of the method's `this`, when its class (or a base)
+    // declares it; false outside a method or for an undeclared name.
+    bool declaredSelfField(const CallFrame &frame, const std::string &name, QuantumValue &out);
     // Ordering used by sort/max_element/... without a comparator: numbers,
     // strings, arrays (pairs) lexicographically, instances via __lt__.
     bool stlLess(const QuantumValue &a, const QuantumValue &b);

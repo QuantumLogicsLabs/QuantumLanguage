@@ -1,0 +1,9 @@
+package java.util.concurrent;
+
+import java.util.*;
+import java.util.function.*;
+
+@FunctionalInterface
+public interface Callable<V> {
+    V call() throws Exception;
+}

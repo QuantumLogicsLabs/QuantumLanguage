@@ -51,6 +51,10 @@ VM::VM()
     registerCppLibNatives();
     registerJsRuntimeNatives();
     registerJavaNatives();
+    registerJavaStyleNatives();
+    for (const auto &kv : globals->getVars())
+        if (kv.second.isNative())
+            builtinNames_.insert(kv.first);
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
@@ -221,8 +225,15 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
 {
     QuantumValue L = L_in;
     QuantumValue R = R_in;
-    if (L.isNative()) L = L.asNative()->fn({});
-    if (R.isNative()) R = R.asNative()->fn({});
+    // A native read as a value (a paren-less call: `sock.gets + "!"`) is
+    // called for its result. Not in `f == nil` / `f != nil`: a function
+    // compared with nil is just a function (a comparator would run without
+    // its arguments).
+    bool nilTest = (op == Op::EQ || op == Op::NEQ) && (L_in.isNil() || R_in.isNil());
+    auto isGetter = [&](const QuantumValue &v)
+    { return v.isNative() && (!nilTest || v.asNative()->name.rfind("__method__", 0) == 0); };
+    if (isGetter(L)) L = L.asNative()->fn({});
+    if (isGetter(R)) R = R.asNative()->fn({});
 
     // A JS Date in arithmetic or ordering is its epoch ms (`Date.now() - d`,
     // `d1 < d2`), as through valueOf.
@@ -323,9 +334,16 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
             return result;
     }
 
-    // String concatenation
+    // String concatenation: an object by its toString() / __str__() (all of
+    // a value the Java way in Java-style code)
     if (op == Op::ADD && (L.isString() || R.isString()))
+    {
+        if (javaStyle_)
+            return QuantumValue(javaString(L) + javaString(R));
+        if (L.isInstance() || R.isInstance())
+            return QuantumValue(displayString(L) + displayString(R));
         return QuantumValue(L.toString() + R.toString());
+    }
 
     // Array concatenation
     if (op == Op::ADD && L.isArray() && R.isArray())
@@ -362,6 +380,23 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
         case Op::LTE: return QuantumValue(c <= 0);
         default: return QuantumValue(c >= 0);
         }
+    }
+
+    // Java-style code: a char (one-character string) in arithmetic is its
+    // code: c - '0', 'z' - c
+    if (javaStyle_ && (op == Op::SUB || op == Op::MUL || op == Op::DIV || op == Op::MOD) &&
+        ((L.isString() && L.asString().size() == 1) || (R.isString() && R.asString().size() == 1)) &&
+        (L.isNumber() || L.isString()) && (R.isNumber() || R.isString()))
+    {
+        auto code = [](const QuantumValue &v) -> QuantumValue
+        {
+            if (v.isString() && v.asString().size() == 1)
+                return QuantumValue((double)(unsigned char)v.asString()[0]);
+            return v;
+        };
+        QuantumValue a = code(L), b = code(R);
+        if (a.isNumber() && b.isNumber())
+            return execBinary(op, a, b, line);
     }
 
     // C/C++ 64-bit integers (long long, uint64_t, size_t constants): exact,
@@ -1195,6 +1230,13 @@ void VM::callClass(std::shared_ptr<QuantumClass> klass, int argCount, int line)
 QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
                                    std::vector<QuantumValue> args, int line)
 {
+    if (javaStyle_)
+    {
+        bool handled = false;
+        QuantumValue r = javaStyleMethod(obj, method, args, handled);
+        if (handled)
+            return r;
+    }
     if (obj.isNumber())
     {
         if (method == "zero")

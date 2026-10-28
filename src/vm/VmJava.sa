@@ -1146,12 +1146,25 @@ struct JavaInput
                 return false;
         }
     }
-    // The next token, without consuming it (empty at end of input).
+    // The next token, without consuming it (empty at end of input). The
+    // whitespace before it is not consumed either: after hasNext(), a
+    // nextLine() still returns the rest of the current line, as in Java.
     std::string peekToken()
     {
-        if (!skipSpace())
-            return "";
-        size_t end = pos;
+        size_t start = pos;
+        while (true)
+        {
+            while (start < buf.size() && space(buf[start]))
+                ++start;
+            if (start < buf.size())
+                break;
+            size_t before = pos;
+            if (!fill())
+                return "";
+            if (pos != before)
+                start = pos; // fill() dropped the text already read
+        }
+        size_t end = start;
         while (true)
         {
             while (end < buf.size() && !space(buf[end]))
@@ -1159,10 +1172,15 @@ struct JavaInput
             if (end < buf.size() || eof || !fill())
                 break;
         }
-        return buf.substr(pos, end - pos);
+        return buf.substr(start, end - start);
     }
     bool nextToken(std::string &out)
     {
+        if (!skipSpace())
+        {
+            out.clear();
+            return false;
+        }
         out = peekToken();
         if (out.empty())
             return false;
@@ -1536,7 +1554,7 @@ void VM::registerJavaNatives()
 
     registerJavaLibNatives(reg, this);
 
-    // ── prelude natives (`native` methods of src/java/prelude) ──
+    // ── library natives (`native` methods of the Java library, src/java/<package>/) ──
     reg("__jn_String_$format", [this, arg](std::vector<QV> a) -> QV
         {
         if (arg(a, 0).isNil())

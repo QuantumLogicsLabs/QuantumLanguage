@@ -5,8 +5,8 @@
 //
 //   .rb/.py/.js/.c/.cpp → strict single-dialect: the whole file is that
 //                         language, so its rewrites apply unconditionally.
-//   .sa                 → multi-dialect: Ruby, Python, JavaScript, C and C++
-//                         syntax may be mixed in one file, so every Ruby-only
+//   .sa                 → multi-dialect: Ruby, Python, JavaScript, C, C++ and
+//                         Java syntax may be mixed in one file, so every Ruby-only
 //                         rewrite is gated behind an ambiguity check and only
 //                         fires on lines that are not already valid in one of
 //                         the other styles.
@@ -18,6 +18,7 @@
 
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 // ─── Router ───────────────────────────────────────────────────────────────
@@ -45,6 +46,21 @@ std::string applyRubyDialect(const std::string &source, bool strict);
 // wherever a class does `include Enumerable`; every method is defined purely
 // in terms of the including class's own `each`.
 const std::vector<std::string> &rubyEnumerableModuleSource();
+
+// ─── Java dialect ─────────────────────────────────────────────────────────
+// Java-style code in a .sa file (src/dialect/JavaDialect.sa): rewritten into
+// the common syntax, with the file's line numbers kept. A file showing no
+// Java (System.out.print..., import java..., access modifiers on members,
+// implements, @Override, String[]) comes back unchanged. A rewritten file
+// ends with the marker line `// quantum: java-style`, which makes
+// compileSource() load the Java-style library (src/dialect/javastyle/).
+std::string applyJavaDialect(const std::string &source);
+bool isJavaStyleSource(const std::string &source);
+namespace javastyle
+{
+// The library's source files (src/generated/JavaStyleData.sa)
+const std::vector<std::pair<std::string, std::string>> &librarySources();
+} // namespace javastyle
 
 // ─── C/C++ dialect ────────────────────────────────────────────────────────
 // True if the source defines a function named main ("main" followed by "(",

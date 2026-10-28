@@ -611,6 +611,25 @@ Sema::Resolved Sema::resolveCall(std::vector<MethodSym *> &cands, const std::vec
         for (size_t i = 0; i < args.size(); ++i)
             if (!isPoly(args[i]) && !lowered[i].polyCall)
                 inf.unify(formalFor(i), lowered[i].type, 0);
+        // an explicitly typed lambda's parameter types are its function
+        // type's: (Task t) -> ... for a ToIntFunction<? super T> gives T = Task
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            const ExprP &a = args[i];
+            if (a->k != EK::Lambda || a->params.empty() || !a->params[0].type ||
+                a->params[0].type->kind == TypeRef::Var)
+                continue;
+            TypeP f = formalFor(i);
+            if (!f || f->k != TK::Class || !f->cls)
+                continue;
+            MethodSym *sam = functionalMethod(f->cls);
+            TypeP view = sam ? asSuper(f, sam->owner) : nullptr;
+            if (!view || sam->params.size() != a->params.size())
+                continue;
+            Subst fs = fiSubst(view);
+            for (size_t j = 0; j < sam->params.size(); ++j)
+                inf.unify(subst(sam->params[j], fs), resolveType(a->params[j].type), 1);
+        }
         Subst s = res.subst;
         auto solveAll = [&]()
         {
@@ -697,7 +716,10 @@ Sema::Resolved Sema::resolveCall(std::vector<MethodSym *> &cands, const std::vec
             if (isPoly(args[i]) || !lowered[i].polyCall)
                 continue;
             TypeP f = formalFor(i);
-            if (argOk(*this, lowered[i], f, 3))
+            // typed without a target it may fit (Comparator<Object> for a
+            // Comparator<? super String>) yet have failed inside, a lambda
+            // parameter typed Object: then its target types it again
+            if (argOk(*this, lowered[i], f, 3) && deferred[i].empty())
                 continue;
             size_t savedDiags = diags_.size();
             Val again = expr(args[i], f);
@@ -1333,9 +1355,9 @@ Val Sema::newObject(const ExprP &e, const TypeP &target)
     // library types with their own representation (String, boxes, ...)
     {
         Val lib;
+        // attributed by resolveCall, which defers a generic argument's errors
+        // until its target is known
         std::vector<Val> lowered;
-        for (auto &a : e->args)
-            lowered.push_back(isPoly(a) ? Val{} : expr(a));
         auto bn = c->binaryName;
         if (bn == "java.lang.String" || bn == "java.lang.Integer" || bn == "java.lang.Double" ||
             bn == "java.lang.Boolean" || bn == "java.lang.Float")

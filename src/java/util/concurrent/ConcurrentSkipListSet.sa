@@ -1,0 +1,9 @@
+package java.util.concurrent;
+
+import java.util.*;
+import java.util.function.*;
+
+public class ConcurrentSkipListSet<E> extends TreeSet<E> {
+    public ConcurrentSkipListSet() { super(); }
+    public ConcurrentSkipListSet(Comparator<? super E> comparator) { super(comparator); }
+}

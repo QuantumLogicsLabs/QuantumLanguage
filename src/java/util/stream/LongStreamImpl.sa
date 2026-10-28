@@ -1,0 +1,124 @@
+package java.util.stream;
+
+import java.util.*;
+import java.util.function.*;
+
+final class LongStreamImpl extends AbstractPipeline<Long> implements LongStream {
+    LongStreamImpl(Iterator<Long> source) { super(source); }
+
+    public Iterator<Long> iterator() { return take(); }
+    public LongStream sequential() { return this; }
+    public LongStream parallel() { return this; }
+    public LongStream unordered() { return this; }
+    public LongStream onClose(Runnable closeHandler) { return this; }
+
+    public LongStream filter(LongPredicate predicate) { return new LongStreamImpl(new StreamSupport.Filter<Long>(take(), x -> predicate.test(x))); }
+    public LongStream map(LongUnaryOperator mapper) { return new LongStreamImpl(new StreamSupport.Map<Long, Long>(take(), x -> mapper.applyAsLong(x))); }
+    public <U> Stream<U> mapToObj(LongFunction<? extends U> mapper) { return new RefStream<U>(new StreamSupport.Map<Long, U>(take(), x -> mapper.apply(x))); }
+    public IntStream mapToInt(LongToIntFunction mapper) { return new IntStreamImpl(new StreamSupport.Map<Long, Integer>(take(), x -> mapper.applyAsInt(x))); }
+    public DoubleStream mapToDouble(LongToDoubleFunction mapper) { return new DoubleStreamImpl(new StreamSupport.Map<Long, Double>(take(), x -> mapper.applyAsDouble(x))); }
+    public LongStream distinct() { return new LongStreamImpl(new StreamSupport.Distinct<Long>(take())); }
+
+    public LongStream sorted() {
+        ArrayList<Long> all = StreamSupport.drain(take());
+        long[] a = new long[all.size()];
+        for (int k = 0; k < a.length; k++)
+            a[k] = all.get(k);
+        Arrays.sort(a);
+        return LongStream.of(a);
+    }
+
+    public LongStream peek(LongConsumer action) { return new LongStreamImpl(new StreamSupport.Peek<Long>(take(), x -> action.accept(x))); }
+    public LongStream limit(long maxSize) { return new LongStreamImpl(new StreamSupport.Limit<Long>(take(), maxSize)); }
+    public LongStream skip(long n) { return new LongStreamImpl(new StreamSupport.Skip<Long>(take(), n)); }
+
+    public void forEach(LongConsumer action) {
+        Iterator<Long> it = take();
+        while (it.hasNext())
+            action.accept(it.next());
+    }
+
+    public long[] toArray() {
+        ArrayList<Long> all = StreamSupport.drain(take());
+        long[] a = new long[all.size()];
+        for (int i = 0; i < a.length; i++)
+            a[i] = all.get(i);
+        return a;
+    }
+
+    public long reduce(long identity, LongBinaryOperator op) {
+        long result = identity;
+        Iterator<Long> it = take();
+        while (it.hasNext())
+            result = op.applyAsLong(result, it.next());
+        return result;
+    }
+
+    public OptionalLong reduce(LongBinaryOperator op) {
+        Iterator<Long> it = take();
+        if (!it.hasNext())
+            return OptionalLong.empty();
+        long result = it.next();
+        while (it.hasNext())
+            result = op.applyAsLong(result, it.next());
+        return OptionalLong.of(result);
+    }
+
+    public long sum() { return reduce(0L, (a, b) -> a + b); }
+    public OptionalLong min() { return reduce((a, b) -> Math.min(a, b)); }
+    public OptionalLong max() { return reduce((a, b) -> Math.max(a, b)); }
+
+    public long count() {
+        long n = 0;
+        Iterator<Long> it = take();
+        while (it.hasNext()) {
+            it.next();
+            n++;
+        }
+        return n;
+    }
+
+    public OptionalDouble average() {
+        long count = 0, sum = 0;
+        Iterator<Long> it = take();
+        while (it.hasNext()) {
+            count++;
+            sum += it.next();
+        }
+        return count > 0 ? OptionalDouble.of((double) sum / count) : OptionalDouble.empty();
+    }
+
+    public LongSummaryStatistics summaryStatistics() {
+        LongSummaryStatistics s = new LongSummaryStatistics();
+        Iterator<Long> it = take();
+        while (it.hasNext())
+            s.accept((long) it.next());
+        return s;
+    }
+
+    public boolean anyMatch(LongPredicate predicate) {
+        Iterator<Long> it = take();
+        while (it.hasNext())
+            if (predicate.test(it.next()))
+                return true;
+        return false;
+    }
+
+    public boolean allMatch(LongPredicate predicate) {
+        Iterator<Long> it = take();
+        while (it.hasNext())
+            if (!predicate.test(it.next()))
+                return false;
+        return true;
+    }
+
+    public boolean noneMatch(LongPredicate predicate) { return !anyMatch(predicate); }
+
+    public OptionalLong findFirst() {
+        Iterator<Long> it = take();
+        return it.hasNext() ? OptionalLong.of(it.next()) : OptionalLong.empty();
+    }
+
+    public DoubleStream asDoubleStream() { return new DoubleStreamImpl(new StreamSupport.Map<Long, Double>(take(), x -> (double) (long) x)); }
+    public Stream<Long> boxed() { return new RefStream<Long>(take()); }
+}

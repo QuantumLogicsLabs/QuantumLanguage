@@ -1,0 +1,13 @@
+package java.util.function;
+
+import java.util.Comparator;
+import java.util.Objects;
+
+@FunctionalInterface
+public interface LongUnaryOperator {
+    long applyAsLong(long operand);
+
+    default LongUnaryOperator compose(LongUnaryOperator before) { return (long v) -> applyAsLong(before.applyAsLong(v)); }
+    default LongUnaryOperator andThen(LongUnaryOperator after) { return (long t) -> after.applyAsLong(applyAsLong(t)); }
+    static LongUnaryOperator identity() { return t -> t; }
+}

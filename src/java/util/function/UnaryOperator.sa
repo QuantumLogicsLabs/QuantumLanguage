@@ -1,0 +1,9 @@
+package java.util.function;
+
+import java.util.Comparator;
+import java.util.Objects;
+
+@FunctionalInterface
+public interface UnaryOperator<T> extends Function<T, T> {
+    static <T> UnaryOperator<T> identity() { return t -> t; }
+}

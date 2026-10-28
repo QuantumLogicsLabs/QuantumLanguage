@@ -1,0 +1,23 @@
+package java.util.concurrent.atomic;
+
+import java.util.function.*;
+
+public class AtomicIntegerArray implements java.io.Serializable {
+    private final int[] array;
+
+    public AtomicIntegerArray(int length) { array = new int[length]; }
+    public AtomicIntegerArray(int[] array) { this.array = array.clone(); }
+
+    public final int length() { return array.length; }
+    public final int get(int i) { return array[i]; }
+    public final void set(int i, int newValue) { array[i] = newValue; }
+    public final int getAndIncrement(int i) { return array[i]++; }
+    public final int incrementAndGet(int i) { return ++array[i]; }
+    public final int addAndGet(int i, int delta) { return array[i] += delta; }
+    public final int getAndAdd(int i, int delta) {
+        int old = array[i];
+        array[i] += delta;
+        return old;
+    }
+    public String toString() { return java.util.Arrays.toString(array); }
+}

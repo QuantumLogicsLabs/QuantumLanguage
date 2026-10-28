@@ -1,0 +1,52 @@
+package java.lang;
+
+public final class Double extends Number implements Comparable<Double> {
+    public static final double POSITIVE_INFINITY = 1.0 / 0.0;
+    public static final double NEGATIVE_INFINITY = -1.0 / 0.0;
+    public static final double NaN = 0.0d / 0.0;
+    public static final double MAX_VALUE = 1.7976931348623157E308;
+    public static final double MIN_NORMAL = 2.2250738585072014E-308;
+    public static final double MIN_VALUE = 4.9E-324;
+    public static final int MAX_EXPONENT = 1023;
+    public static final int MIN_EXPONENT = -1022;
+    public static final int SIZE = 64;
+    public static final int BYTES = 8;
+
+    public Double(double value) {}
+    public Double(String s) throws NumberFormatException {}
+
+    public static Double valueOf(double d) { return d; }
+    public static Double valueOf(String s) throws NumberFormatException { return parseDouble(s); }
+    public static native double parseDouble(String s) throws NumberFormatException;
+    public static String toString(double d) { return "" + d; }
+    public static String toHexString(double d) { return "0x" + Long.toHexString(doubleToLongBits(d)); }
+    public static boolean isNaN(double v) { return v != v; }
+    public static boolean isInfinite(double v) { return v == POSITIVE_INFINITY || v == NEGATIVE_INFINITY; }
+    public static boolean isFinite(double d) { return Math.abs(d) <= MAX_VALUE; }
+    public static native int compare(double d1, double d2);
+    public static double max(double a, double b) { return Math.max(a, b); }
+    public static double min(double a, double b) { return Math.min(a, b); }
+    public static double sum(double a, double b) { return a + b; }
+    public static native long doubleToLongBits(double value);
+    public static long doubleToRawLongBits(double value) { return doubleToLongBits(value); }
+    public static native double longBitsToDouble(long bits);
+    public static int hashCode(double value) {
+        long bits = doubleToLongBits(value);
+        return (int) (bits ^ (bits >>> 32));
+    }
+
+    public double doubleValue() { return this; }
+    public int intValue() { return (int) (double) this; }
+    public long longValue() { return (long) (double) this; }
+    public float floatValue() { return (float) (double) this; }
+    public byte byteValue() { return (byte) (double) this; }
+    public short shortValue() { return (short) (double) this; }
+    public boolean isNaN() { return isNaN(this); }
+    public boolean isInfinite() { return isInfinite(this); }
+    public int compareTo(Double anotherDouble) { return compare(this, anotherDouble); }
+    public boolean equals(Object obj) {
+        return obj instanceof Double && doubleToLongBits((Double) obj) == doubleToLongBits(this);
+    }
+    public int hashCode() { return hashCode((double) this); }
+    public String toString() { return toString((double) this); }
+}

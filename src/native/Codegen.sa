@@ -1845,7 +1845,12 @@ void Gen::layoutClass(ClassInfo *c)
     {
         while (data.size() % 8)
             data.push_back('\0');
+        // the 8 bytes before the table: the base class's table (0 for a root),
+        // the chain dynamic_cast walks
+        data.append(8, '\0');
         c->vtableOff = (int)data.size();
+        if (c->base && c->base->polymorphic)
+            dataPtrs.push_back({c->vtableOff - 8, c->base->vtableOff});
         data.append(8 * c->vslots.size(), '\0'); // filled once the code is placed
     }
     // destructors: a user one, or one generated to destroy members and the base
@@ -7009,6 +7014,57 @@ void Gen::construct(const ThisSrc &self, ClassInfo *c, const std::vector<cpp::Ex
     }
     if (braced)
     {
+        // T{{a, b}}: a list of one element when the inner list makes one
+        // (vector<pair<K, V>>{{k, v}}); otherwise the inner list's items, as
+        // for vector<int>{{1, 2, 3}}
+        if (args.size() == 1 && args[0]->k == cpp::EK::InitList)
+            for (Method *m : c->ctors)
+            {
+                if (m->params.size() != 1)
+                    continue;
+                NT p = m->params[0]->cat == C_REF ? m->params[0]->elem : m->params[0];
+                if (p->cat != C_CLASS || p->cls->templateName != "initializer_list" || !p->cls->bind ||
+                    p->cls->bind->types.empty())
+                    continue;
+                NT el = p->cls->bind->types.begin()->second;
+                const std::vector<cpp::ExprP> &inner = args[0]->kids;
+                bool itemsAreElements = true;
+                for (const cpp::ExprP &x : inner)
+                    if (x->k != cpp::EK::InitList && argCost(el, x, typeOfExpr(x)) < 0)
+                        itemsAreElements = false;
+                // the element from the inner list: an aggregate or a constructor
+                // that is not a template ({first, last} is an iterator range for
+                // the container's own constructor)
+                bool buildsElement = false;
+                if (el->cat == C_CLASS && !itemsAreElements)
+                {
+                    ClassInfo *ec = el->cls;
+                    if (noCtors(ec) && !ec->polymorphic)
+                        buildsElement = ec->fields.size() >= inner.size();
+                    for (Method *k : ec->ctors)
+                    {
+                        if (k->params.size() == 1)
+                        {
+                            NT lp = k->params[0]->cat == C_REF ? k->params[0]->elem : k->params[0];
+                            if (lp->cat == C_CLASS && lp->cls->templateName == "initializer_list" &&
+                                listBuilds(lp->cls, inner))
+                                buildsElement = true;
+                        }
+                        if (k->params.size() < inner.size())
+                            continue;
+                        bool ok = true;
+                        for (size_t i = 0; ok && i < k->params.size(); ++i)
+                            ok = i < inner.size() ? (inner[i]->k == cpp::EK::InitList ||
+                                                     argCost(k->params[i], inner[i], typeOfExpr(inner[i])) >= 0)
+                                                  : k->defaults[i] != nullptr;
+                        if (ok)
+                            buildsElement = true;
+                    }
+                }
+                if (buildsElement && initListCtor(self, c, args, line))
+                    return;
+                break;
+            }
         std::vector<cpp::ExprP> items = args;
         if (items.size() == 1 && items[0]->k == cpp::EK::InitList)
             items = items[0]->kids;
@@ -7536,6 +7592,26 @@ NT Gen::expr(const cpp::ExprP &e)
         NT from = expr(src);
         if (t->cat == C_VOID)
             return t;
+        if (e->op == "dynamic_cast" && t->cat == C_PTR && from->cat == C_PTR && t->elem->cat == C_CLASS &&
+            t->elem->cls->polymorphic &&
+            !(from->elem->cat == C_CLASS && derivesFrom(from->elem->cls, t->elem->cls)))
+        {
+            // a downcast: the object's vtable, or one of its bases', is the target's
+            int loop = a.newLabel(), done = a.newLabel();
+            a.test(RAX, RAX);
+            a.jcc(CC_E, done);
+            a.loadInd(RCX, RAX);
+            a.leaData(RDX, t->elem->cls->vtableOff);
+            a.bind(loop);
+            a.alu(0x39, RCX, RDX);
+            a.jcc(CC_E, done);
+            a.loadDisp(RCX, RCX, -8);
+            a.test(RCX, RCX);
+            a.jcc(CC_NE, loop);
+            a.movImm(RAX, 0);
+            a.bind(done);
+            return t;
+        }
         if (t->cat == C_PTR && (from->cat == C_PTR || from->cat == C_INT))
             return t; // a pointer cast reinterprets
         if (t->cat == C_INT && from->cat == C_PTR)
@@ -8087,7 +8163,9 @@ void Gen::stmt(const cpp::StmtP &s)
                 init = list;
             }
             std::vector<cpp::ExprP> args = d.args;
-            if (braced && args.size() == 1 && args[0]->k == cpp::EK::InitList)
+            // (an object's construct() reads T x{{a, b}} itself: one element
+            // {a, b} of an initializer_list, or the items a, b)
+            if (braced && args.size() == 1 && args[0]->k == cpp::EK::InitList && t->cat != C_CLASS)
                 args = args[0]->kids;
             declare(d.name, t, init, braced, args, s->line);
         }

@@ -1,0 +1,61 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public final class StringJoiner {
+    private final String prefix;
+    private final String delimiter;
+    private final String suffix;
+    private StringBuilder value;
+    private String emptyValue;
+
+    public StringJoiner(CharSequence delimiter) { this(delimiter, "", ""); }
+
+    public StringJoiner(CharSequence delimiter, CharSequence prefix, CharSequence suffix) {
+        Objects.requireNonNull(prefix, "The prefix must not be null");
+        Objects.requireNonNull(delimiter, "The delimiter must not be null");
+        Objects.requireNonNull(suffix, "The suffix must not be null");
+        this.prefix = prefix.toString();
+        this.delimiter = delimiter.toString();
+        this.suffix = suffix.toString();
+        this.emptyValue = this.prefix + this.suffix;
+    }
+
+    public StringJoiner setEmptyValue(CharSequence emptyValue) {
+        this.emptyValue = Objects.requireNonNull(emptyValue, "The empty value must not be null").toString();
+        return this;
+    }
+
+    public String toString() {
+        if (value == null)
+            return emptyValue;
+        if (suffix.isEmpty())
+            return value.toString();
+        return value.toString() + suffix;
+    }
+
+    public StringJoiner add(CharSequence newElement) {
+        if (value != null)
+            value.append(delimiter);
+        else
+            value = new StringBuilder().append(prefix);
+        value.append(String.valueOf(newElement));
+        return this;
+    }
+
+    public StringJoiner merge(StringJoiner other) {
+        Objects.requireNonNull(other);
+        if (other.value != null) {
+            String content = other.value.substring(other.prefix.length());
+            if (value != null)
+                value.append(delimiter);
+            else
+                value = new StringBuilder().append(prefix);
+            value.append(content);
+        }
+        return this;
+    }
+
+    public int length() { return (value != null ? value.length() + suffix.length() : emptyValue.length()); }
+}

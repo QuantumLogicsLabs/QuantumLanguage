@@ -1,0 +1,132 @@
+package java.io;
+
+// System.out / System.err, or a PrintStream over another stream.
+public class PrintStream extends OutputStream implements Appendable, Closeable {
+    private final OutputStream out; // null: the console
+    private final boolean err;
+    private final boolean autoFlush;
+    private boolean trouble;
+
+    private PrintStream(boolean err, int dummy) {
+        this.out = null;
+        this.err = err;
+        this.autoFlush = true;
+    }
+
+    public static PrintStream $console(boolean err) { return new PrintStream(err, 0); }
+
+    public PrintStream(OutputStream out) { this(out, false); }
+
+    public PrintStream(OutputStream out, boolean autoFlush) {
+        this.out = java.util.Objects.requireNonNull(out, "Null output stream");
+        this.err = false;
+        this.autoFlush = autoFlush;
+    }
+
+    public PrintStream(OutputStream out, boolean autoFlush, String encoding) { this(out, autoFlush); }
+
+    private void text(String s) {
+        if (out == null) {
+            if (err)
+                System.err.print(s);
+            else
+                System.out.print(s);
+            return;
+        }
+        try {
+            out.$text(s);
+        } catch (IOException e) {
+            trouble = true;
+        }
+    }
+
+    public void write(int b) {
+        if (out == null) {
+            $Console.write(err, b);
+            return;
+        }
+        try {
+            out.write(b);
+        } catch (IOException e) {
+            trouble = true;
+        }
+    }
+
+    public void write(byte[] buf, int off, int len) {
+        for (int i = 0; i < len; i++)
+            write(buf[off + i]);
+    }
+
+    public void flush() {
+        if (out == null) {
+            System.out.flush();
+            return;
+        }
+        try {
+            out.flush();
+        } catch (IOException e) {
+            trouble = true;
+        }
+    }
+
+    public void close() { flush(); }
+    public boolean checkError() {
+        flush();
+        return trouble;
+    }
+
+    public void print(boolean b) { text(String.valueOf(b)); }
+    public void print(char c) { text(String.valueOf(c)); }
+    public void print(int i) { text(String.valueOf(i)); }
+    public void print(long l) { text(String.valueOf(l)); }
+    public void print(float f) { text(String.valueOf(f)); }
+    public void print(double d) { text(String.valueOf(d)); }
+    public void print(char[] s) { text(new String(s)); }
+    public void print(String s) { text(String.valueOf(s)); }
+    public void print(Object obj) { text(String.valueOf(obj)); }
+
+    public void println() { text("\n"); }
+    public void println(boolean x) { text(String.valueOf(x) + "\n"); }
+    public void println(char x) { text(String.valueOf(x) + "\n"); }
+    public void println(int x) { text(String.valueOf(x) + "\n"); }
+    public void println(long x) { text(String.valueOf(x) + "\n"); }
+    public void println(float x) { text(String.valueOf(x) + "\n"); }
+    public void println(double x) { text(String.valueOf(x) + "\n"); }
+    public void println(char[] x) { text(new String(x) + "\n"); }
+    public void println(String x) { text(String.valueOf(x) + "\n"); }
+    public void println(Object x) { text(String.valueOf(x) + "\n"); }
+
+    public PrintStream printf(String format, Object... args) {
+        text(String.format(format, args));
+        return this;
+    }
+
+    public PrintStream printf(java.util.Locale l, String format, Object... args) {
+        text(String.format(format, args));
+        return this;
+    }
+
+    public PrintStream format(String format, Object... args) { return printf(format, args); }
+    public PrintStream format(java.util.Locale l, String format, Object... args) { return printf(format, args); }
+
+    public PrintStream append(CharSequence csq) {
+        print(String.valueOf(csq));
+        return this;
+    }
+
+    public PrintStream append(CharSequence csq, int start, int end) {
+        if (csq == null)
+            csq = "null";
+        return append(csq.subSequence(start, end));
+    }
+
+    public PrintStream append(char c) {
+        print(c);
+        return this;
+    }
+}
+
+public final class $Console {
+    private $Console() {}
+    public static native void write(boolean err, int b); // one raw byte to stdout / stderr
+}

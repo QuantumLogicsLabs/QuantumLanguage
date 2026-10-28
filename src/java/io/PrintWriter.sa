@@ -1,0 +1,156 @@
+package java.io;
+
+public class PrintWriter extends Writer {
+    protected Writer out;
+    private final boolean autoFlush;
+    private boolean trouble = false;
+
+    public PrintWriter(Writer out) { this(out, false); }
+
+    public PrintWriter(Writer out, boolean autoFlush) {
+        this.out = java.util.Objects.requireNonNull(out);
+        this.autoFlush = autoFlush;
+    }
+
+    public PrintWriter(OutputStream out) { this(out, false); }
+    public PrintWriter(OutputStream out, boolean autoFlush) { this(new BufferedWriter(new OutputStreamWriter(out)), autoFlush); }
+
+    public void flush() {
+        try {
+            out.flush();
+        } catch (IOException x) {
+            trouble = true;
+        }
+    }
+
+    public void close() {
+        try {
+            out.close();
+        } catch (IOException x) {
+            trouble = true;
+        }
+    }
+
+    public boolean checkError() {
+        flush();
+        return trouble;
+    }
+
+    public void write(int c) {
+        try {
+            out.write(c);
+        } catch (IOException x) {
+            trouble = true;
+        }
+    }
+
+    public void write(char[] buf, int off, int len) {
+        try {
+            out.write(buf, off, len);
+        } catch (IOException x) {
+            trouble = true;
+        }
+    }
+
+    public void write(char[] buf) { write(buf, 0, buf.length); }
+
+    public void write(String s, int off, int len) {
+        try {
+            out.write(s, off, len);
+        } catch (IOException x) {
+            trouble = true;
+        }
+    }
+
+    public void write(String s) { write(s, 0, s.length()); }
+
+    private void newLine() {
+        write("\n");
+        if (autoFlush)
+            flush();
+    }
+
+    public void print(boolean b) { write(String.valueOf(b)); }
+    public void print(char c) { write(String.valueOf(c)); }
+    public void print(int i) { write(String.valueOf(i)); }
+    public void print(long l) { write(String.valueOf(l)); }
+    public void print(float f) { write(String.valueOf(f)); }
+    public void print(double d) { write(String.valueOf(d)); }
+    public void print(char[] s) { write(s); }
+    public void print(String s) { write(String.valueOf(s)); }
+    public void print(Object obj) { write(String.valueOf(obj)); }
+
+    public void println() { newLine(); }
+
+    public void println(boolean x) {
+        print(x);
+        newLine();
+    }
+
+    public void println(char x) {
+        print(x);
+        newLine();
+    }
+
+    public void println(int x) {
+        print(x);
+        newLine();
+    }
+
+    public void println(long x) {
+        print(x);
+        newLine();
+    }
+
+    public void println(float x) {
+        print(x);
+        newLine();
+    }
+
+    public void println(double x) {
+        print(x);
+        newLine();
+    }
+
+    public void println(char[] x) {
+        print(x);
+        newLine();
+    }
+
+    public void println(String x) {
+        print(x);
+        newLine();
+    }
+
+    public void println(Object x) {
+        print(String.valueOf(x));
+        newLine();
+    }
+
+    public PrintWriter printf(String format, Object... args) {
+        write(String.format(format, args));
+        if (autoFlush)
+            flush();
+        return this;
+    }
+
+    public PrintWriter printf(java.util.Locale l, String format, Object... args) { return printf(format, args); }
+    public PrintWriter format(String format, Object... args) { return printf(format, args); }
+    public PrintWriter format(java.util.Locale l, String format, Object... args) { return printf(format, args); }
+
+    public PrintWriter append(CharSequence csq) {
+        write(String.valueOf(csq));
+        return this;
+    }
+
+    public PrintWriter append(CharSequence csq, int start, int end) {
+        if (csq == null)
+            csq = "null";
+        return append(csq.subSequence(start, end));
+    }
+
+    public PrintWriter append(char c) {
+        write(c);
+        return this;
+    }
+}

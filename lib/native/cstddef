@@ -1,2 +1,0 @@
-// <cstddef> for Quantum's native backend (size_t, ptrdiff_t are built in).
-#pragma once

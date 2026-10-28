@@ -1,0 +1,196 @@
+package java.lang;
+
+public final class Character implements java.io.Serializable, Comparable<Character> {
+    public static final char MIN_VALUE = '\u0000';
+    public static final char MAX_VALUE = '￿';
+    public static final int MIN_RADIX = 2;
+    public static final int MAX_RADIX = 36;
+    public static final int MIN_CODE_POINT = 0;
+    public static final int MAX_CODE_POINT = 0x10FFFF;
+    public static final int MIN_SUPPLEMENTARY_CODE_POINT = 0x010000;
+    public static final char MIN_HIGH_SURROGATE = '\uD800';
+    public static final char MAX_HIGH_SURROGATE = '\uDBFF';
+    public static final char MIN_LOW_SURROGATE = '\uDC00';
+    public static final char MAX_LOW_SURROGATE = '\uDFFF';
+    public static final char MIN_SURROGATE = '\uD800';
+    public static final char MAX_SURROGATE = '\uDFFF';
+    public static final int SIZE = 16;
+    public static final int BYTES = 2;
+    // Unicode general categories (getType)
+    public static final byte UNASSIGNED = 0;
+    public static final byte UPPERCASE_LETTER = 1;
+    public static final byte LOWERCASE_LETTER = 2;
+    public static final byte TITLECASE_LETTER = 3;
+    public static final byte MODIFIER_LETTER = 4;
+    public static final byte OTHER_LETTER = 5;
+    public static final byte NON_SPACING_MARK = 6;
+    public static final byte ENCLOSING_MARK = 7;
+    public static final byte COMBINING_SPACING_MARK = 8;
+    public static final byte DECIMAL_DIGIT_NUMBER = 9;
+    public static final byte LETTER_NUMBER = 10;
+    public static final byte OTHER_NUMBER = 11;
+    public static final byte SPACE_SEPARATOR = 12;
+    public static final byte LINE_SEPARATOR = 13;
+    public static final byte PARAGRAPH_SEPARATOR = 14;
+    public static final byte CONTROL = 15;
+    public static final byte FORMAT = 16;
+    public static final byte PRIVATE_USE = 18;
+    public static final byte SURROGATE = 19;
+    public static final byte DASH_PUNCTUATION = 20;
+    public static final byte START_PUNCTUATION = 21;
+    public static final byte END_PUNCTUATION = 22;
+    public static final byte CONNECTOR_PUNCTUATION = 23;
+    public static final byte OTHER_PUNCTUATION = 24;
+    public static final byte MATH_SYMBOL = 25;
+    public static final byte CURRENCY_SYMBOL = 26;
+    public static final byte MODIFIER_SYMBOL = 27;
+    public static final byte OTHER_SYMBOL = 28;
+    public static final byte INITIAL_QUOTE_PUNCTUATION = 29;
+    public static final byte FINAL_QUOTE_PUNCTUATION = 30;
+    private final char value;
+
+    public Character(char value) { this.value = value; }
+
+    // Exact for ASCII and Latin-1 punctuation / symbols; beyond that, from
+    // the letter / digit / space tests (other symbols count as OTHER_SYMBOL).
+    public static int getType(char ch) {
+        if (ch < 0x20 || (ch >= 0x7F && ch <= 0x9F))
+            return CONTROL;
+        if (ch < 0x7F) {
+            switch (ch) {
+                case ' ': return SPACE_SEPARATOR;
+                case '-': return DASH_PUNCTUATION;
+                case '(': case '[': case '{': return START_PUNCTUATION;
+                case ')': case ']': case '}': return END_PUNCTUATION;
+                case '_': return CONNECTOR_PUNCTUATION;
+                case '+': case '<': case '=': case '>': case '|': case '~': return MATH_SYMBOL;
+                case '$': return CURRENCY_SYMBOL;
+                case '^': case '`': return MODIFIER_SYMBOL;
+            }
+            if (ch >= '0' && ch <= '9')
+                return DECIMAL_DIGIT_NUMBER;
+            if (ch >= 'A' && ch <= 'Z')
+                return UPPERCASE_LETTER;
+            if (ch >= 'a' && ch <= 'z')
+                return LOWERCASE_LETTER;
+            return OTHER_PUNCTUATION;
+        }
+        if (isSurrogate(ch))
+            return SURROGATE;
+        if (ch == ' ')
+            return LINE_SEPARATOR;
+        if (ch == ' ')
+            return PARAGRAPH_SEPARATOR;
+        if (isSpaceChar(ch))
+            return SPACE_SEPARATOR;
+        if (isDigit(ch))
+            return DECIMAL_DIGIT_NUMBER;
+        if (isUpperCase(ch))
+            return UPPERCASE_LETTER;
+        if (isLowerCase(ch))
+            return LOWERCASE_LETTER;
+        if (isLetter(ch))
+            return OTHER_LETTER;
+        switch (ch) {
+            case '¡': case '§': case '¶': case '·': case '¿': return OTHER_PUNCTUATION;
+            case '«': return INITIAL_QUOTE_PUNCTUATION;
+            case '»': return FINAL_QUOTE_PUNCTUATION;
+            case '­': return FORMAT;
+            case '¢': case '£': case '¤': case '¥': return CURRENCY_SYMBOL;
+            case '¬': case '±': case '×': case '÷': return MATH_SYMBOL;
+            case '¨': case '¯': case '´': case '¸': return MODIFIER_SYMBOL;
+            case '²': case '³': case '¹': case '¼': case '½': case '¾': return OTHER_NUMBER;
+        }
+        return OTHER_SYMBOL;
+    }
+
+    public static int getType(int codePoint) { return getType((char) codePoint); }
+
+    public static Character valueOf(char c) { return c; }
+    public static native boolean isDigit(char ch);
+    public static native boolean isDigit(int codePoint);
+    public static native boolean isLetter(char ch);
+    public static native boolean isLetter(int codePoint);
+    public static native boolean isLetterOrDigit(char ch);
+    public static native boolean isLetterOrDigit(int codePoint);
+    public static native boolean isAlphabetic(int codePoint);
+    public static native boolean isUpperCase(char ch);
+    public static native boolean isUpperCase(int codePoint);
+    public static native boolean isLowerCase(char ch);
+    public static native boolean isLowerCase(int codePoint);
+    public static native boolean isWhitespace(char ch);
+    public static native boolean isWhitespace(int codePoint);
+    public static native boolean isSpaceChar(char ch);
+    public static native char toUpperCase(char ch);
+    public static native int toUpperCase(int codePoint);
+    public static native char toLowerCase(char ch);
+    public static native int toLowerCase(int codePoint);
+    public static char toTitleCase(char ch) { return toUpperCase(ch); }
+
+    public static int getNumericValue(char ch) {
+        if (ch >= '0' && ch <= '9')
+            return ch - '0';
+        if (ch >= 'a' && ch <= 'z')
+            return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'Z')
+            return ch - 'A' + 10;
+        return isDigit(ch) ? 0 : -1;
+    }
+
+    public static int getNumericValue(int codePoint) { return getNumericValue((char) codePoint); }
+
+    public static int digit(char ch, int radix) {
+        if (radix < MIN_RADIX || radix > MAX_RADIX)
+            return -1;
+        int v = -1;
+        if (ch >= '0' && ch <= '9')
+            v = ch - '0';
+        else if (ch >= 'a' && ch <= 'z')
+            v = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'Z')
+            v = ch - 'A' + 10;
+        return v < radix ? v : -1;
+    }
+
+    public static int digit(int codePoint, int radix) { return digit((char) codePoint, radix); }
+
+    public static char forDigit(int digit, int radix) {
+        if (digit >= radix || digit < 0 || radix < MIN_RADIX || radix > MAX_RADIX)
+            return '\0';
+        if (digit < 10)
+            return (char) ('0' + digit);
+        return (char) ('a' - 10 + digit);
+    }
+
+    public static boolean isDefined(char ch) { return true; }
+    public static boolean isISOControl(char ch) { return ch <= 0x1F || (ch >= 0x7F && ch <= 0x9F); }
+    public static boolean isSurrogate(char ch) { return ch >= MIN_SURROGATE && ch <= MAX_SURROGATE; }
+    public static boolean isHighSurrogate(char ch) { return ch >= MIN_HIGH_SURROGATE && ch <= MAX_HIGH_SURROGATE; }
+    public static boolean isLowSurrogate(char ch) { return ch >= MIN_LOW_SURROGATE && ch <= MAX_LOW_SURROGATE; }
+    public static boolean isValidCodePoint(int codePoint) { return codePoint >= 0 && codePoint <= MAX_CODE_POINT; }
+    public static boolean isBmpCodePoint(int codePoint) { return codePoint >>> 16 == 0; }
+    public static boolean isSupplementaryCodePoint(int codePoint) { return codePoint >= MIN_SUPPLEMENTARY_CODE_POINT && codePoint <= MAX_CODE_POINT; }
+    public static int charCount(int codePoint) { return codePoint >= MIN_SUPPLEMENTARY_CODE_POINT ? 2 : 1; }
+    public static int toCodePoint(char high, char low) { return ((high - MIN_HIGH_SURROGATE) << 10) + (low - MIN_LOW_SURROGATE) + MIN_SUPPLEMENTARY_CODE_POINT; }
+    public static boolean isJavaIdentifierStart(char ch) { return isLetter(ch) || ch == '$' || ch == '_'; }
+    public static boolean isJavaIdentifierPart(char ch) { return isLetterOrDigit(ch) || ch == '$' || ch == '_'; }
+
+    public static char[] toChars(int codePoint) {
+        if (codePoint < MIN_SUPPLEMENTARY_CODE_POINT)
+            return new char[] {(char) codePoint};
+        int c = codePoint - MIN_SUPPLEMENTARY_CODE_POINT;
+        return new char[] {(char) ((c >>> 10) + MIN_HIGH_SURROGATE), (char) ((c & 0x3ff) + MIN_LOW_SURROGATE)};
+    }
+
+    public static String toString(char c) { return String.valueOf(c); }
+    public static String toString(int codePoint) { return new String(toChars(codePoint)); }
+    public static int compare(char x, char y) { return x - y; }
+    public static int hashCode(char value) { return value; }
+    public static char reverseBytes(char ch) { return (char) (((ch & 0xFF00) >> 8) | (ch << 8)); }
+
+    public char charValue() { return value; }
+    public int compareTo(Character anotherCharacter) { return compare(this.value, anotherCharacter.value); }
+    public boolean equals(Object obj) { return obj instanceof Character && value == ((Character) obj).value; }
+    public int hashCode() { return value; }
+    public String toString() { return String.valueOf(value); }
+}

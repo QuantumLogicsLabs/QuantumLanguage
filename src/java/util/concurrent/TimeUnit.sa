@@ -1,0 +1,27 @@
+package java.util.concurrent;
+
+import java.util.*;
+import java.util.function.*;
+
+public enum TimeUnit {
+    NANOSECONDS, MICROSECONDS, MILLISECONDS, SECONDS, MINUTES, HOURS, DAYS;
+
+    private long scale() {
+        switch (this) {
+            case NANOSECONDS: return 1L;
+            case MICROSECONDS: return 1000L;
+            case MILLISECONDS: return 1000000L;
+            case SECONDS: return 1000000000L;
+            case MINUTES: return 60000000000L;
+            case HOURS: return 3600000000000L;
+            default: return 86400000000000L;
+        }
+    }
+
+    public long toNanos(long d) { return d * scale(); }
+    public long toMillis(long d) { return d * scale() / 1000000L; }
+    public long toSeconds(long d) { return d * scale() / 1000000000L; }
+    public long toMinutes(long d) { return d * scale() / 60000000000L; }
+    public long convert(long sourceDuration, TimeUnit sourceUnit) { return sourceDuration * sourceUnit.scale() / scale(); }
+    public void sleep(long timeout) throws InterruptedException { Thread.sleep(toMillis(timeout)); }
+}

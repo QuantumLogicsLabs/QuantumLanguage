@@ -1,0 +1,16 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public interface SortedSet<E> extends Set<E>, SequencedSet<E> {
+    Comparator<? super E> comparator();
+    SortedSet<E> subSet(E fromElement, E toElement);
+    SortedSet<E> headSet(E toElement);
+    SortedSet<E> tailSet(E fromElement);
+    E first();
+    E last();
+
+    default E getFirst() { return this.first(); }
+    default E getLast() { return this.last(); }
+}

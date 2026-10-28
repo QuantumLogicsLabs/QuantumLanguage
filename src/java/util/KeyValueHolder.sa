@@ -1,0 +1,30 @@
+package java.util;
+
+import java.util.function.*;
+
+// An immutable entry (Map.entry, Map.Entry.copyOf).
+final class KeyValueHolder<K, V> implements Map.Entry<K, V> {
+    final K key;
+    final V value;
+
+    KeyValueHolder(K k, V v) {
+        key = Objects.requireNonNull(k);
+        value = Objects.requireNonNull(v);
+    }
+
+    KeyValueHolder(Map.Entry<K, V> e) {
+        key = e.getKey();
+        value = e.getValue();
+    }
+
+    public K getKey() { return key; }
+    public V getValue() { return value; }
+    public V setValue(V value) { throw new UnsupportedOperationException("not supported"); }
+
+    public boolean equals(Object o) {
+        return o instanceof Map.Entry<?, ?> e && key.equals(e.getKey()) && value.equals(e.getValue());
+    }
+
+    public int hashCode() { return key.hashCode() ^ value.hashCode(); }
+    public String toString() { return key + "=" + value; }
+}

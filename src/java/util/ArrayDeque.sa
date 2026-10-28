@@ -1,0 +1,299 @@
+package java.util;
+
+import java.util.function.*;
+
+public class ArrayDeque<E> extends AbstractCollection<E> implements Deque<E>, Cloneable, java.io.Serializable {
+    transient Object[] elements;
+    transient int head;
+    transient int tail;
+
+    public ArrayDeque() { elements = new Object[16 + 1]; }
+
+    public ArrayDeque(int numElements) {
+        elements = new Object[(numElements < 1) ? 1 : (numElements == Integer.MAX_VALUE) ? Integer.MAX_VALUE : numElements + 1];
+    }
+
+    public ArrayDeque(Collection<? extends E> c) {
+        this(c.size());
+        for (E e : c)
+            addLast(e);
+    }
+
+    private void grow(int needed) {
+        final int oldCapacity = elements.length;
+        int jump = (oldCapacity < 64) ? oldCapacity + 2 : oldCapacity >> 1;
+        int newCapacity = oldCapacity + Math.max(jump, needed);
+        final Object[] es = elements = java.util.Arrays.copyOf(elements, newCapacity);
+        if (tail < head || (tail == head && es[head] != null)) {
+            int newSpace = newCapacity - oldCapacity;
+            System.arraycopy(es, head, es, head + newSpace, oldCapacity - head);
+            for (int i = head, to = (head += newSpace); i < to; i++)
+                es[i] = null;
+        }
+    }
+
+    static final int inc(int i, int modulus) {
+        if (++i >= modulus)
+            i = 0;
+        return i;
+    }
+
+    static final int dec(int i, int modulus) {
+        if (--i < 0)
+            i = modulus - 1;
+        return i;
+    }
+
+    static final int sub(int i, int j, int modulus) {
+        if ((i -= j) < 0)
+            i += modulus;
+        return i;
+    }
+
+    @SuppressWarnings("unchecked")
+    static final <E> E elementAt(Object[] es, int i) { return (E) es[i]; }
+
+    public void addFirst(E e) {
+        if (e == null)
+            throw new NullPointerException();
+        final Object[] es = elements;
+        es[head = dec(head, es.length)] = e;
+        if (head == tail)
+            grow(1);
+    }
+
+    public void addLast(E e) {
+        if (e == null)
+            throw new NullPointerException();
+        final Object[] es = elements;
+        es[tail] = e;
+        if (head == (tail = inc(tail, es.length)))
+            grow(1);
+    }
+
+    public boolean offerFirst(E e) {
+        addFirst(e);
+        return true;
+    }
+
+    public boolean offerLast(E e) {
+        addLast(e);
+        return true;
+    }
+
+    public E removeFirst() {
+        E e = pollFirst();
+        if (e == null)
+            throw new NoSuchElementException();
+        return e;
+    }
+
+    public E removeLast() {
+        E e = pollLast();
+        if (e == null)
+            throw new NoSuchElementException();
+        return e;
+    }
+
+    public E pollFirst() {
+        final Object[] es;
+        final int h;
+        E e = elementAt(es = elements, h = head);
+        if (e != null) {
+            es[h] = null;
+            head = inc(h, es.length);
+        }
+        return e;
+    }
+
+    public E pollLast() {
+        final Object[] es;
+        final int t;
+        E e = elementAt(es = elements, t = dec(tail, es.length));
+        if (e != null)
+            es[tail = t] = null;
+        return e;
+    }
+
+    public E getFirst() {
+        E e = elementAt(elements, head);
+        if (e == null)
+            throw new NoSuchElementException();
+        return e;
+    }
+
+    public E getLast() {
+        final Object[] es = elements;
+        E e = elementAt(es, dec(tail, es.length));
+        if (e == null)
+            throw new NoSuchElementException();
+        return e;
+    }
+
+    public E peekFirst() { return elementAt(elements, head); }
+    public E peekLast() {
+        final Object[] es = elements;
+        return elementAt(es, dec(tail, es.length));
+    }
+
+    public boolean removeFirstOccurrence(Object o) {
+        if (o != null) {
+            final Object[] es = elements;
+            for (int i = head; i != tail; i = inc(i, es.length))
+                if (o.equals(es[i])) {
+                    delete(i);
+                    return true;
+                }
+        }
+        return false;
+    }
+
+    public boolean removeLastOccurrence(Object o) {
+        if (o != null) {
+            final Object[] es = elements;
+            for (int i = dec(tail, es.length); i != dec(head, es.length); i = dec(i, es.length))
+                if (o.equals(es[i])) {
+                    delete(i);
+                    return true;
+                }
+        }
+        return false;
+    }
+
+    public boolean add(E e) {
+        addLast(e);
+        return true;
+    }
+
+    public boolean offer(E e) { return offerLast(e); }
+    public E remove() { return removeFirst(); }
+    public E poll() { return pollFirst(); }
+    public E element() { return getFirst(); }
+    public E peek() { return peekFirst(); }
+    public void push(E e) { addFirst(e); }
+    public E pop() { return removeFirst(); }
+
+    // removes elements[i], shifting the shorter side over it
+    boolean delete(int i) {
+        final Object[] es = elements;
+        final int capacity = es.length;
+        final int h = head, t = tail;
+        final int front = sub(i, h, capacity);
+        final int back = sub(t, i, capacity) - 1;
+        if (front < back) {
+            for (int k = i; k != h; ) {
+                int p = dec(k, capacity);
+                es[k] = es[p];
+                k = p;
+            }
+            es[h] = null;
+            head = inc(h, capacity);
+            return false;
+        } else {
+            tail = dec(t, capacity);
+            for (int k = i; k != tail; ) {
+                int n = inc(k, capacity);
+                es[k] = es[n];
+                k = n;
+            }
+            es[tail] = null;
+            return true;
+        }
+    }
+
+    public int size() { return sub(tail, head, elements.length); }
+    public boolean isEmpty() { return head == tail; }
+
+    public Iterator<E> iterator() { return new DeqIterator(); }
+    public Iterator<E> descendingIterator() { return new DescendingIterator(); }
+
+    private class DeqIterator implements Iterator<E> {
+        int cursor;
+        int remaining = size();
+        int lastRet = -1;
+
+        DeqIterator() { cursor = head; }
+
+        public final boolean hasNext() { return remaining > 0; }
+
+        public E next() {
+            if (remaining <= 0)
+                throw new NoSuchElementException();
+            final Object[] es = elements;
+            E e = elementAt(es, cursor);
+            if (e == null)
+                throw new ConcurrentModificationException();
+            cursor = inc(lastRet = cursor, es.length);
+            remaining--;
+            return e;
+        }
+
+        public final void remove() {
+            if (lastRet < 0)
+                throw new IllegalStateException();
+            if (delete(lastRet))
+                cursor = dec(cursor, elements.length);
+            lastRet = -1;
+        }
+    }
+
+    private class DescendingIterator implements Iterator<E> {
+        int cursor;
+        int remaining = size();
+        int lastRet = -1;
+
+        DescendingIterator() { cursor = dec(tail, elements.length); }
+
+        public final boolean hasNext() { return remaining > 0; }
+
+        public E next() {
+            if (remaining <= 0)
+                throw new NoSuchElementException();
+            final Object[] es = elements;
+            E e = elementAt(es, cursor);
+            if (e == null)
+                throw new ConcurrentModificationException();
+            cursor = dec(lastRet = cursor, es.length);
+            remaining--;
+            return e;
+        }
+
+        public final void remove() {
+            if (lastRet < 0)
+                throw new IllegalStateException();
+            if (!delete(lastRet))
+                cursor = inc(cursor, elements.length);
+            lastRet = -1;
+        }
+    }
+
+    public boolean contains(Object o) {
+        if (o != null) {
+            final Object[] es = elements;
+            for (int i = head; i != tail; i = inc(i, es.length))
+                if (o.equals(es[i]))
+                    return true;
+        }
+        return false;
+    }
+
+    public boolean remove(Object o) { return removeFirstOccurrence(o); }
+
+    public void clear() {
+        final Object[] es = elements;
+        for (int i = head; i != tail; i = inc(i, es.length))
+            es[i] = null;
+        head = tail = 0;
+    }
+
+    public Object[] toArray() {
+        Object[] a = new Object[size()];
+        int k = 0;
+        final Object[] es = elements;
+        for (int i = head; i != tail; i = inc(i, es.length))
+            a[k++] = es[i];
+        return a;
+    }
+
+    public ArrayDeque<E> clone() { return new ArrayDeque<>(this); }
+}

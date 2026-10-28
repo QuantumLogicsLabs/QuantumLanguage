@@ -1,0 +1,9 @@
+package java.util;
+
+public class EnumMap<K extends Enum<K>, V> extends TreeMap<K, V> {
+    public EnumMap(Class<K> keyType) { super(); }
+    public EnumMap(EnumMap<K, ? extends V> m) { super(m); }
+    public EnumMap(Map<K, ? extends V> m) { super(m); }
+
+    public EnumMap<K, V> clone() { return new EnumMap<>(this); }
+}

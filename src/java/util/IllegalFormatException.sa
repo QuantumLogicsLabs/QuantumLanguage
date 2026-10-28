@@ -1,0 +1,9 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public class IllegalFormatException extends IllegalArgumentException {
+    IllegalFormatException() { super(); }
+    IllegalFormatException(String s) { super(s); }
+}

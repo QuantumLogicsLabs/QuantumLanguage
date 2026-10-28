@@ -1,0 +1,47 @@
+package java.util.stream;
+
+import java.util.*;
+import java.util.function.*;
+
+public interface DoubleStream extends BaseStream<Double, DoubleStream> {
+    DoubleStream filter(DoublePredicate predicate);
+    DoubleStream map(DoubleUnaryOperator mapper);
+    <U> Stream<U> mapToObj(DoubleFunction<? extends U> mapper);
+    IntStream mapToInt(DoubleToIntFunction mapper);
+    LongStream mapToLong(DoubleToLongFunction mapper);
+    DoubleStream distinct();
+    DoubleStream sorted();
+    DoubleStream peek(DoubleConsumer action);
+    DoubleStream limit(long maxSize);
+    DoubleStream skip(long n);
+    void forEach(DoubleConsumer action);
+    double[] toArray();
+    double reduce(double identity, DoubleBinaryOperator op);
+    OptionalDouble reduce(DoubleBinaryOperator op);
+    double sum();
+    OptionalDouble min();
+    OptionalDouble max();
+    long count();
+    OptionalDouble average();
+    DoubleSummaryStatistics summaryStatistics();
+    boolean anyMatch(DoublePredicate predicate);
+    boolean allMatch(DoublePredicate predicate);
+    boolean noneMatch(DoublePredicate predicate);
+    OptionalDouble findFirst();
+    Stream<Double> boxed();
+
+    public static DoubleStream empty() { return new DoubleStreamImpl(Collections.<Double>emptyIterator()); }
+    public static DoubleStream of(double t) { return StreamSupport.$doublesOfArray(new double[] {t}, 0, 1); }
+    public static DoubleStream of(double... values) { return StreamSupport.$doublesOfArray(values, 0, values.length); }
+
+    public static DoubleStream iterate(final double seed, final DoubleUnaryOperator f) {
+        return new DoubleStreamImpl(Stream.<Double>iterate(seed, x -> f.applyAsDouble(x)).iterator());
+    }
+
+    public static DoubleStream generate(DoubleSupplier s) {
+        return new DoubleStreamImpl(new Iterator<Double>() {
+            public boolean hasNext() { return true; }
+            public Double next() { return s.getAsDouble(); }
+        });
+    }
+}

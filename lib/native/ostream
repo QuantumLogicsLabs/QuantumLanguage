@@ -1,3 +1,0 @@
-// <ostream> for Quantum's native backend: part of <iostream>.
-#pragma once
-#include <iostream>

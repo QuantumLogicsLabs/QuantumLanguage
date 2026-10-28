@@ -1,0 +1,28 @@
+package java.util.concurrent.atomic;
+
+import java.util.function.*;
+
+public class AtomicBoolean implements java.io.Serializable {
+    private boolean value;
+
+    public AtomicBoolean(boolean initialValue) { value = initialValue; }
+    public AtomicBoolean() {}
+
+    public final boolean get() { return value; }
+    public final void set(boolean newValue) { value = newValue; }
+
+    public final boolean compareAndSet(boolean expectedValue, boolean newValue) {
+        if (value != expectedValue)
+            return false;
+        value = newValue;
+        return true;
+    }
+
+    public final boolean getAndSet(boolean newValue) {
+        boolean prev = value;
+        value = newValue;
+        return prev;
+    }
+
+    public String toString() { return Boolean.toString(value); }
+}

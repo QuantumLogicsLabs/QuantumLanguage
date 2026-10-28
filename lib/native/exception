@@ -1,4 +1,0 @@
-// <exception> for Quantum's native backend: std::exception and its family
-// live in <stdexcept>.
-#pragma once
-#include <stdexcept>

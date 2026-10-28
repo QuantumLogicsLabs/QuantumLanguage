@@ -1,0 +1,234 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+// java.util.Scanner over standard input (through the VM's line buffer) or a String.
+public final class Scanner implements java.io.Closeable, Iterator<String> {
+    private final String src; // null: standard input
+    private int pos;
+    private boolean closed;
+
+    public Scanner(java.io.InputStream source) { this.src = null; }
+    public Scanner(java.io.InputStream source, String charsetName) { this.src = null; }
+    public Scanner(java.io.Reader source) { this.src = null; }
+    public Scanner(String source) { this.src = source; }
+
+    private void ensureOpen() {
+        if (closed)
+            throw new IllegalStateException("Scanner closed");
+    }
+
+    private static boolean space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\u000b'; }
+
+    private String peekToken() {
+        ensureOpen();
+        if (src == null)
+            return $In.peek();
+        int i = pos;
+        while (i < src.length() && space(src.charAt(i)))
+            i++;
+        if (i >= src.length())
+            return null;
+        int j = i;
+        while (j < src.length() && !space(src.charAt(j)))
+            j++;
+        return src.substring(i, j);
+    }
+
+    private String takeToken() {
+        ensureOpen();
+        if (src == null)
+            return $In.token();
+        int i = pos;
+        while (i < src.length() && space(src.charAt(i)))
+            i++;
+        if (i >= src.length())
+            return null;
+        int j = i;
+        while (j < src.length() && !space(src.charAt(j)))
+            j++;
+        pos = j;
+        return src.substring(i, j);
+    }
+
+    public boolean hasNext() { return peekToken() != null; }
+
+    public String next() {
+        String t = takeToken();
+        if (t == null)
+            throw new NoSuchElementException();
+        return t;
+    }
+
+    public boolean hasNextLine() {
+        ensureOpen();
+        if (src == null)
+            return $In.hasLine();
+        return pos < src.length();
+    }
+
+    public String nextLine() {
+        ensureOpen();
+        if (src == null) {
+            String line = $In.line();
+            if (line == null)
+                throw new NoSuchElementException("No line found");
+            return line;
+        }
+        if (pos >= src.length())
+            throw new NoSuchElementException("No line found");
+        int nl = src.indexOf('\n', pos);
+        String line;
+        if (nl < 0) {
+            line = src.substring(pos);
+            pos = src.length();
+        } else {
+            line = src.substring(pos, nl);
+            pos = nl + 1;
+        }
+        if (line.endsWith("\r"))
+            line = line.substring(0, line.length() - 1);
+        return line;
+    }
+
+    private String numberToken() {
+        String t = peekToken();
+        if (t == null)
+            throw new NoSuchElementException();
+        return t;
+    }
+
+    private static boolean isInteger(String t, int radix, boolean isLong) {
+        if (t == null)
+            return false;
+        try {
+            if (isLong)
+                Long.parseLong(t, radix);
+            else
+                Integer.parseInt(t, radix);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    private static boolean isDouble(String t) {
+        if (t == null)
+            return false;
+        try {
+            Double.parseDouble(t);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    public boolean hasNextInt() { return isInteger(peekToken(), 10, false); }
+    public boolean hasNextInt(int radix) { return isInteger(peekToken(), radix, false); }
+    public boolean hasNextLong() { return isInteger(peekToken(), 10, true); }
+    public boolean hasNextDouble() { return isDouble(peekToken()); }
+    public boolean hasNextFloat() { return isDouble(peekToken()); }
+
+    public boolean hasNextShort() {
+        String t = peekToken();
+        if (!isInteger(t, 10, false))
+            return false;
+        int v = Integer.parseInt(t);
+        return v >= Short.MIN_VALUE && v <= Short.MAX_VALUE;
+    }
+
+    public boolean hasNextByte() {
+        String t = peekToken();
+        if (!isInteger(t, 10, false))
+            return false;
+        int v = Integer.parseInt(t);
+        return v >= Byte.MIN_VALUE && v <= Byte.MAX_VALUE;
+    }
+
+    public boolean hasNextBoolean() {
+        String t = peekToken();
+        return t != null && (t.equalsIgnoreCase("true") || t.equalsIgnoreCase("false"));
+    }
+
+    public int nextInt() { return nextInt(10); }
+
+    public int nextInt(int radix) {
+        String t = numberToken();
+        int v;
+        try {
+            v = Integer.parseInt(t, radix);
+        } catch (NumberFormatException e) {
+            throw new InputMismatchException("For input string: \"" + t + "\"");
+        }
+        takeToken();
+        return v;
+    }
+
+    public long nextLong() {
+        String t = numberToken();
+        long v;
+        try {
+            v = Long.parseLong(t);
+        } catch (NumberFormatException e) {
+            throw new InputMismatchException("For input string: \"" + t + "\"");
+        }
+        takeToken();
+        return v;
+    }
+
+    public short nextShort() {
+        String t = numberToken();
+        if (!hasNextShort())
+            throw new InputMismatchException("For input string: \"" + t + "\"");
+        takeToken();
+        return (short) Integer.parseInt(t);
+    }
+
+    public byte nextByte() {
+        String t = numberToken();
+        if (!hasNextByte())
+            throw new InputMismatchException("For input string: \"" + t + "\"");
+        takeToken();
+        return (byte) Integer.parseInt(t);
+    }
+
+    public double nextDouble() {
+        String t = numberToken();
+        double v;
+        try {
+            v = Double.parseDouble(t);
+        } catch (NumberFormatException e) {
+            throw new InputMismatchException("For input string: \"" + t + "\"");
+        }
+        takeToken();
+        return v;
+    }
+
+    public float nextFloat() { return (float) nextDouble(); }
+
+    public boolean nextBoolean() {
+        String t = numberToken();
+        if (t.equalsIgnoreCase("true")) {
+            takeToken();
+            return true;
+        }
+        if (t.equalsIgnoreCase("false")) {
+            takeToken();
+            return false;
+        }
+        throw new InputMismatchException("For input string: \"" + t + "\"");
+    }
+
+    public Scanner useDelimiter(String pattern) { return this; }
+    public Scanner useLocale(Locale locale) { return this; }
+    public void remove() { throw new UnsupportedOperationException(); }
+    public void close() { closed = true; }
+
+    public Stream<String> tokens() {
+        ArrayList<String> out = new ArrayList<>();
+        while (hasNext())
+            out.add(next());
+        return out.stream();
+    }
+}

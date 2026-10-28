@@ -191,6 +191,26 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
     parser.setPythonSource(python);
     auto ast = parser.parse();
 
+    // Java-style code (applyJavaDialect): the Java-style library goes in
+    // front of the program, parsed on its own so the program keeps its line
+    // numbers.
+    if (isJavaStyleSource(source) && ast->is<BlockStmt>())
+    {
+        std::vector<ASTNodePtr> lib;
+        for (const auto &item : javastyle::librarySources())
+        {
+            Lexer libLexer(item.second);
+            Parser libParser(libLexer.tokenize());
+            auto part = libParser.parse();
+            if (part->is<BlockStmt>())
+                for (auto &s : part->as<BlockStmt>().statements)
+                    lib.push_back(std::move(s));
+        }
+        auto &stmts = ast->as<BlockStmt>().statements;
+        for (size_t k = 0; k < lib.size(); ++k)
+            stmts.insert(stmts.begin() + (std::ptrdiff_t)k, std::move(lib[k]));
+    }
+
     // A Python program prints Python's way (True / None / 'str' in lists).
     // Done by an instruction rather than a runner flag so that a bundled
     // .exe behaves the same.

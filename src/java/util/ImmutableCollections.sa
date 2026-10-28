@@ -1,0 +1,139 @@
+package java.util;
+
+import java.util.function.*;
+
+// The collections of List.of, Set.of and Map.of: unmodifiable; no nulls.
+// (Set.of / Map.of keep insertion order; a real JVM's order is unspecified.)
+final class ImmutableCollections {
+    private ImmutableCollections() {}
+
+    static UnsupportedOperationException uoe() { return new UnsupportedOperationException(); }
+
+    @SuppressWarnings("unchecked")
+    static <E> List<E> listOf(Object[] elements) {
+        Object[] copy = new Object[elements.length];
+        for (int i = 0; i < elements.length; i++)
+            copy[i] = Objects.requireNonNull(elements[i]);
+        return (List<E>) new ListN<>(copy);
+    }
+
+    @SuppressWarnings("unchecked")
+    static <E> Set<E> setOf(Object[] elements) {
+        LinkedHashMap<Object, Boolean> m = new LinkedHashMap<>();
+        for (Object e : elements)
+            if (m.put(Objects.requireNonNull(e), Boolean.TRUE) != null)
+                throw new IllegalArgumentException("duplicate element: " + e);
+        return (Set<E>) new SetN<>(m);
+    }
+
+    @SuppressWarnings("unchecked")
+    static <K, V> Map<K, V> mapOf(Object... kv) {
+        LinkedHashMap<Object, Object> m = new LinkedHashMap<>();
+        for (int i = 0; i < kv.length; i += 2)
+            if (m.put(Objects.requireNonNull(kv[i]), Objects.requireNonNull(kv[i + 1])) != null)
+                throw new IllegalArgumentException("duplicate key: " + kv[i]);
+        return (Map<K, V>) new MapN<>(m);
+    }
+
+    static final class ListN<E> extends AbstractList<E> implements RandomAccess, java.io.Serializable {
+        private final Object[] elements;
+
+        ListN(Object[] elements) { this.elements = elements; }
+
+        @SuppressWarnings("unchecked")
+        public E get(int index) {
+            Objects.checkIndex(index, elements.length);
+            return (E) elements[index];
+        }
+
+        public int size() { return elements.length; }
+
+        public boolean contains(Object o) { return indexOf(o) >= 0; }
+
+        public int indexOf(Object o) {
+            Objects.requireNonNull(o);
+            for (int i = 0; i < elements.length; i++)
+                if (o.equals(elements[i]))
+                    return i;
+            return -1;
+        }
+
+        public Object[] toArray() { return Arrays.copyOf(elements, elements.length); }
+        public boolean add(E e) { throw uoe(); }
+        public void add(int index, E e) { throw uoe(); }
+        public boolean addAll(Collection<? extends E> c) { throw uoe(); }
+        public boolean addAll(int index, Collection<? extends E> c) { throw uoe(); }
+        public void clear() { throw uoe(); }
+        public boolean remove(Object o) { throw uoe(); }
+        public E remove(int index) { throw uoe(); }
+        public boolean removeAll(Collection<?> c) { throw uoe(); }
+        public boolean removeIf(Predicate<? super E> filter) { throw uoe(); }
+        public void replaceAll(UnaryOperator<E> operator) { throw uoe(); }
+        public boolean retainAll(Collection<?> c) { throw uoe(); }
+        public E set(int index, E element) { throw uoe(); }
+        public void sort(Comparator<? super E> c) { throw uoe(); }
+    }
+
+    static final class SetN<E> extends AbstractSet<E> implements java.io.Serializable {
+        private final LinkedHashMap<E, Boolean> m;
+
+        SetN(LinkedHashMap<E, Boolean> m) { this.m = m; }
+
+        public int size() { return m.size(); }
+        public boolean contains(Object o) { return m.containsKey(Objects.requireNonNull(o)); }
+
+        public Iterator<E> iterator() {
+            return new Iterator<E>() {
+                private final Iterator<E> i = m.keySet().iterator();
+                public boolean hasNext() { return i.hasNext(); }
+                public E next() { return i.next(); }
+            };
+        }
+
+        public boolean add(E e) { throw uoe(); }
+        public boolean addAll(Collection<? extends E> c) { throw uoe(); }
+        public void clear() { throw uoe(); }
+        public boolean remove(Object o) { throw uoe(); }
+        public boolean removeAll(Collection<?> c) { throw uoe(); }
+        public boolean removeIf(Predicate<? super E> filter) { throw uoe(); }
+        public boolean retainAll(Collection<?> c) { throw uoe(); }
+    }
+
+    static final class MapN<K, V> extends AbstractMap<K, V> implements java.io.Serializable {
+        private final LinkedHashMap<K, V> m;
+
+        MapN(LinkedHashMap<K, V> m) { this.m = m; }
+
+        public int size() { return m.size(); }
+        public V get(Object o) { return m.get(Objects.requireNonNull(o)); }
+        public boolean containsKey(Object o) { return m.containsKey(Objects.requireNonNull(o)); }
+        public boolean containsValue(Object o) { return m.containsValue(Objects.requireNonNull(o)); }
+
+        public Set<Map.Entry<K, V>> entrySet() {
+            return new AbstractSet<Map.Entry<K, V>>() {
+                public int size() { return m.size(); }
+                public Iterator<Map.Entry<K, V>> iterator() {
+                    return new Iterator<Map.Entry<K, V>>() {
+                        private final Iterator<Map.Entry<K, V>> i = m.entrySet().iterator();
+                        public boolean hasNext() { return i.hasNext(); }
+                        public Map.Entry<K, V> next() {
+                            Map.Entry<K, V> e = i.next();
+                            return new KeyValueHolder<>(e.getKey(), e.getValue());
+                        }
+                    };
+                }
+            };
+        }
+
+        public V put(K key, V value) { throw uoe(); }
+        public V remove(Object key) { throw uoe(); }
+        public void putAll(Map<? extends K, ? extends V> map) { throw uoe(); }
+        public void clear() { throw uoe(); }
+        public V putIfAbsent(K key, V value) { throw uoe(); }
+        public V merge(K key, V value, BiFunction<? super V, ? super V, ? extends V> f) { throw uoe(); }
+        public V compute(K key, BiFunction<? super K, ? super V, ? extends V> f) { throw uoe(); }
+        public V computeIfAbsent(K key, Function<? super K, ? extends V> f) { throw uoe(); }
+        public V computeIfPresent(K key, BiFunction<? super K, ? super V, ? extends V> f) { throw uoe(); }
+        public void replaceAll(BiFunction<? super K, ? super V, ? extends V> f) { throw uoe(); }
+    }
+}

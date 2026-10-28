@@ -1,0 +1,309 @@
+package java.util;
+
+import java.util.function.*;
+
+public class PriorityQueue<E> extends AbstractQueue<E> implements java.io.Serializable {
+    private static final int DEFAULT_INITIAL_CAPACITY = 11;
+    transient Object[] queue;
+    int size;
+    private final Comparator<? super E> comparator;
+    transient int modCount;
+
+    public PriorityQueue() { this(DEFAULT_INITIAL_CAPACITY, null); }
+    public PriorityQueue(int initialCapacity) { this(initialCapacity, null); }
+    public PriorityQueue(Comparator<? super E> comparator) { this(DEFAULT_INITIAL_CAPACITY, comparator); }
+
+    public PriorityQueue(int initialCapacity, Comparator<? super E> comparator) {
+        if (initialCapacity < 1)
+            throw new IllegalArgumentException();
+        this.queue = new Object[Math.max(1, initialCapacity)];
+        this.comparator = comparator;
+    }
+
+    @SuppressWarnings("unchecked")
+    public PriorityQueue(Collection<? extends E> c) {
+        if (c instanceof SortedSet<?>) {
+            SortedSet<? extends E> ss = (SortedSet<? extends E>) c;
+            this.comparator = (Comparator<? super E>) ss.comparator();
+            initElementsFromCollection(ss);
+        } else if (c instanceof PriorityQueue<?>) {
+            PriorityQueue<? extends E> pq = (PriorityQueue<? extends E>) c;
+            this.comparator = (Comparator<? super E>) pq.comparator();
+            initElementsFromCollection(pq);
+        } else {
+            this.comparator = null;
+            initElementsFromCollection(c);
+            heapify();
+        }
+    }
+
+    public PriorityQueue(PriorityQueue<? extends E> c) { this((Collection<? extends E>) c); }
+    public PriorityQueue(SortedSet<? extends E> c) { this((Collection<? extends E>) c); }
+
+    private void initElementsFromCollection(Collection<? extends E> c) {
+        Object[] es = c.toArray();
+        int len = es.length;
+        for (Object e : es)
+            if (e == null)
+                throw new NullPointerException();
+        this.queue = (es.length > 0) ? es : new Object[1];
+        this.size = len;
+    }
+
+    private void grow(int minCapacity) {
+        int oldCapacity = queue.length;
+        int newCapacity = oldCapacity + Math.max(minCapacity - oldCapacity, oldCapacity < 64 ? oldCapacity + 2 : oldCapacity >> 1);
+        queue = java.util.Arrays.copyOf(queue, newCapacity);
+    }
+
+    public boolean add(E e) { return offer(e); }
+
+    public boolean offer(E e) {
+        if (e == null)
+            throw new NullPointerException();
+        modCount++;
+        int i = size;
+        if (i >= queue.length)
+            grow(i + 1);
+        siftUp(i, e);
+        size = i + 1;
+        return true;
+    }
+
+    @SuppressWarnings("unchecked")
+    public E peek() { return (E) queue[0]; }
+
+    private int indexOf(Object o) {
+        if (o != null) {
+            final Object[] es = queue;
+            for (int i = 0, n = size; i < n; i++)
+                if (o.equals(es[i]))
+                    return i;
+        }
+        return -1;
+    }
+
+    public boolean remove(Object o) {
+        int i = indexOf(o);
+        if (i == -1)
+            return false;
+        else {
+            removeAt(i);
+            return true;
+        }
+    }
+
+    public boolean contains(Object o) { return indexOf(o) >= 0; }
+    public Object[] toArray() { return java.util.Arrays.copyOf(queue, size); }
+
+    @SuppressWarnings("unchecked")
+    public <T> T[] toArray(T[] a) {
+        final int size = this.size;
+        if (a.length < size)
+            return (T[]) java.util.Arrays.copyOf(queue, size);
+        System.arraycopy(queue, 0, a, 0, size);
+        if (a.length > size)
+            a[size] = null;
+        return a;
+    }
+
+    public Iterator<E> iterator() { return new Itr(); }
+
+    private final class Itr implements Iterator<E> {
+        private int cursor;
+        private int lastRet = -1;
+        private ArrayDeque<E> forgetMeNot;
+        private E lastRetElt;
+        private int expectedModCount = modCount;
+
+        public boolean hasNext() { return cursor < size || (forgetMeNot != null && !forgetMeNot.isEmpty()); }
+
+        @SuppressWarnings("unchecked")
+        public E next() {
+            if (expectedModCount != modCount)
+                throw new ConcurrentModificationException();
+            if (cursor < size)
+                return (E) queue[lastRet = cursor++];
+            if (forgetMeNot != null) {
+                lastRet = -1;
+                lastRetElt = forgetMeNot.poll();
+                if (lastRetElt != null)
+                    return lastRetElt;
+            }
+            throw new NoSuchElementException();
+        }
+
+        public void remove() {
+            if (expectedModCount != modCount)
+                throw new ConcurrentModificationException();
+            if (lastRet != -1) {
+                E moved = PriorityQueue.this.removeAt(lastRet);
+                lastRet = -1;
+                if (moved == null)
+                    cursor--;
+                else {
+                    if (forgetMeNot == null)
+                        forgetMeNot = new ArrayDeque<>();
+                    forgetMeNot.add(moved);
+                }
+            } else if (lastRetElt != null) {
+                PriorityQueue.this.removeEq(lastRetElt);
+                lastRetElt = null;
+            } else {
+                throw new IllegalStateException();
+            }
+            expectedModCount = modCount;
+        }
+    }
+
+    void removeEq(Object o) {
+        final Object[] es = queue;
+        for (int i = 0, n = size; i < n; i++) {
+            if (o == es[i]) {
+                removeAt(i);
+                break;
+            }
+        }
+    }
+
+    public int size() { return size; }
+
+    public void clear() {
+        modCount++;
+        final Object[] es = queue;
+        for (int i = 0, n = size; i < n; i++)
+            es[i] = null;
+        size = 0;
+    }
+
+    @SuppressWarnings("unchecked")
+    public E poll() {
+        final Object[] es;
+        final E result;
+        if ((result = (E) ((es = queue)[0])) != null) {
+            modCount++;
+            final int n;
+            final E x = (E) es[(n = --size)];
+            es[n] = null;
+            if (n > 0) {
+                final Comparator<? super E> cmp;
+                if ((cmp = comparator) == null)
+                    siftDownComparable(0, x, es, n);
+                else
+                    siftDownUsingComparator(0, x, es, n, cmp);
+            }
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    E removeAt(int i) {
+        final Object[] es = queue;
+        modCount++;
+        int s = --size;
+        if (s == i)
+            es[i] = null;
+        else {
+            E moved = (E) es[s];
+            es[s] = null;
+            siftDown(i, moved);
+            if (es[i] == moved) {
+                siftUp(i, moved);
+                if (es[i] != moved)
+                    return moved;
+            }
+        }
+        return null;
+    }
+
+    private void siftUp(int k, E x) {
+        if (comparator != null)
+            siftUpUsingComparator(k, x, queue, comparator);
+        else
+            siftUpComparable(k, x, queue);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> void siftUpComparable(int k, T x, Object[] es) {
+        Comparable<? super T> key = (Comparable<? super T>) x;
+        while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            Object e = es[parent];
+            if (key.compareTo((T) e) >= 0)
+                break;
+            es[k] = e;
+            k = parent;
+        }
+        es[k] = key;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> void siftUpUsingComparator(int k, T x, Object[] es, Comparator<? super T> cmp) {
+        while (k > 0) {
+            int parent = (k - 1) >>> 1;
+            Object e = es[parent];
+            if (cmp.compare(x, (T) e) >= 0)
+                break;
+            es[k] = e;
+            k = parent;
+        }
+        es[k] = x;
+    }
+
+    private void siftDown(int k, E x) {
+        if (comparator != null)
+            siftDownUsingComparator(k, x, queue, size, comparator);
+        else
+            siftDownComparable(k, x, queue, size);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> void siftDownComparable(int k, T x, Object[] es, int n) {
+        Comparable<? super T> key = (Comparable<? super T>) x;
+        int half = n >>> 1;
+        while (k < half) {
+            int child = (k << 1) + 1;
+            Object c = es[child];
+            int right = child + 1;
+            if (right < n && ((Comparable<? super T>) c).compareTo((T) es[right]) > 0)
+                c = es[child = right];
+            if (key.compareTo((T) c) <= 0)
+                break;
+            es[k] = c;
+            k = child;
+        }
+        es[k] = key;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> void siftDownUsingComparator(int k, T x, Object[] es, int n, Comparator<? super T> cmp) {
+        int half = n >>> 1;
+        while (k < half) {
+            int child = (k << 1) + 1;
+            Object c = es[child];
+            int right = child + 1;
+            if (right < n && cmp.compare((T) c, (T) es[right]) > 0)
+                c = es[child = right];
+            if (cmp.compare(x, (T) c) <= 0)
+                break;
+            es[k] = c;
+            k = child;
+        }
+        es[k] = x;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void heapify() {
+        final Object[] es = queue;
+        int n = size, i = (n >>> 1) - 1;
+        final Comparator<? super E> cmp;
+        if ((cmp = comparator) == null)
+            for (; i >= 0; i--)
+                siftDownComparable(i, (E) es[i], es, n);
+        else
+            for (; i >= 0; i--)
+                siftDownUsingComparator(i, (E) es[i], es, n, cmp);
+    }
+
+    public Comparator<? super E> comparator() { return comparator; }
+}

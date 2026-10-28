@@ -1,0 +1,9 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public class InputMismatchException extends NoSuchElementException {
+    public InputMismatchException() { super(); }
+    public InputMismatchException(String s) { super(s); }
+}

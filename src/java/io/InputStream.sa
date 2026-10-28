@@ -1,0 +1,61 @@
+package java.io;
+
+// ─── byte streams ───────────────────────────────────────────────────────────
+
+public abstract class InputStream implements Closeable {
+    public InputStream() {}
+
+    public abstract int read() throws IOException;
+
+    public int read(byte[] b) throws IOException { return read(b, 0, b.length); }
+
+    public int read(byte[] b, int off, int len) throws IOException {
+        java.util.Objects.checkFromIndexSize(off, len, b.length);
+        if (len == 0)
+            return 0;
+        int c = read();
+        if (c == -1)
+            return -1;
+        b[off] = (byte) c;
+        int i = 1;
+        for (; i < len; i++) {
+            if (available() <= 0)
+                break;
+            c = read();
+            if (c == -1)
+                break;
+            b[off + i] = (byte) c;
+        }
+        return i;
+    }
+
+    public long skip(long n) throws IOException {
+        long k = 0;
+        while (k < n && read() != -1)
+            k++;
+        return k;
+    }
+
+    public int available() throws IOException { return 0; }
+    public void close() throws IOException {}
+
+    public byte[] readAllBytes() throws IOException {
+        java.util.ArrayList<Integer> out = new java.util.ArrayList<>();
+        int c;
+        while ((c = read()) != -1)
+            out.add(c);
+        byte[] b = new byte[out.size()];
+        for (int i = 0; i < b.length; i++)
+            b[i] = (byte) (int) out.get(i);
+        return b;
+    }
+
+    boolean $isStdin() { return false; }
+}
+
+// System.in
+public final class $StdIn extends InputStream {
+    public int read() { return $In.read(); }
+    public int available() { return $In.available(); }
+    boolean $isStdin() { return true; }
+}

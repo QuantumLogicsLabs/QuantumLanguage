@@ -1,0 +1,190 @@
+package java.lang;
+
+public class Throwable implements java.io.Serializable {
+    private String detailMessage;
+    private Throwable cause = this;
+    private String[] stackTrace;
+    private java.util.ArrayList<Throwable> suppressed;
+
+    public Throwable() { stackTrace = $stack(); }
+
+    public Throwable(String message) {
+        this();
+        detailMessage = message;
+    }
+
+    public Throwable(String message, Throwable cause) {
+        this();
+        detailMessage = message;
+        this.cause = cause;
+    }
+
+    public Throwable(Throwable cause) {
+        this();
+        detailMessage = cause == null ? null : cause.toString();
+        this.cause = cause;
+    }
+
+    protected Throwable(String message, Throwable cause, boolean enableSuppression, boolean writableStackTrace) {
+        this(message, cause);
+    }
+
+    private static native String[] $stack();
+
+    public String getMessage() { return detailMessage; }
+    public String getLocalizedMessage() { return getMessage(); }
+    public Throwable getCause() { return cause == this ? null : cause; }
+
+    public Throwable initCause(Throwable cause) {
+        if (this.cause != this)
+            throw new IllegalStateException("Can't overwrite cause with " + java.util.Objects.toString(cause, "a null"), this);
+        if (cause == this)
+            throw new IllegalArgumentException("Self-causation not permitted", this);
+        this.cause = cause;
+        return this;
+    }
+
+    public String toString() {
+        String s = getClass().getName();
+        String message = getLocalizedMessage();
+        return (message != null) ? (s + ": " + message) : s;
+    }
+
+    public final void addSuppressed(Throwable exception) {
+        if (exception == this)
+            throw new IllegalArgumentException("Self-suppression not permitted", exception);
+        if (exception == null)
+            throw new NullPointerException("Cannot suppress a null exception.");
+        if (suppressed == null)
+            suppressed = new java.util.ArrayList<>();
+        suppressed.add(exception);
+    }
+
+    public final Throwable[] getSuppressed() {
+        if (suppressed == null)
+            return new Throwable[0];
+        return suppressed.toArray(new Throwable[0]);
+    }
+
+    public Throwable fillInStackTrace() {
+        stackTrace = $stack();
+        return this;
+    }
+
+    public StackTraceElement[] getStackTrace() {
+        String[] t = stackTrace == null ? new String[0] : stackTrace;
+        StackTraceElement[] out = new StackTraceElement[t.length];
+        for (int i = 0; i < t.length; i++)
+            out[i] = StackTraceElement.$parse(t[i]);
+        return out;
+    }
+
+    public void setStackTrace(StackTraceElement[] trace) {
+        String[] t = new String[trace.length];
+        for (int i = 0; i < trace.length; i++)
+            t[i] = trace[i].toString();
+        stackTrace = t;
+    }
+
+    public void printStackTrace() {
+        StringBuilder sb = new StringBuilder();
+        $trace(sb, null, "", "");
+        System.out.flush();
+        System.err.print(sb.toString());
+    }
+
+    public void printStackTrace(java.io.PrintStream s) {
+        StringBuilder sb = new StringBuilder();
+        $trace(sb, null, "", "");
+        s.print(sb.toString());
+    }
+
+    public void printStackTrace(java.io.PrintWriter s) {
+        StringBuilder sb = new StringBuilder();
+        $trace(sb, null, "", "");
+        s.print(sb.toString());
+    }
+
+    // Java's layout: the frames this trace shares with the enclosing one are
+    // left out ("... n more").
+    private void $trace(StringBuilder sb, String[] enclosing, String caption, String prefix) {
+        sb.append(prefix).append(caption).append(toString()).append('\n');
+        String[] trace = stackTrace == null ? new String[0] : stackTrace;
+        int m = trace.length - 1;
+        if (enclosing != null) {
+            int n = enclosing.length - 1;
+            while (m >= 0 && n >= 0 && trace[m].equals(enclosing[n])) {
+                m--;
+                n--;
+            }
+        }
+        int inCommon = trace.length - 1 - m;
+        for (int i = 0; i <= m; i++)
+            sb.append(prefix).append("\tat ").append(trace[i]).append('\n');
+        if (inCommon != 0)
+            sb.append(prefix).append("\t... ").append(inCommon).append(" more\n");
+        if (suppressed != null)
+            for (Throwable se : suppressed)
+                se.$trace(sb, trace, "Suppressed: ", prefix + "\t");
+        Throwable c = getCause();
+        if (c != null)
+            c.$trace(sb, trace, "Caused by: ", prefix);
+    }
+
+    static Throwable $wrap(Object raw) {
+        if (raw instanceof Throwable)
+            return (Throwable) raw;
+        String d = String.valueOf(raw);
+        if (d.length() > 2 && d.charAt(0) == '\u001f' && d.charAt(1) == 'J') {
+            int a = d.indexOf('\u001f', 2);
+            int b = d.indexOf('\u001f', a + 1);
+            String cls = d.substring(2, a);
+            String msg = d.substring(a + 1, b);
+            String frames = d.substring(b + 1);
+            Throwable t = $create(cls, msg.isEmpty() ? null : msg);
+            t.stackTrace = frames.isEmpty() ? new String[0] : frames.split("\n");
+            return t;
+        }
+        return new RuntimeException(d);
+    }
+
+    private static Throwable $create(String cls, String msg) {
+        switch (cls) {
+            case "java.lang.ArithmeticException": return new ArithmeticException(msg);
+            case "java.lang.ArrayIndexOutOfBoundsException": return new ArrayIndexOutOfBoundsException(msg);
+            case "java.lang.StringIndexOutOfBoundsException": return new StringIndexOutOfBoundsException(msg);
+            case "java.lang.IndexOutOfBoundsException": return new IndexOutOfBoundsException(msg);
+            case "java.lang.NullPointerException": return new NullPointerException(msg);
+            case "java.lang.ClassCastException": return new ClassCastException(msg);
+            case "java.lang.NegativeArraySizeException": return new NegativeArraySizeException(msg);
+            case "java.lang.ArrayStoreException": return new ArrayStoreException(msg);
+            case "java.lang.NumberFormatException": return new NumberFormatException(msg);
+            case "java.lang.IllegalArgumentException": return new IllegalArgumentException(msg);
+            case "java.lang.IllegalStateException": return new IllegalStateException(msg);
+            case "java.lang.UnsupportedOperationException": return new UnsupportedOperationException(msg);
+            case "java.lang.StackOverflowError": return new StackOverflowError(msg);
+            case "java.lang.OutOfMemoryError": return new OutOfMemoryError(msg);
+            case "java.lang.AbstractMethodError": return new AbstractMethodError(msg);
+            case "java.lang.InterruptedException": return new InterruptedException(msg);
+            case "java.util.NoSuchElementException": return new java.util.NoSuchElementException(msg);
+            case "java.util.InputMismatchException": return new java.util.InputMismatchException(msg);
+            case "java.util.ConcurrentModificationException": return new java.util.ConcurrentModificationException(msg);
+            case "java.util.IllegalFormatConversionException": return new java.util.IllegalFormatConversionException(msg);
+            case "java.util.UnknownFormatConversionException": return new java.util.UnknownFormatConversionException(msg);
+            case "java.util.MissingFormatArgumentException": return new java.util.MissingFormatArgumentException(msg);
+            case "java.util.IllegalFormatCodePointException": return new java.util.IllegalFormatCodePointException(msg);
+            case "java.util.IllegalFormatException": return new java.util.IllegalFormatException(msg);
+            case "java.util.regex.PatternSyntaxException": return new java.util.regex.PatternSyntaxException(msg);
+            default: return new RuntimeException(msg);
+        }
+    }
+
+    static void $uncaught(Object raw) {
+        Throwable t = $wrap(raw);
+        StringBuilder sb = new StringBuilder("Exception in thread \"main\" ");
+        t.$trace(sb, null, "", "");
+        System.out.flush();
+        System.err.print(sb.toString());
+        System.exit(1);
+    }
+}

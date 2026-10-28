@@ -17,6 +17,7 @@
 - [Functions](#functions)
 - [Closures](#closures)
 - [Classes & OOP](#classes--oop)
+- [Java Style](#java-style)
 - [Arrays](#arrays)
 - [Dictionaries](#dictionaries)
 - [Strings](#strings)
@@ -373,6 +374,55 @@ print(dog.fetch("ball")) # Rex fetches the ball
 - `self` refers to the current instance (no explicit `self` parameter needed in method calls)
 - `extends` provides single inheritance
 - Parent methods can be accessed via the inherited instance
+
+---
+
+## Java Style
+
+A `.sa` file may contain Java code next to Python, JavaScript, C++ and Ruby. It is recognised by
+unmistakable Java (`System.out.println`, `import java.util.*;`, `public`/`private` members,
+`implements`, `@Override`, `String[]`) and rewritten into the common syntax before it is compiled.
+
+```java
+import java.util.*;
+
+interface Shape { double area(); default String describe() { return getClass().getSimpleName() + " " + area(); } }
+
+class Square implements Shape {
+    private final double side;
+    Square(double side) { this.side = side; }
+    public double area() { return side * side; }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        List<Shape> shapes = new ArrayList<>(List.of(new Square(3), new Square(1.5)));
+        shapes.sort(Comparator.comparingDouble(Shape::area));
+        for (Shape s : shapes) System.out.println(s.describe());
+        System.out.printf("%.2f%n", shapes.stream().mapToDouble(Shape::area).sum());
+    }
+}
+```
+
+**Supported:** classes, abstract classes, interfaces with default/static methods, enums with fields and
+methods, generics (erased), varargs, lambdas and method references, anonymous classes with one method,
+`instanceof` and casts, typed and multi-`catch`, custom exceptions, the common `java.lang` / `java.util`
+classes (`String`, `StringBuilder`, `Math`, boxes, `ArrayList`, `LinkedList`, `ArrayDeque`, `Stack`,
+`PriorityQueue`, `HashMap`/`TreeMap`/`LinkedHashMap`, the sets, `Arrays`, `Collections`, `Optional`,
+`Comparator`, `Collectors`, streams, `Scanner`, `BufferedReader`, `Random`) and `String.format`/`printf`.
+A `public static void main` is called after the file's other top-level code.
+
+**Differences from real Java** (this is Quantum, with Quantum's values): there is one number type, so a
+`double` such as `5.0` prints as `5` and `/` on two `int` values inside an expression gives a fraction
+(assigning to an `int` variable truncates); a `char` is a one-character string (`c - '0'` works, `'a' + 1`
+concatenates); `HashMap` keeps insertion order. **Not supported:** labeled `break`/`continue`, `>>>`,
+`switch` with `->`, try-with-resources, anonymous classes with fields and `this(...)` constructor
+chaining (each is a parse or runtime error), and inner (non-static) classes that read the outer
+object's fields: `outer.new Inner()` compiles but gives wrong values, so use a `static` nested class
+or pass the outer object in.
+
+For exact Java behaviour, put the code in a `.java` file: it goes through a strict front-end that
+follows `javac` and the JDK (`qrun Program.java`; see `src/java/README.md`).
 
 ---
 

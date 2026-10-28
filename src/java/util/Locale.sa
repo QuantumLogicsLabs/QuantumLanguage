@@ -1,0 +1,43 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public final class Locale implements java.io.Serializable {
+    public static final Locale ENGLISH = new Locale("en", "");
+    public static final Locale US = new Locale("en", "US");
+    public static final Locale UK = new Locale("en", "GB");
+    public static final Locale CANADA = new Locale("en", "CA");
+    public static final Locale ROOT = new Locale("", "");
+    public static final Locale GERMANY = new Locale("de", "DE");
+    public static final Locale GERMAN = new Locale("de", "");
+    public static final Locale FRANCE = new Locale("fr", "FR");
+    public static final Locale FRENCH = new Locale("fr", "");
+    public static final Locale ITALY = new Locale("it", "IT");
+    public static final Locale JAPAN = new Locale("ja", "JP");
+    private final String language, country;
+
+    public Locale(String language) { this(language, ""); }
+
+    public Locale(String language, String country) {
+        this.language = language.toLowerCase();
+        this.country = country.toUpperCase();
+    }
+
+    public Locale(String language, String country, String variant) { this(language, country); }
+
+    public static Locale getDefault() { return US; }
+    public static Locale of(String language) { return new Locale(language); }
+    public static Locale of(String language, String country) { return new Locale(language, country); }
+    public static Locale forLanguageTag(String tag) {
+        int dash = tag.indexOf('-');
+        return dash < 0 ? new Locale(tag) : new Locale(tag.substring(0, dash), tag.substring(dash + 1));
+    }
+
+    public String getLanguage() { return language; }
+    public String getCountry() { return country; }
+    public String toLanguageTag() { return country.isEmpty() ? language : language + "-" + country; }
+    public String toString() { return country.isEmpty() ? language : language + "_" + country; }
+    public boolean equals(Object o) { return o instanceof Locale l && l.language.equals(language) && l.country.equals(country); }
+    public int hashCode() { return toString().hashCode(); }
+}

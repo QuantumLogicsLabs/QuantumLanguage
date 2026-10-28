@@ -1,0 +1,40 @@
+package java.io;
+
+// ─── character streams ──────────────────────────────────────────────────────
+
+public abstract class Reader implements Readable, Closeable {
+    protected Reader() {}
+
+    public int read() throws IOException {
+        char[] cb = new char[1];
+        if (read(cb, 0, 1) == -1)
+            return -1;
+        else
+            return cb[0];
+    }
+
+    public int read(char[] cbuf) throws IOException { return read(cbuf, 0, cbuf.length); }
+    public abstract int read(char[] cbuf, int off, int len) throws IOException;
+
+    public long skip(long n) throws IOException {
+        long k = 0;
+        while (k < n && read() != -1)
+            k++;
+        return k;
+    }
+
+    public boolean ready() throws IOException { return false; }
+    public abstract void close() throws IOException;
+
+    boolean $isStdin() { return false; }
+
+    public long transferTo(Writer out) throws IOException {
+        long n = 0;
+        int c;
+        while ((c = read()) != -1) {
+            out.write(c);
+            n++;
+        }
+        return n;
+    }
+}

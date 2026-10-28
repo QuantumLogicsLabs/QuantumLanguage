@@ -1,0 +1,16 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public interface ListIterator<E> extends Iterator<E> {
+    boolean hasNext();
+    E next();
+    boolean hasPrevious();
+    E previous();
+    int nextIndex();
+    int previousIndex();
+    void remove();
+    void set(E e);
+    void add(E e);
+}

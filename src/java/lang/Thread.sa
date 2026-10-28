@@ -1,0 +1,55 @@
+package java.lang;
+
+// Threads run their work synchronously when started: there is one thread.
+public class Thread implements Runnable {
+    private static Thread main;
+    private static int counter;
+    private Runnable target;
+    private String name;
+    private boolean daemon;
+    private boolean interrupted;
+    private int priority = 5;
+
+    public Thread() { this(null, null); }
+    public Thread(Runnable target) { this(target, null); }
+    public Thread(String name) { this(null, name); }
+
+    public Thread(Runnable target, String name) {
+        this.target = target;
+        this.name = name != null ? name : "Thread-" + counter++;
+    }
+
+    public static Thread currentThread() {
+        if (main == null)
+            main = new Thread(null, "main");
+        return main;
+    }
+
+    public static native void sleep(long millis) throws InterruptedException;
+    public static void sleep(long millis, int nanos) throws InterruptedException { sleep(millis); }
+    public static void onSpinWait() {}
+    public static boolean interrupted() { return false; }
+
+    public void start() { run(); }
+
+    public void run() {
+        if (target != null)
+            target.run();
+    }
+
+    public void join() throws InterruptedException {}
+    public void join(long millis) throws InterruptedException {}
+    public void interrupt() { interrupted = true; }
+    public boolean isInterrupted() { return interrupted; }
+    public boolean isAlive() { return false; }
+    public boolean isDaemon() { return daemon; }
+    public void setDaemon(boolean on) { daemon = on; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public int getPriority() { return priority; }
+    public void setPriority(int p) { priority = p; }
+    public long getId() { return 1; }
+    public long threadId() { return 1; }
+    public StackTraceElement[] getStackTrace() { return new StackTraceElement[0]; }
+    public String toString() { return "Thread[#1," + name + "," + priority + ",main]"; }
+}

@@ -1,0 +1,206 @@
+package java.lang;
+
+// ─── Strings ────────────────────────────────────────────────────────────────
+
+public final class String implements java.io.Serializable, Comparable<String>, CharSequence {
+    public static final java.util.Comparator<String> CASE_INSENSITIVE_ORDER = (a, b) -> a.compareToIgnoreCase(b);
+
+    // `new String(...)` is lowered to __jn_String_new: these bodies never run
+    public String() {}
+    public String(String original) {}
+    public String(char[] value) {}
+    public String(char[] value, int offset, int count) {}
+    public String(byte[] bytes) {}
+    public String(StringBuilder builder) {}
+    public String(StringBuffer buffer) {}
+
+    public native int length();
+    public native char charAt(int index);
+    public native boolean isEmpty();
+    public native String substring(int beginIndex);
+    public native String substring(int beginIndex, int endIndex);
+    public native CharSequence subSequence(int beginIndex, int endIndex);
+    public native int indexOf(int ch);
+    public native int indexOf(int ch, int fromIndex);
+    public native int indexOf(String str);
+    public native int indexOf(String str, int fromIndex);
+    public native int lastIndexOf(int ch);
+    public native int lastIndexOf(int ch, int fromIndex);
+    public native int lastIndexOf(String str);
+    public native int lastIndexOf(String str, int fromIndex);
+    public native boolean contains(CharSequence s);
+    public native boolean startsWith(String prefix);
+    public native boolean startsWith(String prefix, int toffset);
+    public native boolean endsWith(String suffix);
+    public native boolean equals(Object anObject);
+    public native boolean equalsIgnoreCase(String anotherString);
+    public native int compareTo(String anotherString);
+    public native int compareToIgnoreCase(String str);
+    public native String toUpperCase();
+    public native String toLowerCase();
+    public native String trim();
+    public native String strip();
+    public native String stripLeading();
+    public native String stripTrailing();
+    public native boolean isBlank();
+    public native String replace(char oldChar, char newChar);
+    public native String replace(CharSequence target, CharSequence replacement);
+    public native String replaceAll(String regex, String replacement);
+    public native String replaceFirst(String regex, String replacement);
+    public native boolean matches(String regex);
+    public native String[] split(String regex);
+    public native String[] split(String regex, int limit);
+    public native char[] toCharArray();
+    public native int hashCode();
+    public native String repeat(int count);
+    public native String concat(String str);
+    public native int codePointAt(int index);
+
+    public String toString() { return this; }
+    public String intern() { return this; }
+    public String toUpperCase(java.util.Locale locale) { return toUpperCase(); }
+    public String toLowerCase(java.util.Locale locale) { return toLowerCase(); }
+    public boolean contentEquals(CharSequence cs) { return equals(cs.toString()); }
+
+    public boolean regionMatches(int toffset, String other, int ooffset, int len) {
+        return regionMatches(false, toffset, other, ooffset, len);
+    }
+
+    public boolean regionMatches(boolean ignoreCase, int toffset, String other, int ooffset, int len) {
+        if (ooffset < 0 || toffset < 0 || toffset > (long) length() - len || ooffset > (long) other.length() - len)
+            return false;
+        for (int i = 0; i < len; i++) {
+            char c1 = charAt(toffset + i), c2 = other.charAt(ooffset + i);
+            if (c1 == c2)
+                continue;
+            if (ignoreCase && (Character.toUpperCase(c1) == Character.toUpperCase(c2)
+                    || Character.toLowerCase(c1) == Character.toLowerCase(c2)))
+                continue;
+            return false;
+        }
+        return true;
+    }
+
+    public int codePointCount(int beginIndex, int endIndex) {
+        int n = 0;
+        for (int i = beginIndex; i < endIndex; i++, n++)
+            if (Character.isHighSurrogate(charAt(i)) && i + 1 < endIndex && Character.isLowSurrogate(charAt(i + 1)))
+                i++;
+        return n;
+    }
+
+    public byte[] getBytes() {
+        java.util.ArrayList<Integer> out = new java.util.ArrayList<>();
+        for (int i = 0; i < length(); i++) {
+            int c = charAt(i);
+            if (Character.isHighSurrogate((char) c) && i + 1 < length()) {
+                c = 0x10000 + ((c - 0xD800) << 10) + (charAt(i + 1) - 0xDC00);
+                i++;
+            }
+            if (c < 0x80) {
+                out.add(c);
+            } else if (c < 0x800) {
+                out.add(0xC0 | (c >> 6));
+                out.add(0x80 | (c & 0x3F));
+            } else if (c < 0x10000) {
+                out.add(0xE0 | (c >> 12));
+                out.add(0x80 | ((c >> 6) & 0x3F));
+                out.add(0x80 | (c & 0x3F));
+            } else {
+                out.add(0xF0 | (c >> 18));
+                out.add(0x80 | ((c >> 12) & 0x3F));
+                out.add(0x80 | ((c >> 6) & 0x3F));
+                out.add(0x80 | (c & 0x3F));
+            }
+        }
+        byte[] b = new byte[out.size()];
+        for (int i = 0; i < b.length; i++)
+            b[i] = (byte) (int) out.get(i);
+        return b;
+    }
+
+    public java.util.stream.IntStream chars() {
+        int n = length();
+        int[] a = new int[n];
+        for (int i = 0; i < n; i++)
+            a[i] = charAt(i);
+        return java.util.Arrays.stream(a);
+    }
+
+    public java.util.stream.Stream<String> lines() {
+        java.util.ArrayList<String> out = new java.util.ArrayList<>();
+        int start = 0, n = length();
+        for (int i = 0; i < n; i++) {
+            char c = charAt(i);
+            if (c == '\n' || c == '\r') {
+                out.add(substring(start, i));
+                if (c == '\r' && i + 1 < n && charAt(i + 1) == '\n')
+                    i++;
+                start = i + 1;
+            }
+        }
+        if (start < n)
+            out.add(substring(start));
+        return out.stream();
+    }
+
+    public String indent(int n) {
+        if (isEmpty())
+            return "";
+        StringBuilder sb = new StringBuilder();
+        for (String line : lines().toList()) {
+            if (n > 0)
+                sb.append(" ".repeat(n)).append(line);
+            else if (n < 0) {
+                int k = 0;
+                while (k < -n && k < line.length() && Character.isWhitespace(line.charAt(k)))
+                    k++;
+                sb.append(line.substring(k));
+            } else
+                sb.append(line);
+            sb.append('\n');
+        }
+        return sb.toString();
+    }
+
+    public static String valueOf(Object obj) { return obj == null ? "null" : obj.toString(); }
+    public static String valueOf(char[] data) { return new String(data); }
+    public static String valueOf(char[] data, int offset, int count) { return new String(data, offset, count); }
+    public static String copyValueOf(char[] data) { return new String(data); }
+    public static String copyValueOf(char[] data, int offset, int count) { return new String(data, offset, count); }
+    public static String valueOf(boolean b) { return b ? "true" : "false"; }
+    public static String valueOf(char c) { return "" + c; }
+    public static String valueOf(int i) { return "" + i; }
+    public static String valueOf(long l) { return "" + l; }
+    public static String valueOf(float f) { return "" + f; }
+    public static String valueOf(double d) { return "" + d; }
+
+    public static String join(CharSequence delimiter, CharSequence... elements) {
+        StringBuilder sb = new StringBuilder();
+        String d = delimiter.toString();
+        for (int i = 0; i < elements.length; i++) {
+            if (i > 0)
+                sb.append(d);
+            sb.append(String.valueOf(elements[i]));
+        }
+        return sb.toString();
+    }
+
+    public static String join(CharSequence delimiter, Iterable<? extends CharSequence> elements) {
+        StringBuilder sb = new StringBuilder();
+        String d = delimiter.toString();
+        boolean first = true;
+        for (CharSequence cs : elements) {
+            if (!first)
+                sb.append(d);
+            sb.append(String.valueOf(cs));
+            first = false;
+        }
+        return sb.toString();
+    }
+
+    public static String format(String format, Object... args) { return $format(format, args); }
+    public static String format(java.util.Locale l, String format, Object... args) { return $format(format, args); }
+    public String formatted(Object... args) { return $format(this, args); }
+    private static native String $format(String format, Object[] args);
+}

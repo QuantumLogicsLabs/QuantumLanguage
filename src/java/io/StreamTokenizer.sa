@@ -1,0 +1,112 @@
+package java.io;
+
+// Reads numbers and words from a stream (the usual fast-input idiom).
+public class StreamTokenizer {
+    public static final int TT_EOF = -1;
+    public static final int TT_EOL = '\n';
+    public static final int TT_NUMBER = -2;
+    public static final int TT_WORD = -3;
+    public int ttype = -4;
+    public String sval;
+    public double nval;
+    private final Reader reader;
+    private boolean pushedBack;
+    private int lineno = 1;
+    private int peekc = -2;
+
+    public StreamTokenizer(Reader r) { reader = java.util.Objects.requireNonNull(r); }
+    public StreamTokenizer(InputStream is) { reader = new InputStreamReader(is); }
+
+    public void resetSyntax() {}
+    public void wordChars(int low, int hi) {}
+    public void whitespaceChars(int low, int hi) {}
+    public void ordinaryChars(int low, int hi) {}
+    public void ordinaryChar(int ch) {}
+    public void commentChar(int ch) {}
+    public void quoteChar(int ch) {}
+    public void parseNumbers() {}
+    public void eolIsSignificant(boolean flag) {}
+    public void slashStarComments(boolean flag) {}
+    public void slashSlashComments(boolean flag) {}
+    public void lowerCaseMode(boolean fl) {}
+    public void pushBack() {
+        if (ttype != -4)
+            pushedBack = true;
+    }
+    public int lineno() { return lineno; }
+
+    private int readChar() throws IOException {
+        if (peekc != -2) {
+            int c = peekc;
+            peekc = -2;
+            return c;
+        }
+        return reader.read();
+    }
+
+    public int nextToken() throws IOException {
+        if (pushedBack) {
+            pushedBack = false;
+            return ttype;
+        }
+        sval = null;
+        String t;
+        if (reader.$isStdin() && peekc == -2) {
+            t = $In.token();
+        } else {
+            int c = readChar();
+            while (c != -1 && c <= ' ') {
+                if (c == '\n')
+                    lineno++;
+                c = readChar();
+            }
+            if (c == -1) {
+                t = null;
+            } else {
+                StringBuilder sb = new StringBuilder();
+                while (c != -1 && c > ' ') {
+                    sb.append((char) c);
+                    c = readChar();
+                }
+                peekc = c;
+                t = sb.toString();
+            }
+        }
+        if (t == null)
+            return ttype = TT_EOF;
+        if (isNumber(t)) {
+            nval = Double.parseDouble(t);
+            return ttype = TT_NUMBER;
+        }
+        sval = t;
+        return ttype = TT_WORD;
+    }
+
+    private static boolean isNumber(String t) {
+        int i = 0, n = t.length();
+        if (i < n && t.charAt(i) == '-')
+            i++;
+        boolean digits = false, dot = false;
+        for (; i < n; i++) {
+            char c = t.charAt(i);
+            if (c >= '0' && c <= '9')
+                digits = true;
+            else if (c == '.' && !dot)
+                dot = true;
+            else
+                return false;
+        }
+        return digits;
+    }
+
+    public String toString() {
+        String ret;
+        switch (ttype) {
+            case TT_EOF: ret = "EOF"; break;
+            case TT_NUMBER: ret = "n=" + nval; break;
+            case TT_WORD: ret = sval; break;
+            default: ret = "NOTHING"; break;
+        }
+        return "Token[" + ret + "], line " + lineno;
+    }
+}

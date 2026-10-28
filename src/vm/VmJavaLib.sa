@@ -1204,20 +1204,40 @@ void registerJavaLibNatives(const std::function<void(const std::string &, Quantu
             f = QV(std::string());
         return f.mutString();
     };
+    // Whether the text is all ASCII (one char per byte). The field "$k" holds
+    // the length of a prefix already checked: append only adds bytes, so a
+    // loop of length() / charAt() checks each byte once rather than the whole
+    // text on every call. Any other edit starts the check over.
+    auto sbAscii = [sbText](const QV &self) -> bool
+    {
+        std::string &s = sbText(self);
+        QV &k = self.asInstance()->fields["$k"];
+        size_t from = k.isNil() ? 0 : (size_t)jint(k);
+        if (from > s.size())
+            from = 0;
+        for (size_t i = from; i < s.size(); ++i)
+            if ((unsigned char)s[i] >= 0x80)
+            {
+                k = jlong((int64_t)i);
+                return false;
+            }
+        k = jlong((int64_t)s.size());
+        return true;
+    };
     reg("__jn_StringBuilder_append", [sbText](std::vector<QV> a) -> QV
         {
         sbText(arg(a, 0)) += S(arg(a, 1));
         return arg(a, 0); });
-    reg("__jn_StringBuilder_length", [sbText](std::vector<QV> a) -> QV
+    reg("__jn_StringBuilder_length", [sbText, sbAscii](std::vector<QV> a) -> QV
         {
         std::string &s = sbText(arg(a, 0));
-        return I(isAscii(s) ? (int64_t)s.size() : u16Length(s)); });
+        return I(sbAscii(arg(a, 0)) ? (int64_t)s.size() : u16Length(s)); });
     reg("__jn_StringBuilder_toString", [sbText](std::vector<QV> a) -> QV { return Str(sbText(arg(a, 0))); });
-    reg("__jn_StringBuilder_charAt", [sbText](std::vector<QV> a) -> QV
+    reg("__jn_StringBuilder_charAt", [sbText, sbAscii](std::vector<QV> a) -> QV
         {
         std::string &s = sbText(arg(a, 0));
         int64_t i = jint(arg(a, 1));
-        if (isAscii(s))
+        if (sbAscii(arg(a, 0)))
         {
             if (i < 0 || i >= (int64_t)s.size())
                 jthrow("java.lang.StringIndexOutOfBoundsException", "index " + std::to_string(i) + ",length " + std::to_string(s.size()));
@@ -1230,6 +1250,7 @@ void registerJavaLibNatives(const std::function<void(const std::string &, Quantu
         std::u16string u = toU16(s);
         f(u);
         s = fromU16(u);
+        self.asInstance()->fields["$k"] = QV(); // sbAscii checks it all again
     };
     auto sioobe = [](const std::string &m) { jthrow("java.lang.StringIndexOutOfBoundsException", m); };
     reg("__jn_StringBuilder_insert", [edit, sioobe](std::vector<QV> a) -> QV

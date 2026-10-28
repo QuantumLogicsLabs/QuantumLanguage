@@ -1,0 +1,37 @@
+package java.lang;
+
+public final class Short extends Number implements Comparable<Short> {
+    public static final short MIN_VALUE = -32768;
+    public static final short MAX_VALUE = 32767;
+    public static final int SIZE = 16;
+    public static final int BYTES = 2;
+    private final short value;
+
+    public Short(short value) { this.value = value; }
+    public Short(String s) throws NumberFormatException { this.value = parseShort(s); }
+
+    public static Short valueOf(short s) { return s; }
+    public static Short valueOf(String s) throws NumberFormatException { return parseShort(s); }
+    public static short parseShort(String s) throws NumberFormatException { return parseShort(s, 10); }
+    public static short parseShort(String s, int radix) throws NumberFormatException {
+        int i = Integer.parseInt(s, radix);
+        if (i < MIN_VALUE || i > MAX_VALUE)
+            throw new NumberFormatException("Value out of range. Value:\"" + s + "\" Radix:" + radix);
+        return (short) i;
+    }
+    public static String toString(short s) { return "" + s; }
+    public static int compare(short x, short y) { return x - y; }
+    public static int hashCode(short value) { return value; }
+    public static int toUnsignedInt(short x) { return ((int) x) & 0xffff; }
+
+    public short shortValue() { return value; }
+    public byte byteValue() { return (byte) value; }
+    public int intValue() { return value; }
+    public long longValue() { return value; }
+    public float floatValue() { return value; }
+    public double doubleValue() { return value; }
+    public int compareTo(Short anotherShort) { return compare(this.value, anotherShort.value); }
+    public boolean equals(Object obj) { return obj instanceof Short && value == ((Short) obj).value; }
+    public int hashCode() { return value; }
+    public String toString() { return toString(value); }
+}

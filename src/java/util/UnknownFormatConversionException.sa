@@ -1,0 +1,13 @@
+package java.util;
+
+import java.util.function.*;
+import java.util.stream.*;
+
+public class UnknownFormatConversionException extends IllegalFormatException {
+    private final String s;
+    public UnknownFormatConversionException(String s) {
+        super(s);
+        this.s = s;
+    }
+    public String getConversion() { return s; }
+}

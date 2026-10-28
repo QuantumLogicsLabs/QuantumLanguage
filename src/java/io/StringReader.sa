@@ -1,0 +1,29 @@
+package java.io;
+
+public class StringReader extends Reader {
+    private String str;
+    private int next = 0;
+
+    public StringReader(String s) { this.str = s; }
+
+    public int read() throws IOException {
+        if (next >= str.length())
+            return -1;
+        return str.charAt(next++);
+    }
+
+    public int read(char[] cbuf, int off, int len) throws IOException {
+        if (len == 0)
+            return 0;
+        if (next >= str.length())
+            return -1;
+        int n = Math.min(str.length() - next, len);
+        for (int i = 0; i < n; i++)
+            cbuf[off + i] = str.charAt(next + i);
+        next += n;
+        return n;
+    }
+
+    public boolean ready() throws IOException { return true; }
+    public void close() {}
+}

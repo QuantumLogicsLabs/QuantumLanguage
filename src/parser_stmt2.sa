@@ -479,7 +479,9 @@ fn parseOneField(cd, ctx, ln) {
     }
     let typeToken = ctx["typeToken"]
     # a member object / container is constructed for each instance
-    let perInstance = ctx["objectType"] and !fieldIsPtr and !ctx["isStatic"] and !P_NOT_CONSTRUCTED.has(typeToken)
+    # a member of the class's own type is a reference: constructing one per
+    # instance would recurse without end
+    let perInstance = ctx["objectType"] and !fieldIsPtr and !ctx["isStatic"] and !P_NOT_CONSTRUCTED.has(typeToken) and typeToken != cd["name"]
     if perInstance and init == nil {
         let check = nCall(nIdent("__constructible__", ln), [nIdent(typeToken, ln)], ln)
         let ctor = nCall(nIdent(typeToken, ln), [], ln)

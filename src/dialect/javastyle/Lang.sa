@@ -1,0 +1,567 @@
+// Java-style library, part 1 (java.lang): what Java-style code in a .sa file calls
+// (src/dialect/JavaDialect.sa rewrites the code; compileSource() puts this
+// directory's files, in name order, in front of it). Java's library classes
+// as Quantum values. This part: the helpers the rewritten code calls,
+// String.format, System.out / err / in, the String / Integer / Long / Double /
+// Boolean / Character / Math statics, Objects, the exceptions. Util.sa: the
+// rest of java.util, with the collections:
+//   ArrayList / Stack / Vector     Quantum arrays (Java methods: VmJavaStyle)
+//   LinkedList / ArrayDeque        __JDeque (head first: push / pop / peek)
+//   HashMap / TreeMap / ...        __JMap   (keys keep their type)
+//   HashSet / TreeSet / ...        __JSet
+//   PriorityQueue                  __JPriorityQueue (java.util's heap order)
+// Values follow Quantum's semantics: numbers are one type, a char is a
+// one-character string.
+
+__java_style__()
+
+// ── helpers the rewritten code calls ────────────────────────────────────────
+
+// natural order: numbers, strings, booleans, compareTo()
+fn __jcompare(a, b) {
+    if (a == nil && b == nil) { return 0 }
+    if (a == nil) { return -1 }
+    if (b == nil) { return 1 }
+    if (type(a) == "array" && type(b) == "array") {
+        let n = len(a) < len(b) ? len(a) : len(b)
+        let i = 0
+        while (i < n) {
+            let c = __jcompare(a[i], b[i])
+            if (c != 0) { return c }
+            i += 1
+        }
+        return len(a) - len(b)
+    }
+    if (__jhas(a, "compareTo")) { return a.compareTo(b) }
+    if (type(a) == "bool") { return a == b ? 0 : (a ? 1 : -1) }
+    if (type(a) == "string" && type(b) == "string") { return a.compareTo(b) }
+    if (a < b) { return -1 }
+    if (a > b) { return 1 }
+    return 0
+}
+
+fn __jequals(a, b) {
+    if (__jhas(a, "equals")) { return a.equals(b) }
+    return a == b
+}
+
+// a map / set key that keeps the value's type: 1 and "1" differ
+fn __jkey(k) {
+    let t = type(k)
+    if (t == "number") { return "n:" + str(k) }
+    if (t == "string") { return "s:" + k }
+    if (t == "bool") { return k ? "b:1" : "b:0" }
+    if (k == nil) { return "z:" }
+    if (t == "array") { return "a:" + __jstr(k) }
+    if (__jhas(k, "hashCode")) { return "h:" + str(k.hashCode()) + ":" + __jstr(k) }
+    return "o:" + __jstr(k)
+}
+
+// what a for-each loop walks: arrays, collections, Iterables, map keys
+fn __jit(x) {
+    if (x == nil) { return [] }
+    let t = type(x)
+    if (t == "array" || t == "string") { return x }
+    if (t == "dict") { return x.keys() }
+    if (__jhas(x, "toArray")) { return x.toArray() }
+    if (__jhas(x, "iterator")) {
+        let out = []
+        let it = x.iterator()
+        while (it.hasNext()) { out.push(it.next()) }
+        return out
+    }
+    return x
+}
+
+// new T[n][m]: nested arrays filled with `fill`
+fn __jarr(fill, *dims) {
+    return __jarrDims(fill, dims, 0)
+}
+
+fn __jarrDims(fill, dims, level) {
+    let out = []
+    let n = dims[level]
+    let i = 0
+    while (i < n) {
+        if (level + 1 < len(dims)) { out.push(__jarrDims(fill, dims, level + 1)) } else { out.push(fill) }
+        i += 1
+    }
+    return out
+}
+
+// a lambda, a function or a native (a comparator made by thenComparing)
+fn __jcallable(v) { return type(v) == "function" || type(v) == "native" }
+
+fn __jchar(v) {
+    if (type(v) == "number") { return chr(v) }
+    return v
+}
+
+fn __jinstanceof(v, t) {
+    if (v == nil) { return false }
+    if (type(t) != "string") { return isinstance(v, t) }
+    let ty = type(v)
+    if (t == "Object") { return true }
+    if (t == "String" || t == "CharSequence") { return ty == "string" }
+    if (t == "Character") { return ty == "string" && len(v) == 1 }
+    if (t == "Integer" || t == "Long" || t == "Short" || t == "Byte") { return ty == "number" && floor(v) == v }
+    if (t == "Double" || t == "Float" || t == "Number") { return ty == "number" }
+    if (t == "Boolean") { return ty == "bool" }
+    if (t == "Comparable") { return ty == "number" || ty == "string" || __jhas(v, "compareTo") }
+    if (t == "List" || t == "ArrayList") { return ty == "array" || __jinChain(v, "__JDeque") }
+    if (t == "Collection" || t == "Iterable") {
+        return ty == "array" || __jinChain(v, "__JDeque") || __jinChain(v, "__JSet") || __jhas(v, "iterator")
+    }
+    if (t == "Map" || t == "HashMap" || t == "TreeMap") { return __jinChain(v, "__JMap") }
+    if (t == "Set" || t == "HashSet" || t == "TreeSet") { return __jinChain(v, "__JSet") }
+    if (t == "Runnable" || t == "Function") { return __jcallable(v) }
+    return __jinChain(v, t)
+}
+
+fn __jinChain(v, name) {
+    for (let n of __jclassChain(v)) {
+        if (n == name) { return true }
+    }
+    return false
+}
+
+// a caught value as an exception object (errors the VM raises included)
+fn __jexc(raw) {
+    if (__jinChain(raw, "Throwable")) { return raw }
+    if (type(raw) != "string") { return new RuntimeException(__jstr(raw)) }
+    let kind = __jerrorKind()
+    if (raw.contains("by zero")) { return new ArithmeticException("/ by zero") }
+    if (raw.startsWith("NoSuchElementException")) { return new NoSuchElementException(nil) }
+    if (kind == "IndexError" || raw.contains("out of bounds") || raw.contains("out of range")) {
+        return new IndexOutOfBoundsException(raw)
+    }
+    if (kind == "TypeError" && (raw.contains("nil") || raw.contains("null"))) { return new NullPointerException(raw) }
+    return new RuntimeException(raw)
+}
+
+// whether exception `x` is one of the classes `names` (empty: any)
+fn __jcatch(x, names) {
+    if (len(names) == 0) { return true }
+    for (let n of names) {
+        if (__jinChain(x, n)) { return true }
+    }
+    return false
+}
+
+fn __jenum(obj, name, ordinal) {
+    obj.__name = name
+    obj.__ordinal = ordinal
+    return obj
+}
+
+fn __jenumValueOf(values, s) {
+    for (let v of values) {
+        if (v.__name == s) { return v }
+    }
+    throw new IllegalArgumentException("No enum constant " + s)
+}
+
+fn __jopt(v) { return new __JOptional(v) }
+
+// ── String.format / printf ─────────────────────────────────────────────────
+
+fn __jpad(s, width, left, zero) {
+    if (width <= len(s)) { return s }
+    let fill = (zero && !left) ? "0" : " "
+    let pad = fill.repeat(width - len(s))
+    if (left) { return s + pad }
+    if (zero && (s.startsWith("-") || s.startsWith("+"))) { return s[0] + pad + s.substring(1) }
+    return pad + s
+}
+
+fn __jgroup(digits) {
+    let out = ""
+    let n = len(digits)
+    let i = 0
+    while (i < n) {
+        if (i > 0 && (n - i) % 3 == 0) { out += "," }
+        out += digits[i]
+        i += 1
+    }
+    return out
+}
+
+fn __jtrunc(v) { return v < 0 ? -floor(-v) : floor(v) }
+
+fn __jradix(v, radix, upper) {
+    let n = __jtrunc(v)
+    if (n < 0) { n += 4294967296 }
+    if (n == 0) { return "0" }
+    let digits = upper ? "0123456789ABCDEF" : "0123456789abcdef"
+    let out = ""
+    while (n > 0) {
+        out = digits[n % radix] + out
+        n = floor(n / radix)
+    }
+    return out
+}
+
+fn __jsci(v, prec, upper) {
+    let neg = v < 0
+    let a = neg ? -v : v
+    let e = 0
+    if (a != 0) {
+        while (a >= 10) { a /= 10; e += 1 }
+        while (a < 1) { a *= 10; e -= 1 }
+    }
+    let m = a.toFixed(prec)
+    if (m.startsWith("10")) { a /= 10; e += 1; m = a.toFixed(prec) }
+    let es = str(e < 0 ? -e : e)
+    if (len(es) < 2) { es = "0" + es }
+    return (neg ? "-" : "") + m + (upper ? "E" : "e") + (e < 0 ? "-" : "+") + es
+}
+
+fn __jformat(fmt, args) {
+    let out = ""
+    let i = 0
+    let next = 0
+    let n = len(fmt)
+    while (i < n) {
+        let c = fmt[i]
+        if (c != "%") {
+            out += c
+            i += 1
+            continue
+        }
+        i += 1
+        // %2$s: an explicit argument
+        let argIndex = -1
+        let j = i
+        let num = ""
+        while (j < n && fmt[j] >= "0" && fmt[j] <= "9") { num += fmt[j]; j += 1 }
+        if (j < n && fmt[j] == "$" && num != "") { argIndex = num.to_i() - 1; i = j + 1 }
+        let flags = ""
+        while (i < n && "-+0 ,#(".contains(fmt[i])) { flags += fmt[i]; i += 1 }
+        let width = ""
+        while (i < n && fmt[i] >= "0" && fmt[i] <= "9") { width += fmt[i]; i += 1 }
+        let prec = -1
+        if (i < n && fmt[i] == ".") {
+            i += 1
+            let p = ""
+            while (i < n && fmt[i] >= "0" && fmt[i] <= "9") { p += fmt[i]; i += 1 }
+            prec = p.to_i()
+        }
+        let conv = fmt[i]
+        i += 1
+        if (conv == "n") { out += "\n"; continue }
+        if (conv == "%") { out += "%"; continue }
+        let arg = nil
+        if (argIndex >= 0) { arg = args[argIndex] } else { arg = args[next]; next += 1 }
+        let left = flags.contains("-")
+        let zero = flags.contains("0")
+        let w = width == "" ? 0 : width.to_i()
+        let s = ""
+        if (conv == "d") {
+            let v = __jtrunc(arg)
+            let digits = str(v < 0 ? -v : v)
+            if (flags.contains(",")) { digits = __jgroup(digits) }
+            s = (v < 0 ? "-" : (flags.contains("+") ? "+" : (flags.contains(" ") ? " " : ""))) + digits
+        } else if (conv == "f") {
+            let v = arg
+            let body = (v < 0 ? -v : v).toFixed(prec < 0 ? 6 : prec)
+            if (flags.contains(",")) {
+                let dot = body.indexOf(".")
+                body = dot < 0 ? __jgroup(body) : __jgroup(body.substring(0, dot)) + body.substring(dot)
+            }
+            s = (v < 0 ? "-" : (flags.contains("+") ? "+" : "")) + body
+        } else if (conv == "e" || conv == "E") {
+            s = __jsci(arg, prec < 0 ? 6 : prec, conv == "E")
+        } else if (conv == "x" || conv == "X") {
+            s = __jradix(arg, 16, conv == "X")
+        } else if (conv == "o") {
+            s = __jradix(arg, 8, false)
+        } else if (conv == "c") {
+            s = type(arg) == "number" ? chr(arg) : str(arg)
+        } else if (conv == "b" || conv == "B") {
+            s = (arg == nil || arg == false) ? "false" : "true"
+        } else {
+            s = __jstr(arg)
+            if (prec >= 0 && len(s) > prec) { s = s.substring(0, prec) }
+            if (conv == "S") { s = s.toUpperCase() }
+        }
+        out += __jpad(s, w, left, zero && conv != "s")
+    }
+    return out
+}
+
+// ── System ─────────────────────────────────────────────────────────────────
+
+fn __jprintStream(err) {
+    let emit = fn(s) { if (err) { __jeprint(s) } else { print(s, end="") } }
+    return {
+        "println": fn(*a) { emit((len(a) == 0 ? "" : __jstr(a[0])) + "\n") },
+        "print": fn(x) { emit(__jstr(x)) },
+        "printf": fn(f, *a) { emit(__jformat(f, a)) },
+        "format": fn(f, *a) { emit(__jformat(f, a)) },
+        "flush": fn() { __jflush() }
+    }
+}
+
+let System = {
+    "out": __jprintStream(false),
+    "err": __jprintStream(true),
+    "in": "System.in",
+    "currentTimeMillis": fn() { return floor(time() * 1000) },
+    "nanoTime": fn() { return floor(time() * 1000000000) },
+    "exit": fn(code) { __jexit(code) },
+    "lineSeparator": fn() { return "\n" },
+    "arraycopy": fn(src, sp, dst, dp, n) {
+        let tmp = src.slice(sp, sp + n)
+        let i = 0
+        while (i < n) { dst[dp + i] = tmp[i]; i += 1 }
+    },
+    "identityHashCode": fn(o) { return __jkey(o).hashCode() }
+}
+
+// ── boxes and utility classes ──────────────────────────────────────────────
+
+fn __jparseInt(s, radix) {
+    if (radix == nil) { radix = 10 }
+    if (type(s) != "string") { throw new NumberFormatException("Cannot parse null string: null") }
+    let t = s
+    let neg = false
+    let i = 0
+    if (len(t) > 0 && (t[0] == "-" || t[0] == "+")) { neg = t[0] == "-"; i = 1 }
+    if (i >= len(t)) { throw new NumberFormatException("For input string: \"" + s + "\"") }
+    let digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    let v = 0
+    while (i < len(t)) {
+        let d = digits.indexOf(t[i].toLowerCase())
+        if (d < 0 || d >= radix) { throw new NumberFormatException("For input string: \"" + s + "\"") }
+        v = v * radix + d
+        i += 1
+    }
+    return neg ? -v : v
+}
+
+fn __jparseDouble(s) {
+    let t = str(s).trim()
+    if (t == "" || !t.matches("[+-]?(NaN|Infinity|((\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?))[fFdD]?")) {
+        throw new NumberFormatException("For input string: \"" + s + "\"")
+    }
+    return t.to_f()
+}
+
+let Integer = {
+    "MAX_VALUE": 2147483647, "MIN_VALUE": -2147483648, "SIZE": 32,
+    "parseInt": fn(s, radix) { return __jparseInt(s, radix) },
+    "valueOf": fn(s, radix) { return type(s) == "string" ? __jparseInt(s, radix) : s },
+    "toString": fn(v, radix) { return radix == nil ? __jstr(__jtrunc(v)) : (v < 0 ? "-" + __jradix(-v, radix, false) : __jradix(v, radix, false)) },
+    "toBinaryString": fn(v) { return __jradix(v, 2, false) },
+    "toHexString": fn(v) { return __jradix(v, 16, false) },
+    "toOctalString": fn(v) { return __jradix(v, 8, false) },
+    "sum": fn(a, b) { return a + b },
+    "max": fn(a, b) { return a > b ? a : b },
+    "min": fn(a, b) { return a < b ? a : b },
+    "compare": fn(a, b) { return a < b ? -1 : (a > b ? 1 : 0) },
+    "signum": fn(v) { return v < 0 ? -1 : (v > 0 ? 1 : 0) },
+    "abs": fn(v) { return v < 0 ? -v : v },
+    "bitCount": fn(v) {
+        let n = __jtrunc(v)
+        if (n < 0) { n += 4294967296 }
+        let c = 0
+        while (n > 0) { c += n % 2; n = floor(n / 2) }
+        return c
+    }
+}
+
+let Long = {
+    "MAX_VALUE": 9223372036854775807, "MIN_VALUE": -9223372036854775808,
+    "parseLong": fn(s, radix) { return __jparseInt(s, radix) },
+    "valueOf": fn(s) { return type(s) == "string" ? __jparseInt(s, 10) : s },
+    "toString": fn(v) { return __jstr(__jtrunc(v)) },
+    "sum": fn(a, b) { return a + b },
+    "max": fn(a, b) { return a > b ? a : b },
+    "min": fn(a, b) { return a < b ? a : b },
+    "compare": fn(a, b) { return a < b ? -1 : (a > b ? 1 : 0) }
+}
+
+// (x / 0.0 raises in Quantum: infinity by overflow)
+let __jinf = 1e308 * 10
+let Double = {
+    "MAX_VALUE": 1.7976931348623157e308, "MIN_VALUE": 4.9e-324,
+    "POSITIVE_INFINITY": __jinf, "NEGATIVE_INFINITY": -__jinf, "NaN": __jinf - __jinf,
+    "parseDouble": fn(s) { return __jparseDouble(s) },
+    "valueOf": fn(s) { return type(s) == "string" ? __jparseDouble(s) : s },
+    "toString": fn(v) { return __jstr(v) },
+    "compare": fn(a, b) { return a < b ? -1 : (a > b ? 1 : 0) },
+    "isNaN": fn(v) { return v != v },
+    "sum": fn(a, b) { return a + b },
+    "max": fn(a, b) { return a > b ? a : b },
+    "min": fn(a, b) { return a < b ? a : b }
+}
+let Float = Double
+
+let Boolean = {
+    "TRUE": true, "FALSE": false,
+    "parseBoolean": fn(s) { return s != nil && str(s).toLowerCase() == "true" },
+    "valueOf": fn(s) { return type(s) == "bool" ? s : (s != nil && str(s).toLowerCase() == "true") },
+    "toString": fn(b) { return b ? "true" : "false" },
+    "compare": fn(a, b) { return a == b ? 0 : (a ? 1 : -1) },
+    "logicalAnd": fn(a, b) { return a && b },
+    "logicalOr": fn(a, b) { return a || b },
+    "logicalXor": fn(a, b) { return a != b }
+}
+
+let Character = {
+    "MIN_VALUE": chr(0), "MAX_VALUE": chr(65535),
+    "isDigit": fn(c) { return c != nil && c >= "0" && c <= "9" },
+    "isLetter": fn(c) { return c != nil && ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || ord(c) > 127) },
+    "isLetterOrDigit": fn(c) { return Character.isLetter(c) || Character.isDigit(c) },
+    "isAlphabetic": fn(c) { return Character.isLetter(c) },
+    "isUpperCase": fn(c) { return c >= "A" && c <= "Z" },
+    "isLowerCase": fn(c) { return c >= "a" && c <= "z" },
+    "isWhitespace": fn(c) { return c == " " || c == "\t" || c == "\n" || c == "\r" },
+    "toUpperCase": fn(c) { return c.toUpperCase() },
+    "toLowerCase": fn(c) { return c.toLowerCase() },
+    "getNumericValue": fn(c) {
+        let d = "0123456789abcdefghijklmnopqrstuvwxyz".indexOf(c.toLowerCase())
+        return d
+    },
+    "toString": fn(c) { return __jstr(c) },
+    "valueOf": fn(c) { return c }
+}
+
+Math.floorDiv = fn(a, b) { return floor(a / b) }
+Math.floorMod = fn(a, b) { return a - floor(a / b) * b }
+Math.hypot = fn(a, b) { return Math.sqrt(a * a + b * b) }
+Math.cbrt = fn(a) { return a < 0 ? -Math.pow(-a, 1.0 / 3) : Math.pow(a, 1.0 / 3) }
+Math.signum = fn(a) { return a < 0 ? -1 : (a > 0 ? 1 : 0) }
+Math.toRadians = fn(d) { return d * Math.PI / 180 }
+Math.toDegrees = fn(r) { return r * 180 / Math.PI }
+Math.addExact = fn(a, b) { return a + b }
+Math.multiplyExact = fn(a, b) { return a * b }
+
+let String = {
+    "valueOf": fn(v) { return type(v) == "array" ? v.join("") : __jstr(v) },
+    "copyValueOf": fn(v) { return v.join("") },
+    "format": fn(f, *a) { return __jformat(f, a) },
+    "join": fn(sep, *parts) {
+        let items = parts
+        if (len(parts) == 1 && type(parts[0]) != "string") { items = __jit(parts[0]) }
+        let out = ""
+        let first = true
+        for (let p of items) {
+            if (!first) { out += sep }
+            out += __jstr(p)
+            first = false
+        }
+        return out
+    },
+    "CASE_INSENSITIVE_ORDER": fn(a, b) { return a.compareToIgnoreCase(b) }
+}
+
+let Objects = {
+    "equals": fn(a, b) { return a == nil ? b == nil : __jequals(a, b) },
+    "hash": fn(*xs) {
+        let h = 1
+        for (let x of xs) { h = (31 * h + Objects.hashCode(x)) % 4294967296 }
+        return h >= 2147483648 ? h - 4294967296 : h
+    },
+    "hashCode": fn(o) {
+        if (o == nil) { return 0 }
+        if (type(o) == "string") { return o.hashCode() }
+        if (type(o) == "number") { return __jtrunc(o) }
+        if (type(o) == "bool") { return o ? 1231 : 1237 }
+        if (__jhas(o, "hashCode")) { return o.hashCode() }
+        return __jkey(o).hashCode()
+    },
+    "isNull": fn(o) { return o == nil },
+    "nonNull": fn(o) { return o != nil },
+    "toString": fn(o, d) { return o == nil && d != nil ? d : __jstr(o) },
+    "requireNonNull": fn(o, msg) {
+        if (o == nil) { throw new NullPointerException(msg) }
+        return o
+    },
+    "requireNonNullElse": fn(o, d) { return o == nil ? d : o }
+}
+
+let Thread = { "sleep": fn(ms) {} }
+
+class __JObject {
+    toString() { return __jstr(this) }
+}
+// new Object() (the name Object stays JavaScript's)
+fn __jobject() { return new __JObject() }
+
+// ── exceptions ─────────────────────────────────────────────────────────────
+
+class Throwable {
+    constructor(message, cause) {
+        if (__jinChain(message, "Throwable")) {
+            this.cause = message
+            this.message = message.toString()
+        } else {
+            this.message = message
+            this.cause = cause
+        }
+        this.suppressed = []
+    }
+    getMessage() { return this.message }
+    getLocalizedMessage() { return this.message }
+    getCause() { return this.cause }
+    initCause(c) { this.cause = c; return this }
+    addSuppressed(e) { this.suppressed.push(e) }
+    getSuppressed() { return this.suppressed }
+    getStackTrace() { return [] }
+    toString() {
+        let name = __jexcName(this)
+        return this.message == nil ? name : name + ": " + this.message
+    }
+    printStackTrace() {
+        __jeprint(this.toString() + "\n")
+        if (this.cause != nil) { __jeprint("Caused by: " + this.cause.toString() + "\n") }
+    }
+}
+
+// a library exception's Java name (java.lang.ArithmeticException), or the class's
+fn __jexcName(e) {
+    let n = __jclassChain(e)[0]
+    let util = ["NoSuchElementException", "ConcurrentModificationException", "InputMismatchException", "EmptyStackException"]
+    for (let u of util) {
+        if (n == u) { return "java.util." + n }
+    }
+    if (n == "IOException" || n == "FileNotFoundException" || n == "UncheckedIOException") { return "java.io." + n }
+    let lang = ["Throwable", "Exception", "RuntimeException", "Error", "ArithmeticException", "IllegalArgumentException",
+                "IllegalStateException", "NullPointerException", "IndexOutOfBoundsException",
+                "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException", "NumberFormatException",
+                "ClassCastException", "UnsupportedOperationException", "CloneNotSupportedException",
+                "InterruptedException", "StackOverflowError", "OutOfMemoryError", "AssertionError",
+                "NegativeArraySizeException"]
+    for (let l of lang) {
+        if (n == l) { return "java.lang." + n }
+    }
+    return n
+}
+
+class Exception extends Throwable {}
+class Error extends Throwable {}
+class RuntimeException extends Exception {}
+class ArithmeticException extends RuntimeException {}
+class IllegalArgumentException extends RuntimeException {}
+class NumberFormatException extends IllegalArgumentException {}
+class IllegalStateException extends RuntimeException {}
+class NullPointerException extends RuntimeException {}
+class ClassCastException extends RuntimeException {}
+class UnsupportedOperationException extends RuntimeException {}
+class NegativeArraySizeException extends RuntimeException {}
+class IndexOutOfBoundsException extends RuntimeException {}
+class ArrayIndexOutOfBoundsException extends IndexOutOfBoundsException {}
+class StringIndexOutOfBoundsException extends IndexOutOfBoundsException {}
+class NoSuchElementException extends RuntimeException {}
+class InputMismatchException extends NoSuchElementException {}
+class EmptyStackException extends RuntimeException {}
+class ConcurrentModificationException extends RuntimeException {}
+class CloneNotSupportedException extends Exception {}
+class InterruptedException extends Exception {}
+class IOException extends Exception {}
+class FileNotFoundException extends IOException {}
+class UncheckedIOException extends RuntimeException {}
+class StackOverflowError extends Error {}
+class OutOfMemoryError extends Error {}
+class AssertionError extends Error {}

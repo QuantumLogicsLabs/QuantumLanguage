@@ -1,0 +1,73 @@
+package java.io;
+
+public class BufferedReader extends Reader {
+    private final Reader in;
+    private int pushedBack = -2;
+
+    public BufferedReader(Reader in) { this.in = java.util.Objects.requireNonNull(in); }
+    public BufferedReader(Reader in, int sz) { this(in); }
+
+    public int read() throws IOException {
+        if (pushedBack != -2) {
+            int c = pushedBack;
+            pushedBack = -2;
+            return c;
+        }
+        return in.read();
+    }
+
+    public int read(char[] cbuf, int off, int len) throws IOException {
+        if (len == 0)
+            return 0;
+        int c = read();
+        if (c == -1)
+            return -1;
+        cbuf[off] = (char) c;
+        int i = 1;
+        while (i < len && in.ready()) {
+            c = read();
+            if (c == -1)
+                break;
+            cbuf[off + i++] = (char) c;
+        }
+        return i;
+    }
+
+    public String readLine() throws IOException {
+        if (in.$isStdin() && pushedBack == -2)
+            return $In.line();
+        StringBuilder sb = null;
+        while (true) {
+            int c = read();
+            if (c == -1)
+                return sb == null ? null : sb.toString();
+            if (sb == null)
+                sb = new StringBuilder();
+            if (c == '\n')
+                return sb.toString();
+            if (c == '\r') {
+                int d = read();
+                if (d != '\n' && d != -1)
+                    pushedBack = d;
+                return sb.toString();
+            }
+            sb.append((char) c);
+        }
+    }
+
+    public boolean ready() throws IOException { return pushedBack != -2 || in.ready(); }
+    public void close() throws IOException { in.close(); }
+    boolean $isStdin() { return in.$isStdin(); }
+
+    public java.util.stream.Stream<String> lines() {
+        java.util.ArrayList<String> out = new java.util.ArrayList<>();
+        try {
+            String line;
+            while ((line = readLine()) != null)
+                out.add(line);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return out.stream();
+    }
+}

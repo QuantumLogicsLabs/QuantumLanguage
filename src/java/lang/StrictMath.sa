@@ -1,0 +1,25 @@
+package java.lang;
+
+public final class StrictMath {
+    private StrictMath() {}
+    public static double sqrt(double a) { return Math.sqrt(a); }
+    public static double cbrt(double a) { return Math.cbrt(a); }
+    public static double pow(double a, double b) { return Math.pow(a, b); }
+    public static double exp(double a) { return Math.exp(a); }
+    public static double log(double a) { return Math.log(a); }
+    public static double log10(double a) { return Math.log10(a); }
+    public static double sin(double a) { return Math.sin(a); }
+    public static double cos(double a) { return Math.cos(a); }
+    public static double tan(double a) { return Math.tan(a); }
+    public static double atan2(double y, double x) { return Math.atan2(y, x); }
+    public static double floor(double a) { return Math.floor(a); }
+    public static double ceil(double a) { return Math.ceil(a); }
+    public static int abs(int a) { return Math.abs(a); }
+    public static long abs(long a) { return Math.abs(a); }
+    public static double abs(double a) { return Math.abs(a); }
+    public static int max(int a, int b) { return Math.max(a, b); }
+    public static int min(int a, int b) { return Math.min(a, b); }
+    public static double max(double a, double b) { return Math.max(a, b); }
+    public static double min(double a, double b) { return Math.min(a, b); }
+    public static long round(double a) { return Math.round(a); }
+}

@@ -493,12 +493,16 @@ void VM::registerNatives()
     }
 
     // ── Utility ───────────────────────────────────────────────────────────
-    reg("len", [](std::vector<QuantumValue> args) -> QuantumValue
+    reg("len", [this](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) throw RuntimeError("len() requires 1 argument");
         if (args[0].isString()) return QuantumValue((double)args[0].asString().size());
         if (args[0].isArray())  return QuantumValue((double)args[0].asArray()->size());
         if (args[0].isDict())   return QuantumValue((double)args[0].asDict()->size());
+        // an object: its __len__() (Python) or size() (a Java collection)
+        QuantumValue n;
+        if (invokeMagic(args[0], "__len__", {}, n) || invokeMagic(args[0], "size", {}, n))
+            return n;
         throw TypeError("len() unsupported for " + args[0].typeName()); });
     reg("type", [](std::vector<QuantumValue> args) -> QuantumValue
         {

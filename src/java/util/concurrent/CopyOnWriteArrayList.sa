@@ -1,0 +1,9 @@
+package java.util.concurrent;
+
+import java.util.*;
+import java.util.function.*;
+
+public class CopyOnWriteArrayList<E> extends ArrayList<E> {
+    public CopyOnWriteArrayList() { super(); }
+    public CopyOnWriteArrayList(Collection<? extends E> c) { super(c); }
+}

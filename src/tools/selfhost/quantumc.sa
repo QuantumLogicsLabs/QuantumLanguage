@@ -38,6 +38,7 @@
 #include "../../dialect/DialectScan.sa"
 #include "../../dialect/CDialect.sa"
 #include "../../dialect/CppDialect.sa"
+#include "../../dialect/JavaDialect.sa"
 #include "../../dialect/RubyDialect.sa"
 #include "../../dialect/RubyStdlib.sa"
 #include "../../cpp/CppLex.sa"
@@ -61,6 +62,7 @@
 #include "../../native/Codegen.sa"
 #include "../../generated/CppLibData.sa"
 #include "../../generated/JavaPreludeData.sa"
+#include "../../generated/JavaStyleData.sa"
 #include "../../generated/NativeLibData.sa"
 
 #include <fstream>

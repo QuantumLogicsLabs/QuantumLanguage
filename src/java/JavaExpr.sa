@@ -1749,6 +1749,10 @@ Val Sema::conditional(const ExprP &e, const TypeP &target)
         error(at->k == TK::Void ? e->b->pos : e->c->pos, "'void' type not allowed here");
         r.type = tError();
     }
+    // both operands of one type: that type, so Integer : Integer stays boxed
+    // (a null operand is not unboxed) (JLS 15.25)
+    else if (sameType(at, bt))
+        r.type = at;
     else if (isBooleanish(at) && isBooleanish(bt) && (isPrim(at) || isPrim(bt)))
         r.type = prim(TK::Boolean);
     else if (numericUnboxed(at) && numericUnboxed(bt) && (isPrim(at) || isPrim(bt) || (unboxed(at) && unboxed(bt))))

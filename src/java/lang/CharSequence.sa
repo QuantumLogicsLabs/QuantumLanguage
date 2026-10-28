@@ -1,0 +1,14 @@
+package java.lang;
+
+public interface CharSequence {
+    int length();
+    char charAt(int index);
+    CharSequence subSequence(int start, int end);
+    String toString();
+
+    default boolean isEmpty() { return length() == 0; }
+
+    default java.util.stream.IntStream chars() { return toString().chars(); }
+
+    static int compare(CharSequence cs1, CharSequence cs2) { return cs1.toString().compareTo(cs2.toString()); }
+}

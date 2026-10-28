@@ -1,0 +1,1521 @@
+// quantum: cpp
+#include "Dialect.h.sa"
+
+#include <cctype>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+// ─── Java dialect support (.sa files) ──────────────────────────────────────
+// Java-style code mixed into a .sa file is rewritten into syntax the common
+// Quantum parser already accepts (its C++ / JavaScript forms), then runs on
+// the normal pipeline with Quantum's dynamic semantics. (A whole .java file
+// goes to the strict Java front-end in src/java/ instead.)
+//
+// The pass works on tokens: each token keeps the whitespace and comments in
+// front of it, and a rewrite only changes token texts, so every line keeps
+// its number. It runs only on a file that shows unmistakable Java
+// (System.out.print..., import java..., access modifiers on members,
+// implements, @Override, String[]), so other .sa files are untouched.
+//
+// What it lowers:
+//   imports / package / annotations          removed
+//   generic arguments  List<String>, <T> m() removed
+//   array types  int[] a, String... args     int a, *args
+//   new int[n][m], new int[]{1, 2}           __jarr(0, n, m), [1, 2]
+//   new ArrayList<>() (library classes)      ArrayList()  (library functions)
+//   access / other modifiers, throws         removed (static is kept)
+//   interface / implements / default         class / extends / plain methods
+//   abstract and interface method headers    removed
+//   enum with names / fields / methods       a class with one instance per constant
+//   (a, b) -> expr, x -> { ... }             JavaScript arrows
+//   Type::method, obj::method, Type::new     bound members / small lambdas
+//   anonymous class with one method          a lambda
+//   x instanceof T, (RefType) x              __jinstanceof(x, T), x
+//   for (T x : xs)                           for (let x of __jit(xs))
+//   catch (A | B e) clauses                  one catch dispatching on the class
+//   case CONSTANT: of an enum                case Enum.CONSTANT:
+//   getClass() inside a class                this.getClass()
+//   List.of / Set.of / Map.of, new Object()  __jList_of, ..., __jobject()
+//   class Main { static void main(...) }     Main.main([]) at the end of the file
+// and appends the marker line that makes compileSource() load the Java-style
+// library (System.out, StringBuilder, collections, exceptions, ...).
+
+const char *const kJavaStyleMarker = "// quantum: java-style";
+
+namespace
+{
+
+enum class JK
+{
+    Ident,
+    Number,
+    String,
+    Punct
+};
+
+struct JTok
+{
+    JK kind;
+    std::string text; // as written
+    std::string out;  // what is emitted ("" = removed)
+    std::string pre;  // whitespace / comments in front of it
+};
+
+bool identStart(char c) { return std::isalpha((unsigned char)c) || c == '_' || c == '$'; }
+bool identChar(char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '$'; }
+
+// Splits the source into tokens; `tail` gets what follows the last one.
+std::vector<JTok> tokenize(const std::string &s, std::string &tail)
+{
+    static const char *multi[] = {">>>=", "<<=", ">>=", "...", "->", "::", "==", "!=", "<=", ">=", "&&", "||", "=>",
+                                  "++",   "--",  "+=",  "-=",  "*=", "/=", "%=", "&=", "|=", "^="};
+    std::vector<JTok> out;
+    std::string pre;
+    size_t i = 0, n = s.size();
+    while (i < n)
+    {
+        char c = s[i];
+        if (std::isspace((unsigned char)c))
+        {
+            pre += c;
+            ++i;
+            continue;
+        }
+        if (c == '#' || (c == '/' && i + 1 < n && s[i + 1] == '/'))
+        {
+            size_t e = s.find('\n', i);
+            if (e == std::string::npos)
+                e = n;
+            pre += s.substr(i, e - i);
+            i = e;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && s[i + 1] == '*')
+        {
+            size_t e = s.find("*/", i + 2);
+            e = e == std::string::npos ? n : e + 2;
+            pre += s.substr(i, e - i);
+            i = e;
+            continue;
+        }
+        JTok t;
+        size_t start = i;
+        if (c == '"' || c == '\'' || c == '`')
+        {
+            bool triple = c != '`' && i + 2 < n && s[i + 1] == c && s[i + 2] == c;
+            if (triple)
+            {
+                size_t e = s.find(std::string(3, c), i + 3);
+                i = e == std::string::npos ? n : e + 3;
+            }
+            else
+            {
+                ++i;
+                while (i < n && s[i] != c)
+                {
+                    if (s[i] == '\\')
+                        ++i;
+                    else if (s[i] == '\n' && c != '`')
+                        break;
+                    ++i;
+                }
+                if (i < n)
+                    ++i;
+            }
+            t.kind = JK::String;
+        }
+        else if (identStart(c))
+        {
+            while (i < n && identChar(s[i]))
+                ++i;
+            t.kind = JK::Ident;
+        }
+        else if (std::isdigit((unsigned char)c) || (c == '.' && i + 1 < n && std::isdigit((unsigned char)s[i + 1])))
+        {
+            while (i < n && (std::isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '.' ||
+                             ((s[i] == '+' || s[i] == '-') && (s[i - 1] == 'e' || s[i - 1] == 'E') &&
+                              !(s[start] == '0' && start + 1 < n && (s[start + 1] == 'x' || s[start + 1] == 'X')))))
+            {
+                if (s[i] == '.' && i + 1 < n && s[i + 1] == '.')
+                    break; // a range: 1..5
+                ++i;
+            }
+            t.kind = JK::Number;
+        }
+        else
+        {
+            t.kind = JK::Punct;
+            size_t len = 1;
+            for (const char *m : multi)
+            {
+                size_t ml = std::char_traits<char>::length(m);
+                if (s.compare(i, ml, m) == 0)
+                {
+                    len = ml;
+                    break;
+                }
+            }
+            i += len;
+        }
+        t.text = s.substr(start, i - start);
+        t.out = t.text;
+        t.pre = pre;
+        pre.clear();
+        out.push_back(t);
+    }
+    tail = pre;
+    return out;
+}
+
+bool isUpperIdent(const std::string &s) { return !s.empty() && std::isupper((unsigned char)s[0]); }
+
+const std::set<std::string> &keywords()
+{
+    static const std::set<std::string> k = {
+        "if",     "else",   "for",     "while",   "do",      "switch",  "case",       "default",    "break",
+        "continue", "return", "new",   "throw",   "try",     "catch",   "finally",    "class",      "interface",
+        "enum",   "extends", "implements", "import", "package", "this", "super",      "instanceof", "null",
+        "true",   "false",  "let",     "const",   "var",     "fn",      "def",        "function",   "in",
+        "of",     "and",    "or",      "not",     "print",   "static",  "public",     "private",    "protected",
+        "final",  "abstract", "throws", "void",   "nil",     "elif",    "lambda",     "yield",      "await"};
+    return k;
+}
+
+// Java library classes the Java-style library makes as plain functions:
+// `new ArrayList<>()` is called as `ArrayList()`.
+const std::set<std::string> &libraryFactories()
+{
+    static const std::set<std::string> k = {
+        "ArrayList", "LinkedList", "Vector",  "HashMap",     "TreeMap",       "LinkedHashMap", "HashSet",
+        "TreeSet",   "LinkedHashSet", "ArrayDeque", "Stack", "PriorityQueue", "StringBuilder", "StringBuffer",
+        "Scanner",   "Random",    "EnumMap",     "IdentityHashMap", "BufferedReader",
+        "InputStreamReader"};
+    return k;
+}
+
+// Types whose instanceof test the library makes by value kind (no class).
+const std::set<std::string> &valueTypes()
+{
+    static const std::set<std::string> k = {
+        "String",  "Integer", "Long",    "Double",     "Float", "Short",    "Byte",  "Number", "Boolean", "Character",
+        "Object",  "List",    "ArrayList", "LinkedList", "Collection", "Map", "HashMap", "TreeMap", "Set",
+        "HashSet", "TreeSet", "Iterable", "CharSequence", "Comparable", "Runnable", "Function"};
+    return k;
+}
+
+// Static methods of library classes, for Type::method references.
+bool libraryStatic(const std::string &type, const std::string &m)
+{
+    static const std::set<std::string> allStatic = {"Math", "Arrays", "Collections", "Objects", "List", "Map", "Set",
+                                                    "Collectors", "System", "Thread"};
+    if (allStatic.count(type))
+        return true;
+    static const std::map<std::string, std::set<std::string>> k = {
+        {"Integer", {"parseInt", "valueOf", "sum", "max", "min", "compare", "toString", "signum", "bitCount",
+                     "toBinaryString", "toHexString", "toOctalString", "abs"}},
+        {"Long", {"parseLong", "valueOf", "sum", "max", "min", "compare", "toString"}},
+        {"Double", {"parseDouble", "valueOf", "sum", "max", "min", "compare", "isNaN", "toString"}},
+        {"String", {"valueOf", "join", "format"}},
+        {"Boolean", {"parseBoolean", "valueOf", "toString", "logicalAnd", "logicalOr", "logicalXor"}},
+        {"Character", {"isDigit", "isLetter", "isLetterOrDigit", "isUpperCase", "isLowerCase", "isWhitespace",
+                       "toUpperCase", "toLowerCase", "isAlphabetic", "getNumericValue", "toString", "valueOf"}}};
+    auto it = k.find(type);
+    return it != k.end() && it->second.count(m);
+}
+
+class JavaRewriter
+{
+  public:
+    explicit JavaRewriter(std::vector<JTok> &t) : t_(t) {}
+
+    bool isJava() const
+    {
+        for (size_t i = 0; i < t_.size(); ++i)
+        {
+            const std::string &x = t_[i].text;
+            if (x == "System" && is(i + 1, ".") && (is(i + 2, "out") || is(i + 2, "err")) && is(i + 3, "."))
+                return true;
+            if (x == "import" && (is(i + 1, "java") || is(i + 1, "javax")) && is(i + 2, "."))
+                return true;
+            if ((x == "public" || x == "private" || x == "protected") && i + 1 < t_.size() &&
+                t_[i + 1].kind == JK::Ident)
+                return true;
+            if (x == "implements" && i + 1 < t_.size() && t_[i + 1].kind == JK::Ident)
+                return true;
+            if (x == "@" && is(i + 1, "Override"))
+                return true;
+            if (x == "String" && is(i + 1, "[") && is(i + 2, "]"))
+                return true;
+        }
+        return false;
+    }
+
+    void run()
+    {
+        pairBrackets();
+        removeImportsAndAnnotations();
+        normalizeNumbers();
+        removeGenerics();
+        collectDeclarations();
+        arrayTypesAndVarargs();
+        anonymousClasses();
+        methodReferences();
+        lambdas();
+        enums();
+        classHeaders();
+        bodilessMethods();
+        modifiers();
+        newExpressions();
+        casts();
+        instanceOf();
+        enhancedFor();
+        declarations();
+        typedCatches();
+        enumCases();
+        implicitThis();
+        collectionFactories();
+    }
+
+    // `Main.main([])` for a class with a Java entry point (unless the file calls it)
+    std::string mainCall() const
+    {
+        for (size_t i = 0; i + 3 < t_.size(); ++i)
+        {
+            if (!(t_[i].text == "static" && liveNext(i) != npos))
+                continue;
+            size_t v = liveNext(i);
+            if (t_[v].text != "void")
+                continue;
+            size_t m = liveNext(v);
+            if (m == npos || t_[m].text != "main" || !is(m + 1, "("))
+                continue;
+            size_t body = enclosing_[i];
+            if (body == npos || classOf_.count(body) == 0)
+                continue;
+            const std::string &cls = classOf_.at(body);
+            for (size_t k = 0; k + 2 < t_.size(); ++k)
+                if (t_[k].text == cls && is(k + 1, ".") && is(k + 2, "main") && enclosing_[k] != body)
+                    return "";
+            return cls + ".main([])";
+        }
+        return "";
+    }
+
+  private:
+    static const size_t npos = (size_t)-1;
+    std::vector<JTok> &t_;
+    std::vector<size_t> match_;                  // ( [ { and their closers, both ways
+    std::vector<size_t> enclosing_;              // the innermost `{` around each token
+    std::map<size_t, std::string> classOf_;      // class-body `{` -> class name
+    std::set<size_t> interfaceBodies_;           // interface-body `{`
+    std::set<std::string> interfaces_;           // interfaces declared in the file
+    std::set<std::string> userClasses_;          // classes / interfaces / enums declared
+    std::set<std::string> staticMethods_;        // names of methods declared static
+    std::map<std::string, std::string> enumOf_;  // enum constant -> its enum (if unique)
+    int catchCount_ = 0;
+
+    bool is(size_t i, const char *s) const { return i < t_.size() && t_[i].text == s; }
+    bool live(size_t i) const { return i < t_.size() && !t_[i].out.empty(); }
+    size_t liveNext(size_t i) const
+    {
+        for (++i; i < t_.size(); ++i)
+            if (!t_[i].out.empty())
+                return i;
+        return npos;
+    }
+    size_t livePrev(size_t i) const
+    {
+        while (i-- > 0)
+            if (!t_[i].out.empty())
+                return i;
+        return npos;
+    }
+    bool liveIs(size_t i, const char *s) const { return i != npos && i < t_.size() && t_[i].out == s; }
+    void blank(size_t from, size_t to) // inclusive
+    {
+        for (size_t k = from; k <= to && k < t_.size(); ++k)
+            t_[k].out.clear();
+    }
+
+    void pairBrackets()
+    {
+        match_.assign(t_.size(), npos);
+        enclosing_.assign(t_.size(), npos);
+        std::vector<size_t> stack, braces;
+        for (size_t i = 0; i < t_.size(); ++i)
+        {
+            enclosing_[i] = braces.empty() ? npos : braces.back();
+            if (t_[i].kind != JK::Punct)
+                continue;
+            const std::string &x = t_[i].text;
+            if (x == "(" || x == "[" || x == "{")
+            {
+                stack.push_back(i);
+                if (x == "{")
+                    braces.push_back(i);
+            }
+            else if ((x == ")" || x == "]" || x == "}") && !stack.empty())
+            {
+                size_t o = stack.back();
+                stack.pop_back();
+                match_[o] = i;
+                match_[i] = o;
+                if (x == "}" && !braces.empty())
+                    braces.pop_back();
+            }
+        }
+        // class / interface / enum bodies
+        for (size_t i = 0; i + 1 < t_.size(); ++i)
+        {
+            const std::string &k = t_[i].text;
+            if ((k != "class" && k != "interface" && k != "enum") || t_[i + 1].kind != JK::Ident)
+                continue;
+            if (i > 0 && t_[i - 1].text == ".")
+                continue; // Foo.class
+            size_t j = i + 2;
+            while (j < t_.size() && t_[j].text != "{" && t_[j].text != ";" && t_[j].text != ":")
+                ++j;
+            if (j >= t_.size() || t_[j].text != "{")
+                continue;
+            classOf_[j] = t_[i + 1].text;
+            userClasses_.insert(t_[i + 1].text);
+            if (k == "interface")
+            {
+                interfaceBodies_.insert(j);
+                interfaces_.insert(t_[i + 1].text);
+            }
+        }
+    }
+
+    bool inClassBody(size_t i) const { return enclosing_[i] != npos && classOf_.count(enclosing_[i]); }
+
+    // The start of the statement / member that token i belongs to.
+    bool statementStart(size_t i) const
+    {
+        size_t p = livePrev(i);
+        if (p == npos)
+            return true;
+        const std::string &x = t_[p].out;
+        return x == ";" || x == "{" || x == "}" || (x == ")" && t_[i].pre.find('\n') != std::string::npos);
+    }
+
+    void removeImportsAndAnnotations()
+    {
+        static const std::set<std::string> annotations = {"Override", "FunctionalInterface", "SuppressWarnings",
+                                                          "Deprecated", "SafeVarargs"};
+        for (size_t i = 0; i < t_.size(); ++i)
+        {
+            const std::string &x = t_[i].text;
+            if ((x == "import" && (is(i + 1, "java") || is(i + 1, "javax") || is(i + 1, "static")) &&
+                 statementStart(i)) ||
+                (x == "package" && i + 1 < t_.size() && t_[i + 1].kind == JK::Ident && statementStart(i)))
+            {
+                // up to its `;`, or the end of the line
+                size_t j = i + 1;
+                while (j < t_.size() && t_[j].text != ";" && t_[j].pre.find('\n') == std::string::npos)
+                    ++j;
+                blank(i, j < t_.size() && t_[j].text == ";" ? j : j - 1);
+            }
+            else if (x == "@" && i + 1 < t_.size() && annotations.count(t_[i + 1].text))
+            {
+                size_t end = i + 1;
+                if (is(i + 2, "(") && match_[i + 2] != npos)
+                    end = match_[i + 2];
+                blank(i, end);
+            }
+        }
+    }
+
+    // 1_000L -> 1000, 0b101 -> 5, 2.5f -> 2.5
+    void normalizeNumbers()
+    {
+        for (auto &tk : t_)
+        {
+            if (tk.kind != JK::Number)
+                continue;
+            std::string s;
+            for (char c : tk.text)
+                if (c != '_')
+                    s += c;
+            bool hex = s.size() > 1 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+            bool bin = s.size() > 1 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B');
+            if (!s.empty() && (s.back() == 'L' || s.back() == 'l' ||
+                               (!hex && (s.back() == 'f' || s.back() == 'F' || s.back() == 'd' || s.back() == 'D'))))
+                s.pop_back();
+            if (bin)
+            {
+                long long v = 0;
+                for (size_t k = 2; k < s.size(); ++k)
+                    v = v * 2 + (s[k] == '1' ? 1 : 0);
+                s = std::to_string(v);
+            }
+            tk.out = s;
+        }
+    }
+
+    // `<...>` holding only type syntax, after a type name (List<String>,
+    // new HashMap<>()) or before a generic method's return type (<T> T max)
+    void removeGenerics()
+    {
+        static const std::set<std::string> before = {"static", "public", "private", "protected", "final", "abstract",
+                                                     "default", "synchronized", "."};
+        for (size_t i = 1; i < t_.size(); ++i)
+        {
+            if (t_[i].text != "<" || t_[i].out.empty())
+                continue;
+            const JTok &p = t_[i - 1];
+            bool afterType = p.kind == JK::Ident && isUpperIdent(p.text) && t_[i].pre.empty();
+            bool methodParams = before.count(p.text) > 0;
+            if (!afterType && !methodParams)
+                continue;
+            int depth = 0;
+            size_t j = i;
+            bool ok = true;
+            for (; j < t_.size(); ++j)
+            {
+                const std::string &x = t_[j].text;
+                if (x == "<")
+                    ++depth;
+                else if (x == ">")
+                {
+                    if (--depth == 0)
+                        break;
+                }
+                else if (!(t_[j].kind == JK::Ident || x == "," || x == "." || x == "?" || x == "[" || x == "]" ||
+                           x == "&"))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok || j >= t_.size())
+                continue;
+            if (j + 1 < t_.size())
+            {
+                const JTok &a = t_[j + 1];
+                const std::string &y = a.text;
+                bool follows = a.kind == JK::Ident || y == "(" || y == ")" || y == "[" || y == "," || y == ">" ||
+                               y == ";" || y == "{" || y == "..." || y == "::" || y == "." || y == "=" || y == ":";
+                if (!follows)
+                    continue;
+            }
+            blank(i, j);
+        }
+    }
+
+    void collectDeclarations()
+    {
+        // static methods (for Type::method), enum constants
+        for (size_t i = 0; i < t_.size(); ++i)
+        {
+            if (t_[i].text == "static")
+            {
+                for (size_t j = i + 1; j < t_.size() && j < i + 12; ++j)
+                {
+                    if (t_[j].text == "(")
+                    {
+                        if (t_[j - 1].kind == JK::Ident)
+                            staticMethods_.insert(t_[j - 1].text);
+                        break;
+                    }
+                    if (t_[j].text == "=" || t_[j].text == ";" || t_[j].text == "{")
+                        break;
+                }
+            }
+        }
+    }
+
+    // new Comparator<T>() { public int compare(T a, T b) { ... } } -> ((a, b) => { ... })
+    void anonymousClasses()
+    {
+        for (size_t i = 0; i + 4 < t_.size(); ++i)
+        {
+            if (t_[i].text != "new" || t_[i + 1].kind != JK::Ident)
+                continue;
+            size_t open = liveNext(i + 1);
+            if (open == npos || t_[open].text != "(" || match_[open] == npos)
+                continue;
+            size_t body = liveNext(match_[open]);
+            if (body == npos || t_[body].text != "{" || match_[body] == npos)
+                continue;
+            if (open != liveNext(i + 1) || liveNext(open) != match_[open])
+                continue; // constructor arguments: a real subclass
+            size_t end = match_[body];
+            // exactly one member: [modifiers] Type name ( params ) { ... }
+            static const std::set<std::string> mods = {"public", "protected", "private", "final", "synchronized"};
+            size_t k = liveNext(body);
+            while (k != npos && mods.count(t_[k].text))
+                k = liveNext(k);
+            size_t paren = npos;
+            for (size_t j = k; j != npos && j < end; j = liveNext(j))
+            {
+                if (t_[j].text == "(")
+                {
+                    paren = j;
+                    break;
+                }
+                if (t_[j].kind != JK::Ident && t_[j].text != "." && t_[j].text != "[" && t_[j].text != "]")
+                    break;
+            }
+            if (paren == npos || paren == k || match_[paren] == npos)
+                continue;
+            size_t mbody = liveNext(match_[paren]);
+            if (mbody == npos || t_[mbody].text != "{" || match_[mbody] == npos || liveNext(match_[mbody]) != end)
+                continue;
+            blank(i, open);
+            t_[match_[open]].out.clear();
+            t_[body].out = "(";
+            blank(liveNext(body), paren - 1);
+            stripParamTypes(paren);
+            t_[match_[paren]].out = ") =>";
+            t_[end].out = ")";
+        }
+    }
+
+    // `(int a, String b)` -> `(a, b)`: keep the last name of each parameter
+    void stripParamTypes(size_t open)
+    {
+        size_t close = match_[open];
+        // per comma-separated group, blank all but its last identifier
+        size_t groupStart = open + 1;
+        for (size_t j = open + 1; j <= close; ++j)
+        {
+            bool sep = j == close || (t_[j].text == "," && enclosingParen(j) == open);
+            if (!sep)
+                continue;
+            size_t lastIdent = npos;
+            for (size_t k = groupStart; k < j; ++k)
+                if (t_[k].kind == JK::Ident && !t_[k].out.empty())
+                    lastIdent = k;
+            bool rest = false;
+            for (size_t k = groupStart; k < j; ++k)
+                if (t_[k].text == "...")
+                    rest = true;
+            for (size_t k = groupStart; k < j; ++k)
+                if (k != lastIdent)
+                    t_[k].out.clear();
+            if (rest && lastIdent != npos)
+                t_[lastIdent].out = "*" + t_[lastIdent].out;
+            groupStart = j + 1;
+        }
+    }
+
+    size_t enclosingParen(size_t j) const
+    {
+        int depth = 0;
+        for (size_t k = j; k-- > 0;)
+        {
+            const std::string &x = t_[k].text;
+            if (x == ")" || x == "]" || x == "}")
+                ++depth;
+            else if (x == "(" || x == "[" || x == "{")
+            {
+                if (depth == 0)
+                    return k;
+                --depth;
+            }
+        }
+        return npos;
+    }
+
+    void methodReferences()
+    {
+        for (size_t i = 1; i + 1 < t_.size(); ++i)
+        {
+            if (t_[i].text != "::" || t_[i + 1].kind != JK::Ident)
+                continue;
+            size_t r = livePrev(i);
+            if (r == npos)
+                continue;
+            const std::string &m = t_[i + 1].text;
+            const std::string &recv = t_[r].text;
+            bool typeRecv = t_[r].kind == JK::Ident && isUpperIdent(recv) && !(r > 0 && t_[r - 1].text == ".");
+            if (m == "new")
+            {
+                if (!typeRecv)
+                    continue;
+                if (libraryFactories().count(recv))
+                    t_[i].out.clear(), t_[i + 1].out.clear();
+                else
+                {
+                    t_[r].out = "((__a, __b) => __b == nil ? (__a == nil ? new " + recv + "() : new " + recv +
+                                "(__a)) : new " + recv + "(__a, __b))";
+                    t_[i].out.clear();
+                    t_[i + 1].out.clear();
+                }
+                continue;
+            }
+            if (typeRecv && !libraryStatic(recv, m) && !(userClasses_.count(recv) && staticMethods_.count(m)))
+            {
+                // an instance method of the first argument: String::length
+                t_[r].out = "((__r, __a, __b) => __b == nil ? (__a == nil ? __r." + m + "() : __r." + m +
+                            "(__a)) : __r." + m + "(__a, __b))";
+                t_[i].out.clear();
+                t_[i + 1].out.clear();
+                continue;
+            }
+            t_[i].out = "."; // Type.staticMethod / obj.method: a callable member
+        }
+    }
+
+    void lambdas()
+    {
+        static const std::set<std::string> lead = {"(", ",", "=", "return", "?", ":", "=>", "->", "{", ";",
+                                                   "&&", "||", "!"};
+        for (size_t i = 1; i < t_.size(); ++i)
+        {
+            if (t_[i].text != "->")
+                continue;
+            size_t p = livePrev(i);
+            if (p == npos)
+                continue;
+            if (t_[p].text == ")" && match_[p] != npos)
+            {
+                size_t open = match_[p];
+                size_t before = livePrev(open);
+                if (before != npos && (t_[before].kind == JK::Ident && !keywords().count(t_[before].text)))
+                    continue; // f(...) -> : C++ member access through a call
+                if (before != npos && (t_[before].text == ")" || t_[before].text == "]"))
+                    continue;
+                bool params = true;
+                for (size_t k = open + 1; k < p; ++k)
+                    if (!(t_[k].kind == JK::Ident || t_[k].text == "," || t_[k].text == "." || t_[k].out.empty()))
+                        params = false;
+                if (!params)
+                    continue;
+                stripParamTypes(open);
+                t_[i].out = "=>";
+            }
+            else if (t_[p].kind == JK::Ident)
+            {
+                bool spaced = !t_[i].pre.empty() || (i + 1 < t_.size() && !t_[i + 1].pre.empty());
+                size_t before = livePrev(p);
+                if (spaced && (before == npos || lead.count(t_[before].text)))
+                    t_[i].out = "=>";
+            }
+        }
+    }
+
+    // enum E { A, B(1), C; fields / methods } -> a class with one instance per constant
+    void enums()
+    {
+        for (size_t i = 0; i + 2 < t_.size(); ++i)
+        {
+            if (t_[i].text != "enum" || t_[i + 1].kind != JK::Ident || !is(i + 2, "{") || match_[i + 2] == npos)
+                continue;
+            const std::string name = t_[i + 1].text;
+            size_t open = i + 2, close = match_[open];
+            // constants: Ident [ (args) ] separated by commas, up to ; or }
+            struct Constant
+            {
+                size_t tok, argsOpen;
+            };
+            std::vector<Constant> found;
+            size_t j = open + 1;
+            bool bodies = false;
+            while (j < close && t_[j].kind == JK::Ident)
+            {
+                Constant c{j, npos};
+                ++j;
+                if (j < close && t_[j].text == "(" && match_[j] != npos)
+                {
+                    c.argsOpen = j;
+                    j = match_[j] + 1;
+                }
+                if (j < close && t_[j].text == "{")
+                    bodies = true; // constant-specific class bodies: not supported
+                found.push_back(c);
+                if (j < close && t_[j].text == ",")
+                    ++j;
+                else
+                    break;
+            }
+            bool hasMembers = j < close && t_[j].text == ";";
+            // a C/C++ `enum E { A, B };` stays the core's (integer constants)
+            if (bodies || found.empty() || (!hasMembers && is(close + 1, ";")))
+                continue;
+            std::vector<std::pair<std::string, std::string>> constants;
+            for (const Constant &c : found)
+            {
+                std::string args;
+                if (c.argsOpen != npos)
+                {
+                    for (size_t k = c.argsOpen + 1; k < match_[c.argsOpen]; ++k)
+                        args += (t_[k].pre.empty() ? "" : " ") + t_[k].out;
+                    blank(c.argsOpen, match_[c.argsOpen]);
+                }
+                constants.push_back({t_[c.tok].text, args});
+                blank(c.tok, c.tok);
+                size_t comma = c.argsOpen != npos ? match_[c.argsOpen] + 1 : c.tok + 1;
+                if (comma < close && t_[comma].text == ",")
+                    blank(comma, comma);
+            }
+            if (hasMembers)
+                t_[j].out.clear();
+            t_[i].out = "class";
+            t_[open].out = "{ name() { return this.__name; } ordinal() { return this.__ordinal; } "
+                           "toString() { return this.__name; } compareTo(o) { return this.__ordinal - o.__ordinal; } "
+                           "hashCode() { return this.__ordinal; } static values() { return " +
+                           name + ".__values.slice(0); } static valueOf(s) { return __jenumValueOf(" + name +
+                           ".__values, s); }";
+            std::string after = " " + name + ".__values = [];";
+            for (size_t c = 0; c < constants.size(); ++c)
+            {
+                const std::string &cn = constants[c].first;
+                after += " " + name + "." + cn + " = __jenum(new " + name + "(" + constants[c].second + "), \"" + cn +
+                         "\", " + std::to_string(c) + "); " + name + ".__values.push(" + name + "." + cn + ");";
+                if (enumOf_.count(cn) && enumOf_[cn] != name)
+                    enumOf_[cn] = "";
+                else
+                    enumOf_[cn] = name;
+            }
+            t_[close].out = "}" + after;
+            userClasses_.insert(name);
+        }
+    }
+
+    // interface -> class; implements -> extends (an interface of this file,
+    // for its default methods) or nothing; throws clauses removed
+    void classHeaders()
+    {
+        for (size_t i = 0; i + 1 < t_.size(); ++i)
+        {
+            const std::string &x = t_[i].text;
+            if (x == "interface" && t_[i + 1].kind == JK::Ident)
+            {
+                t_[i].out = "class";
+                // interface I extends A, B: keep the first
+                size_t j = i + 2;
+                while (j < t_.size() && t_[j].text != "{")
+                {
+                    if (t_[j].text == "extends")
+                    {
+                        size_t k = j + 2;
+                        while (k < t_.size() && t_[k].text != "{")
+                            t_[k++].out.clear();
+                        break;
+                    }
+                    ++j;
+                }
+            }
+            else if (x == "implements")
+            {
+                bool hasExtends = false;
+                for (size_t k = i; k-- > 0;)
+                {
+                    if (t_[k].text == "class" || t_[k].text == "{" || t_[k].text == ";")
+                        break;
+                    if (t_[k].text == "extends")
+                        hasExtends = true;
+                }
+                size_t k = i + 1;
+                std::string first;
+                while (k < t_.size() && t_[k].text != "{")
+                {
+                    if (first.empty() && t_[k].kind == JK::Ident && !t_[k].out.empty())
+                        first = t_[k].text;
+                    t_[k++].out.clear();
+                }
+                t_[i].out.clear();
+                if (!hasExtends && interfaces_.count(first))
+                    t_[i].out = "extends " + first;
+            }
+            else if (x == "throws")
+            {
+                size_t k = i;
+                while (k < t_.size() && t_[k].text != "{" && t_[k].text != ";")
+                    t_[k++].out.clear();
+            }
+        }
+    }
+
+    // abstract / interface method headers ending in `;` (no body)
+    void bodilessMethods()
+    {
+        for (size_t i = 0; i < t_.size(); ++i)
+        {
+            if (t_[i].text != "(" || match_[i] == npos || !inClassBody(i))
+                continue;
+            size_t after = liveNext(match_[i]);
+            if (after == npos || t_[after].text != ";")
+                continue;
+            size_t start = i;
+            bool assignment = false;
+            while (start > 0)
+            {
+                const std::string &x = t_[start - 1].text;
+                if (x == ";" || x == "{" || x == "}")
+                    break;
+                if (x == "=")
+                    assignment = true;
+                --start;
+            }
+            if (assignment || start == i || t_[i - 1].kind != JK::Ident)
+                continue;
+            blank(start, after);
+        }
+    }
+
+    void modifiers()
+    {
+        static const std::set<std::string> drop = {"final", "abstract", "synchronized", "transient", "volatile",
+                                                   "native", "strictfp"};
+        for (size_t i = 0; i < t_.size(); ++i)
+        {
+            const std::string &x = t_[i].text;
+            if (t_[i].kind != JK::Ident || t_[i].out.empty())
+                continue;
+            if (x == "public" || x == "private" || x == "protected")
+            {
+                if (!is(i + 1, ":"))
+                    t_[i].out.clear();
+            }
+            else if (drop.count(x))
+            {
+                size_t n = liveNext(i);
+                if (n != npos && t_[n].kind == JK::Ident)
+                    t_[i].out.clear();
+            }
+            else if (x == "default" && inClassBody(i))
+            {
+                size_t n = liveNext(i);
+                if (n != npos && t_[n].kind == JK::Ident)
+                    t_[i].out.clear(); // an interface's default method
+            }
+            else if (x == "boolean")
+                t_[i].out = "bool";
+            else if (x == "byte" || x == "short")
+                t_[i].out = "int";
+        }
+        // interface constants are static
+        for (size_t b : interfaceBodies_)
+            for (size_t i = b + 1; i < match_[b] && i < t_.size(); ++i)
+                if (enclosing_[i] == b && statementStart(i) && t_[i].kind == JK::Ident && t_[i].text != "static")
+                {
+                    size_t n = liveNext(i);
+                    size_t eq = n == npos ? npos : liveNext(n);
+                    if (n != npos && t_[n].kind == JK::Ident && eq != npos && t_[eq].text == "=")
+                        t_[i].out = "static " + t_[i].out;
+                }
+    }
+
+    std::set<size_t> arrayTyped_; // declared names whose type had []
+
+    // int[] a / String... args: the brackets go (values are dynamic arrays);
+    // a varargs parameter collects its arguments: *args
+    void arrayTypesAndVarargs()
+    {
+        for (size_t i = 1; i + 1 < t_.size(); ++i)
+        {
+            if (t_[i].text == "[" && is(i + 1, "]"))
+            {
+                size_t p = livePrev(i);
+                if (p == npos || !(t_[p].kind == JK::Ident || t_[p].text == "]" || t_[p].out.empty()))
+                    continue;
+                if (p != npos && t_[p].text == "new")
+                    continue;
+                if (livePrev(i) != npos && t_[livePrev(i)].kind == JK::Ident && keywords().count(t_[livePrev(i)].text) &&
+                    t_[livePrev(i)].text != "void")
+                    continue;
+                // `new int[]{...}` is newExpressions' work
+                size_t q = livePrev(i);
+                size_t qq = q == npos ? npos : livePrev(q);
+                if (qq != npos && t_[qq].text == "new")
+                    continue;
+                size_t j = i;
+                while (is(j, "[") && is(j + 1, "]"))
+                    j += 2;
+                size_t n = liveNext(j - 1);
+                if (n == npos)
+                    continue;
+                if (t_[n].kind == JK::Ident || t_[n].text == "..." || t_[n].text == ")" || t_[n].text == ",")
+                {
+                    blank(i, j - 1);
+                    if (t_[n].kind == JK::Ident)
+                    {
+                        arrayTyped_.insert(n);
+                        // int[] a = {1, 2}: an array literal
+                        size_t eq = liveNext(n);
+                        size_t init = eq == npos ? npos : liveNext(eq);
+                        if (eq != npos && t_[eq].text == "=" && init != npos && t_[init].text == "{")
+                            bracesToBrackets(init);
+                    }
+                }
+            }
+        }
+        for (size_t i = 1; i + 1 < t_.size(); ++i)
+            if (t_[i].text == "..." && t_[i + 1].kind == JK::Ident && livePrev(i) != npos &&
+                t_[livePrev(i)].kind == JK::Ident)
+            {
+                // Type... name -> *name
+                size_t ty = livePrev(i);
+                t_[ty].out.clear();
+                t_[i].out.clear();
+                t_[i + 1].out = "*" + t_[i + 1].out;
+            }
+    }
+
+    static std::string defaultFor(const std::string &type)
+    {
+        if (type == "int" || type == "long" || type == "double" || type == "float")
+            return "0";
+        if (type == "bool")
+            return "false";
+        if (type == "char")
+            return "chr(0)";
+        return "nil";
+    }
+
+    // array initializer braces -> brackets (only braces that start an element)
+    void bracesToBrackets(size_t open)
+    {
+        size_t close = match_[open];
+        if (close == npos)
+            return;
+        t_[open].out = "[";
+        t_[close].out = "]";
+        for (size_t k = open + 1; k < close; ++k)
+        {
+            if (t_[k].text == "{" && match_[k] != npos)
+            {
+                size_t p = livePrev(k);
+                if (p == open || (p != npos && t_[p].text == ","))
+                    bracesToBrackets(k);
+                k = match_[k];
+            }
+            else if ((t_[k].text == "(" || t_[k].text == "[") && match_[k] != npos)
+                k = match_[k];
+        }
+    }
+
+    void newExpressions()
+    {
+        for (size_t i = 0; i + 2 < t_.size(); ++i)
+        {
+            if (t_[i].text != "new" || t_[i].out.empty())
+                continue;
+            size_t ty = liveNext(i);
+            if (ty == npos || t_[ty].kind != JK::Ident)
+                continue;
+            // qualified: new java.util.ArrayList
+            size_t last = ty;
+            while (liveIs(liveNext(last), ".") && liveNext(liveNext(last)) != npos)
+                last = liveNext(liveNext(last));
+            size_t b = liveNext(last);
+            if (b == npos)
+                continue;
+            if (t_[b].text == "[")
+            {
+                std::string def = defaultFor(t_[last].out);
+                if (is(b + 1, "]"))
+                {
+                    // new T[]{...} / new T[][]{{...}}
+                    size_t j = b;
+                    while (is(j, "[") && is(j + 1, "]"))
+                        j += 2;
+                    size_t init = liveNext(j - 1);
+                    if (init == npos || t_[init].text != "{")
+                        continue;
+                    blank(i, j - 1);
+                    bracesToBrackets(init);
+                    continue;
+                }
+                // new T[n][m][] -> __jarr(default, n, m)
+                std::vector<size_t> sized;
+                size_t j = b;
+                while (is(j, "[") && match_[j] != npos && match_[j] != j + 1)
+                {
+                    sized.push_back(j);
+                    j = match_[j] + 1;
+                }
+                bool trailing = is(j, "[") && is(j + 1, "]");
+                while (is(j, "[") && is(j + 1, "]"))
+                {
+                    t_[j].out.clear();
+                    t_[j + 1].out.clear();
+                    j += 2;
+                }
+                t_[i].out = "__jarr(" + (trailing ? std::string("nil") : def);
+                for (size_t k = ty; k <= last; ++k)
+                    t_[k].out.clear();
+                for (size_t s = 0; s < sized.size(); ++s)
+                {
+                    t_[sized[s]].out = ",";
+                    t_[match_[sized[s]]].out = s + 1 == sized.size() ? ")" : "";
+                }
+                continue;
+            }
+            if (t_[b].text == "(" && t_[last].text == "Object")
+            {
+                // new Object(): not JavaScript's Object
+                t_[i].out.clear();
+                for (size_t k = ty; k < last; ++k)
+                    t_[k].out.clear();
+                t_[last].out = "__jobject";
+                continue;
+            }
+            if (t_[b].text == "(" && libraryFactories().count(t_[last].text))
+            {
+                t_[i].out.clear(); // a library function, not a class
+                for (size_t k = ty; k < last; ++k)
+                    t_[k].out.clear(); // java.util.
+            }
+        }
+    }
+
+    // (String) x / (Circle) shape: a reference cast is a no-op; (char) n makes a character
+    void casts()
+    {
+        for (size_t i = 0; i + 2 < t_.size(); ++i)
+        {
+            if (t_[i].text != "(" || match_[i] == npos)
+                continue;
+            size_t ty = liveNext(i);
+            if (ty == npos || t_[ty].kind != JK::Ident)
+                continue;
+            size_t close = liveNext(ty);
+            while (close != npos && t_[close].text == "." && liveNext(close) != npos)
+                close = liveNext(liveNext(close));
+            if (close == npos || close != match_[i])
+                continue;
+            size_t operand = liveNext(close);
+            if (operand == npos)
+                continue;
+            const JTok &o = t_[operand];
+            bool operandStart = (o.kind == JK::Ident && !keywords().count(o.text)) || o.kind == JK::Number ||
+                                o.kind == JK::String || o.text == "(" || o.text == "this" || o.text == "new";
+            if (!operandStart)
+                continue;
+            size_t before = livePrev(i);
+            static const std::set<std::string> notCast = {"if", "while", "for", "switch", "catch", "elif", "with"};
+            if (before != npos && t_[before].kind == JK::Ident &&
+                (!keywords().count(t_[before].text) || notCast.count(t_[before].text)))
+                continue; // f(x) y / if (DEBUG) y: not a cast
+            const std::string &type = t_[ty].out;
+            if (type == "char")
+            {
+                if (o.text != "(" || match_[operand] == npos)
+                    continue;
+                t_[i].out = "__jchar";
+                for (size_t k = ty; k <= close; ++k)
+                    t_[k].out.clear();
+                continue;
+            }
+            if (!isUpperIdent(t_[ty].text))
+                continue; // (int) / (double): the core's numeric casts
+            if (type == "Integer" || type == "Long" || type == "Short" || type == "Byte")
+            {
+                t_[ty].out = "int";
+                continue;
+            }
+            if (type == "Double" || type == "Float")
+            {
+                t_[ty].out = "double";
+                continue;
+            }
+            for (size_t k = i; k <= close; ++k)
+                t_[k].out.clear();
+        }
+    }
+
+    // the start of the postfix expression ending at token e
+    size_t operandStart(size_t e) const
+    {
+        size_t k = e;
+        while (true)
+        {
+            if ((t_[k].text == ")" || t_[k].text == "]") && match_[k] != npos)
+            {
+                k = match_[k];
+                size_t p = livePrev(k);
+                if (p != npos && (t_[p].kind == JK::Ident && !keywords().count(t_[p].text) || t_[p].text == ")" ||
+                                  t_[p].text == "]"))
+                {
+                    k = p;
+                    continue;
+                }
+            }
+            size_t p = livePrev(k);
+            if (p != npos && t_[p].text == ".")
+            {
+                size_t pp = livePrev(p);
+                if (pp == npos)
+                    return k;
+                k = pp;
+                continue;
+            }
+            return k;
+        }
+    }
+
+    void instanceOf()
+    {
+        for (size_t i = 1; i + 1 < t_.size(); ++i)
+        {
+            if (t_[i].text != "instanceof")
+                continue;
+            size_t e = livePrev(i);
+            size_t ty = liveNext(i);
+            if (e == npos || ty == npos || t_[ty].kind != JK::Ident)
+                continue;
+            size_t last = ty;
+            while (liveIs(liveNext(last), ".") && liveNext(liveNext(last)) != npos)
+                last = liveNext(liveNext(last));
+            size_t s = operandStart(e);
+            std::string type = t_[last].text;
+            for (size_t k = ty; k <= last; ++k)
+                t_[k].out.clear();
+            bool byName = valueTypes().count(type) || !userClasses_.count(type);
+            t_[s].out = "__jinstanceof(" + t_[s].out;
+            t_[i].out = ",";
+            t_[last].out = byName ? "\"" + type + "\")" : type + ")";
+        }
+    }
+
+    // for (T x : xs) -> for (let x of __jit(xs))
+    void enhancedFor()
+    {
+        for (size_t i = 0; i + 1 < t_.size(); ++i)
+        {
+            if (t_[i].text != "for" || !is(i + 1, "(") || match_[i + 1] == npos)
+                continue;
+            size_t open = i + 1, close = match_[open];
+            size_t colon = npos;
+            for (size_t k = open + 1; k < close; ++k)
+            {
+                if ((t_[k].text == "(" || t_[k].text == "[" || t_[k].text == "{") && match_[k] != npos)
+                {
+                    k = match_[k];
+                    continue;
+                }
+                if (t_[k].text == ";")
+                    break;
+                if (t_[k].text == ":")
+                {
+                    colon = k;
+                    break;
+                }
+            }
+            if (colon == npos)
+                continue;
+            size_t name = livePrev(colon);
+            if (name == npos || t_[name].kind != JK::Ident || name <= open)
+                continue;
+            bool typed = false;
+            for (size_t k = open + 1; k < name; ++k)
+                if (!t_[k].out.empty())
+                {
+                    typed = true;
+                    t_[k].out.clear();
+                }
+            if (!typed)
+                continue;
+            t_[open].out = "(let ";
+            t_[colon].out = "of __jit(";
+            t_[close].out = "))";
+        }
+    }
+
+    bool isTypeLike(size_t k) const
+    {
+        return t_[k].kind == JK::Ident && !keywords().count(t_[k].text);
+    }
+
+    // var x = -> let x = ; Type x; fields get Java's default values
+    void declarations()
+    {
+        for (size_t i = 0; i < t_.size(); ++i)
+        {
+            if (t_[i].out.empty() || !isTypeLike(i) && t_[i].text != "var")
+                continue;
+            size_t prev = livePrev(i);
+            bool start = prev == npos || t_[prev].out == ";" || t_[prev].out == "{" || t_[prev].out == "}" ||
+                         t_[prev].out == "static" || t_[prev].out == "(let " ||
+                         (t_[prev].out == ")" && t_[i].pre.find('\n') != std::string::npos);
+            if (!start)
+                continue;
+            // Type (. Type)* name
+            size_t last = i;
+            while (liveIs(liveNext(last), ".") && liveNext(liveNext(last)) != npos &&
+                   t_[liveNext(liveNext(last))].kind == JK::Ident)
+                last = liveNext(liveNext(last));
+            size_t name = liveNext(last);
+            if (name == npos || t_[name].kind != JK::Ident || keywords().count(t_[name].text))
+                continue;
+            size_t after = liveNext(name);
+            if (after == npos)
+                continue;
+            const std::string &a = t_[after].out;
+            if (a != "=" && a != ";" && a != ",")
+                continue;
+            bool field = inClassBody(i);
+            if (t_[i].text == "var" && !field)
+            {
+                t_[i].out = "let";
+                continue;
+            }
+            if (!field || a == "=")
+                continue;
+            // a field without an initializer: Java's default value, for each declarator
+            std::string def = arrayTyped_.count(name) ? "nil" : defaultFor(t_[last].out);
+            if (t_[last].out != "int" && t_[last].out != "long" && t_[last].out != "double" &&
+                t_[last].out != "float" && t_[last].out != "bool" && t_[last].out != "char")
+                def = "nil";
+            size_t n = name;
+            while (n != npos)
+            {
+                size_t nx = liveNext(n);
+                if (nx == npos)
+                    break;
+                if (t_[nx].out == "=")
+                {
+                    // skip its initializer up to , or ;
+                    size_t k = nx;
+                    while (k != npos && t_[k].out != ";" && !(t_[k].out == "," && enclosingParen(k) == enclosing_[k]))
+                    {
+                        if ((t_[k].text == "(" || t_[k].text == "[" || t_[k].text == "{") && match_[k] != npos)
+                            k = match_[k];
+                        k = liveNext(k);
+                    }
+                    nx = k;
+                }
+                else
+                    t_[n].out += " = " + def;
+                if (nx == npos || t_[nx].out != ",")
+                    break;
+                n = liveNext(nx);
+                if (n == npos || t_[n].kind != JK::Ident)
+                    break;
+            }
+        }
+    }
+
+    // try { } catch (A | B e) { } catch (C e) { } -> one catch that tests the class
+    void typedCatches()
+    {
+        for (size_t i = 0; i + 1 < t_.size(); ++i)
+        {
+            if (t_[i].text != "try")
+                continue;
+            size_t block = liveNext(i);
+            if (block == npos || t_[block].text != "{" || match_[block] == npos)
+                continue;
+            struct Clause
+            {
+                size_t kw, open, close, name, body, end;
+                std::vector<std::string> types;
+            };
+            std::vector<Clause> clauses;
+            size_t j = match_[block] + 1;
+            while (is(j, "catch") && is(j + 1, "(") && match_[j + 1] != npos)
+            {
+                Clause c;
+                c.kw = j;
+                c.open = j + 1;
+                c.close = match_[j + 1];
+                c.name = livePrev(c.close);
+                for (size_t k = c.open + 1; k < c.name; ++k)
+                    if (t_[k].kind == JK::Ident && !t_[k].out.empty() && t_[k].text != "final" &&
+                        !(is(k + 1, ".")))
+                        c.types.push_back(t_[k].text);
+                c.body = liveNext(c.close);
+                if (c.body == npos || t_[c.body].text != "{" || match_[c.body] == npos)
+                    break;
+                c.end = match_[c.body];
+                clauses.push_back(c);
+                j = c.end + 1;
+            }
+            if (clauses.empty())
+                continue;
+            bool typed = false;
+            for (auto &c : clauses)
+                if (!c.types.empty())
+                    typed = true;
+            if (!typed)
+                continue;
+            std::string x = "__jx" + std::to_string(++catchCount_);
+            for (size_t c = 0; c < clauses.size(); ++c)
+            {
+                Clause &cl = clauses[c];
+                std::string list;
+                for (auto &ty : cl.types)
+                    list += (list.empty() ? "\"" : ", \"") + ty + "\"";
+                std::string test = "__jcatch(" + x + ", [" + list + "])";
+                std::string bind = " let " + t_[cl.name].text + " = " + x + ";";
+                for (size_t k = cl.open + 1; k < cl.close; ++k)
+                    t_[k].out.clear();
+                if (c == 0)
+                {
+                    t_[cl.name].out = x;
+                    t_[cl.body].out = "{ " + x + " = __jexc(" + x + "); if (" + test + ") {" + bind;
+                }
+                else
+                {
+                    t_[cl.kw].out.clear();
+                    t_[cl.open].out.clear();
+                    t_[cl.close].out.clear();
+                    t_[cl.body].out = "else if (" + test + ") {" + bind;
+                }
+                if (c + 1 == clauses.size())
+                    t_[cl.end].out = "} else { throw " + x + "; } }";
+            }
+        }
+    }
+
+    // List.of / Set.of / Map.of / Map.entry / ...copyOf -> __jList_of, ...:
+    // JavaScript's Set and Map stay what they are in the same file
+    void collectionFactories()
+    {
+        static const std::set<std::string> types = {"List", "Set", "Map"};
+        static const std::set<std::string> methods = {"of", "copyOf", "entry", "ofEntries"};
+        for (size_t i = 0; i + 2 < t_.size(); ++i)
+        {
+            if (!types.count(t_[i].text) || t_[i].out != t_[i].text || !is(i + 1, ".") ||
+                !methods.count(t_[i + 2].text))
+                continue;
+            size_t p = livePrev(i);
+            if (p != npos && t_[p].out == ".")
+            {
+                // java.util.List.of: the qualifier goes too; another obj.List.of stays
+                if (p < 2 || t_[p - 1].text != "util" || t_[p - 2].text != "." || p < 3 || t_[p - 3].text != "java")
+                    continue;
+                blank(p - 3, p);
+            }
+            t_[i].out = "__j" + t_[i].text + "_" + t_[i + 2].text;
+            t_[i + 1].out.clear();
+            t_[i + 2].out.clear();
+        }
+    }
+
+    // An unqualified call of a method the enclosing class (or a superclass
+    // in this file) declares: this.m(...) / Cls.m(...), so a builtin of the
+    // same name (sum, max, print, ...) does not answer it. getClass() too.
+    void implicitThis()
+    {
+        // the methods each class body declares: name -> static?
+        std::map<std::string, std::map<std::string, bool>> methods;
+        std::map<std::string, std::string> superOf;
+        std::map<size_t, std::string> bodyClass = classOf_;
+        for (auto &kv : classOf_)
+        {
+            size_t body = kv.first;
+            for (size_t k = body; k-- > 0 && t_[k].text != "class" && t_[k].text != "interface" &&
+                                  t_[k].text != "enum";)
+                if (t_[k].text == "extends" && k + 1 < t_.size() && t_[k + 1].kind == JK::Ident)
+                    superOf[kv.second] = t_[k + 1].text;
+            for (size_t i = body + 1; i < match_[body] && i < t_.size(); ++i)
+            {
+                if (enclosing_[i] != body || t_[i].kind != JK::Ident || !is(i + 1, "(") || match_[i + 1] == npos)
+                    continue;
+                size_t prev = livePrev(i);
+                bool declaration = prev != npos && (t_[prev].kind == JK::Ident || t_[prev].out == ">" ||
+                                                    t_[prev].out == "]") &&
+                                   !keywords().count(t_[prev].text);
+                size_t after = liveNext(match_[i + 1]);
+                if (!declaration || after == npos || t_[after].text != "{")
+                    continue;
+                bool isStatic = false;
+                for (size_t k = i; k-- > body + 1;)
+                {
+                    const std::string &x = t_[k].text;
+                    if (x == ";" || x == "}" || x == "{")
+                        break;
+                    if (x == "static")
+                        isStatic = true;
+                }
+                methods[kv.second][t_[i].text] = isStatic;
+            }
+        }
+        auto lookup = [&](std::string cls, const std::string &m, bool &isStatic, std::string &owner) -> bool
+        {
+            for (int depth = 0; depth < 32 && !cls.empty(); ++depth)
+            {
+                auto it = methods.find(cls);
+                if (it != methods.end() && it->second.count(m))
+                {
+                    isStatic = it->second.at(m);
+                    owner = cls;
+                    return true;
+                }
+                auto s = superOf.find(cls);
+                cls = s == superOf.end() ? "" : s->second;
+            }
+            return false;
+        };
+        for (size_t i = 0; i + 1 < t_.size(); ++i)
+        {
+            if (t_[i].kind != JK::Ident || !is(i + 1, "(") || t_[i].out != t_[i].text || enclosing_[i] == npos)
+                continue;
+            size_t p = livePrev(i);
+            if (p != npos && (t_[p].out == "." || t_[p].text == "new" || t_[p].text == "::" ||
+                              ((t_[p].kind == JK::Ident || t_[p].out == ">" || t_[p].out == "]") &&
+                               !keywords().count(t_[p].text))))
+                continue; // a member call, a constructor, or a declaration
+            if (t_[i].text == "getClass")
+            {
+                t_[i].out = "this.getClass";
+                continue;
+            }
+            // the innermost class around the call that has the method
+            for (size_t b = enclosing_[i]; b != npos; b = enclosing_[b])
+            {
+                auto c = bodyClass.find(b);
+                if (c == bodyClass.end())
+                    continue;
+                bool isStatic = false;
+                std::string owner;
+                if (lookup(c->second, t_[i].text, isStatic, owner))
+                {
+                    t_[i].out = (isStatic ? owner : std::string("this")) + "." + t_[i].text;
+                    break;
+                }
+            }
+        }
+    }
+
+    // case RED: in a switch over an enum of this file -> case Color.RED:
+    void enumCases()
+    {
+        for (size_t i = 0; i + 2 < t_.size(); ++i)
+        {
+            if (t_[i].text != "case" || t_[i + 1].kind != JK::Ident || !is(i + 2, ":"))
+                continue;
+            auto it = enumOf_.find(t_[i + 1].text);
+            if (it != enumOf_.end() && !it->second.empty())
+                t_[i + 1].out = it->second + "." + t_[i + 1].text;
+        }
+    }
+};
+
+} // namespace
+
+std::string applyJavaDialect(const std::string &source)
+{
+    std::string tail;
+    std::vector<JTok> toks = tokenize(source, tail);
+    JavaRewriter rw(toks);
+    if (!rw.isJava())
+        return source;
+    rw.run();
+    std::string call = rw.mainCall();
+    std::string out;
+    out.reserve(source.size() + 256);
+    for (const JTok &t : toks)
+        out += t.pre + t.out;
+    out += tail;
+    if (!out.empty() && out.back() != '\n')
+        out += '\n';
+    if (!call.empty())
+        out += call + "\n";
+    out += kJavaStyleMarker;
+    out += "\n";
+    return out;
+}
+
+bool isJavaStyleSource(const std::string &source)
+{
+    size_t at = source.rfind(kJavaStyleMarker);
+    return at != std::string::npos && (at == 0 || source[at - 1] == '\n');
+}

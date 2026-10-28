@@ -1,0 +1,7 @@
+package java.io;
+
+public class UncheckedIOException extends RuntimeException {
+    public UncheckedIOException(String message, IOException cause) { super(message, java.util.Objects.requireNonNull(cause)); }
+    public UncheckedIOException(IOException cause) { super(java.util.Objects.requireNonNull(cause)); }
+    public IOException getCause() { return (IOException) super.getCause(); }
+}

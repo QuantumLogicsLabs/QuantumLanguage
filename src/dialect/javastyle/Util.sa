@@ -1,0 +1,910 @@
+// Java-style library, part 2 (java.util): Optional, Comparator, the
+// collections, streams, StringBuilder, Scanner, Random. Lang.sa (loaded
+// first) has the helpers, String.format, System, the boxes and exceptions.
+
+// ── Optional ───────────────────────────────────────────────────────────────
+
+class __JOptional {
+    constructor(v) { this.v = v }
+    isPresent() { return this.v != nil }
+    isEmpty() { return this.v == nil }
+    get() {
+        if (this.v == nil) { throw new NoSuchElementException("No value present") }
+        return this.v
+    }
+    getAsInt() { return this.get() }
+    getAsDouble() { return this.get() }
+    getAsLong() { return this.get() }
+    orElse(d) { return this.v == nil ? d : this.v }
+    orElseGet(f) { return this.v == nil ? f() : this.v }
+    orElseThrow(f) {
+        if (this.v == nil) {
+            if (f == nil) { throw new NoSuchElementException("No value present") }
+            throw f()
+        }
+        return this.v
+    }
+    ifPresent(f) { if (this.v != nil) { f(this.v) } }
+    ifPresentOrElse(f, g) { if (this.v != nil) { f(this.v) } else { g() } }
+    map(f) { return this.v == nil ? this : new __JOptional(f(this.v)) }
+    flatMap(f) { return this.v == nil ? this : f(this.v) }
+    filter(p) { return (this.v != nil && p(this.v)) ? this : new __JOptional(nil) }
+    equals(o) { return __jinChain(o, "__JOptional") && __jequals(this.v, o.v) }
+    toString() { return this.v == nil ? "Optional.empty" : "Optional[" + __jstr(this.v) + "]" }
+}
+
+let Optional = {
+    "of": fn(v) {
+        if (v == nil) { throw new NullPointerException(nil) }
+        return new __JOptional(v)
+    },
+    "ofNullable": fn(v) { return new __JOptional(v) },
+    "empty": fn() { return new __JOptional(nil) }
+}
+let OptionalInt = Optional
+let OptionalDouble = Optional
+
+// ── Comparator / Function ──────────────────────────────────────────────────
+
+let Comparator = {
+    "naturalOrder": fn() { return __jcompare },
+    "reverseOrder": fn() { return fn(a, b) { return __jcompare(b, a) } },
+    "comparing": fn(key, cmp) {
+        return fn(a, b) { return cmp == nil ? __jcompare(key(a), key(b)) : cmp(key(a), key(b)) }
+    },
+    "comparingInt": fn(key) { return fn(a, b) { return __jcompare(key(a), key(b)) } },
+    "comparingDouble": fn(key) { return fn(a, b) { return __jcompare(key(a), key(b)) } },
+    "comparingLong": fn(key) { return fn(a, b) { return __jcompare(key(a), key(b)) } },
+    "nullsFirst": fn(cmp) {
+        return fn(a, b) { return a == nil ? (b == nil ? 0 : -1) : (b == nil ? 1 : cmp(a, b)) }
+    },
+    "nullsLast": fn(cmp) {
+        return fn(a, b) { return a == nil ? (b == nil ? 0 : 1) : (b == nil ? -1 : cmp(a, b)) }
+    }
+}
+
+let Function = { "identity": fn() { return fn(x) { return x } } }
+let UnaryOperator = Function
+
+// ── collections ────────────────────────────────────────────────────────────
+
+fn __jlistFrom(src) {
+    if (src == nil || type(src) == "number") { return [] }
+    let out = []
+    for (let x of __jit(src)) { out.push(x) }
+    return out
+}
+
+fn ArrayList(src) { return __jlistFrom(src) }
+fn Vector(src) { return __jlistFrom(src) }
+fn Stack() { return [] }
+fn LinkedList(src) { return new __JDeque(__jlistFrom(src)) }
+fn ArrayDeque(src) { return new __JDeque(__jlistFrom(src)) }
+fn HashMap(src) { return new __JMap(false, nil, src) }
+fn LinkedHashMap(src) { return new __JMap(false, nil, src) }
+fn IdentityHashMap(src) { return new __JMap(false, nil, src) }
+fn EnumMap(src) { return new __JMap(true, fn(a, b) { return a.ordinal() - b.ordinal() }, nil) }
+fn TreeMap(src) {
+    if (__jcallable(src)) { return new __JMap(true, src, nil) }
+    return new __JMap(true, nil, src)
+}
+fn HashSet(src) { return new __JSet(false, nil, src) }
+fn LinkedHashSet(src) { return new __JSet(false, nil, src) }
+fn TreeSet(src) {
+    if (__jcallable(src)) { return new __JSet(true, src, nil) }
+    return new __JSet(true, nil, src)
+}
+fn PriorityQueue(a, b) {
+    // (), (capacity), (comparator), (capacity, comparator), (collection)
+    let cmp = nil
+    let src = nil
+    if (__jcallable(a)) { cmp = a }
+    if (__jcallable(b)) { cmp = b }
+    if (a != nil && !__jcallable(a) && type(a) != "number") { src = a }
+    let q = new __JPriorityQueue(cmp)
+    if (src != nil) { q.addAll(src) }
+    return q
+}
+
+// a deque / linked list, head first
+class __JDeque {
+    constructor(items) { this.items = items }
+    size() { return len(this.items) }
+    isEmpty() { return len(this.items) == 0 }
+    push(x) { this.items.addFirst(x) }
+    addFirst(x) { this.items.addFirst(x) }
+    offerFirst(x) { this.items.addFirst(x); return true }
+    add(a, b) {
+        if (b == nil) { this.items.push(a); return true }
+        this.items.add(a, b)
+    }
+    addLast(x) { this.items.push(x) }
+    offer(x) { this.items.push(x); return true }
+    offerLast(x) { this.items.push(x); return true }
+    addAll(c) { for (let x of __jit(c)) { this.items.push(x) } return true }
+    pop() { return this.removeFirst() }
+    remove(x) {
+        if (x == nil) { return this.removeFirst() }
+        return this.items.remove(x)
+    }
+    removeFirst() {
+        if (len(this.items) == 0) { throw new NoSuchElementException(nil) }
+        return this.items.removeFirst()
+    }
+    removeLast() {
+        if (len(this.items) == 0) { throw new NoSuchElementException(nil) }
+        return this.items.removeLast()
+    }
+    poll() { return this.items.pollFirst() }
+    pollFirst() { return this.items.pollFirst() }
+    pollLast() { return this.items.pollLast() }
+    peek() { return this.items.peekFirst() }
+    peekFirst() { return this.items.peekFirst() }
+    peekLast() { return this.items.peekLast() }
+    element() { return this.getFirst() }
+    getFirst() {
+        if (len(this.items) == 0) { throw new NoSuchElementException(nil) }
+        return this.items[0]
+    }
+    getLast() {
+        if (len(this.items) == 0) { throw new NoSuchElementException(nil) }
+        return this.items[len(this.items) - 1]
+    }
+    get(i) { return this.items.get(i) }
+    set(i, v) { return this.items.set(i, v) }
+    indexOf(x) { return this.items.indexOf(x) }
+    contains(x) { return this.items.contains(x) }
+    clear() { this.items = [] }
+    toArray() { return this.items.toArray() }
+    stream() { return this.items.toArray() }
+    forEach(f) { for (let x of this.items) { f(x) } }
+    descendingIterator() { return new __JIterator(this.items.toArray().reverse()) }
+    iterator() { return new __JIterator(this.items) }
+    toString() { return __jstr(this.items) }
+}
+
+class __JIterator {
+    constructor(items) { this.items = items; this.i = 0 }
+    hasNext() { return this.i < len(this.items) }
+    next() {
+        if (this.i >= len(this.items)) { throw new NoSuchElementException(nil) }
+        let v = this.items[this.i]
+        this.i += 1
+        return v
+    }
+}
+
+// a map: insertion order, or sorted (TreeMap); keys keep their type
+class __JMap {
+    constructor(sorted, cmp, src) {
+        this.sorted = sorted
+        this.cmp = cmp
+        this.ks = []
+        this.vs = []
+        this.index = {}
+        if (src != nil && type(src) != "number") { this.putAll(src) }
+    }
+    __find(k) {
+        let p = this.index[__jkey(k)]
+        return p == nil ? -1 : p
+    }
+    __reindex() {
+        this.index = {}
+        let i = 0
+        while (i < len(this.ks)) { this.index[__jkey(this.ks[i])] = i; i += 1 }
+    }
+    __order(a, b) { return this.cmp == nil ? __jcompare(a, b) : this.cmp(a, b) }
+    size() { return len(this.ks) }
+    isEmpty() { return len(this.ks) == 0 }
+    containsKey(k) { return this.__find(k) >= 0 }
+    containsValue(v) {
+        for (let x of this.vs) { if (__jequals(x, v)) { return true } }
+        return false
+    }
+    get(k) {
+        let p = this.__find(k)
+        return p < 0 ? nil : this.vs[p]
+    }
+    getOrDefault(k, d) {
+        let p = this.__find(k)
+        return p < 0 ? d : this.vs[p]
+    }
+    put(k, v) {
+        let p = this.__find(k)
+        if (p >= 0) {
+            let old = this.vs[p]
+            this.vs[p] = v
+            return old
+        }
+        if (!this.sorted) {
+            this.index[__jkey(k)] = len(this.ks)
+            this.ks.push(k)
+            this.vs.push(v)
+            return nil
+        }
+        let lo = 0
+        let hi = len(this.ks)
+        while (lo < hi) {
+            let mid = floor((lo + hi) / 2)
+            if (this.__order(this.ks[mid], k) < 0) { lo = mid + 1 } else { hi = mid }
+        }
+        this.ks.add(lo, k)
+        this.vs.add(lo, v)
+        this.__reindex()
+        return nil
+    }
+    putAll(m) {
+        if (__jinChain(m, "__JMap")) {
+            let i = 0
+            while (i < len(m.ks)) { this.put(m.ks[i], m.vs[i]); i += 1 }
+        } else if (type(m) == "dict") {
+            for (let k of m.keys()) { this.put(k, m[k]) }
+        }
+    }
+    putIfAbsent(k, v) {
+        let old = this.get(k)
+        if (old == nil) { this.put(k, v) }
+        return old
+    }
+    remove(k) {
+        let p = this.__find(k)
+        if (p < 0) { return nil }
+        let old = this.vs[p]
+        this.ks.remove(p)
+        this.vs.remove(p)
+        this.__reindex()
+        return old
+    }
+    clear() { this.ks = []; this.vs = []; this.index = {} }
+    merge(k, v, f) {
+        let old = this.get(k)
+        let nv = old == nil ? v : f(old, v)
+        if (nv == nil) { this.remove(k) } else { this.put(k, nv) }
+        return nv
+    }
+    compute(k, f) {
+        let nv = f(k, this.get(k))
+        if (nv == nil) { this.remove(k) } else { this.put(k, nv) }
+        return nv
+    }
+    computeIfAbsent(k, f) {
+        let old = this.get(k)
+        if (old != nil) { return old }
+        let nv = f(k)
+        if (nv != nil) { this.put(k, nv) }
+        return nv
+    }
+    computeIfPresent(k, f) {
+        let old = this.get(k)
+        if (old == nil) { return nil }
+        return this.compute(k, fn(key, v) { return f(key, v) })
+    }
+    keySet() { return new __JSet(false, nil, this.ks) }
+    values() { return this.vs.toArray() }
+    entrySet() {
+        let out = []
+        let i = 0
+        while (i < len(this.ks)) { out.push([this.ks[i], this.vs[i]]); i += 1 }
+        return out
+    }
+    forEach(f) {
+        let i = 0
+        while (i < len(this.ks)) { f(this.ks[i], this.vs[i]); i += 1 }
+    }
+    toArray() { return this.ks.toArray() }
+    firstKey() { return this.__end(0) }
+    lastKey() { return this.__end(len(this.ks) - 1) }
+    __end(i) {
+        if (len(this.ks) == 0) { throw new NoSuchElementException(nil) }
+        return this.ks[i]
+    }
+    firstEntry() { return len(this.ks) == 0 ? nil : [this.ks[0], this.vs[0]] }
+    lastEntry() { return len(this.ks) == 0 ? nil : [this.ks[len(this.ks) - 1], this.vs[len(this.vs) - 1]] }
+    pollFirstEntry() {
+        let e = this.firstEntry()
+        if (e != nil) { this.remove(e[0]) }
+        return e
+    }
+    // the greatest key <= k (floor), < k (lower), the least >= k (ceiling), > k (higher)
+    __search(k, below, inclusive) {
+        let best = nil
+        for (let x of this.ks) {
+            let c = this.__order(x, k)
+            if (below && (c < 0 || (inclusive && c == 0))) { best = x }
+            if (!below && (c > 0 || (inclusive && c == 0)) && best == nil) { best = x }
+        }
+        return best
+    }
+    floorKey(k) { return this.__search(k, true, true) }
+    lowerKey(k) { return this.__search(k, true, false) }
+    ceilingKey(k) { return this.__search(k, false, true) }
+    higherKey(k) { return this.__search(k, false, false) }
+    headMap(k) {
+        let m = new __JMap(this.sorted, this.cmp, nil)
+        let i = 0
+        while (i < len(this.ks)) { if (this.__order(this.ks[i], k) < 0) { m.put(this.ks[i], this.vs[i]) } i += 1 }
+        return m
+    }
+    tailMap(k) {
+        let m = new __JMap(this.sorted, this.cmp, nil)
+        let i = 0
+        while (i < len(this.ks)) { if (this.__order(this.ks[i], k) >= 0) { m.put(this.ks[i], this.vs[i]) } i += 1 }
+        return m
+    }
+    equals(o) {
+        if (!__jinChain(o, "__JMap") || o.size() != this.size()) { return false }
+        let i = 0
+        while (i < len(this.ks)) {
+            if (!o.containsKey(this.ks[i]) || !__jequals(o.get(this.ks[i]), this.vs[i])) { return false }
+            i += 1
+        }
+        return true
+    }
+    toString() {
+        let out = "{"
+        let i = 0
+        while (i < len(this.ks)) {
+            if (i > 0) { out += ", " }
+            out += __jstr(this.ks[i]) + "=" + __jstr(this.vs[i])
+            i += 1
+        }
+        return out + "}"
+    }
+}
+
+class __JSet {
+    constructor(sorted, cmp, src) {
+        this.m = new __JMap(sorted, cmp, nil)
+        if (src != nil && type(src) != "number") { this.addAll(src) }
+    }
+    add(x) {
+        if (this.m.containsKey(x)) { return false }
+        this.m.put(x, true)
+        return true
+    }
+    addAll(c) {
+        let changed = false
+        for (let x of __jit(c)) { if (this.add(x)) { changed = true } }
+        return changed
+    }
+    remove(x) { return this.m.remove(x) != nil }
+    removeAll(c) { for (let x of __jit(c)) { this.remove(x) } return true }
+    retainAll(c) {
+        let keep = new __JSet(false, nil, c)
+        for (let x of this.toArray()) { if (!keep.contains(x)) { this.remove(x) } }
+        return true
+    }
+    removeIf(p) { for (let x of this.toArray()) { if (p(x)) { this.remove(x) } } return true }
+    contains(x) { return this.m.containsKey(x) }
+    containsAll(c) {
+        for (let x of __jit(c)) { if (!this.contains(x)) { return false } }
+        return true
+    }
+    size() { return this.m.size() }
+    isEmpty() { return this.m.size() == 0 }
+    clear() { this.m.clear() }
+    toArray() { return this.m.ks.toArray() }
+    stream() { return this.m.ks.toArray() }
+    iterator() { return new __JIterator(this.m.ks.toArray()) }
+    forEach(f) { for (let x of this.m.ks.toArray()) { f(x) } }
+    first() { return this.m.firstKey() }
+    last() { return this.m.lastKey() }
+    floor(x) { return this.m.floorKey(x) }
+    lower(x) { return this.m.lowerKey(x) }
+    ceiling(x) { return this.m.ceilingKey(x) }
+    higher(x) { return this.m.higherKey(x) }
+    pollFirst() {
+        if (this.m.size() == 0) { return nil }
+        let x = this.m.firstKey()
+        this.remove(x)
+        return x
+    }
+    pollLast() {
+        if (this.m.size() == 0) { return nil }
+        let x = this.m.lastKey()
+        this.remove(x)
+        return x
+    }
+    headSet(x) { return new __JSet(this.m.sorted, this.m.cmp, this.m.headMap(x).ks) }
+    tailSet(x) { return new __JSet(this.m.sorted, this.m.cmp, this.m.tailMap(x).ks) }
+    descendingSet() { return this.m.ks.toArray().reverse() }
+    equals(o) { return __jinChain(o, "__JSet") && o.size() == this.size() && this.containsAll(o) }
+    hashCode() {
+        let h = 0
+        for (let x of this.m.ks) { h += Objects.hashCode(x) }
+        return h
+    }
+    toString() { return __jstr(this.m.ks) }
+}
+
+// java.util.PriorityQueue: the same binary heap, so the same iteration order
+class __JPriorityQueue {
+    constructor(cmp) { this.q = []; this.cmp = cmp }
+    __c(a, b) { return this.cmp == nil ? __jcompare(a, b) : this.cmp(a, b) }
+    size() { return len(this.q) }
+    isEmpty() { return len(this.q) == 0 }
+    add(x) { return this.offer(x) }
+    addAll(c) { for (let x of __jit(c)) { this.offer(x) } return true }
+    offer(x) {
+        let k = len(this.q)
+        this.q.push(x)
+        while (k > 0) {
+            let parent = floor((k - 1) / 2)
+            if (this.__c(x, this.q[parent]) >= 0) { break }
+            this.q[k] = this.q[parent]
+            k = parent
+        }
+        this.q[k] = x
+        return true
+    }
+    peek() { return len(this.q) == 0 ? nil : this.q[0] }
+    element() {
+        if (len(this.q) == 0) { throw new NoSuchElementException(nil) }
+        return this.q[0]
+    }
+    poll() {
+        if (len(this.q) == 0) { return nil }
+        let top = this.q[0]
+        let last = this.q.pop()
+        let n = len(this.q)
+        if (n > 0) {
+            let k = 0
+            let half = floor(n / 2)
+            while (k < half) {
+                let child = 2 * k + 1
+                let right = child + 1
+                if (right < n && this.__c(this.q[child], this.q[right]) > 0) { child = right }
+                if (this.__c(last, this.q[child]) <= 0) { break }
+                this.q[k] = this.q[child]
+                k = child
+            }
+            this.q[k] = last
+        }
+        return top
+    }
+    remove() {
+        if (len(this.q) == 0) { throw new NoSuchElementException(nil) }
+        return this.poll()
+    }
+    contains(x) { return this.q.contains(x) }
+    clear() { this.q = [] }
+    toArray() { return this.q.toArray() }
+    stream() { return this.q.toArray() }
+    iterator() { return new __JIterator(this.q.toArray()) }
+    toString() { return __jstr(this.q) }
+}
+
+// List.of, Set.of, Map.of, ... (the rewrite names them so: JavaScript's Set
+// and Map keep their names)
+fn __jList_of(*xs) { return xs }
+fn __jList_copyOf(c) { return __jlistFrom(c) }
+fn __jSet_of(*xs) { return new __JSet(false, nil, xs) }
+fn __jSet_copyOf(c) { return new __JSet(false, nil, c) }
+fn __jMap_of(*kv) {
+    let m = new __JMap(false, nil, nil)
+    let i = 0
+    while (i + 1 < len(kv)) { m.put(kv[i], kv[i + 1]); i += 2 }
+    return m
+}
+fn __jMap_ofEntries(*entries) {
+    let m = new __JMap(false, nil, nil)
+    for (let e of entries) { m.put(e[0], e[1]) }
+    return m
+}
+fn __jMap_entry(k, v) { return [k, v] }
+fn __jMap_copyOf(m) { return new __JMap(false, nil, m) }
+
+fn __jsortRange(a, lo, to, cmp) {
+    let part = a.slice(lo, to)
+    part.sort(cmp)
+    let i = 0
+    while (i < len(part)) { a[lo + i] = part[i]; i += 1 }
+}
+
+fn __jdefaultLike(a) {
+    if (len(a) == 0) { return nil }
+    let t = type(a[0])
+    if (t == "number") { return 0 }
+    if (t == "bool") { return false }
+    return nil
+}
+
+let Arrays = {
+    "toString": fn(a) { return a == nil ? "null" : __jstr(a) },
+    "deepToString": fn(a) { return __jstr(a) },
+    // sort(a), sort(a, cmp), sort(a, from, to), sort(a, from, to, cmp)
+    "sort": fn(a, *r) {
+        if (len(r) >= 2) { __jsortRange(a, r[0], r[1], len(r) > 2 ? r[2] : nil) } else { a.sort(len(r) == 1 ? r[0] : nil) }
+    },
+    // fill(a, v), fill(a, from, to, v)
+    "fill": fn(a, *r) {
+        let lo = len(r) == 3 ? r[0] : 0
+        let to = len(r) == 3 ? r[1] : len(a)
+        let v = r[len(r) - 1]
+        let i = lo
+        while (i < to) { a[i] = v; i += 1 }
+    },
+    "asList": fn(*xs) { return xs },
+    "copyOf": fn(a, n) {
+        let out = a.slice(0, n < len(a) ? n : len(a))
+        let d = __jdefaultLike(a)
+        while (len(out) < n) { out.push(d) }
+        return out
+    },
+    "copyOfRange": fn(a, lo, to) { return a.slice(lo, to) },
+    "equals": fn(a, b) { return a == b },
+    "stream": fn(a) { return a.toArray() },
+    "binarySearch": fn(a, key) {
+        let lo = 0
+        let hi = len(a) - 1
+        while (lo <= hi) {
+            let mid = floor((lo + hi) / 2)
+            let c = __jcompare(a[mid], key)
+            if (c < 0) { lo = mid + 1 } else if (c > 0) { hi = mid - 1 } else { return mid }
+        }
+        return -(lo + 1)
+    },
+    "hashCode": fn(a) {
+        let h = 1
+        for (let x of a) { h = (31 * h + Objects.hashCode(x)) % 4294967296 }
+        return h >= 2147483648 ? h - 4294967296 : h
+    }
+}
+
+let Collections = {
+    "sort": fn(list, cmp) { list.sort(cmp) },
+    "reverse": fn(list) { list.reverse() },
+    "max": fn(c, cmp) { return __jit(c).max(cmp).get() },
+    "min": fn(c, cmp) { return __jit(c).min(cmp).get() },
+    "swap": fn(list, i, j) {
+        let t = list[i]
+        list[i] = list[j]
+        list[j] = t
+    },
+    "frequency": fn(c, x) {
+        let n = 0
+        for (let v of __jit(c)) { if (__jequals(v, x)) { n += 1 } }
+        return n
+    },
+    "shuffle": fn(list, rnd) {
+        if (rnd == nil) { rnd = new __JRandom(nil) }
+        let i = len(list) - 1
+        while (i > 0) {
+            let j = rnd.nextInt(i + 1)
+            let t = list[i]
+            list[i] = list[j]
+            list[j] = t
+            i -= 1
+        }
+    },
+    "nCopies": fn(n, v) { return __jarr(v, n) },
+    "emptyList": fn() { return [] },
+    "emptyMap": fn() { return new __JMap(false, nil, nil) },
+    "emptySet": fn() { return new __JSet(false, nil, nil) },
+    "singletonList": fn(x) { return [x] },
+    "unmodifiableList": fn(x) { return x },
+    "unmodifiableMap": fn(x) { return x },
+    "unmodifiableSet": fn(x) { return x },
+    "addAll": fn(c, *xs) { for (let x of xs) { c.add(x) } return true },
+    "reverseOrder": fn(cmp) {
+        if (cmp == nil) { return fn(a, b) { return __jcompare(b, a) } }
+        return fn(a, b) { return cmp(b, a) }
+    }
+}
+
+// ── streams (eager: a stream is a Quantum array) ───────────────────────────
+
+class __JIterate {
+    constructor(seed, f) { this.seed = seed; this.f = f }
+    limit(n) {
+        let out = []
+        let v = this.seed
+        while (len(out) < n) {
+            out.push(v)
+            v = this.f(v)
+        }
+        return out
+    }
+}
+
+let IntStream = {
+    "range": fn(a, b) { return range(a, b) },
+    "rangeClosed": fn(a, b) { return range(a, b + 1) },
+    "of": fn(*xs) { return xs },
+    "empty": fn() { return [] },
+    "iterate": fn(seed, f) { return new __JIterate(seed, f) }
+}
+let LongStream = IntStream
+let DoubleStream = IntStream
+let Stream = {
+    "of": fn(*xs) { return xs },
+    "empty": fn() { return [] },
+    "iterate": fn(seed, f) { return new __JIterate(seed, f) },
+    "concat": fn(a, b) { return a.concat(b) }
+}
+
+fn __jgroupBy(keyFn, factory, downstream) {
+    return fn(items) {
+        let m = factory == nil ? new __JMap(false, nil, nil) : factory()
+        for (let x of items) {
+            let k = keyFn(x)
+            let bucket = m.get(k)
+            if (bucket == nil) {
+                bucket = []
+                m.put(k, bucket)
+            }
+            bucket.push(x)
+        }
+        if (downstream != nil) {
+            for (let k of m.ks) { m.put(k, downstream(m.get(k))) }
+        }
+        return m
+    }
+}
+
+let Collectors = {
+    "toList": fn() { return fn(items) { return items } },
+    "toUnmodifiableList": fn() { return fn(items) { return items } },
+    "toSet": fn() { return fn(items) { return new __JSet(false, nil, items) } },
+    "toCollection": fn(factory) {
+        return fn(items) {
+            let c = factory()
+            for (let x of items) { c.add(x) }
+            return c
+        }
+    },
+    "joining": fn(sep, pre, post) {
+        return fn(items) {
+            let out = pre == nil ? "" : pre
+            let first = true
+            for (let x of items) {
+                if (!first && sep != nil) { out += sep }
+                out += __jstr(x)
+                first = false
+            }
+            return out + (post == nil ? "" : post)
+        }
+    },
+    "counting": fn() { return fn(items) { return len(items) } },
+    "summingInt": fn(f) { return fn(items) { return items.map(f).sum() } },
+    "summingDouble": fn(f) { return fn(items) { return items.map(f).sum() } },
+    "summingLong": fn(f) { return fn(items) { return items.map(f).sum() } },
+    "averagingInt": fn(f) { return fn(items) { return len(items) == 0 ? 0 : items.map(f).sum() / len(items) } },
+    "averagingDouble": fn(f) { return fn(items) { return len(items) == 0 ? 0 : items.map(f).sum() / len(items) } },
+    "mapping": fn(f, downstream) { return fn(items) { return downstream(items.map(f)) } },
+    "maxBy": fn(cmp) { return fn(items) { return items.max(cmp) } },
+    "minBy": fn(cmp) { return fn(items) { return items.min(cmp) } },
+    "groupingBy": fn(keyFn, a, b) {
+        // (key), (key, downstream), (key, mapFactory, downstream)
+        if (b != nil) { return __jgroupBy(keyFn, a, b) }
+        return __jgroupBy(keyFn, nil, a)
+    },
+    "partitioningBy": fn(pred, downstream) {
+        return fn(items) {
+            let no = []
+            let yes = []
+            for (let x of items) { if (pred(x)) { yes.push(x) } else { no.push(x) } }
+            let m = new __JMap(false, nil, nil)
+            m.put(false, downstream == nil ? no : downstream(no))
+            m.put(true, downstream == nil ? yes : downstream(yes))
+            return m
+        }
+    },
+    "toMap": fn(keyFn, valueFn, merge, factory) {
+        return fn(items) {
+            let m = factory == nil ? new __JMap(false, nil, nil) : factory()
+            for (let x of items) {
+                let k = keyFn(x)
+                let v = valueFn(x)
+                if (m.containsKey(k)) {
+                    if (merge == nil) { throw new IllegalStateException("Duplicate key " + __jstr(k)) }
+                    v = merge(m.get(k), v)
+                }
+                m.put(k, v)
+            }
+            return m
+        }
+    }
+}
+
+// ── StringBuilder ──────────────────────────────────────────────────────────
+
+class __JStringBuilder {
+    constructor(init) { this.s = (init == nil || type(init) == "number") ? "" : __jstr(init) }
+    append(x) { this.s += __jstr(x); return this }
+    insert(i, x) { this.s = this.s.substring(0, i) + __jstr(x) + this.s.substring(i); return this }
+    reverse() {
+        let out = ""
+        for (let c of this.s.toCharArray()) { out = c + out }
+        this.s = out
+        return this
+    }
+    length() { return len(this.s) }
+    isEmpty() { return len(this.s) == 0 }
+    charAt(i) { return this.s.charAt(i) }
+    indexOf(x) { return this.s.indexOf(x) }
+    lastIndexOf(x) { return this.s.lastIndexOf(x) }
+    setCharAt(i, c) { this.s = this.s.substring(0, i) + c + this.s.substring(i + 1) }
+    deleteCharAt(i) { this.s = this.s.substring(0, i) + this.s.substring(i + 1); return this }
+    delete(a, b) {
+        if (b > len(this.s)) { b = len(this.s) }
+        this.s = this.s.substring(0, a) + this.s.substring(b)
+        return this
+    }
+    replace(a, b, x) {
+        if (b > len(this.s)) { b = len(this.s) }
+        this.s = this.s.substring(0, a) + x + this.s.substring(b)
+        return this
+    }
+    setLength(n) {
+        if (n <= len(this.s)) { this.s = this.s.substring(0, n) } else { this.s += chr(0).repeat(n - len(this.s)) }
+    }
+    substring(a, b) { return b == nil ? this.s.substring(a) : this.s.substring(a, b) }
+    chars() { return this.s.chars() }
+    equals(o) { return this == o }
+    compareTo(o) { return this.s.compareTo(o.s) }
+    toString() { return this.s }
+}
+fn StringBuilder(init) { return new __JStringBuilder(init) }
+fn StringBuffer(init) { return new __JStringBuilder(init) }
+
+// ── Scanner ────────────────────────────────────────────────────────────────
+
+class __JScanner {
+    constructor(src) {
+        // System.in, or a string to scan
+        this.cur = nil
+        this.ahead = []
+        this.text = src != "System.in" && type(src) == "string" ? src.split("\n") : nil
+    }
+    __read() {
+        if (len(this.ahead) > 0) { return this.ahead.removeFirst() }
+        if (this.text != nil) { return len(this.text) == 0 ? nil : this.text.removeFirst() }
+        return __jreadline()
+    }
+    // whether a token is left (reads lines ahead, consuming nothing)
+    hasNext() {
+        if (this.cur != nil && this.cur.trim() != "") { return true }
+        for (let l of this.ahead) { if (l.trim() != "") { return true } }
+        while (true) {
+            let l = this.text != nil ? (len(this.text) == 0 ? nil : this.text.removeFirst()) : __jreadline()
+            if (l == nil) { return false }
+            this.ahead.push(l)
+            if (l.trim() != "") { return true }
+        }
+    }
+    hasNextLine() {
+        if (this.cur != nil || len(this.ahead) > 0) { return true }
+        let l = this.__read()
+        if (l == nil) { return false }
+        this.ahead.push(l)
+        return true
+    }
+    hasNextInt() {
+        if (!this.hasNext()) { return false }
+        let t = this.__peekToken()
+        return t.matches("[+-]?\\d+")
+    }
+    __peekToken() {
+        while (this.cur == nil || this.cur.trim() == "") { this.cur = this.__read() }
+        return this.cur.trim().split("\\s+")[0]
+    }
+    next() {
+        if (!this.hasNext()) { throw new NoSuchElementException(nil) }
+        while (this.cur == nil || this.cur.trim() == "") { this.cur = this.__read() }
+        let s = this.cur
+        let i = 0
+        while (i < len(s) && (s[i] == " " || s[i] == "\t")) { i += 1 }
+        let j = i
+        while (j < len(s) && s[j] != " " && s[j] != "\t") { j += 1 }
+        this.cur = s.substring(j)
+        return s.substring(i, j)
+    }
+    nextInt() {
+        let t = this.next()
+        if (!t.matches("[+-]?\\d+")) { throw new InputMismatchException("For input string: \"" + t + "\"") }
+        return __jparseInt(t, 10)
+    }
+    nextLong() { return this.nextInt() }
+    nextDouble() { return __jparseDouble(this.next()) }
+    nextBoolean() { return this.next().toLowerCase() == "true" }
+    nextLine() {
+        if (this.cur != nil) {
+            let r = this.cur
+            this.cur = nil
+            return r
+        }
+        let l = this.__read()
+        if (l == nil) { throw new NoSuchElementException("No line found") }
+        return l
+    }
+    close() {}
+}
+fn Scanner(src) { return new __JScanner(src) }
+
+// BufferedReader(new InputStreamReader(System.in)): lines of standard input
+class __JReader {
+    readLine() { return __jreadline() }
+    lines() {
+        let out = []
+        let l = __jreadline()
+        while (l != nil) {
+            out.push(l)
+            l = __jreadline()
+        }
+        return out
+    }
+    read() { return -1 }
+    ready() { return false }
+    close() {}
+}
+fn InputStreamReader(src) { return src }
+fn BufferedReader(src) { return new __JReader() }
+
+// list.iterator() on a Quantum array
+fn __jiterator(a) { return new __JIterator(a) }
+
+// ── Random: java.util.Random's generator, so a seed gives Java's numbers ────
+
+class __JRandom {
+    constructor(seed) {
+        if (seed == nil) { seed = floor(time() * 1000000) }
+        // (seed ^ 0x5DEECE66D) mod 2^48, in two 24-bit halves
+        let lo = seed % 16777216
+        let hi = floor(seed / 16777216) % 16777216
+        if (lo < 0) { lo += 16777216 }
+        if (hi < 0) { hi += 16777216 }
+        this.lo = lo ^ 15525485
+        this.hi = hi ^ 1502
+        this.haveGaussian = false
+    }
+    // the next `bits` random bits
+    next(bits) {
+        // seed = seed * 0x5DEECE66D + 0xB mod 2^48
+        let plo = this.lo * 15525485 + 11
+        let carry = floor(plo / 16777216)
+        let newLo = plo % 16777216
+        let mid = this.hi * 15525485 + this.lo * 1502 + carry
+        this.hi = mid % 16777216
+        this.lo = newLo
+        let value = floor((this.hi * 16777216 + this.lo) / Math.pow(2, 48 - bits))
+        if (bits == 32 && value >= 2147483648) { value -= 4294967296 }
+        return value
+    }
+    nextInt(bound) {
+        if (bound == nil) { return this.next(32) }
+        if (bound <= 0) { throw new IllegalArgumentException("bound must be positive") }
+        let r = this.next(31)
+        let m = bound - 1
+        if ((bound & m) == 0) { return floor(bound * r / 2147483648) }
+        let u = r
+        r = u % bound
+        while (u - r + m >= 2147483648) {
+            u = this.next(31)
+            r = u % bound
+        }
+        return r
+    }
+    nextLong() { return this.next(32) * 4294967296 + this.next(32) }
+    nextBoolean() { return this.next(1) != 0 }
+    nextDouble() { return (this.next(26) * 134217728 + this.next(27)) / 9007199254740992 }
+    nextGaussian() {
+        if (this.haveGaussian) {
+            this.haveGaussian = false
+            return this.nextG
+        }
+        let v1 = 0
+        let v2 = 0
+        let s = 0
+        while (s >= 1 || s == 0) {
+            v1 = 2 * this.nextDouble() - 1
+            v2 = 2 * this.nextDouble() - 1
+            s = v1 * v1 + v2 * v2
+        }
+        let mul = Math.sqrt(-2 * Math.log(s) / s)
+        this.nextG = v2 * mul
+        this.haveGaussian = true
+        return v1 * mul
+    }
+}
+fn Random(seed) { return new __JRandom(seed) }

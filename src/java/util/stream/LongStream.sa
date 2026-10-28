@@ -1,0 +1,78 @@
+package java.util.stream;
+
+import java.util.*;
+import java.util.function.*;
+
+public interface LongStream extends BaseStream<Long, LongStream> {
+    LongStream filter(LongPredicate predicate);
+    LongStream map(LongUnaryOperator mapper);
+    <U> Stream<U> mapToObj(LongFunction<? extends U> mapper);
+    IntStream mapToInt(LongToIntFunction mapper);
+    DoubleStream mapToDouble(LongToDoubleFunction mapper);
+    LongStream distinct();
+    LongStream sorted();
+    LongStream peek(LongConsumer action);
+    LongStream limit(long maxSize);
+    LongStream skip(long n);
+    void forEach(LongConsumer action);
+    long[] toArray();
+    long reduce(long identity, LongBinaryOperator op);
+    OptionalLong reduce(LongBinaryOperator op);
+    long sum();
+    OptionalLong min();
+    OptionalLong max();
+    long count();
+    OptionalDouble average();
+    LongSummaryStatistics summaryStatistics();
+    boolean anyMatch(LongPredicate predicate);
+    boolean allMatch(LongPredicate predicate);
+    boolean noneMatch(LongPredicate predicate);
+    OptionalLong findFirst();
+    DoubleStream asDoubleStream();
+    Stream<Long> boxed();
+
+    public static LongStream empty() { return new LongStreamImpl(Collections.<Long>emptyIterator()); }
+    public static LongStream of(long t) { return StreamSupport.$longsOfArray(new long[] {t}, 0, 1); }
+    public static LongStream of(long... values) { return StreamSupport.$longsOfArray(values, 0, values.length); }
+
+    public static LongStream range(long startInclusive, long endExclusive) {
+        return new LongStreamImpl(new Iterator<Long>() {
+            long i = startInclusive;
+            public boolean hasNext() { return i < endExclusive; }
+            public Long next() {
+                if (i >= endExclusive)
+                    throw new NoSuchElementException();
+                return i++;
+            }
+        });
+    }
+
+    public static LongStream rangeClosed(long startInclusive, long endInclusive) {
+        return new LongStreamImpl(new Iterator<Long>() {
+            long i = startInclusive;
+            boolean done = startInclusive > endInclusive;
+            public boolean hasNext() { return !done; }
+            public Long next() {
+                if (done)
+                    throw new NoSuchElementException();
+                long r = i;
+                if (i == endInclusive)
+                    done = true;
+                else
+                    i++;
+                return r;
+            }
+        });
+    }
+
+    public static LongStream iterate(final long seed, final LongUnaryOperator f) {
+        return new LongStreamImpl(Stream.<Long>iterate(seed, x -> f.applyAsLong(x)).iterator());
+    }
+
+    public static LongStream generate(LongSupplier s) {
+        return new LongStreamImpl(new Iterator<Long>() {
+            public boolean hasNext() { return true; }
+            public Long next() { return s.getAsLong(); }
+        });
+    }
+}

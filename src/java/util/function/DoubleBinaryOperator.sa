@@ -1,0 +1,9 @@
+package java.util.function;
+
+import java.util.Comparator;
+import java.util.Objects;
+
+@FunctionalInterface
+public interface DoubleBinaryOperator {
+    double applyAsDouble(double left, double right);
+}

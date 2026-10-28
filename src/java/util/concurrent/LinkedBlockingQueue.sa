@@ -1,0 +1,11 @@
+package java.util.concurrent;
+
+import java.util.*;
+import java.util.function.*;
+
+public class LinkedBlockingQueue<E> extends ArrayDeque<E> implements BlockingQueue<E> {
+    public LinkedBlockingQueue() { super(); }
+    public LinkedBlockingQueue(int capacity) { super(capacity); }
+    public void put(E e) throws InterruptedException { add(e); }
+    public E take() throws InterruptedException { return remove(); }
+}

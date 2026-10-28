@@ -1,0 +1,19 @@
+package java.util.concurrent;
+
+import java.util.*;
+import java.util.function.*;
+
+public class ConcurrentHashMap<K, V> extends HashMap<K, V> implements ConcurrentMap<K, V> {
+    public ConcurrentHashMap() { super(); }
+    public ConcurrentHashMap(int initialCapacity) { super(initialCapacity); }
+    public ConcurrentHashMap(int initialCapacity, float loadFactor) { super(initialCapacity, loadFactor); }
+    public ConcurrentHashMap(Map<? extends K, ? extends V> m) { super(m); }
+
+    public V put(K key, V value) {
+        if (key == null || value == null)
+            throw new NullPointerException();
+        return super.put(key, value);
+    }
+
+    public static <K> Set<K> newKeySet() { return new HashSet<>(); }
+}

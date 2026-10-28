@@ -1,0 +1,45 @@
+package java.io;
+
+public class InputStreamReader extends Reader {
+    private final InputStream in;
+
+    public InputStreamReader(InputStream in) { this.in = java.util.Objects.requireNonNull(in); }
+    public InputStreamReader(InputStream in, String charsetName) { this(in); }
+
+    public int read() throws IOException {
+        int b = in.read();
+        if (b < 0x80)
+            return b;
+        // UTF-8: a multi-byte character
+        int n = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : 1;
+        int cp = b & (0x3F >> n);
+        for (int k = 0; k < n; k++) {
+            int c = in.read();
+            if (c < 0)
+                break;
+            cp = (cp << 6) | (c & 0x3F);
+        }
+        return cp;
+    }
+
+    public int read(char[] cbuf, int off, int len) throws IOException {
+        if (len == 0)
+            return 0;
+        int c = read();
+        if (c == -1)
+            return -1;
+        cbuf[off] = (char) c;
+        int i = 1;
+        while (i < len && in.available() > 0) {
+            c = read();
+            if (c == -1)
+                break;
+            cbuf[off + i++] = (char) c;
+        }
+        return i;
+    }
+
+    public boolean ready() throws IOException { return in.available() > 0; }
+    public void close() throws IOException { in.close(); }
+    boolean $isStdin() { return in.$isStdin(); }
+}

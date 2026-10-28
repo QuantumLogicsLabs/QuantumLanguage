@@ -504,7 +504,7 @@ Quantum-Language/
 │   ├── compiler/                 # AST → bytecode (closures, upvalues)
 │   ├── vm/                       # Bytecode VM, natives, dialect runtimes
 │   ├── cpp/                      # Typed C-family front-end
-│   ├── java/                     # Java front-end (+ prelude/*.jpl standard library)
+│   ├── java/                     # Java front-end; lang/ io/ util/: its standard library
 │   ├── dialect/                  # Python / JS / Ruby / C dialect passes
 │   ├── cli/                      # CLI, bundler, test runner, self-host hooks
 │   ├── qpm/                      # qpm package manager

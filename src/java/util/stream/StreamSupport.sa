@@ -1,0 +1,361 @@
+package java.util.stream;
+
+import java.util.*;
+import java.util.function.*;
+
+// ─── implementation ─────────────────────────────────────────────────────────
+
+public final class StreamSupport {
+    private StreamSupport() {}
+
+    // a stream over a collection: its iterator is taken when the pipeline first pulls
+    public static <T> Stream<T> $of(Iterable<T> source) {
+        return new RefStream<T>(new Iterator<T>() {
+            Iterator<T> it;
+            public boolean hasNext() {
+                if (it == null)
+                    it = source.iterator();
+                return it.hasNext();
+            }
+            public T next() {
+                if (it == null)
+                    it = source.iterator();
+                return it.next();
+            }
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T> Stream<T> $ofArray(Object[] a, int from, int to) {
+        return new RefStream<T>(new Iterator<T>() {
+            int i = from;
+            public boolean hasNext() { return i < to; }
+            public T next() {
+                if (i >= to)
+                    throw new NoSuchElementException();
+                return (T) a[i++];
+            }
+        });
+    }
+
+    public static IntStream $intsOfArray(int[] a, int from, int to) {
+        return new IntStreamImpl(new Iterator<Integer>() {
+            int i = from;
+            public boolean hasNext() { return i < to; }
+            public Integer next() {
+                if (i >= to)
+                    throw new NoSuchElementException();
+                return a[i++];
+            }
+        });
+    }
+
+    public static LongStream $longsOfArray(long[] a, int from, int to) {
+        return new LongStreamImpl(new Iterator<Long>() {
+            int i = from;
+            public boolean hasNext() { return i < to; }
+            public Long next() {
+                if (i >= to)
+                    throw new NoSuchElementException();
+                return a[i++];
+            }
+        });
+    }
+
+    public static DoubleStream $doublesOfArray(double[] a, int from, int to) {
+        return new DoubleStreamImpl(new Iterator<Double>() {
+            int i = from;
+            public boolean hasNext() { return i < to; }
+            public Double next() {
+                if (i >= to)
+                    throw new NoSuchElementException();
+                return a[i++];
+            }
+        });
+    }
+
+    public static <T> Stream<T> stream(Iterable<T> source, boolean parallel) { return $of(source); }
+
+    static final class BuilderImpl<T> implements Stream.Builder<T> {
+        private final ArrayList<T> items = new ArrayList<>();
+        private boolean built;
+
+        public void accept(T t) {
+            if (built)
+                throw new IllegalStateException();
+            items.add(t);
+        }
+
+        public Stream<T> build() {
+            if (built)
+                throw new IllegalStateException();
+            built = true;
+            return items.stream();
+        }
+    }
+
+    // ── shared stages ──
+
+    static final class Filter<T> implements Iterator<T> {
+        private final Iterator<T> src;
+        private final Predicate<? super T> p;
+        private T nextVal;
+        private boolean ready;
+
+        Filter(Iterator<T> src, Predicate<? super T> p) {
+            this.src = src;
+            this.p = p;
+        }
+
+        public boolean hasNext() {
+            while (!ready && src.hasNext()) {
+                T t = src.next();
+                if (p.test(t)) {
+                    nextVal = t;
+                    ready = true;
+                }
+            }
+            return ready;
+        }
+
+        public T next() {
+            if (!hasNext())
+                throw new NoSuchElementException();
+            ready = false;
+            T t = nextVal;
+            nextVal = null;
+            return t;
+        }
+    }
+
+    static final class Map<T, R> implements Iterator<R> {
+        private final Iterator<T> src;
+        private final Function<? super T, ? extends R> f;
+
+        Map(Iterator<T> src, Function<? super T, ? extends R> f) {
+            this.src = src;
+            this.f = f;
+        }
+
+        public boolean hasNext() { return src.hasNext(); }
+        public R next() { return f.apply(src.next()); }
+    }
+
+    static final class Peek<T> implements Iterator<T> {
+        private final Iterator<T> src;
+        private final Consumer<? super T> action;
+
+        Peek(Iterator<T> src, Consumer<? super T> action) {
+            this.src = src;
+            this.action = action;
+        }
+
+        public boolean hasNext() { return src.hasNext(); }
+
+        public T next() {
+            T t = src.next();
+            action.accept(t);
+            return t;
+        }
+    }
+
+    static final class Limit<T> implements Iterator<T> {
+        private final Iterator<T> src;
+        private final long max;
+        private long count;
+
+        Limit(Iterator<T> src, long max) {
+            if (max < 0)
+                throw new IllegalArgumentException(Long.toString(max));
+            this.src = src;
+            this.max = max;
+        }
+
+        public boolean hasNext() { return count < max && src.hasNext(); }
+
+        public T next() {
+            if (count >= max)
+                throw new NoSuchElementException();
+            count++;
+            return src.next();
+        }
+    }
+
+    static final class Skip<T> implements Iterator<T> {
+        private final Iterator<T> src;
+        private long n;
+
+        Skip(Iterator<T> src, long n) {
+            if (n < 0)
+                throw new IllegalArgumentException(Long.toString(n));
+            this.src = src;
+            this.n = n;
+        }
+
+        private void skip() {
+            while (n > 0 && src.hasNext()) {
+                src.next();
+                n--;
+            }
+            n = 0;
+        }
+
+        public boolean hasNext() {
+            skip();
+            return src.hasNext();
+        }
+
+        public T next() {
+            skip();
+            return src.next();
+        }
+    }
+
+    static final class Distinct<T> implements Iterator<T> {
+        private final Iterator<T> src;
+        private final HashSet<T> seen = new HashSet<>();
+        private T nextVal;
+        private boolean ready;
+
+        Distinct(Iterator<T> src) { this.src = src; }
+
+        public boolean hasNext() {
+            while (!ready && src.hasNext()) {
+                T t = src.next();
+                if (seen.add(t)) {
+                    nextVal = t;
+                    ready = true;
+                }
+            }
+            return ready;
+        }
+
+        public T next() {
+            if (!hasNext())
+                throw new NoSuchElementException();
+            ready = false;
+            return nextVal;
+        }
+    }
+
+    static final class TakeWhile<T> implements Iterator<T> {
+        private final Iterator<T> src;
+        private final Predicate<? super T> p;
+        private T nextVal;
+        private boolean ready, done;
+
+        TakeWhile(Iterator<T> src, Predicate<? super T> p) {
+            this.src = src;
+            this.p = p;
+        }
+
+        public boolean hasNext() {
+            if (ready)
+                return true;
+            if (done || !src.hasNext())
+                return false;
+            T t = src.next();
+            if (!p.test(t)) {
+                done = true;
+                return false;
+            }
+            nextVal = t;
+            ready = true;
+            return true;
+        }
+
+        public T next() {
+            if (!hasNext())
+                throw new NoSuchElementException();
+            ready = false;
+            return nextVal;
+        }
+    }
+
+    static final class DropWhile<T> implements Iterator<T> {
+        private final Iterator<T> src;
+        private final Predicate<? super T> p;
+        private T nextVal;
+        private boolean ready, dropping = true;
+
+        DropWhile(Iterator<T> src, Predicate<? super T> p) {
+            this.src = src;
+            this.p = p;
+        }
+
+        public boolean hasNext() {
+            if (ready)
+                return true;
+            while (src.hasNext()) {
+                T t = src.next();
+                if (dropping && p.test(t))
+                    continue;
+                dropping = false;
+                nextVal = t;
+                ready = true;
+                return true;
+            }
+            return false;
+        }
+
+        public T next() {
+            if (!hasNext())
+                throw new NoSuchElementException();
+            ready = false;
+            return nextVal;
+        }
+    }
+
+    static final class FlatMap<T, R> implements Iterator<R> {
+        private final Iterator<T> src;
+        private final Function<? super T, ? extends Iterator<? extends R>> f;
+        private Iterator<? extends R> current;
+
+        FlatMap(Iterator<T> src, Function<? super T, ? extends Iterator<? extends R>> f) {
+            this.src = src;
+            this.f = f;
+        }
+
+        public boolean hasNext() {
+            while (current == null || !current.hasNext()) {
+                if (!src.hasNext())
+                    return false;
+                current = f.apply(src.next());
+            }
+            return true;
+        }
+
+        public R next() {
+            if (!hasNext())
+                throw new NoSuchElementException();
+            return current.next();
+        }
+    }
+
+    // ── shared terminal helpers ──
+
+    static <T> ArrayList<T> drain(Iterator<T> it) {
+        ArrayList<T> out = new ArrayList<>();
+        while (it.hasNext())
+            out.add(it.next());
+        return out;
+    }
+
+    static double[] sumWithCompensation(double[] intermediateSum, double value) {
+        double tmp = value - intermediateSum[1];
+        double sum = intermediateSum[0];
+        double velvel = sum + tmp;
+        intermediateSum[1] = (velvel - sum) - tmp;
+        intermediateSum[0] = velvel;
+        return intermediateSum;
+    }
+
+    static double computeFinalSum(double[] summands) {
+        double tmp = summands[0] - summands[1];
+        double simpleSum = summands[summands.length - 1];
+        if (Double.isNaN(tmp) && Double.isInfinite(simpleSum))
+            return simpleSum;
+        else
+            return tmp;
+    }
+}

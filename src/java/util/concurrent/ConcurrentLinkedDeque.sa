@@ -1,0 +1,8 @@
+package java.util.concurrent;
+
+import java.util.*;
+import java.util.function.*;
+
+public class ConcurrentLinkedDeque<E> extends ArrayDeque<E> {
+    public ConcurrentLinkedDeque() { super(); }
+}

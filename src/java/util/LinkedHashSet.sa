@@ -1,0 +1,44 @@
+package java.util;
+
+import java.util.function.*;
+
+public class LinkedHashSet<E> extends HashSet<E> implements SequencedSet<E>, Cloneable, java.io.Serializable {
+    public LinkedHashSet(int initialCapacity, float loadFactor) { super(initialCapacity, loadFactor, true); }
+    public LinkedHashSet(int initialCapacity) { super(initialCapacity, .75f, true); }
+    public LinkedHashSet() { super(16, .75f, true); }
+
+    public LinkedHashSet(Collection<? extends E> c) {
+        super(HashMap.calculateHashMapCapacity(Math.max(c.size(), 12)), .75f, true);
+        addAll(c);
+    }
+
+    public static <T> LinkedHashSet<T> newLinkedHashSet(int numElements) {
+        return new LinkedHashSet<>(HashMap.calculateHashMapCapacity(numElements));
+    }
+
+    public E getFirst() {
+        Iterator<E> it = iterator();
+        if (!it.hasNext())
+            throw new NoSuchElementException();
+        return it.next();
+    }
+
+    public E getLast() {
+        Map.Entry<E, Object> e = ((LinkedHashMap<E, Object>) map).lastEntry();
+        if (e == null)
+            throw new NoSuchElementException();
+        return e.getKey();
+    }
+
+    public E removeFirst() {
+        E e = getFirst();
+        remove(e);
+        return e;
+    }
+
+    public E removeLast() {
+        E e = getLast();
+        remove(e);
+        return e;
+    }
+}

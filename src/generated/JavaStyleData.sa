@@ -1,0 +1,1494 @@
+// quantum: cpp
+// Generated from src/dialect/javastyle by src/tools/embed.sa. Do not edit.
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace javastyle
+{
+const std::vector<std::pair<std::string, std::string>> &librarySources()
+{
+    static const std::vector<std::pair<std::string, std::string>> items = {
+        {"Lang.sa", R"QJAVASTYLE(// Java-style library, part 1 (java.lang): what Java-style code in a .sa file calls
+// (src/dialect/JavaDialect.sa rewrites the code; compileSource() puts this
+// directory's files, in name order, in front of it). Java's library classes
+// as Quantum values. This part: the helpers the rewritten code calls,
+// String.format, System.out / err / in, the String / Integer / Long / Double /
+// Boolean / Character / Math statics, Objects, the exceptions. Util.sa: the
+// rest of java.util, with the collections:
+//   ArrayList / Stack / Vector     Quantum arrays (Java methods: VmJavaStyle)
+//   LinkedList / ArrayDeque        __JDeque (head first: push / pop / peek)
+//   HashMap / TreeMap / ...        __JMap   (keys keep their type)
+//   HashSet / TreeSet / ...        __JSet
+//   PriorityQueue                  __JPriorityQueue (java.util's heap order)
+// Values follow Quantum's semantics: numbers are one type, a char is a
+// one-character string.
+
+__java_style__()
+
+// ── helpers the rewritten code calls ────────────────────────────────────────
+
+// natural order: numbers, strings, booleans, compareTo()
+fn __jcompare(a, b) {
+    if (a == nil && b == nil) { return 0 }
+    if (a == nil) { return -1 }
+    if (b == nil) { return 1 }
+    if (type(a) == "array" && type(b) == "array") {
+        let n = len(a) < len(b) ? len(a) : len(b)
+        let i = 0
+        while (i < n) {
+            let c = __jcompare(a[i], b[i])
+            if (c != 0) { return c }
+            i += 1
+        }
+        return len(a) - len(b)
+    }
+    if (__jhas(a, "compareTo")) { return a.compareTo(b) }
+    if (type(a) == "bool") { return a == b ? 0 : (a ? 1 : -1) }
+    if (type(a) == "string" && type(b) == "string") { return a.compareTo(b) }
+    if (a < b) { return -1 }
+    if (a > b) { return 1 }
+    return 0
+}
+
+fn __jequals(a, b) {
+    if (__jhas(a, "equals")) { return a.equals(b) }
+    return a == b
+}
+
+// a map / set key that keeps the value's type: 1 and "1" differ
+fn __jkey(k) {
+    let t = type(k)
+    if (t == "number") { return "n:" + str(k) }
+    if (t == "string") { return "s:" + k }
+    if (t == "bool") { return k ? "b:1" : "b:0" }
+    if (k == nil) { return "z:" }
+    if (t == "array") { return "a:" + __jstr(k) }
+    if (__jhas(k, "hashCode")) { return "h:" + str(k.hashCode()) + ":" + __jstr(k) }
+    return "o:" + __jstr(k)
+}
+
+// what a for-each loop walks: arrays, collections, Iterables, map keys
+fn __jit(x) {
+    if (x == nil) { return [] }
+    let t = type(x)
+    if (t == "array" || t == "string") { return x }
+    if (t == "dict") { return x.keys() }
+    if (__jhas(x, "toArray")) { return x.toArray() }
+    if (__jhas(x, "iterator")) {
+        let out = []
+        let it = x.iterator()
+        while (it.hasNext()) { out.push(it.next()) }
+        return out
+    }
+    return x
+}
+
+// new T[n][m]: nested arrays filled with `fill`
+fn __jarr(fill, *dims) {
+    return __jarrDims(fill, dims, 0)
+}
+
+fn __jarrDims(fill, dims, level) {
+    let out = []
+    let n = dims[level]
+    let i = 0
+    while (i < n) {
+        if (level + 1 < len(dims)) { out.push(__jarrDims(fill, dims, level + 1)) } else { out.push(fill) }
+        i += 1
+    }
+    return out
+}
+
+// a lambda, a function or a native (a comparator made by thenComparing)
+fn __jcallable(v) { return type(v) == "function" || type(v) == "native" }
+
+fn __jchar(v) {
+    if (type(v) == "number") { return chr(v) }
+    return v
+}
+
+fn __jinstanceof(v, t) {
+    if (v == nil) { return false }
+    if (type(t) != "string") { return isinstance(v, t) }
+    let ty = type(v)
+    if (t == "Object") { return true }
+    if (t == "String" || t == "CharSequence") { return ty == "string" }
+    if (t == "Character") { return ty == "string" && len(v) == 1 }
+    if (t == "Integer" || t == "Long" || t == "Short" || t == "Byte") { return ty == "number" && floor(v) == v }
+    if (t == "Double" || t == "Float" || t == "Number") { return ty == "number" }
+    if (t == "Boolean") { return ty == "bool" }
+    if (t == "Comparable") { return ty == "number" || ty == "string" || __jhas(v, "compareTo") }
+    if (t == "List" || t == "ArrayList") { return ty == "array" || __jinChain(v, "__JDeque") }
+    if (t == "Collection" || t == "Iterable") {
+        return ty == "array" || __jinChain(v, "__JDeque") || __jinChain(v, "__JSet") || __jhas(v, "iterator")
+    }
+    if (t == "Map" || t == "HashMap" || t == "TreeMap") { return __jinChain(v, "__JMap") }
+    if (t == "Set" || t == "HashSet" || t == "TreeSet") { return __jinChain(v, "__JSet") }
+    if (t == "Runnable" || t == "Function") { return __jcallable(v) }
+    return __jinChain(v, t)
+}
+
+fn __jinChain(v, name) {
+    for (let n of __jclassChain(v)) {
+        if (n == name) { return true }
+    }
+    return false
+}
+
+// a caught value as an exception object (errors the VM raises included)
+fn __jexc(raw) {
+    if (__jinChain(raw, "Throwable")) { return raw }
+    if (type(raw) != "string") { return new RuntimeException(__jstr(raw)) }
+    let kind = __jerrorKind()
+    if (raw.contains("by zero")) { return new ArithmeticException("/ by zero") }
+    if (raw.startsWith("NoSuchElementException")) { return new NoSuchElementException(nil) }
+    if (kind == "IndexError" || raw.contains("out of bounds") || raw.contains("out of range")) {
+        return new IndexOutOfBoundsException(raw)
+    }
+    if (kind == "TypeError" && (raw.contains("nil") || raw.contains("null"))) { return new NullPointerException(raw) }
+    return new RuntimeException(raw)
+}
+
+// whether exception `x` is one of the classes `names` (empty: any)
+fn __jcatch(x, names) {
+    if (len(names) == 0) { return true }
+    for (let n of names) {
+        if (__jinChain(x, n)) { return true }
+    }
+    return false
+}
+
+fn __jenum(obj, name, ordinal) {
+    obj.__name = name
+    obj.__ordinal = ordinal
+    return obj
+}
+
+fn __jenumValueOf(values, s) {
+    for (let v of values) {
+        if (v.__name == s) { return v }
+    }
+    throw new IllegalArgumentException("No enum constant " + s)
+}
+
+fn __jopt(v) { return new __JOptional(v) }
+
+// ── String.format / printf ─────────────────────────────────────────────────
+
+fn __jpad(s, width, left, zero) {
+    if (width <= len(s)) { return s }
+    let fill = (zero && !left) ? "0" : " "
+    let pad = fill.repeat(width - len(s))
+    if (left) { return s + pad }
+    if (zero && (s.startsWith("-") || s.startsWith("+"))) { return s[0] + pad + s.substring(1) }
+    return pad + s
+}
+
+fn __jgroup(digits) {
+    let out = ""
+    let n = len(digits)
+    let i = 0
+    while (i < n) {
+        if (i > 0 && (n - i) % 3 == 0) { out += "," }
+        out += digits[i]
+        i += 1
+    }
+    return out
+}
+
+fn __jtrunc(v) { return v < 0 ? -floor(-v) : floor(v) }
+
+fn __jradix(v, radix, upper) {
+    let n = __jtrunc(v)
+    if (n < 0) { n += 4294967296 }
+    if (n == 0) { return "0" }
+    let digits = upper ? "0123456789ABCDEF" : "0123456789abcdef"
+    let out = ""
+    while (n > 0) {
+        out = digits[n % radix] + out
+        n = floor(n / radix)
+    }
+    return out
+}
+
+fn __jsci(v, prec, upper) {
+    let neg = v < 0
+    let a = neg ? -v : v
+    let e = 0
+    if (a != 0) {
+        while (a >= 10) { a /= 10; e += 1 }
+        while (a < 1) { a *= 10; e -= 1 }
+    }
+    let m = a.toFixed(prec)
+    if (m.startsWith("10")) { a /= 10; e += 1; m = a.toFixed(prec) }
+    let es = str(e < 0 ? -e : e)
+    if (len(es) < 2) { es = "0" + es }
+    return (neg ? "-" : "") + m + (upper ? "E" : "e") + (e < 0 ? "-" : "+") + es
+}
+
+fn __jformat(fmt, args) {
+    let out = ""
+    let i = 0
+    let next = 0
+    let n = len(fmt)
+    while (i < n) {
+        let c = fmt[i]
+        if (c != "%") {
+            out += c
+            i += 1
+            continue
+        }
+        i += 1
+        // %2$s: an explicit argument
+        let argIndex = -1
+        let j = i
+        let num = ""
+        while (j < n && fmt[j] >= "0" && fmt[j] <= "9") { num += fmt[j]; j += 1 }
+        if (j < n && fmt[j] == "$" && num != "") { argIndex = num.to_i() - 1; i = j + 1 }
+        let flags = ""
+        while (i < n && "-+0 ,#(".contains(fmt[i])) { flags += fmt[i]; i += 1 }
+        let width = ""
+        while (i < n && fmt[i] >= "0" && fmt[i] <= "9") { width += fmt[i]; i += 1 }
+        let prec = -1
+        if (i < n && fmt[i] == ".") {
+            i += 1
+            let p = ""
+            while (i < n && fmt[i] >= "0" && fmt[i] <= "9") { p += fmt[i]; i += 1 }
+            prec = p.to_i()
+        }
+        let conv = fmt[i]
+        i += 1
+        if (conv == "n") { out += "\n"; continue }
+        if (conv == "%") { out += "%"; continue }
+        let arg = nil
+        if (argIndex >= 0) { arg = args[argIndex] } else { arg = args[next]; next += 1 }
+        let left = flags.contains("-")
+        let zero = flags.contains("0")
+        let w = width == "" ? 0 : width.to_i()
+        let s = ""
+        if (conv == "d") {
+            let v = __jtrunc(arg)
+            let digits = str(v < 0 ? -v : v)
+            if (flags.contains(",")) { digits = __jgroup(digits) }
+            s = (v < 0 ? "-" : (flags.contains("+") ? "+" : (flags.contains(" ") ? " " : ""))) + digits
+        } else if (conv == "f") {
+            let v = arg
+            let body = (v < 0 ? -v : v).toFixed(prec < 0 ? 6 : prec)
+            if (flags.contains(",")) {
+                let dot = body.indexOf(".")
+                body = dot < 0 ? __jgroup(body) : __jgroup(body.substring(0, dot)) + body.substring(dot)
+            }
+            s = (v < 0 ? "-" : (flags.contains("+") ? "+" : "")) + body
+        } else if (conv == "e" || conv == "E") {
+            s = __jsci(arg, prec < 0 ? 6 : prec, conv == "E")
+        } else if (conv == "x" || conv == "X") {
+            s = __jradix(arg, 16, conv == "X")
+        } else if (conv == "o") {
+            s = __jradix(arg, 8, false)
+        } else if (conv == "c") {
+            s = type(arg) == "number" ? chr(arg) : str(arg)
+        } else if (conv == "b" || conv == "B") {
+            s = (arg == nil || arg == false) ? "false" : "true"
+        } else {
+            s = __jstr(arg)
+            if (prec >= 0 && len(s) > prec) { s = s.substring(0, prec) }
+            if (conv == "S") { s = s.toUpperCase() }
+        }
+        out += __jpad(s, w, left, zero && conv != "s")
+    }
+    return out
+}
+
+// ── System ─────────────────────────────────────────────────────────────────
+
+fn __jprintStream(err) {
+    let emit = fn(s) { if (err) { __jeprint(s) } else { print(s, end="") } }
+    return {
+        "println": fn(*a) { emit((len(a) == 0 ? "" : __jstr(a[0])) + "\n") },
+        "print": fn(x) { emit(__jstr(x)) },
+        "printf": fn(f, *a) { emit(__jformat(f, a)) },
+        "format": fn(f, *a) { emit(__jformat(f, a)) },
+        "flush": fn() { __jflush() }
+    }
+}
+
+let System = {
+    "out": __jprintStream(false),
+    "err": __jprintStream(true),
+    "in": "System.in",
+    "currentTimeMillis": fn() { return floor(time() * 1000) },
+    "nanoTime": fn() { return floor(time() * 1000000000) },
+    "exit": fn(code) { __jexit(code) },
+    "lineSeparator": fn() { return "\n" },
+    "arraycopy": fn(src, sp, dst, dp, n) {
+        let tmp = src.slice(sp, sp + n)
+        let i = 0
+        while (i < n) { dst[dp + i] = tmp[i]; i += 1 }
+    },
+    "identityHashCode": fn(o) { return __jkey(o).hashCode() }
+}
+
+// ── boxes and utility classes ──────────────────────────────────────────────
+
+fn __jparseInt(s, radix) {
+    if (radix == nil) { radix = 10 }
+    if (type(s) != "string") { throw new NumberFormatException("Cannot parse null string: null") }
+    let t = s
+    let neg = false
+    let i = 0
+    if (len(t) > 0 && (t[0] == "-" || t[0] == "+")) { neg = t[0] == "-"; i = 1 }
+    if (i >= len(t)) { throw new NumberFormatException("For input string: \"" + s + "\"") }
+    let digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    let v = 0
+    while (i < len(t)) {
+        let d = digits.indexOf(t[i].toLowerCase())
+        if (d < 0 || d >= radix) { throw new NumberFormatException("For input string: \"" + s + "\"") }
+        v = v * radix + d
+        i += 1
+    }
+    return neg ? -v : v
+}
+
+fn __jparseDouble(s) {
+    let t = str(s).trim()
+    if (t == "" || !t.matches("[+-]?(NaN|Infinity|((\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?))[fFdD]?")) {
+        throw new NumberFormatException("For input string: \"" + s + "\"")
+    }
+    return t.to_f()
+}
+
+let Integer = {
+    "MAX_VALUE": 2147483647, "MIN_VALUE": -2147483648, "SIZE": 32,
+    "parseInt": fn(s, radix) { return __jparseInt(s, radix) },
+    "valueOf": fn(s, radix) { return type(s) == "string" ? __jparseInt(s, radix) : s },
+    "toString": fn(v, radix) { return radix == nil ? __jstr(__jtrunc(v)) : (v < 0 ? "-" + __jradix(-v, radix, false) : __jradix(v, radix, false)) },
+    "toBinaryString": fn(v) { return __jradix(v, 2, false) },
+    "toHexString": fn(v) { return __jradix(v, 16, false) },
+    "toOctalString": fn(v) { return __jradix(v, 8, false) },
+    "sum": fn(a, b) { return a + b },
+    "max": fn(a, b) { return a > b ? a : b },
+    "min": fn(a, b) { return a < b ? a : b },
+    "compare": fn(a, b) { return a < b ? -1 : (a > b ? 1 : 0) },
+    "signum": fn(v) { return v < 0 ? -1 : (v > 0 ? 1 : 0) },
+    "abs": fn(v) { return v < 0 ? -v : v },
+    "bitCount": fn(v) {
+        let n = __jtrunc(v)
+        if (n < 0) { n += 4294967296 }
+        let c = 0
+        while (n > 0) { c += n % 2; n = floor(n / 2) }
+        return c
+    }
+}
+
+let Long = {
+    "MAX_VALUE": 9223372036854775807, "MIN_VALUE": -9223372036854775808,
+    "parseLong": fn(s, radix) { return __jparseInt(s, radix) },
+    "valueOf": fn(s) { return type(s) == "string" ? __jparseInt(s, 10) : s },
+    "toString": fn(v) { return __jstr(__jtrunc(v)) },
+    "sum": fn(a, b) { return a + b },
+    "max": fn(a, b) { return a > b ? a : b },
+    "min": fn(a, b) { return a < b ? a : b },
+    "compare": fn(a, b) { return a < b ? -1 : (a > b ? 1 : 0) }
+}
+
+// (x / 0.0 raises in Quantum: infinity by overflow)
+let __jinf = 1e308 * 10
+let Double = {
+    "MAX_VALUE": 1.7976931348623157e308, "MIN_VALUE": 4.9e-324,
+    "POSITIVE_INFINITY": __jinf, "NEGATIVE_INFINITY": -__jinf, "NaN": __jinf - __jinf,
+    "parseDouble": fn(s) { return __jparseDouble(s) },
+    "valueOf": fn(s) { return type(s) == "string" ? __jparseDouble(s) : s },
+    "toString": fn(v) { return __jstr(v) },
+    "compare": fn(a, b) { return a < b ? -1 : (a > b ? 1 : 0) },
+    "isNaN": fn(v) { return v != v },
+    "sum": fn(a, b) { return a + b },
+    "max": fn(a, b) { return a > b ? a : b },
+    "min": fn(a, b) { return a < b ? a : b }
+}
+let Float = Double
+
+let Boolean = {
+    "TRUE": true, "FALSE": false,
+    "parseBoolean": fn(s) { return s != nil && str(s).toLowerCase() == "true" },
+    "valueOf": fn(s) { return type(s) == "bool" ? s : (s != nil && str(s).toLowerCase() == "true") },
+    "toString": fn(b) { return b ? "true" : "false" },
+    "compare": fn(a, b) { return a == b ? 0 : (a ? 1 : -1) },
+    "logicalAnd": fn(a, b) { return a && b },
+    "logicalOr": fn(a, b) { return a || b },
+    "logicalXor": fn(a, b) { return a != b }
+}
+
+let Character = {
+    "MIN_VALUE": chr(0), "MAX_VALUE": chr(65535),
+    "isDigit": fn(c) { return c != nil && c >= "0" && c <= "9" },
+    "isLetter": fn(c) { return c != nil && ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || ord(c) > 127) },
+    "isLetterOrDigit": fn(c) { return Character.isLetter(c) || Character.isDigit(c) },
+    "isAlphabetic": fn(c) { return Character.isLetter(c) },
+    "isUpperCase": fn(c) { return c >= "A" && c <= "Z" },
+    "isLowerCase": fn(c) { return c >= "a" && c <= "z" },
+    "isWhitespace": fn(c) { return c == " " || c == "\t" || c == "\n" || c == "\r" },
+    "toUpperCase": fn(c) { return c.toUpperCase() },
+    "toLowerCase": fn(c) { return c.toLowerCase() },
+    "getNumericValue": fn(c) {
+        let d = "0123456789abcdefghijklmnopqrstuvwxyz".indexOf(c.toLowerCase())
+        return d
+    },
+    "toString": fn(c) { return __jstr(c) },
+    "valueOf": fn(c) { return c }
+}
+
+Math.floorDiv = fn(a, b) { return floor(a / b) }
+Math.floorMod = fn(a, b) { return a - floor(a / b) * b }
+Math.hypot = fn(a, b) { return Math.sqrt(a * a + b * b) }
+Math.cbrt = fn(a) { return a < 0 ? -Math.pow(-a, 1.0 / 3) : Math.pow(a, 1.0 / 3) }
+Math.signum = fn(a) { return a < 0 ? -1 : (a > 0 ? 1 : 0) }
+Math.toRadians = fn(d) { return d * Math.PI / 180 }
+Math.toDegrees = fn(r) { return r * 180 / Math.PI }
+Math.addExact = fn(a, b) { return a + b }
+Math.multiplyExact = fn(a, b) { return a * b }
+
+let String = {
+    "valueOf": fn(v) { return type(v) == "array" ? v.join("") : __jstr(v) },
+    "copyValueOf": fn(v) { return v.join("") },
+    "format": fn(f, *a) { return __jformat(f, a) },
+    "join": fn(sep, *parts) {
+        let items = parts
+        if (len(parts) == 1 && type(parts[0]) != "string") { items = __jit(parts[0]) }
+        let out = ""
+        let first = true
+        for (let p of items) {
+            if (!first) { out += sep }
+            out += __jstr(p)
+            first = false
+        }
+        return out
+    },
+    "CASE_INSENSITIVE_ORDER": fn(a, b) { return a.compareToIgnoreCase(b) }
+}
+
+let Objects = {
+    "equals": fn(a, b) { return a == nil ? b == nil : __jequals(a, b) },
+    "hash": fn(*xs) {
+        let h = 1
+        for (let x of xs) { h = (31 * h + Objects.hashCode(x)) % 4294967296 }
+        return h >= 2147483648 ? h - 4294967296 : h
+    },
+    "hashCode": fn(o) {
+        if (o == nil) { return 0 }
+        if (type(o) == "string") { return o.hashCode() }
+        if (type(o) == "number") { return __jtrunc(o) }
+        if (type(o) == "bool") { return o ? 1231 : 1237 }
+        if (__jhas(o, "hashCode")) { return o.hashCode() }
+        return __jkey(o).hashCode()
+    },
+    "isNull": fn(o) { return o == nil },
+    "nonNull": fn(o) { return o != nil },
+    "toString": fn(o, d) { return o == nil && d != nil ? d : __jstr(o) },
+    "requireNonNull": fn(o, msg) {
+        if (o == nil) { throw new NullPointerException(msg) }
+        return o
+    },
+    "requireNonNullElse": fn(o, d) { return o == nil ? d : o }
+}
+
+let Thread = { "sleep": fn(ms) {} }
+
+class __JObject {
+    toString() { return __jstr(this) }
+}
+// new Object() (the name Object stays JavaScript's)
+fn __jobject() { return new __JObject() }
+
+// ── exceptions ─────────────────────────────────────────────────────────────
+
+class Throwable {
+    constructor(message, cause) {
+        if (__jinChain(message, "Throwable")) {
+            this.cause = message
+            this.message = message.toString()
+        } else {
+            this.message = message
+            this.cause = cause
+        }
+        this.suppressed = []
+    }
+    getMessage() { return this.message }
+    getLocalizedMessage() { return this.message }
+    getCause() { return this.cause }
+    initCause(c) { this.cause = c; return this }
+    addSuppressed(e) { this.suppressed.push(e) }
+    getSuppressed() { return this.suppressed }
+    getStackTrace() { return [] }
+    toString() {
+        let name = __jexcName(this)
+        return this.message == nil ? name : name + ": " + this.message
+    }
+    printStackTrace() {
+        __jeprint(this.toString() + "\n")
+        if (this.cause != nil) { __jeprint("Caused by: " + this.cause.toString() + "\n") }
+    }
+}
+
+// a library exception's Java name (java.lang.ArithmeticException), or the class's
+fn __jexcName(e) {
+    let n = __jclassChain(e)[0]
+    let util = ["NoSuchElementException", "ConcurrentModificationException", "InputMismatchException", "EmptyStackException"]
+    for (let u of util) {
+        if (n == u) { return "java.util." + n }
+    }
+    if (n == "IOException" || n == "FileNotFoundException" || n == "UncheckedIOException") { return "java.io." + n }
+    let lang = ["Throwable", "Exception", "RuntimeException", "Error", "ArithmeticException", "IllegalArgumentException",
+                "IllegalStateException", "NullPointerException", "IndexOutOfBoundsException",
+                "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException", "NumberFormatException",
+                "ClassCastException", "UnsupportedOperationException", "CloneNotSupportedException",
+                "InterruptedException", "StackOverflowError", "OutOfMemoryError", "AssertionError",
+                "NegativeArraySizeException"]
+    for (let l of lang) {
+        if (n == l) { return "java.lang." + n }
+    }
+    return n
+}
+
+class Exception extends Throwable {}
+class Error extends Throwable {}
+class RuntimeException extends Exception {}
+class ArithmeticException extends RuntimeException {}
+class IllegalArgumentException extends RuntimeException {}
+class NumberFormatException extends IllegalArgumentException {}
+class IllegalStateException extends RuntimeException {}
+class NullPointerException extends RuntimeException {}
+class ClassCastException extends RuntimeException {}
+class UnsupportedOperationException extends RuntimeException {}
+class NegativeArraySizeException extends RuntimeException {}
+class IndexOutOfBoundsException extends RuntimeException {}
+class ArrayIndexOutOfBoundsException extends IndexOutOfBoundsException {}
+class StringIndexOutOfBoundsException extends IndexOutOfBoundsException {}
+class NoSuchElementException extends RuntimeException {}
+class InputMismatchException extends NoSuchElementException {}
+class EmptyStackException extends RuntimeException {}
+class ConcurrentModificationException extends RuntimeException {}
+class CloneNotSupportedException extends Exception {}
+class InterruptedException extends Exception {}
+class IOException extends Exception {}
+class FileNotFoundException extends IOException {}
+class UncheckedIOException extends RuntimeException {}
+class StackOverflowError extends Error {}
+class OutOfMemoryError extends Error {}
+class AssertionError extends Error {}
+)QJAVASTYLE"},
+        {"Util.sa", R"QJAVASTYLE(// Java-style library, part 2 (java.util): Optional, Comparator, the
+// collections, streams, StringBuilder, Scanner, Random. Lang.sa (loaded
+// first) has the helpers, String.format, System, the boxes and exceptions.
+
+// ── Optional ───────────────────────────────────────────────────────────────
+
+class __JOptional {
+    constructor(v) { this.v = v }
+    isPresent() { return this.v != nil }
+    isEmpty() { return this.v == nil }
+    get() {
+        if (this.v == nil) { throw new NoSuchElementException("No value present") }
+        return this.v
+    }
+    getAsInt() { return this.get() }
+    getAsDouble() { return this.get() }
+    getAsLong() { return this.get() }
+    orElse(d) { return this.v == nil ? d : this.v }
+    orElseGet(f) { return this.v == nil ? f() : this.v }
+    orElseThrow(f) {
+        if (this.v == nil) {
+            if (f == nil) { throw new NoSuchElementException("No value present") }
+            throw f()
+        }
+        return this.v
+    }
+    ifPresent(f) { if (this.v != nil) { f(this.v) } }
+    ifPresentOrElse(f, g) { if (this.v != nil) { f(this.v) } else { g() } }
+    map(f) { return this.v == nil ? this : new __JOptional(f(this.v)) }
+    flatMap(f) { return this.v == nil ? this : f(this.v) }
+    filter(p) { return (this.v != nil && p(this.v)) ? this : new __JOptional(nil) }
+    equals(o) { return __jinChain(o, "__JOptional") && __jequals(this.v, o.v) }
+    toString() { return this.v == nil ? "Optional.empty" : "Optional[" + __jstr(this.v) + "]" }
+}
+
+let Optional = {
+    "of": fn(v) {
+        if (v == nil) { throw new NullPointerException(nil) }
+        return new __JOptional(v)
+    },
+    "ofNullable": fn(v) { return new __JOptional(v) },
+    "empty": fn() { return new __JOptional(nil) }
+}
+let OptionalInt = Optional
+let OptionalDouble = Optional
+
+// ── Comparator / Function ──────────────────────────────────────────────────
+
+let Comparator = {
+    "naturalOrder": fn() { return __jcompare },
+    "reverseOrder": fn() { return fn(a, b) { return __jcompare(b, a) } },
+    "comparing": fn(key, cmp) {
+        return fn(a, b) { return cmp == nil ? __jcompare(key(a), key(b)) : cmp(key(a), key(b)) }
+    },
+    "comparingInt": fn(key) { return fn(a, b) { return __jcompare(key(a), key(b)) } },
+    "comparingDouble": fn(key) { return fn(a, b) { return __jcompare(key(a), key(b)) } },
+    "comparingLong": fn(key) { return fn(a, b) { return __jcompare(key(a), key(b)) } },
+    "nullsFirst": fn(cmp) {
+        return fn(a, b) { return a == nil ? (b == nil ? 0 : -1) : (b == nil ? 1 : cmp(a, b)) }
+    },
+    "nullsLast": fn(cmp) {
+        return fn(a, b) { return a == nil ? (b == nil ? 0 : 1) : (b == nil ? -1 : cmp(a, b)) }
+    }
+}
+
+let Function = { "identity": fn() { return fn(x) { return x } } }
+let UnaryOperator = Function
+
+// ── collections ────────────────────────────────────────────────────────────
+
+fn __jlistFrom(src) {
+    if (src == nil || type(src) == "number") { return [] }
+    let out = []
+    for (let x of __jit(src)) { out.push(x) }
+    return out
+}
+
+fn ArrayList(src) { return __jlistFrom(src) }
+fn Vector(src) { return __jlistFrom(src) }
+fn Stack() { return [] }
+fn LinkedList(src) { return new __JDeque(__jlistFrom(src)) }
+fn ArrayDeque(src) { return new __JDeque(__jlistFrom(src)) }
+fn HashMap(src) { return new __JMap(false, nil, src) }
+fn LinkedHashMap(src) { return new __JMap(false, nil, src) }
+fn IdentityHashMap(src) { return new __JMap(false, nil, src) }
+fn EnumMap(src) { return new __JMap(true, fn(a, b) { return a.ordinal() - b.ordinal() }, nil) }
+fn TreeMap(src) {
+    if (__jcallable(src)) { return new __JMap(true, src, nil) }
+    return new __JMap(true, nil, src)
+}
+fn HashSet(src) { return new __JSet(false, nil, src) }
+fn LinkedHashSet(src) { return new __JSet(false, nil, src) }
+fn TreeSet(src) {
+    if (__jcallable(src)) { return new __JSet(true, src, nil) }
+    return new __JSet(true, nil, src)
+}
+fn PriorityQueue(a, b) {
+    // (), (capacity), (comparator), (capacity, comparator), (collection)
+    let cmp = nil
+    let src = nil
+    if (__jcallable(a)) { cmp = a }
+    if (__jcallable(b)) { cmp = b }
+    if (a != nil && !__jcallable(a) && type(a) != "number") { src = a }
+    let q = new __JPriorityQueue(cmp)
+    if (src != nil) { q.addAll(src) }
+    return q
+}
+
+// a deque / linked list, head first
+class __JDeque {
+    constructor(items) { this.items = items }
+    size() { return len(this.items) }
+    isEmpty() { return len(this.items) == 0 }
+    push(x) { this.items.addFirst(x) }
+    addFirst(x) { this.items.addFirst(x) }
+    offerFirst(x) { this.items.addFirst(x); return true }
+    add(a, b) {
+        if (b == nil) { this.items.push(a); return true }
+        this.items.add(a, b)
+    }
+    addLast(x) { this.items.push(x) }
+    offer(x) { this.items.push(x); return true }
+    offerLast(x) { this.items.push(x); return true }
+    addAll(c) { for (let x of __jit(c)) { this.items.push(x) } return true }
+    pop() { return this.removeFirst() }
+    remove(x) {
+        if (x == nil) { return this.removeFirst() }
+        return this.items.remove(x)
+    }
+    removeFirst() {
+        if (len(this.items) == 0) { throw new NoSuchElementException(nil) }
+        return this.items.removeFirst()
+    }
+    removeLast() {
+        if (len(this.items) == 0) { throw new NoSuchElementException(nil) }
+        return this.items.removeLast()
+    }
+    poll() { return this.items.pollFirst() }
+    pollFirst() { return this.items.pollFirst() }
+    pollLast() { return this.items.pollLast() }
+    peek() { return this.items.peekFirst() }
+    peekFirst() { return this.items.peekFirst() }
+    peekLast() { return this.items.peekLast() }
+    element() { return this.getFirst() }
+    getFirst() {
+        if (len(this.items) == 0) { throw new NoSuchElementException(nil) }
+        return this.items[0]
+    }
+    getLast() {
+        if (len(this.items) == 0) { throw new NoSuchElementException(nil) }
+        return this.items[len(this.items) - 1]
+    }
+    get(i) { return this.items.get(i) }
+    set(i, v) { return this.items.set(i, v) }
+    indexOf(x) { return this.items.indexOf(x) }
+    contains(x) { return this.items.contains(x) }
+    clear() { this.items = [] }
+    toArray() { return this.items.toArray() }
+    stream() { return this.items.toArray() }
+    forEach(f) { for (let x of this.items) { f(x) } }
+    descendingIterator() { return new __JIterator(this.items.toArray().reverse()) }
+    iterator() { return new __JIterator(this.items) }
+    toString() { return __jstr(this.items) }
+}
+
+class __JIterator {
+    constructor(items) { this.items = items; this.i = 0 }
+    hasNext() { return this.i < len(this.items) }
+    next() {
+        if (this.i >= len(this.items)) { throw new NoSuchElementException(nil) }
+        let v = this.items[this.i]
+        this.i += 1
+        return v
+    }
+}
+
+// a map: insertion order, or sorted (TreeMap); keys keep their type
+class __JMap {
+    constructor(sorted, cmp, src) {
+        this.sorted = sorted
+        this.cmp = cmp
+        this.ks = []
+        this.vs = []
+        this.index = {}
+        if (src != nil && type(src) != "number") { this.putAll(src) }
+    }
+    __find(k) {
+        let p = this.index[__jkey(k)]
+        return p == nil ? -1 : p
+    }
+    __reindex() {
+        this.index = {}
+        let i = 0
+        while (i < len(this.ks)) { this.index[__jkey(this.ks[i])] = i; i += 1 }
+    }
+    __order(a, b) { return this.cmp == nil ? __jcompare(a, b) : this.cmp(a, b) }
+    size() { return len(this.ks) }
+    isEmpty() { return len(this.ks) == 0 }
+    containsKey(k) { return this.__find(k) >= 0 }
+    containsValue(v) {
+        for (let x of this.vs) { if (__jequals(x, v)) { return true } }
+        return false
+    }
+    get(k) {
+        let p = this.__find(k)
+        return p < 0 ? nil : this.vs[p]
+    }
+    getOrDefault(k, d) {
+        let p = this.__find(k)
+        return p < 0 ? d : this.vs[p]
+    }
+    put(k, v) {
+        let p = this.__find(k)
+        if (p >= 0) {
+            let old = this.vs[p]
+            this.vs[p] = v
+            return old
+        }
+        if (!this.sorted) {
+            this.index[__jkey(k)] = len(this.ks)
+            this.ks.push(k)
+            this.vs.push(v)
+            return nil
+        }
+        let lo = 0
+        let hi = len(this.ks)
+        while (lo < hi) {
+            let mid = floor((lo + hi) / 2)
+            if (this.__order(this.ks[mid], k) < 0) { lo = mid + 1 } else { hi = mid }
+        }
+        this.ks.add(lo, k)
+        this.vs.add(lo, v)
+        this.__reindex()
+        return nil
+    }
+    putAll(m) {
+        if (__jinChain(m, "__JMap")) {
+            let i = 0
+            while (i < len(m.ks)) { this.put(m.ks[i], m.vs[i]); i += 1 }
+        } else if (type(m) == "dict") {
+            for (let k of m.keys()) { this.put(k, m[k]) }
+        }
+    }
+    putIfAbsent(k, v) {
+        let old = this.get(k)
+        if (old == nil) { this.put(k, v) }
+        return old
+    }
+    remove(k) {
+        let p = this.__find(k)
+        if (p < 0) { return nil }
+        let old = this.vs[p]
+        this.ks.remove(p)
+        this.vs.remove(p)
+        this.__reindex()
+        return old
+    }
+    clear() { this.ks = []; this.vs = []; this.index = {} }
+    merge(k, v, f) {
+        let old = this.get(k)
+        let nv = old == nil ? v : f(old, v)
+        if (nv == nil) { this.remove(k) } else { this.put(k, nv) }
+        return nv
+    }
+    compute(k, f) {
+        let nv = f(k, this.get(k))
+        if (nv == nil) { this.remove(k) } else { this.put(k, nv) }
+        return nv
+    }
+    computeIfAbsent(k, f) {
+        let old = this.get(k)
+        if (old != nil) { return old }
+        let nv = f(k)
+        if (nv != nil) { this.put(k, nv) }
+        return nv
+    }
+    computeIfPresent(k, f) {
+        let old = this.get(k)
+        if (old == nil) { return nil }
+        return this.compute(k, fn(key, v) { return f(key, v) })
+    }
+    keySet() { return new __JSet(false, nil, this.ks) }
+    values() { return this.vs.toArray() }
+    entrySet() {
+        let out = []
+        let i = 0
+        while (i < len(this.ks)) { out.push([this.ks[i], this.vs[i]]); i += 1 }
+        return out
+    }
+    forEach(f) {
+        let i = 0
+        while (i < len(this.ks)) { f(this.ks[i], this.vs[i]); i += 1 }
+    }
+    toArray() { return this.ks.toArray() }
+    firstKey() { return this.__end(0) }
+    lastKey() { return this.__end(len(this.ks) - 1) }
+    __end(i) {
+        if (len(this.ks) == 0) { throw new NoSuchElementException(nil) }
+        return this.ks[i]
+    }
+    firstEntry() { return len(this.ks) == 0 ? nil : [this.ks[0], this.vs[0]] }
+    lastEntry() { return len(this.ks) == 0 ? nil : [this.ks[len(this.ks) - 1], this.vs[len(this.vs) - 1]] }
+    pollFirstEntry() {
+        let e = this.firstEntry()
+        if (e != nil) { this.remove(e[0]) }
+        return e
+    }
+    // the greatest key <= k (floor), < k (lower), the least >= k (ceiling), > k (higher)
+    __search(k, below, inclusive) {
+        let best = nil
+        for (let x of this.ks) {
+            let c = this.__order(x, k)
+            if (below && (c < 0 || (inclusive && c == 0))) { best = x }
+            if (!below && (c > 0 || (inclusive && c == 0)) && best == nil) { best = x }
+        }
+        return best
+    }
+    floorKey(k) { return this.__search(k, true, true) }
+    lowerKey(k) { return this.__search(k, true, false) }
+    ceilingKey(k) { return this.__search(k, false, true) }
+    higherKey(k) { return this.__search(k, false, false) }
+    headMap(k) {
+        let m = new __JMap(this.sorted, this.cmp, nil)
+        let i = 0
+        while (i < len(this.ks)) { if (this.__order(this.ks[i], k) < 0) { m.put(this.ks[i], this.vs[i]) } i += 1 }
+        return m
+    }
+    tailMap(k) {
+        let m = new __JMap(this.sorted, this.cmp, nil)
+        let i = 0
+        while (i < len(this.ks)) { if (this.__order(this.ks[i], k) >= 0) { m.put(this.ks[i], this.vs[i]) } i += 1 }
+        return m
+    }
+    equals(o) {
+        if (!__jinChain(o, "__JMap") || o.size() != this.size()) { return false }
+        let i = 0
+        while (i < len(this.ks)) {
+            if (!o.containsKey(this.ks[i]) || !__jequals(o.get(this.ks[i]), this.vs[i])) { return false }
+            i += 1
+        }
+        return true
+    }
+    toString() {
+        let out = "{"
+        let i = 0
+        while (i < len(this.ks)) {
+            if (i > 0) { out += ", " }
+            out += __jstr(this.ks[i]) + "=" + __jstr(this.vs[i])
+            i += 1
+        }
+        return out + "}"
+    }
+}
+
+class __JSet {
+    constructor(sorted, cmp, src) {
+        this.m = new __JMap(sorted, cmp, nil)
+        if (src != nil && type(src) != "number") { this.addAll(src) }
+    }
+    add(x) {
+        if (this.m.containsKey(x)) { return false }
+        this.m.put(x, true)
+        return true
+    }
+    addAll(c) {
+        let changed = false
+        for (let x of __jit(c)) { if (this.add(x)) { changed = true } }
+        return changed
+    }
+    remove(x) { return this.m.remove(x) != nil }
+    removeAll(c) { for (let x of __jit(c)) { this.remove(x) } return true }
+    retainAll(c) {
+        let keep = new __JSet(false, nil, c)
+        for (let x of this.toArray()) { if (!keep.contains(x)) { this.remove(x) } }
+        return true
+    }
+    removeIf(p) { for (let x of this.toArray()) { if (p(x)) { this.remove(x) } } return true }
+    contains(x) { return this.m.containsKey(x) }
+    containsAll(c) {
+        for (let x of __jit(c)) { if (!this.contains(x)) { return false } }
+        return true
+    }
+    size() { return this.m.size() }
+    isEmpty() { return this.m.size() == 0 }
+    clear() { this.m.clear() }
+    toArray() { return this.m.ks.toArray() }
+    stream() { return this.m.ks.toArray() }
+    iterator() { return new __JIterator(this.m.ks.toArray()) }
+    forEach(f) { for (let x of this.m.ks.toArray()) { f(x) } }
+    first() { return this.m.firstKey() }
+    last() { return this.m.lastKey() }
+    floor(x) { return this.m.floorKey(x) }
+    lower(x) { return this.m.lowerKey(x) }
+    ceiling(x) { return this.m.ceilingKey(x) }
+    higher(x) { return this.m.higherKey(x) }
+    pollFirst() {
+        if (this.m.size() == 0) { return nil }
+        let x = this.m.firstKey()
+        this.remove(x)
+        return x
+    }
+    pollLast() {
+        if (this.m.size() == 0) { return nil }
+        let x = this.m.lastKey()
+        this.remove(x)
+        return x
+    }
+    headSet(x) { return new __JSet(this.m.sorted, this.m.cmp, this.m.headMap(x).ks) }
+    tailSet(x) { return new __JSet(this.m.sorted, this.m.cmp, this.m.tailMap(x).ks) }
+    descendingSet() { return this.m.ks.toArray().reverse() }
+    equals(o) { return __jinChain(o, "__JSet") && o.size() == this.size() && this.containsAll(o) }
+    hashCode() {
+        let h = 0
+        for (let x of this.m.ks) { h += Objects.hashCode(x) }
+        return h
+    }
+    toString() { return __jstr(this.m.ks) }
+}
+
+// java.util.PriorityQueue: the same binary heap, so the same iteration order
+class __JPriorityQueue {
+    constructor(cmp) { this.q = []; this.cmp = cmp }
+    __c(a, b) { return this.cmp == nil ? __jcompare(a, b) : this.cmp(a, b) }
+    size() { return len(this.q) }
+    isEmpty() { return len(this.q) == 0 }
+    add(x) { return this.offer(x) }
+    addAll(c) { for (let x of __jit(c)) { this.offer(x) } return true }
+    offer(x) {
+        let k = len(this.q)
+        this.q.push(x)
+        while (k > 0) {
+            let parent = floor((k - 1) / 2)
+            if (this.__c(x, this.q[parent]) >= 0) { break }
+            this.q[k] = this.q[parent]
+            k = parent
+        }
+        this.q[k] = x
+        return true
+    }
+    peek() { return len(this.q) == 0 ? nil : this.q[0] }
+    element() {
+        if (len(this.q) == 0) { throw new NoSuchElementException(nil) }
+        return this.q[0]
+    }
+    poll() {
+        if (len(this.q) == 0) { return nil }
+        let top = this.q[0]
+        let last = this.q.pop()
+        let n = len(this.q)
+        if (n > 0) {
+            let k = 0
+            let half = floor(n / 2)
+            while (k < half) {
+                let child = 2 * k + 1
+                let right = child + 1
+                if (right < n && this.__c(this.q[child], this.q[right]) > 0) { child = right }
+                if (this.__c(last, this.q[child]) <= 0) { break }
+                this.q[k] = this.q[child]
+                k = child
+            }
+            this.q[k] = last
+        }
+        return top
+    }
+    remove() {
+        if (len(this.q) == 0) { throw new NoSuchElementException(nil) }
+        return this.poll()
+    }
+    contains(x) { return this.q.contains(x) }
+    clear() { this.q = [] }
+    toArray() { return this.q.toArray() }
+    stream() { return this.q.toArray() }
+    iterator() { return new __JIterator(this.q.toArray()) }
+    toString() { return __jstr(this.q) }
+}
+
+// List.of, Set.of, Map.of, ... (the rewrite names them so: JavaScript's Set
+// and Map keep their names)
+fn __jList_of(*xs) { return xs }
+fn __jList_copyOf(c) { return __jlistFrom(c) }
+fn __jSet_of(*xs) { return new __JSet(false, nil, xs) }
+fn __jSet_copyOf(c) { return new __JSet(false, nil, c) }
+fn __jMap_of(*kv) {
+    let m = new __JMap(false, nil, nil)
+    let i = 0
+    while (i + 1 < len(kv)) { m.put(kv[i], kv[i + 1]); i += 2 }
+    return m
+}
+fn __jMap_ofEntries(*entries) {
+    let m = new __JMap(false, nil, nil)
+    for (let e of entries) { m.put(e[0], e[1]) }
+    return m
+}
+fn __jMap_entry(k, v) { return [k, v] }
+fn __jMap_copyOf(m) { return new __JMap(false, nil, m) }
+
+fn __jsortRange(a, lo, to, cmp) {
+    let part = a.slice(lo, to)
+    part.sort(cmp)
+    let i = 0
+    while (i < len(part)) { a[lo + i] = part[i]; i += 1 }
+}
+
+fn __jdefaultLike(a) {
+    if (len(a) == 0) { return nil }
+    let t = type(a[0])
+    if (t == "number") { return 0 }
+    if (t == "bool") { return false }
+    return nil
+}
+
+let Arrays = {
+    "toString": fn(a) { return a == nil ? "null" : __jstr(a) },
+    "deepToString": fn(a) { return __jstr(a) },
+    // sort(a), sort(a, cmp), sort(a, from, to), sort(a, from, to, cmp)
+    "sort": fn(a, *r) {
+        if (len(r) >= 2) { __jsortRange(a, r[0], r[1], len(r) > 2 ? r[2] : nil) } else { a.sort(len(r) == 1 ? r[0] : nil) }
+    },
+    // fill(a, v), fill(a, from, to, v)
+    "fill": fn(a, *r) {
+        let lo = len(r) == 3 ? r[0] : 0
+        let to = len(r) == 3 ? r[1] : len(a)
+        let v = r[len(r) - 1]
+        let i = lo
+        while (i < to) { a[i] = v; i += 1 }
+    },
+    "asList": fn(*xs) { return xs },
+    "copyOf": fn(a, n) {
+        let out = a.slice(0, n < len(a) ? n : len(a))
+        let d = __jdefaultLike(a)
+        while (len(out) < n) { out.push(d) }
+        return out
+    },
+    "copyOfRange": fn(a, lo, to) { return a.slice(lo, to) },
+    "equals": fn(a, b) { return a == b },
+    "stream": fn(a) { return a.toArray() },
+    "binarySearch": fn(a, key) {
+        let lo = 0
+        let hi = len(a) - 1
+        while (lo <= hi) {
+            let mid = floor((lo + hi) / 2)
+            let c = __jcompare(a[mid], key)
+            if (c < 0) { lo = mid + 1 } else if (c > 0) { hi = mid - 1 } else { return mid }
+        }
+        return -(lo + 1)
+    },
+    "hashCode": fn(a) {
+        let h = 1
+        for (let x of a) { h = (31 * h + Objects.hashCode(x)) % 4294967296 }
+        return h >= 2147483648 ? h - 4294967296 : h
+    }
+}
+
+let Collections = {
+    "sort": fn(list, cmp) { list.sort(cmp) },
+    "reverse": fn(list) { list.reverse() },
+    "max": fn(c, cmp) { return __jit(c).max(cmp).get() },
+    "min": fn(c, cmp) { return __jit(c).min(cmp).get() },
+    "swap": fn(list, i, j) {
+        let t = list[i]
+        list[i] = list[j]
+        list[j] = t
+    },
+    "frequency": fn(c, x) {
+        let n = 0
+        for (let v of __jit(c)) { if (__jequals(v, x)) { n += 1 } }
+        return n
+    },
+    "shuffle": fn(list, rnd) {
+        if (rnd == nil) { rnd = new __JRandom(nil) }
+        let i = len(list) - 1
+        while (i > 0) {
+            let j = rnd.nextInt(i + 1)
+            let t = list[i]
+            list[i] = list[j]
+            list[j] = t
+            i -= 1
+        }
+    },
+    "nCopies": fn(n, v) { return __jarr(v, n) },
+    "emptyList": fn() { return [] },
+    "emptyMap": fn() { return new __JMap(false, nil, nil) },
+    "emptySet": fn() { return new __JSet(false, nil, nil) },
+    "singletonList": fn(x) { return [x] },
+    "unmodifiableList": fn(x) { return x },
+    "unmodifiableMap": fn(x) { return x },
+    "unmodifiableSet": fn(x) { return x },
+    "addAll": fn(c, *xs) { for (let x of xs) { c.add(x) } return true },
+    "reverseOrder": fn(cmp) {
+        if (cmp == nil) { return fn(a, b) { return __jcompare(b, a) } }
+        return fn(a, b) { return cmp(b, a) }
+    }
+}
+
+// ── streams (eager: a stream is a Quantum array) ───────────────────────────
+
+class __JIterate {
+    constructor(seed, f) { this.seed = seed; this.f = f }
+    limit(n) {
+        let out = []
+        let v = this.seed
+        while (len(out) < n) {
+            out.push(v)
+            v = this.f(v)
+        }
+        return out
+    }
+}
+
+let IntStream = {
+    "range": fn(a, b) { return range(a, b) },
+    "rangeClosed": fn(a, b) { return range(a, b + 1) },
+    "of": fn(*xs) { return xs },
+    "empty": fn() { return [] },
+    "iterate": fn(seed, f) { return new __JIterate(seed, f) }
+}
+let LongStream = IntStream
+let DoubleStream = IntStream
+let Stream = {
+    "of": fn(*xs) { return xs },
+    "empty": fn() { return [] },
+    "iterate": fn(seed, f) { return new __JIterate(seed, f) },
+    "concat": fn(a, b) { return a.concat(b) }
+}
+
+fn __jgroupBy(keyFn, factory, downstream) {
+    return fn(items) {
+        let m = factory == nil ? new __JMap(false, nil, nil) : factory()
+        for (let x of items) {
+            let k = keyFn(x)
+            let bucket = m.get(k)
+            if (bucket == nil) {
+                bucket = []
+                m.put(k, bucket)
+            }
+            bucket.push(x)
+        }
+        if (downstream != nil) {
+            for (let k of m.ks) { m.put(k, downstream(m.get(k))) }
+        }
+        return m
+    }
+}
+
+let Collectors = {
+    "toList": fn() { return fn(items) { return items } },
+    "toUnmodifiableList": fn() { return fn(items) { return items } },
+    "toSet": fn() { return fn(items) { return new __JSet(false, nil, items) } },
+    "toCollection": fn(factory) {
+        return fn(items) {
+            let c = factory()
+            for (let x of items) { c.add(x) }
+            return c
+        }
+    },
+    "joining": fn(sep, pre, post) {
+        return fn(items) {
+            let out = pre == nil ? "" : pre
+            let first = true
+            for (let x of items) {
+                if (!first && sep != nil) { out += sep }
+                out += __jstr(x)
+                first = false
+            }
+            return out + (post == nil ? "" : post)
+        }
+    },
+    "counting": fn() { return fn(items) { return len(items) } },
+    "summingInt": fn(f) { return fn(items) { return items.map(f).sum() } },
+    "summingDouble": fn(f) { return fn(items) { return items.map(f).sum() } },
+    "summingLong": fn(f) { return fn(items) { return items.map(f).sum() } },
+    "averagingInt": fn(f) { return fn(items) { return len(items) == 0 ? 0 : items.map(f).sum() / len(items) } },
+    "averagingDouble": fn(f) { return fn(items) { return len(items) == 0 ? 0 : items.map(f).sum() / len(items) } },
+    "mapping": fn(f, downstream) { return fn(items) { return downstream(items.map(f)) } },
+    "maxBy": fn(cmp) { return fn(items) { return items.max(cmp) } },
+    "minBy": fn(cmp) { return fn(items) { return items.min(cmp) } },
+    "groupingBy": fn(keyFn, a, b) {
+        // (key), (key, downstream), (key, mapFactory, downstream)
+        if (b != nil) { return __jgroupBy(keyFn, a, b) }
+        return __jgroupBy(keyFn, nil, a)
+    },
+    "partitioningBy": fn(pred, downstream) {
+        return fn(items) {
+            let no = []
+            let yes = []
+            for (let x of items) { if (pred(x)) { yes.push(x) } else { no.push(x) } }
+            let m = new __JMap(false, nil, nil)
+            m.put(false, downstream == nil ? no : downstream(no))
+            m.put(true, downstream == nil ? yes : downstream(yes))
+            return m
+        }
+    },
+    "toMap": fn(keyFn, valueFn, merge, factory) {
+        return fn(items) {
+            let m = factory == nil ? new __JMap(false, nil, nil) : factory()
+            for (let x of items) {
+                let k = keyFn(x)
+                let v = valueFn(x)
+                if (m.containsKey(k)) {
+                    if (merge == nil) { throw new IllegalStateException("Duplicate key " + __jstr(k)) }
+                    v = merge(m.get(k), v)
+                }
+                m.put(k, v)
+            }
+            return m
+        }
+    }
+}
+
+// ── StringBuilder ──────────────────────────────────────────────────────────
+
+class __JStringBuilder {
+    constructor(init) { this.s = (init == nil || type(init) == "number") ? "" : __jstr(init) }
+    append(x) { this.s += __jstr(x); return this }
+    insert(i, x) { this.s = this.s.substring(0, i) + __jstr(x) + this.s.substring(i); return this }
+    reverse() {
+        let out = ""
+        for (let c of this.s.toCharArray()) { out = c + out }
+        this.s = out
+        return this
+    }
+    length() { return len(this.s) }
+    isEmpty() { return len(this.s) == 0 }
+    charAt(i) { return this.s.charAt(i) }
+    indexOf(x) { return this.s.indexOf(x) }
+    lastIndexOf(x) { return this.s.lastIndexOf(x) }
+    setCharAt(i, c) { this.s = this.s.substring(0, i) + c + this.s.substring(i + 1) }
+    deleteCharAt(i) { this.s = this.s.substring(0, i) + this.s.substring(i + 1); return this }
+    delete(a, b) {
+        if (b > len(this.s)) { b = len(this.s) }
+        this.s = this.s.substring(0, a) + this.s.substring(b)
+        return this
+    }
+    replace(a, b, x) {
+        if (b > len(this.s)) { b = len(this.s) }
+        this.s = this.s.substring(0, a) + x + this.s.substring(b)
+        return this
+    }
+    setLength(n) {
+        if (n <= len(this.s)) { this.s = this.s.substring(0, n) } else { this.s += chr(0).repeat(n - len(this.s)) }
+    }
+    substring(a, b) { return b == nil ? this.s.substring(a) : this.s.substring(a, b) }
+    chars() { return this.s.chars() }
+    equals(o) { return this == o }
+    compareTo(o) { return this.s.compareTo(o.s) }
+    toString() { return this.s }
+}
+fn StringBuilder(init) { return new __JStringBuilder(init) }
+fn StringBuffer(init) { return new __JStringBuilder(init) }
+
+// ── Scanner ────────────────────────────────────────────────────────────────
+
+class __JScanner {
+    constructor(src) {
+        // System.in, or a string to scan
+        this.cur = nil
+        this.ahead = []
+        this.text = src != "System.in" && type(src) == "string" ? src.split("\n") : nil
+    }
+    __read() {
+        if (len(this.ahead) > 0) { return this.ahead.removeFirst() }
+        if (this.text != nil) { return len(this.text) == 0 ? nil : this.text.removeFirst() }
+        return __jreadline()
+    }
+    // whether a token is left (reads lines ahead, consuming nothing)
+    hasNext() {
+        if (this.cur != nil && this.cur.trim() != "") { return true }
+        for (let l of this.ahead) { if (l.trim() != "") { return true } }
+        while (true) {
+            let l = this.text != nil ? (len(this.text) == 0 ? nil : this.text.removeFirst()) : __jreadline()
+            if (l == nil) { return false }
+            this.ahead.push(l)
+            if (l.trim() != "") { return true }
+        }
+    }
+    hasNextLine() {
+        if (this.cur != nil || len(this.ahead) > 0) { return true }
+        let l = this.__read()
+        if (l == nil) { return false }
+        this.ahead.push(l)
+        return true
+    }
+    hasNextInt() {
+        if (!this.hasNext()) { return false }
+        let t = this.__peekToken()
+        return t.matches("[+-]?\\d+")
+    }
+    __peekToken() {
+        while (this.cur == nil || this.cur.trim() == "") { this.cur = this.__read() }
+        return this.cur.trim().split("\\s+")[0]
+    }
+    next() {
+        if (!this.hasNext()) { throw new NoSuchElementException(nil) }
+        while (this.cur == nil || this.cur.trim() == "") { this.cur = this.__read() }
+        let s = this.cur
+        let i = 0
+        while (i < len(s) && (s[i] == " " || s[i] == "\t")) { i += 1 }
+        let j = i
+        while (j < len(s) && s[j] != " " && s[j] != "\t") { j += 1 }
+        this.cur = s.substring(j)
+        return s.substring(i, j)
+    }
+    nextInt() {
+        let t = this.next()
+        if (!t.matches("[+-]?\\d+")) { throw new InputMismatchException("For input string: \"" + t + "\"") }
+        return __jparseInt(t, 10)
+    }
+    nextLong() { return this.nextInt() }
+    nextDouble() { return __jparseDouble(this.next()) }
+    nextBoolean() { return this.next().toLowerCase() == "true" }
+    nextLine() {
+        if (this.cur != nil) {
+            let r = this.cur
+            this.cur = nil
+            return r
+        }
+        let l = this.__read()
+        if (l == nil) { throw new NoSuchElementException("No line found") }
+        return l
+    }
+    close() {}
+}
+fn Scanner(src) { return new __JScanner(src) }
+
+// BufferedReader(new InputStreamReader(System.in)): lines of standard input
+class __JReader {
+    readLine() { return __jreadline() }
+    lines() {
+        let out = []
+        let l = __jreadline()
+        while (l != nil) {
+            out.push(l)
+            l = __jreadline()
+        }
+        return out
+    }
+    read() { return -1 }
+    ready() { return false }
+    close() {}
+}
+fn InputStreamReader(src) { return src }
+fn BufferedReader(src) { return new __JReader() }
+
+// list.iterator() on a Quantum array
+fn __jiterator(a) { return new __JIterator(a) }
+
+// ── Random: java.util.Random's generator, so a seed gives Java's numbers ────
+
+class __JRandom {
+    constructor(seed) {
+        if (seed == nil) { seed = floor(time() * 1000000) }
+        // (seed ^ 0x5DEECE66D) mod 2^48, in two 24-bit halves
+        let lo = seed % 16777216
+        let hi = floor(seed / 16777216) % 16777216
+        if (lo < 0) { lo += 16777216 }
+        if (hi < 0) { hi += 16777216 }
+        this.lo = lo ^ 15525485
+        this.hi = hi ^ 1502
+        this.haveGaussian = false
+    }
+    // the next `bits` random bits
+    next(bits) {
+        // seed = seed * 0x5DEECE66D + 0xB mod 2^48
+        let plo = this.lo * 15525485 + 11
+        let carry = floor(plo / 16777216)
+        let newLo = plo % 16777216
+        let mid = this.hi * 15525485 + this.lo * 1502 + carry
+        this.hi = mid % 16777216
+        this.lo = newLo
+        let value = floor((this.hi * 16777216 + this.lo) / Math.pow(2, 48 - bits))
+        if (bits == 32 && value >= 2147483648) { value -= 4294967296 }
+        return value
+    }
+    nextInt(bound) {
+        if (bound == nil) { return this.next(32) }
+        if (bound <= 0) { throw new IllegalArgumentException("bound must be positive") }
+        let r = this.next(31)
+        let m = bound - 1
+        if ((bound & m) == 0) { return floor(bound * r / 2147483648) }
+        let u = r
+        r = u % bound
+        while (u - r + m >= 2147483648) {
+            u = this.next(31)
+            r = u % bound
+        }
+        return r
+    }
+    nextLong() { return this.next(32) * 4294967296 + this.next(32) }
+    nextBoolean() { return this.next(1) != 0 }
+    nextDouble() { return (this.next(26) * 134217728 + this.next(27)) / 9007199254740992 }
+    nextGaussian() {
+        if (this.haveGaussian) {
+            this.haveGaussian = false
+            return this.nextG
+        }
+        let v1 = 0
+        let v2 = 0
+        let s = 0
+        while (s >= 1 || s == 0) {
+            v1 = 2 * this.nextDouble() - 1
+            v2 = 2 * this.nextDouble() - 1
+            s = v1 * v1 + v2 * v2
+        }
+        let mul = Math.sqrt(-2 * Math.log(s) / s)
+        this.nextG = v2 * mul
+        this.haveGaussian = true
+        return v1 * mul
+    }
+}
+fn Random(seed) { return new __JRandom(seed) }
+)QJAVASTYLE"},
+    };
+    return items;
+}
+} // namespace javastyle

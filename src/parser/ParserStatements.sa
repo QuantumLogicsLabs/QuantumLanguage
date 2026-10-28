@@ -963,6 +963,29 @@ ASTNodePtr Parser::parseStatement()
                             // or "Node head" → IDENTIFIER IDENTIFIER
                             // Distinguish from constructor call: "Foo(b1)" → IDENTIFIER RPAREN or Identifier that's a var
                             size_t i2 = innerPos + 1;
+                            // a template parameter type: vector<int> a, map<K, vector<V>> &m
+                            if (i2 < tokens.size() && tokens[i2].type == TokenType::LT)
+                            {
+                                int tdepth = 0;
+                                size_t k = i2;
+                                for (; k < tokens.size(); ++k)
+                                {
+                                    TokenType tt = tokens[k].type;
+                                    if (tt == TokenType::LT)
+                                        ++tdepth;
+                                    else if (tt == TokenType::GT)
+                                        --tdepth;
+                                    else if (tt == TokenType::RSHIFT)
+                                        tdepth -= 2;
+                                    else if (tt == TokenType::LPAREN || tt == TokenType::RPAREN ||
+                                             tt == TokenType::SEMICOLON || tt == TokenType::NEWLINE)
+                                        break;
+                                    if (tdepth <= 0)
+                                        break;
+                                }
+                                if (k < tokens.size() && tdepth == 0)
+                                    i2 = k + 1;
+                            }
                             if (i2 < tokens.size() &&
                                 (tokens[i2].type == TokenType::STAR ||
                                  tokens[i2].type == TokenType::BIT_AND ||
@@ -2131,8 +2154,11 @@ ASTNodePtr Parser::parseClassDecl()
                             "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
                             "uint32_t", "uint64_t", "time_t", "clock_t", "nullptr_t", "byte",
                             "ifstream", "ofstream", "fstream", "auto", "var", "let"};
+                        // A member of the class's own type (`Node next;`) is a
+                        // reference, never an object: constructing one per
+                        // instance would recurse without end.
                         bool perInstance = objectType && !fieldIsPtr && !isStatic &&
-                                           !notConstructed.count(typeToken);
+                                           !notConstructed.count(typeToken) && typeToken != cd.name;
                         if (perInstance && !init)
                         {
                             auto node = [&](auto &&n)
