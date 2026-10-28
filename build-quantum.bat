@@ -10,7 +10,10 @@ rem                                rebuilds itself byte for byte
 rem   build-quantum.bat --seed     then make the new qrun the seed
 setlocal
 cd /d "%~dp0"
-set OUT=build
+rem QUANTUM_BUILD_OUT redirects the output: `quantum version.sa` builds a release
+rem into build-release, since build\quantum.exe is the program running it
+set OUT=%QUANTUM_BUILD_OUT%
+if "%OUT%"=="" set OUT=build
 set SH=src\tools\selfhost
 rem the library headers come from inside the compiler, never from disk
 set QUANTUM_NATIVE_LIB=
@@ -21,6 +24,9 @@ if not exist seed\qrun.exe (
 )
 
 if not exist %OUT% mkdir %OUT%
+
+rem version.sa is the one place the version is set; stamp it into the sources
+seed\qrun.exe src\tools\stamp_version.sa || goto :fail
 
 echo [1/5] seed\qrun.exe compiles qrun from src\
 seed\qrun.exe --native %SH%\qrun_all.sa %OUT%\stage1.exe || goto :fail

@@ -69,3 +69,8 @@ CLAUDE.md
 !seed/*
 !seed/qrun.exe
 !seed/quantum.exe
+
+# Releases: `quantum version.sa` builds into build-release/ and release/<version>/; the host stores its data in host/data/
+/build-release/
+/release/
+/host/data/

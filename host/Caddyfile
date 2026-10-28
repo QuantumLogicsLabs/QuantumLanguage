@@ -1,0 +1,10 @@
+# HTTPS for the compiler host. Caddy gets and renews the certificate by itself
+# (Let's Encrypt); it needs ports 80 and 443 reachable from the internet and the
+# DNS A record for this name pointing at this machine.
+quantum-compiler.quantumlogicslimited.com {
+	# uploads are the installer and the compiler programs, a few MB each
+	request_body {
+		max_size 200MB
+	}
+	reverse_proxy 127.0.0.1:8080
+}

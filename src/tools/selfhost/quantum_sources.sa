@@ -73,6 +73,8 @@
 #pragma quantum_tu
 #include "../../generated/NativeLibData.sa"
 #pragma quantum_tu
+#include "../../generated/VersionData.sa"
+#pragma quantum_tu
 #include "../../java/JavaCall.sa"
 #pragma quantum_tu
 #include "../../java/JavaEmit.sa"
@@ -122,6 +124,17 @@
 #include "../../qpm/QpmManifest.sa"
 #pragma quantum_tu
 #include "../../qpm/QpmSemver.sa"
+// `quantum version.sa` and `quantum update`: only quantum.exe, so qrun and the stub carry no WinHTTP
+#ifdef QUANTUM_MODE_COMPILER
+#pragma quantum_tu
+#include "../../qpm/QpmHttp.sa"
+#pragma quantum_tu
+#include "../../release/Release.sa"
+#pragma quantum_tu
+#include "../../release/ReleaseHost.sa"
+#pragma quantum_tu
+#include "../../release/Update.sa"
+#endif
 #pragma quantum_tu
 #include "../../vm/VmArrayMethods.sa"
 #pragma quantum_tu
