@@ -29,7 +29,7 @@ void printBanner()
         << " ╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║ ╚═╝ ██║\n"
         << "  ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝\n"
         << Colors::RESET
-        << Colors::YELLOW << "  Quantum Language v2.0.0 | Bytecode VM Edition\n"
+        << Colors::YELLOW << "  Quantum Language v" << quantumVersion() << " | Bytecode VM Edition\n"
         << Colors::RESET << "\n";
 }
 
@@ -354,6 +354,7 @@ void printHelp(const char *prog)
               << "  " << prog << " --dis   <file>     Dump bytecode only\n"
               << "  " << prog << " --test  [dir]      Batch-test all supported source files\n"
               << "  " << prog << " build [name] [--run]  Build a C/C++ project natively (= qpm build)\n"
+              << "  " << prog << " update [--check]   Install the newest Quantum (--check only looks)\n"
               << "  qrun <file>                 Interpret directly (no .exe)\n\n"
               << "  Supported files: .sa .js .py .rb .c .cpp .java — all run natively on the\n"
               << "  Quantum VM (multi-syntax subset; node/python/gcc NOT required)\n\n"

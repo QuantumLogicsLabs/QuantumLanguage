@@ -1,0 +1,8 @@
+// quantum: cpp
+// Generated from version.sa by src/tools/stamp_version.sa. Do not edit.
+#include <string>
+
+std::string quantumVersion()
+{
+    return "3.0.0";
+}

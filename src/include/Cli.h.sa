@@ -74,6 +74,10 @@ int dumpCppAst(const std::string &path);
 // --exec: runs a serialized bytecode file (args after it go to sys.argv).
 int execBytecodeFile(const std::string &path);
 
+// The compiler's version ("3.0.0"): version.sa, stamped into
+// src/generated/VersionData.sa by src/tools/stamp_version.sa at build time.
+std::string quantumVersion();
+
 // ─── Standalone .exe bundling ─────────────────────────────────────────────
 // Path of the currently running executable.
 std::string getExecutablePath();

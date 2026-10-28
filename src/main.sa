@@ -1,5 +1,5 @@
 // quantum: cpp
-/* Quantum Language v2.0.0 — Bytecode VM
+/* Quantum Language — Bytecode VM
  *
  * Entry point only: this file selects the build mode and dispatches the
  * command line. Everything it calls lives in its own translation unit —
@@ -21,6 +21,7 @@
 #include "Vm.h.sa"
 #include "Error.h.sa"
 #include "native/Native.h.sa"
+#include "release/Release.h.sa"
 
 #include <fstream>
 #include <iostream>
@@ -107,7 +108,7 @@ int main(int argc, char *argv[])
     }
     if (a1 == "--version" || a1 == "-v")
     {
-        std::cout << "Quantum Language v2.0.0\n";
+        std::cout << "Quantum Language v" << quantumVersion() << "\n";
         return 0;
     }
     if (a1 == "--check" && argc >= 3)
@@ -214,11 +215,20 @@ int main(int argc, char *argv[])
     }
     if (arg == "--version" || arg == "-v")
     {
-        std::cout << "Quantum Language v2.0.0\nRuntime: Bytecode VM\nBy Muhammad Saad Amin\n";
+        std::cout << "Quantum Language v" << quantumVersion() << "\nRuntime: Bytecode VM\nBy Muhammad Saad Amin\n";
         return 0;
     }
     if (arg == "--check" && argc >= 3)
         return checkFile(argv[2]);
+#ifdef QUANTUM_MODE_COMPILER
+    // `quantum update [--check]` installs the newest published compiler.
+    if (arg == "update")
+        return runUpdate(std::vector<std::string>(argv + 2, argv + argc), exePath);
+    // `quantum version.sa` is the release command when it is the compiler's own
+    // version.sa (see isCompilerVersionFile); any other version.sa is a program.
+    if (isCompilerVersionFile(arg))
+        return runVersionRelease(arg, std::vector<std::string>(argv + 2, argv + argc));
+#endif
     // `quantum build [name] [--run] ...` builds a native C/C++ project — the
     // same command as `qpm build`.
     if (arg == "build")

@@ -1,0 +1,228 @@
+// quantum: cpp
+// `quantum update [--check]`: asks the compiler host for the newest release and, if
+// this one is older, downloads the compiler programs, checks them against the
+// checksums in latest.json, swaps them in and deletes the old ones.
+#include "Release.h.sa"
+#include "Cli.h.sa"
+#include "../qpm/QpmHttp.h.sa"
+#include "Error.h.sa"
+
+#include <cctype>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+namespace fs = std::filesystem;
+
+namespace
+{
+    void say(const std::string &msg)
+    {
+        std::cout << Colors::CYAN << "[Update] " << Colors::RESET << msg << "\n";
+        std::cout.flush();
+    }
+
+    int fail(const std::string &msg)
+    {
+        std::cerr << Colors::RED << "[Update] " << Colors::RESET << msg << "\n";
+        return 1;
+    }
+
+    std::string lowerText(std::string s)
+    {
+        for (char &c : s)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
+
+    fs::path withSuffix(const fs::path &p, const char *suffix)
+    {
+        return fs::path(p.string() + suffix);
+    }
+
+    // Deletes files the update leaves behind that cannot go while this program runs:
+    // a detached command waits a moment, then removes them.
+    void deleteLater(const std::vector<fs::path> &files)
+    {
+        if (files.empty())
+            return;
+        std::string cmd = "cmd.exe /c ping -n 3 127.0.0.1 >nul";
+        for (const fs::path &f : files)
+            cmd += " & del /f /q \"" + f.string() + "\"";
+        STARTUPINFOA si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        std::vector<char> buf(cmd.begin(), cmd.end());
+        buf.push_back('\0');
+        // DETACHED_PROCESS | CREATE_NO_WINDOW; no inherited handles, so it outlives us quietly
+        if (CreateProcessA(nullptr, buf.data(), nullptr, nullptr, FALSE, 0x00000008 | CREATE_NO_WINDOW, nullptr, nullptr,
+                           &si, &pi))
+        {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+    }
+
+    // Removes leftovers of an earlier update (best effort)
+    void cleanLeftovers(const fs::path &dir)
+    {
+        std::error_code ec;
+        for (const std::string &name : releaseProgramNames())
+        {
+            fs::remove(withSuffix(dir / name, ".old"), ec);
+            fs::remove(withSuffix(dir / name, ".new"), ec);
+        }
+    }
+
+    bool looksLikeProgram(const std::string &data)
+    {
+        return data.size() > 1024 && data[0] == 'M' && data[1] == 'Z';
+    }
+} // namespace
+
+int runUpdate(const std::vector<std::string> &flags, const std::string &exePath)
+{
+    bool checkOnly = false, force = false;
+    for (const std::string &f : flags)
+    {
+        if (f == "--check")
+            checkOnly = true;
+        else if (f == "--force")
+            force = true;
+        else
+            return fail("unknown option " + f + " (use --check)");
+    }
+
+    std::error_code ec;
+    fs::path installDir = fs::path(exePath).parent_path();
+    fs::path running = fs::path(exePath).filename();
+
+    // A build inside the compiler's own source tree is a development build, not an install
+    if (!force && fs::is_regular_file(installDir.parent_path() / "build-quantum.bat", ec))
+        return fail("this is a development build (" + installDir.string() +
+                    "), not an installed compiler. Rebuild it, or use --force.");
+
+    std::string host = releaseHostUrl();
+    if (!releaseHostAllowed(host))
+        return fail("the update host must be https:// (http:// only for localhost): " + host);
+
+    if (!checkOnly)
+        cleanLeftovers(installDir);
+
+    ReleaseInfo latest;
+    bool found = false;
+    std::string error;
+    if (!fetchLatestRelease(host, latest, found, error))
+        return fail(error);
+    if (!found)
+        return fail("no release is published on " + host + " yet");
+
+    std::string current = quantumVersion();
+    int cmp = compareVersions(latest.version, current);
+    if (cmp < 0)
+        return fail("cannot compare versions \"" + latest.version + "\" and \"" + current + "\"");
+    if (cmp <= 1)
+    {
+        say("Quantum " + current + " is up to date" + (cmp == 0 ? " (newer than the published " + latest.version + ")" : ""));
+        return 0;
+    }
+    say("update available: " + current + " -> " + latest.version);
+    if (checkOnly)
+        return 0;
+
+    // 1. download everything next to the programs, as <name>.new, and check it
+    std::vector<std::string> names = releaseProgramNames();
+    auto discard = [&]()
+    {
+        for (const std::string &n : names)
+            fs::remove(withSuffix(installDir / n, ".new"), ec);
+    };
+    for (const std::string &name : names)
+    {
+        const ReleaseEntry *entry = findReleaseEntry(latest, name);
+        if (!entry || entry->path.empty() || entry->sha256.size() != 64)
+        {
+            discard();
+            return fail("the published release " + latest.version + " does not list " + name);
+        }
+        say("downloading " + name);
+        qpm::HttpResponse r = qpm::httpRequest("GET", host + "/" + entry->path);
+        if (!r.ok())
+        {
+            discard();
+            return fail("download of " + name + " failed: " + qpm::describeFailure(r));
+        }
+        if (!looksLikeProgram(r.body) || lowerText(sha256Hex(r.body)) != lowerText(entry->sha256))
+        {
+            discard();
+            return fail("download of " + name + " is corrupt (its checksum does not match latest.json); nothing was changed");
+        }
+        if (!releaseWriteFile(withSuffix(installDir / name, ".new").string(), r.body))
+        {
+            discard();
+            return fail("cannot write " + withSuffix(installDir / name, ".new").string() +
+                        " (is the install folder writable?)");
+        }
+    }
+
+    // 2. swap: current -> .old, .new -> current; any failure puts everything back
+    std::vector<std::string> swapped;
+    for (const std::string &name : names)
+    {
+        fs::path cur = installDir / name;
+        fs::path old = withSuffix(cur, ".old");
+        fs::path fresh = withSuffix(cur, ".new");
+        bool hadCurrent = fs::exists(cur, ec);
+        bool ok = true;
+        // rename() reports nothing here, so each step is checked by what exists afterwards
+        if (hadCurrent)
+        {
+            fs::remove(old, ec);
+            fs::rename(cur, old);
+            ok = fs::exists(old, ec) && !fs::exists(cur, ec);
+        }
+        if (ok)
+        {
+            fs::rename(fresh, cur);
+            ok = fs::exists(cur, ec) && !fs::exists(fresh, ec);
+        }
+        if (!ok)
+        {
+            // undo this one, then the ones already done
+            if (hadCurrent && fs::exists(old, ec) && !fs::exists(cur, ec))
+                fs::rename(old, cur);
+            for (const std::string &done : swapped)
+            {
+                fs::path c = installDir / done;
+                fs::remove(c, ec);
+                fs::rename(withSuffix(c, ".old"), c);
+            }
+            discard();
+            return fail("could not replace " + name + "; the previous version was restored");
+        }
+        swapped.push_back(name);
+    }
+
+    // 3. delete the old ones; the running program's cannot go until it exits
+    std::vector<fs::path> later;
+    for (const std::string &name : names)
+    {
+        fs::path old = withSuffix(installDir / name, ".old");
+        fs::remove(old, ec);
+        if (fs::exists(old, ec))
+            later.push_back(old);
+    }
+    deleteLater(later);
+
+    std::cout << Colors::GREEN << "[Update] " << Colors::RESET << "updated " << current << " -> " << latest.version << "\n";
+    return 0;
+}
