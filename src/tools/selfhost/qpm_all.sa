@@ -29,3 +29,7 @@
 #include "../../qpm/QpmSemver.sa"
 #pragma quantum_tu
 #include "../../qpm/QpmTar.sa"
+#pragma quantum_tu
+#include "../../qpm/QpmUpdate.sa"
+#pragma quantum_tu
+#include "../../generated/VersionData.sa"

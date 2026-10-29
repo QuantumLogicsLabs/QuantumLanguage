@@ -1,0 +1,249 @@
+// quantum: cpp
+#include "QpmUpdate.h.sa"
+#include "QpmColor.h.sa"
+#include "QpmHttp.h.sa"
+#include "QpmJson.h.sa"
+#include "QpmRegistry.h.sa"
+#include "QpmSemver.h.sa"
+#include "../include/Version.h.sa"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace qpm
+{
+    namespace
+    {
+        // The folder this qpm.exe is in: where quantum, qrun and the stub are installed too.
+        fs::path installDir()
+        {
+            wchar_t buf[2048];
+            DWORD n = GetModuleFileNameW(nullptr, buf, 2048);
+            return fs::path(std::wstring(buf, n)).parent_path();
+        }
+
+        // The backend's compiler API: QUANTUM_UPDATE_URL, else the registry's
+        // .../api/registry/ with registry/ swapped for compiler/.
+        std::string updateBaseUrl()
+        {
+            const char *env = std::getenv("QUANTUM_UPDATE_URL");
+            std::string base = env && *env ? env : "";
+            if (base.empty())
+            {
+                base = registryBaseUrl();
+                const std::string tail = "registry/";
+                if (base.size() >= tail.size() && base.compare(base.size() - tail.size(), tail.size(), tail) == 0)
+                    base = base.substr(0, base.size() - tail.size()) + "compiler/";
+                else
+                    base += "compiler/";
+            }
+            if (base.back() != '/')
+                base += '/';
+            return base;
+        }
+
+        // A file name the backend may hand us: a plain name, nothing that climbs out of the folder.
+        bool safeName(const std::string &n)
+        {
+            if (n.empty() || n == "." || n == "..")
+                return false;
+            for (char c : n)
+                if (c == '/' || c == '\\' || c == ':')
+                    return false;
+            return true;
+        }
+
+        bool writeFile(const fs::path &p, const std::string &bytes)
+        {
+            std::ofstream out(p, std::ios::binary | std::ios::trunc);
+            out.write(bytes.data(), (std::streamsize)bytes.size());
+            out.close();
+            return (bool)out;
+        }
+
+        struct Item
+        {
+            std::string name;
+            long long size = -1;
+        };
+    } // namespace
+
+    void removeUpdateLeftovers()
+    {
+        std::error_code ec;
+        fs::path dir = installDir();
+        for (const auto &e : fs::directory_iterator(dir, ec))
+        {
+            std::string name = e.path().filename().string();
+            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".old") == 0)
+                fs::remove(e.path(), ec);
+        }
+    }
+
+    int runSelfUpdate(const std::vector<std::string> &args)
+    {
+        bool checkOnly = false, force = false;
+        for (size_t i = 1; i < args.size(); ++i)
+        {
+            if (args[i] == "--check")
+                checkOnly = true;
+            else if (args[i] == "--force")
+                force = true;
+            else
+            {
+                std::cerr << "[qpm] unknown option for update: " << args[i] << "\n"
+                          << "usage: quantum update [--check] [--force]\n";
+                return 1;
+            }
+        }
+
+        const std::string base = updateBaseUrl();
+        const std::string current = quantum::version();
+        std::cout << "[qpm] installed: Quantum " << current << "\n";
+        std::cout << "[qpm] checking " << base << "version\n";
+
+        HttpResponse resp = httpGet(base + "version", "application/json");
+        if (!resp.ok())
+        {
+            std::cerr << "[qpm] couldn't check for updates: " << describeFailure(resp) << "\n";
+            return 1;
+        }
+        std::string latest;
+        std::vector<Item> items;
+        try
+        {
+            JsonValue doc = JsonValue::parse(resp.body);
+            latest = doc.get("version").asString();
+            JsonValue files = doc.get("files"); // held: array() is a reference into it
+            for (const JsonValue &f : files.array())
+            {
+                Item it;
+                it.name = f.get("name").asString();
+                it.size = (long long)f.get("size").asNumber(-1);
+                items.push_back(it);
+            }
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[qpm] the update server answered something unreadable: " << e.what() << "\n";
+            return 1;
+        }
+
+        SemVer have, want;
+        if (!SemVer::tryParse(latest, want))
+        {
+            std::cerr << "[qpm] the update server's version.sa holds \"" << latest << "\", not a version\n";
+            return 1;
+        }
+        if (!SemVer::tryParse(current, have))
+            have = SemVer(); // an unreadable local version: anything is newer
+        int cmp = compareSemVer(have, want);
+        std::cout << "[qpm] latest:    Quantum " << latest << "\n";
+        if (cmp >= 0 && !force)
+        {
+            std::cout << paint("[qpm] Quantum is up to date", "1;32") << "\n";
+            return 0;
+        }
+        if (checkOnly)
+        {
+            std::cout << "[qpm] an update is available: run `quantum update`\n";
+            return 0;
+        }
+        if (items.empty())
+        {
+            std::cerr << "[qpm] the release has no files to install\n";
+            return 1;
+        }
+        for (const Item &it : items)
+            if (!safeName(it.name))
+            {
+                std::cerr << "[qpm] refusing a release file named \"" << it.name << "\"\n";
+                return 1;
+            }
+
+        // 1. everything downloaded next to the old files as <name>.new; any
+        //    failure removes them again and leaves the installation as it was
+        fs::path dir = installDir();
+        std::error_code ec;
+        std::vector<fs::path> fresh;
+        auto discard = [&]()
+        {
+            for (const fs::path &p : fresh)
+                fs::remove(p, ec);
+        };
+        for (const Item &it : items)
+        {
+            std::cout << "[qpm] downloading " << it.name << " ..." << std::flush;
+            HttpResponse file = httpGet(base + "download/" + urlEncodeComponent(it.name));
+            if (!file.ok())
+            {
+                std::cout << "\n";
+                std::cerr << "[qpm] download of " << it.name << " failed: " << describeFailure(file) << "\n";
+                discard();
+                return 1;
+            }
+            if (it.size >= 0 && (long long)file.body.size() != it.size)
+            {
+                std::cout << "\n";
+                std::cerr << "[qpm] " << it.name << " arrived incomplete (" << file.body.size() << " of "
+                          << it.size << " bytes)\n";
+                discard();
+                return 1;
+            }
+            fs::path tmp = dir / (it.name + ".new");
+            if (!writeFile(tmp, file.body))
+            {
+                std::cout << "\n";
+                std::cerr << "[qpm] couldn't write " << tmp.string() << " (is the folder writable?)\n";
+                discard();
+                return 1;
+            }
+            fresh.push_back(tmp);
+            std::cout << " " << file.body.size() << " bytes\n";
+        }
+
+        // 2. the swap: the old file steps aside as <name>.old (a running
+        //    program can be renamed, not overwritten), the new one takes its name
+        for (const Item &it : items)
+        {
+            fs::path target = dir / it.name, old = dir / (it.name + ".old"), tmp = dir / (it.name + ".new");
+            fs::remove(old, ec);
+            ec.clear();
+            if (fs::exists(target))
+            {
+                fs::rename(target, old, ec);
+                if (ec)
+                {
+                    std::cerr << "[qpm] couldn't replace " << target.string() << ": " << ec.message() << "\n";
+                    discard();
+                    return 1;
+                }
+            }
+            fs::rename(tmp, target, ec);
+            if (ec)
+            {
+                std::cerr << "[qpm] couldn't install " << target.string() << ": " << ec.message() << "\n";
+                fs::rename(old, target, ec); // put the old one back
+                discard();
+                return 1;
+            }
+        }
+        writeFile(dir / "version.sa", latest + "\n");
+        std::cout << paint("[qpm] updated Quantum " + current + " -> " + latest, "1;32") << "\n";
+        return 0;
+    }
+} // namespace qpm

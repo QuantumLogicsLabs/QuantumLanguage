@@ -8,6 +8,8 @@ rem   build-quantum.bat            build\{qrun,quantum,quantum_stub,qpm}.exe
 rem   build-quantum.bat --verify   also check the fixed point: the new qrun
 rem                                rebuilds itself byte for byte
 rem   build-quantum.bat --seed     then make the new qrun the seed
+rem The release (the four exes and version.sa) is also put in build\release\:
+rem upload those files to the Google Drive folder `quantum update` reads.
 setlocal
 cd /d "%~dp0"
 set OUT=build
@@ -21,6 +23,9 @@ if not exist seed\qrun.exe (
 )
 
 if not exist %OUT% mkdir %OUT%
+
+echo [0/5] version.sa and lib\ into src\generated\
+seed\qrun.exe src\tools\embed.sa || goto :fail
 
 echo [1/5] seed\qrun.exe compiles qrun from src\
 seed\qrun.exe --native %SH%\qrun_all.sa %OUT%\stage1.exe || goto :fail
@@ -60,6 +65,15 @@ copy /y %OUT%\qrun.exe seed\qrun.exe >nul || goto :fail
 echo [seed] seed\qrun.exe updated
 
 :done
+rem the release: what goes into the Google Drive folder `quantum update` reads
+if not exist %OUT%\release mkdir %OUT%\release
+for %%f in (qrun.exe quantum.exe quantum_stub.exe qpm.exe) do (
+    copy /y %OUT%\%%f %OUT%\release\%%f >nul || goto :fail
+)
+copy /y version.sa %OUT%\release\version.sa >nul || goto :fail
+set /p QVER=<version.sa
+echo.
+echo Release %QVER% in %OUT%\release\ (upload its files to the compiler folder on Google Drive)
 echo.
 echo Built in %OUT%\:
 echo   qrun.exe program.sa          run a program

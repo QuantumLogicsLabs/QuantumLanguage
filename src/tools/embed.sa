@@ -121,6 +121,20 @@ int main()
     changed += writeIfChanged("src/generated/JavaStyleData.sa",
                               generate("src/dialect/javastyle", "javastyle", "librarySources", items, "QJAVASTYLE"));
 
+    // version.sa: the version every tool reports and `quantum update` compares
+    if (fs::exists("version.sa"))
+    {
+        std::string v = readText("version.sa");
+        while (!v.empty() && (v.back() == '\n' || v.back() == '\r' || v.back() == ' '))
+            v.pop_back();
+        std::string out = "// quantum: cpp\n";
+        out += "// Generated from version.sa by src/tools/embed.sa. Do not edit.\n";
+        out += "#include \"../include/Version.h.sa\"\n\nnamespace quantum\n{\n";
+        out += "const std::string &version()\n{\n    static const std::string v = \"" + v + "\";\n    return v;\n}\n";
+        out += "} // namespace quantum\n";
+        changed += writeIfChanged("src/generated/VersionData.sa", out);
+    }
+
     std::cout << "embed: " << changed << " file(s) updated in src/generated\n";
     return 0;
 }

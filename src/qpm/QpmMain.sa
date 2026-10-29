@@ -17,6 +17,8 @@
 #include "QpmResolver.h.sa"
 #include "QpmScripts.h.sa"
 #include "QpmSearch.h.sa"
+#include "QpmUpdate.h.sa"
+#include "../include/Version.h.sa"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -81,6 +83,8 @@ namespace
             "  qpm auth                    shows which profile qpm is attached to: account, email,\n"
             "                              packages, and whether the saved token works / expires\n"
             "  qpm auth login | logout     same as qpm login / qpm logout\n"
+            "  qpm self-update             installs the newest Quantum build if this one is older\n"
+            "                              (also `quantum update`; --check only reports, --force reinstalls)\n"
             "  qpm --help                  show this help\n"
             "  qpm --version               show version\n"
             "\n"
@@ -100,6 +104,8 @@ namespace
             "  QPM_UPSTREAM   where install looks up packages the registry doesn't have\n"
             "                 (default https://registry.npmjs.org/, \"none\" to turn off)\n"
             "  QPM_TOKEN      auth token, overrides the one saved by `qpm login`\n"
+            "  QUANTUM_UPDATE_URL  where self-update looks for Quantum builds (default: the\n"
+            "                 registry's /api/compiler/)\n"
             "  NO_COLOR       turns off colored output\n"
             "\n"
             "qpm downloads packages straight from the registry — no npm or Node.js\n"
@@ -355,11 +361,15 @@ int main(int argc, char *argv[])
     }
     if (args[0] == "--version" || args[0] == "-v")
     {
-        std::cout << "qpm 1.0.0\n";
+        std::cout << "qpm 1.0.0 (Quantum " << quantum::version() << ")\n";
         return 0;
     }
 
     const std::string &cmd = args[0];
+
+    qpm::removeUpdateLeftovers();
+    if (cmd == "self-update")
+        return qpm::runSelfUpdate(args);
 
     if (cmd == "install" || cmd == "i" || cmd == "add")
     {

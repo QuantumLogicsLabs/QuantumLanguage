@@ -73,6 +73,8 @@
 #pragma quantum_tu
 #include "../../generated/NativeLibData.sa"
 #pragma quantum_tu
+#include "../../generated/VersionData.sa"
+#pragma quantum_tu
 #include "../../java/JavaCall.sa"
 #pragma quantum_tu
 #include "../../java/JavaEmit.sa"

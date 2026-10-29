@@ -21,6 +21,7 @@
 #include "Vm.h.sa"
 #include "Error.h.sa"
 #include "native/Native.h.sa"
+#include "Version.h.sa"
 
 #include <fstream>
 #include <iostream>
@@ -99,6 +100,12 @@ int main(int argc, char *argv[])
         return 0;
     }
     std::string a1 = argv[1];
+    if (a1 == "update")
+    {
+        std::vector<std::string> qargs = {"self-update"};
+        qargs.insert(qargs.end(), argv + 2, argv + argc);
+        return runQpm(qargs, exePath);
+    }
     if (a1 == "--help" || a1 == "-h")
     {
         printBanner();
@@ -107,7 +114,7 @@ int main(int argc, char *argv[])
     }
     if (a1 == "--version" || a1 == "-v")
     {
-        std::cout << "Quantum Language v2.0.0\n";
+        std::cout << "Quantum Language v" << quantum::version() << "\n";
         return 0;
     }
     if (a1 == "--check" && argc >= 3)
@@ -214,7 +221,7 @@ int main(int argc, char *argv[])
     }
     if (arg == "--version" || arg == "-v")
     {
-        std::cout << "Quantum Language v2.0.0\nRuntime: Bytecode VM\nBy Muhammad Saad Amin\n";
+        std::cout << "Quantum Language v" << quantum::version() << "\nRuntime: Bytecode VM\nBy Muhammad Saad Amin\n";
         return 0;
     }
     if (arg == "--check" && argc >= 3)
@@ -223,6 +230,14 @@ int main(int argc, char *argv[])
     // same command as `qpm build`.
     if (arg == "build")
         return runQpm(std::vector<std::string>(argv + 1, argv + argc), exePath);
+    // `quantum update [--check] [--force]`: the newest build, if this one is
+    // older (qpm self-update does the work)
+    if (arg == "update")
+    {
+        std::vector<std::string> qargs = {"self-update"};
+        qargs.insert(qargs.end(), argv + 2, argv + argc);
+        return runQpm(qargs, exePath);
+    }
     if (arg == "--test")
         return runTestExamples(argc >= 3 ? argv[2] : "examples");
     // Hidden: run one file in this process for the batch runner (child worker).

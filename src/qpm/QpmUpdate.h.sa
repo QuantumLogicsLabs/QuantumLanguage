@@ -1,0 +1,17 @@
+// quantum: cpp
+#pragma once
+// `qpm self-update` (what `quantum update` runs): asks the registry backend
+// which Quantum build is the newest (/api/compiler/version — the version.sa
+// of the release folder on Google Drive), and when this installation is
+// older, downloads that build and swaps it in for the files next to qpm.exe.
+#include <string>
+#include <vector>
+
+namespace qpm
+{
+    int runSelfUpdate(const std::vector<std::string> &args);
+
+    // Deletes the *.old files a previous update left next to the executable
+    // (a running program can be renamed but not deleted). Best effort.
+    void removeUpdateLeftovers();
+} // namespace qpm

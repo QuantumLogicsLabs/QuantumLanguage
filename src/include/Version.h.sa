@@ -1,0 +1,11 @@
+// quantum: cpp
+#pragma once
+// The version of this build of Quantum (quantum, qrun, quantum_stub, qpm):
+// the text of compiler/version.sa, carried in src/generated/VersionData.sa
+// (written by src/tools/embed.sa).
+#include <string>
+
+namespace quantum
+{
+const std::string &version();
+} // namespace quantum

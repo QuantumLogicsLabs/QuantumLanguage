@@ -4731,9 +4731,19 @@ inline bool copy_file(const path &from, const path &to, copy_options o = copy_op
         throw filesystem_error("cannot copy file", from, ec);
     return r;
 }
+// an existing target is replaced (MOVEFILE_REPLACE_EXISTING)
+inline void rename(const path &from, const path &to, error_code &ec)
+{
+    ec.clear();
+    if (!MoveFileExW(__wide(from.string()).c_str(), __wide(to.string()).c_str(), 1))
+        ec = __last_error();
+}
 inline void rename(const path &from, const path &to)
 {
-    MoveFileExW(__wide(from.string()).c_str(), __wide(to.string()).c_str(), 1);
+    error_code ec;
+    rename(from, to, ec);
+    if (ec)
+        throw filesystem_error("cannot rename", from, ec);
 }
 
 // file times: 100 ns ticks since 1601 (only compared and counted)

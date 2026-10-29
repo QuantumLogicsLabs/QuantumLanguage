@@ -1,0 +1,12 @@
+// quantum: cpp
+// Generated from version.sa by src/tools/embed.sa. Do not edit.
+#include "../include/Version.h.sa"
+
+namespace quantum
+{
+const std::string &version()
+{
+    static const std::string v = "3.0.0";
+    return v;
+}
+} // namespace quantum
