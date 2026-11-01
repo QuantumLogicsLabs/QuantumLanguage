@@ -1,0 +1,22 @@
+module Observable
+  def add_observer(observer, func = :update)
+    @observer_peers ||= {}
+    unless observer.respond_to?(func)
+      raise NoMethodError, "observer does not respond to `#{func}'"
+    end
+    @observer_peers[observer] = func
+  end
+
+  def delete_observer(o) = (@observer_peers.delete(o) if @observer_peers)
+  def delete_observers = (@observer_peers.clear if @observer_peers)
+  def count_observers = @observer_peers ? @observer_peers.size : 0
+  def changed(state = true) = @observer_state = state
+  def changed? = !!@observer_state
+
+  def notify_observers(*arg)
+    if @observer_state
+      @observer_peers&.each { |k, v| k.__send__(v, *arg) }
+      @observer_state = false
+    end
+  end
+end

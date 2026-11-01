@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -34,6 +35,13 @@
 //      suffixes (stripped, since Quantum identifiers don't allow them).
 //   4. A tail-position pass inserts `return` before the final expression of
 //      each method/block body, mirroring Ruby's implicit-return semantics.
+//
+// Next to Java-style code (a .sa file the Java pass marked), the output ends
+// with `// quantum: ruby-lines ...`, the lines that are Ruby code: they keep
+// Ruby's meanings (`"-" * 10`, `s.chars`, `xs.reduce { }`, `xs.min`) where
+// the Java around them gets Java's (Chunk::rubyStyle).
+
+static const char *const kRubyLinesMarker = "// quantum: ruby-lines";
 
 // Known zero-argument Ruby-style method names that our examples call without
 // parens (idiomatic Ruby). Quantum requires explicit call parens, so these
@@ -2566,10 +2574,44 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     }
   };
 
+  // Ruby next to Java-style code (src/dialect/JavaDialect.sa): which output
+  // lines are Ruby — inside a Ruby def / class / block / if ... end, or
+  // rewritten here — so that code keeps Ruby's meanings of method names
+  // and operators while the Java around it keeps Java's (rubyStyleLines).
+  const bool markRuby = !strict && isJavaStyleSource(source);
+  std::vector<char> rubyOut;
+  size_t lineOut = 0;    // the current input line's first output line
+  bool lineInRuby = false;
+  std::string lineCode;  // and its code, without a trailing # comment
+  auto inRubyFrame = [&]() {
+    for (size_t k = 1; k < stack.size(); ++k)
+      if (stack[k].kind != RBFrameKind::Brace)
+        return true;
+    return false;
+  };
+  auto closeLine = [&]() {
+    if (!markRuby)
+      return;
+    bool ruby = lineInRuby || inRubyFrame();
+    rubyOut.resize(outLines.size(), 0);
+    for (size_t k = lineOut; k < outLines.size(); ++k)
+      if (ruby || trimCopy(outLines[k]) != lineCode)
+        rubyOut[k] = 1;
+  };
+
   bool inBlockComment = false;
   char tripleQuote = 0; // open """ / ''' string spanning lines (mixed mode)
   for (size_t li = 0; li < rawLines.size(); li++) {
     const std::string &rawLine = rawLines[li];
+    if (markRuby) {
+      closeLine();
+      lineOut = outLines.size();
+      lineInRuby = inRubyFrame();
+      lineCode = trimCopy(rawLine);
+      size_t hash = rbFindHashComment(lineCode);
+      if (hash != std::string::npos)
+        lineCode = trimCopy(lineCode.substr(0, hash));
+    }
     // Recomputed each line: are we lexically inside a `class ... end`?
     inClassBody = false;
     for (auto &f : stack)
@@ -3166,6 +3208,7 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     emit(indentation, finalCode, true);
     trackNativeBraces(finalCode);
   }
+  closeLine();
 
   // Post-process: rename identifiers that clash with Quantum type keywords.
   // Ruby happily uses `string`, `int`, `float` etc. as variable/parameter names
@@ -3198,10 +3241,46 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
     result += l;
     result += "\n";
   }
+  if (markRuby) {
+    // `// quantum: ruby-lines 3-20 25`: line numbers of this output
+    result += kRubyLinesMarker;
+    rubyOut.resize(outLines.size(), 0);
+    for (size_t k = 0; k < rubyOut.size(); ++k) {
+      if (!rubyOut[k] || (k > 0 && rubyOut[k - 1]))
+        continue;
+      size_t e = k;
+      while (e + 1 < rubyOut.size() && rubyOut[e + 1])
+        ++e;
+      result += " " + std::to_string(k + 1);
+      if (e > k)
+        result += "-" + std::to_string(e + 1);
+    }
+    result += "\n";
+  }
   if (getenv("DUMP_RUBY")) {
     std::cerr << "--- TRANSLATED RUBY ---" << std::endl;
     std::cerr << result << std::endl;
     std::cerr << "-----------------------" << std::endl;
   }
   return result;
+}
+
+std::set<int> rubyStyleLines(const std::string &source) {
+  std::set<int> out;
+  size_t at = source.rfind(kRubyLinesMarker);
+  if (at == std::string::npos || (at > 0 && source[at - 1] != '\n'))
+    return out;
+  size_t end = source.find('\n', at);
+  std::istringstream in(source.substr(at + std::string(kRubyLinesMarker).size(),
+                                      end == std::string::npos ? std::string::npos
+                                                               : end - at - std::string(kRubyLinesMarker).size()));
+  std::string range;
+  while (in >> range) {
+    size_t dash = range.find('-');
+    int from = std::atoi(range.c_str());
+    int to = dash == std::string::npos ? from : std::atoi(range.c_str() + dash + 1);
+    for (int k = from; k <= to; ++k)
+      out.insert(k);
+  }
+  return out;
 }

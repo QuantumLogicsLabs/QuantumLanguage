@@ -1,0 +1,78 @@
+module Benchmark
+  CAPTION = "      user     system      total        real\n"
+  FORMAT = "%10.6u %10.6y %10.6t %10.6r\n"
+
+  class Tms
+    attr_reader :utime, :stime, :cutime, :cstime, :real, :total, :label
+
+    def initialize(utime = 0.0, stime = 0.0, cutime = 0.0, cstime = 0.0, real = 0.0, label = nil)
+      @utime, @stime, @cutime, @cstime, @real, @label = utime, stime, cutime, cstime, real, label.to_s
+      @total = utime + stime + cutime + cstime
+    end
+
+    def format(*)
+      Kernel.format("%10.6f %10.6f %10.6f (%10.6f)\n", utime, stime, total, real)
+    end
+    alias to_s format
+    def to_a = [label, utime, stime, cutime, cstime, real]
+    def +(o) = Tms.new(utime + o.utime, stime + o.stime, cutime + o.cutime, cstime + o.cstime, real + o.real, label)
+    def /(n) = Tms.new(utime / n, stime / n, cutime / n, cstime / n, real / n, label)
+  end
+
+  class Report
+    attr_reader :list
+
+    def initialize(width)
+      @width = width
+      @list = []
+    end
+
+    def item(label = "", &blk)
+      print label.to_s.ljust(@width)
+      t = Benchmark.measure(label, &blk)
+      print t.format
+      @list << t
+      t
+    end
+    alias report item
+  end
+
+  def self.__clock = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  def self.measure(label = "")
+    t0 = __clock
+    yield
+    e = __clock - t0
+    Tms.new(e, 0.0, 0.0, 0.0, e, label)
+  end
+
+  def self.realtime
+    t0 = __clock
+    yield
+    __clock - t0
+  end
+
+  def self.benchmark(caption = "", width = nil, _format = nil, *labels)
+    print " " * (width.to_i + 1) + caption
+    r = Report.new(width.to_i + 1)
+    yield r
+    r.list
+  end
+
+  def self.bm(width = 0, *labels, &blk) = benchmark(CAPTION, width, FORMAT, *labels, &blk)
+
+  def self.bmbm(width = 0)
+    jobs = []
+    collector = Object.new
+    collector.define_singleton_method(:report) { |label = "", &b| jobs << [label.to_s, b] }
+    collector.define_singleton_method(:item) { |label = "", &b| jobs << [label.to_s, b] }
+    yield collector
+    w = [width, jobs.map { |l, _| l.size }.max.to_i].max
+    puts "Rehearsal " + "-" * (w + 35)
+    total = jobs.map { |l, b| print l.ljust(w); t = measure(l, &b); print t.format; t }.sum(0.0) { |t| t.total }
+    puts format("%s total: %fsec", "-" * (w + 21), total)
+    puts
+    print " " * w + CAPTION
+    jobs.map { |l, b| print l.ljust(w); t = measure(l, &b); print t.format; t }
+  end
+end

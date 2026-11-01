@@ -1,0 +1,3108 @@
+// quantum: cpp
+// Ruby front-end: the evaluator. A tree walk over the parser's nodes.
+// `return`, `break` and `next` inside one frame set Interp::unwind, which
+// every statement sequence and loop checks; leaving a block for the method
+// or call around it throws ReturnEx / BreakEx instead.
+#include "RubyRt.h.sa"
+
+#include <cstring>
+
+namespace ruby
+{
+
+namespace
+{
+
+Env *newEnv(int n, Env *parent)
+{
+    Env *e = new Env();
+    e->n = n;
+    e->parent = parent;
+    e->slots = n ? new V[n] : nullptr;
+    for (int i = 0; i < n; ++i)
+        e->slots[i] = Qnil;
+    return e;
+}
+
+// the operators the call node fast path knows
+enum FastOp : uint8_t
+{
+    F_NONE = 1,
+    F_PLUS,
+    F_MINUS,
+    F_MUL,
+    F_LT,
+    F_GT,
+    F_LE,
+    F_GE,
+    F_EQ,
+    F_NEQ,
+    F_MOD,
+    F_DIV,
+    F_AREF,
+    F_LSHIFT,
+    F_CMP,
+    F_AND,
+    F_OR
+};
+
+uint8_t classifyFast(CallNode *n)
+{
+    if (!n->recv || n->args.size() != 1 || n->block || n->safeNav)
+        return F_NONE;
+    N k = n->args[0]->kind;
+    if (k == N::Splat || k == N::BlockPass || k == N::Hash)
+        return F_NONE;
+    const std::string &s = symName(n->name);
+    if (s == "+") return F_PLUS;
+    if (s == "-") return F_MINUS;
+    if (s == "*") return F_MUL;
+    if (s == "<") return F_LT;
+    if (s == ">") return F_GT;
+    if (s == "<=") return F_LE;
+    if (s == ">=") return F_GE;
+    if (s == "==") return F_EQ;
+    if (s == "!=") return F_NEQ;
+    if (s == "%") return F_MOD;
+    if (s == "/") return F_DIV;
+    if (s == "[]") return F_AREF;
+    if (s == "<<") return F_LSHIFT;
+    if (s == "<=>") return F_CMP;
+    if (s == "&") return F_AND;
+    if (s == "|") return F_OR;
+    return F_NONE;
+}
+
+int64_t floorDiv(int64_t a, int64_t b)
+{
+    int64_t q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0)))
+        --q;
+    return q;
+}
+
+int64_t floorMod(int64_t a, int64_t b)
+{
+    int64_t m = a % b;
+    if (m != 0 && ((m < 0) != (b < 0)))
+        m += b;
+    return m;
+}
+
+} // namespace
+
+// The fixnum / float fast path of a binary operator; Qundef when the
+// operands need a real method call
+static V fastBinop(Interp &I, uint8_t opc, V a, V b)
+{
+    if (isFix(a) && isFix(b))
+    {
+        int64_t x = fixv(a), y = fixv(b);
+        switch (opc)
+        {
+        case F_PLUS:
+        {
+            int64_t r = x + y;
+            if (fixable(r))
+                return fix(r);
+            return Qundef;
+        }
+        case F_MINUS:
+        {
+            int64_t r = x - y;
+            if (fixable(r))
+                return fix(r);
+            return Qundef;
+        }
+        case F_MUL:
+            if (x > -2147483648LL && x < 2147483648LL && y > -2147483648LL && y < 2147483648LL)
+                return fix(x * y);
+            return Qundef;
+        case F_LT: return boolv(x < y);
+        case F_GT: return boolv(x > y);
+        case F_LE: return boolv(x <= y);
+        case F_GE: return boolv(x >= y);
+        case F_EQ: return boolv(x == y);
+        case F_NEQ: return boolv(x != y);
+        case F_MOD:
+            if (y == 0)
+                return Qundef;
+            return fix(floorMod(x, y));
+        case F_DIV:
+            if (y == 0)
+                return Qundef;
+            return fix(floorDiv(x, y));
+        case F_CMP: return fix(x < y ? -1 : x > y ? 1 : 0);
+        case F_AND: return fix(x & y);
+        case F_OR: return fix(x | y);
+        default: return Qundef;
+        }
+    }
+    bool af = I.isFloat(a), bf = I.isFloat(b);
+    if ((af || isFix(a)) && (bf || isFix(b)) && (af || bf))
+    {
+        double x = af ? I.fltv(a) : (double)fixv(a);
+        double y = bf ? I.fltv(b) : (double)fixv(b);
+        switch (opc)
+        {
+        case F_PLUS: return I.flo(x + y);
+        case F_MINUS: return I.flo(x - y);
+        case F_MUL: return I.flo(x * y);
+        case F_DIV: return I.flo(x / y);
+        case F_LT: return boolv(x < y);
+        case F_GT: return boolv(x > y);
+        case F_LE: return boolv(x <= y);
+        case F_GE: return boolv(x >= y);
+        case F_EQ: return boolv(x == y);
+        case F_NEQ: return boolv(x != y);
+        default: return Qundef;
+        }
+    }
+    if (opc == F_AREF && isType(a, T::Hash) && op(a)->klass == I.cHash)
+        return I.hfetch(a, b);
+    if (opc == F_AREF && isObj(a) && isFix(b))
+    {
+        Obj *o = op(a);
+        if (o->type == T::Array && o->klass == I.cArray)
+        {
+            auto *ra = static_cast<RArray *>(o);
+            int64_t i = fixv(b);
+            int64_t len = (int64_t)(ra->a.size() - ra->skip);
+            if (i < 0)
+                i += len;
+            if (i < 0 || i >= len)
+                return Qnil;
+            return ra->a.data()[ra->skip + i];
+        }
+    }
+    if (opc == F_LSHIFT && isObj(a) && op(a)->type == T::Array && op(a)->klass == I.cArray)
+    {
+        if (op(a)->frozen)
+            I.frozenError(a);
+        static_cast<RArray *>(op(a))->a.push_back(b);
+        return a;
+    }
+    if ((opc == F_EQ || opc == F_NEQ) && isSymV(a))
+        return boolv((a == b) == (opc == F_EQ));
+    return Qundef;
+}
+
+V *Interp::localRef(VarNode *v, Frame *f)
+{
+    Env *e = f->env;
+    for (int d = v->depth; d > 0; --d)
+        e = e->parent;
+    return &e->slots[v->slot];
+}
+
+V Interp::evalSeq(Node *n, Frame *f)
+{
+    auto *l = static_cast<ListNode *>(n);
+    V r = Qnil;
+    if (!l->raw)
+    {
+        l->raw = l->items.data();
+        l->count = (int)l->items.size();
+    }
+    Node **items = l->raw;
+    int count = l->count;
+    for (int i = 0; i < count; ++i)
+    {
+        Node *st = items[i];
+        f->line = st->line;
+        r = eval(st, f);
+        if (unwind)
+            return r;
+    }
+    return r;
+}
+
+// The commonest nodes, in a function with a small frame: recursion in Ruby is
+// recursion here. Everything else is evalCold.
+V Interp::eval(Node *n, Frame *f)
+{
+    switch (n->kind)
+    {
+    case N::Nil: return Qnil;
+    case N::True: return Qtrue;
+    case N::False: return Qfalse;
+    case N::Self: return f->c->self;
+    case N::Int:
+    case N::Sym:
+    case N::Float:
+    {
+        V c = static_cast<LitNode *>(n)->cache;
+        return c ? c : evalCold(n, f);
+    }
+    case N::LVar:
+    {
+        auto *v = static_cast<VarNode *>(n);
+        Env *e = f->env;
+        for (int d = v->depth; d > 0; --d)
+            e = e->parent;
+        return e->slots[v->slot];
+    }
+    case N::LAsgn:
+    {
+        auto *v = static_cast<VarNode *>(n);
+        V val = eval(v->value, f);
+        if (unwind)
+            return Qnil;
+        Env *e = f->env;
+        for (int d = v->depth; d > 0; --d)
+            e = e->parent;
+        e->slots[v->slot] = val;
+        return val;
+    }
+    case N::IVar:
+    {
+        auto *v = static_cast<VarNode *>(n);
+        V self = f->c->self;
+        if (isObj(self))
+        {
+            Obj *o = op(self);
+            int i = v->slot;
+            if (i < o->niv && o->ivn[i] == v->name)
+                return o->ivv[i];
+        }
+        return evalCold(n, f);
+    }
+    case N::Call: return evalCall(static_cast<CallNode *>(n), f);
+    case N::If:
+    {
+        auto *i = static_cast<IfNode *>(n);
+        V c = eval(i->cond, f);
+        if (unwind)
+            return Qnil;
+        Node *branch = truthy(c) ? i->then : i->els;
+        return branch ? eval(branch, f) : Qnil;
+    }
+    case N::And:
+    {
+        auto *b = static_cast<BinNode *>(n);
+        V l = eval(b->left, f);
+        if (unwind || !truthy(l))
+            return l;
+        return eval(b->right, f);
+    }
+    case N::Or:
+    {
+        auto *b = static_cast<BinNode *>(n);
+        V l = eval(b->left, f);
+        if (unwind || truthy(l))
+            return l;
+        return eval(b->right, f);
+    }
+    case N::Seq: return evalSeq(n, f);
+    case N::OpAsgn: return evalOpAsgn(static_cast<OpAsgnNode *>(n), f);
+    case N::While: return evalWhile(static_cast<WhileNode *>(n), f);
+    case N::Yield: return evalYield(static_cast<YieldNode *>(n), f);
+    case N::Const: return evalConst(static_cast<ConstNode *>(n), f);
+    default: return evalCold(n, f);
+    }
+}
+
+V Interp::evalCold(Node *n, Frame *f)
+{
+    switch (n->kind)
+    {
+    case N::Int:
+    {
+        auto *l = static_cast<LitNode *>(n);
+        if (!l->cache)
+            l->cache = fixable(l->i) ? fix(l->i) : bigFromInt64(*this, l->i);
+        return l->cache;
+    }
+    case N::BigInt:
+    {
+        auto *l = static_cast<LitNode *>(n);
+        if (!l->cache)
+        {
+            l->cache = bigFromString(*this, l->s);
+            if (isObj(l->cache))
+                op(l->cache)->frozen = true;
+        }
+        return l->cache;
+    }
+    case N::Float:
+    {
+        auto *l = static_cast<LitNode *>(n);
+        if (!l->cache)
+            l->cache = flo(l->f);
+        return l->cache;
+    }
+    case N::Rational:
+    {
+        auto *l = static_cast<LitNode *>(n);
+        if (!l->cache)
+        {
+            // 3r, 1.5r: the literal's exact value
+            std::string t = l->s;
+            bool neg = !t.empty() && t[0] == '-';
+            if (neg)
+                t = t.substr(1);
+            size_t dot = t.find('.');
+            V num, den = fix(1);
+            if (dot == std::string::npos)
+                num = bigFromString(*this, t);
+            else
+            {
+                std::string digits = t.substr(0, dot) + t.substr(dot + 1);
+                num = bigFromString(*this, digits);
+                den = intPow(*this, fix(10), fix((int64_t)(t.size() - dot - 1)));
+            }
+            if (neg)
+                num = intNeg(*this, num);
+            l->cache = makeRational(*this, num, den);
+        }
+        return l->cache;
+    }
+    case N::Imaginary:
+    {
+        auto *l = static_cast<LitNode *>(n);
+        if (!l->cache)
+        {
+            std::string t = l->s;
+            V im;
+            if (t.find('.') != std::string::npos || t.find('e') != std::string::npos)
+                im = flo(std::strtod(t.c_str(), nullptr));
+            else
+                im = bigFromString(*this, t[0] == '-' ? t.substr(1) : t);
+            if (t[0] == '-' && !isFloat(im))
+                im = intNeg(*this, im);
+            l->cache = makeComplex(*this, fix(0), im);
+        }
+        return l->cache;
+    }
+    case N::Str: return str(static_cast<LitNode *>(n)->s);
+    case N::DStr: return evalDStr(static_cast<DStrNode *>(n), f);
+    case N::XStr:
+    {
+        V cmd = evalDStr(static_cast<DStrNode *>(n), f);
+        if (unwind)
+            return Qnil;
+        return call(f->c->self, intern("`"), 1, &cmd);
+    }
+    case N::Sym:
+    {
+        auto *l = static_cast<LitNode *>(n);
+        if (!l->cache)
+            l->cache = symv(intern(l->s));
+        return l->cache;
+    }
+    case N::DSym:
+    {
+        V s = evalDStr(static_cast<DStrNode *>(n), f);
+        if (unwind)
+            return Qnil;
+        return symv(intern(sref(s)));
+    }
+    case N::Regex: return regexLiteral(static_cast<DStrNode *>(n), f);
+    case N::Array:
+    {
+        auto *l = static_cast<ListNode *>(n);
+        auto *arr = new RArray();
+        arr->klass = cArray;
+        arr->type = T::Array;
+        arr->a.reserve(l->items.size());
+        for (Node *item : l->items)
+        {
+            if (item->kind == N::Splat)
+            {
+                V v = eval(static_cast<UnaryNode *>(item)->expr, f);
+                if (unwind)
+                    return Qnil;
+                V a = arrayOf(v);
+                for (V x : aref(a))
+                    arr->a.push_back(x);
+                continue;
+            }
+            V v = eval(item, f);
+            if (unwind)
+                return Qnil;
+            arr->a.push_back(v);
+        }
+        return ov(arr);
+    }
+    case N::Hash:
+    {
+        auto *h = static_cast<HashNode *>(n);
+        V hv = newHash();
+        RHash *hp = href(hv);
+        for (size_t i = 0; i < h->keys.size(); ++i)
+        {
+            if (!h->keys[i])
+            {
+                V other = eval(h->values[i], f);
+                if (unwind)
+                    return Qnil;
+                if (other == Qnil)
+                    continue;
+                if (!isHash(other))
+                    other = call0(other, s.to_hash);
+                RHash *oh = href(other);
+                for (size_t j = 0; j < oh->keys.size(); ++j)
+                    if (oh->keys[j] != Qundef)
+                        hset(hp, oh->keys[j], oh->vals[j]);
+                continue;
+            }
+            V k = eval(h->keys[i], f);
+            if (unwind)
+                return Qnil;
+            V v = eval(h->values[i], f);
+            if (unwind)
+                return Qnil;
+            hset(hp, k, v);
+        }
+        return hv;
+    }
+    case N::Range:
+    {
+        auto *r = static_cast<RangeNode *>(n);
+        if (r->cache)
+            return r->cache;
+        V lo = r->lo ? eval(r->lo, f) : Qnil;
+        if (unwind)
+            return Qnil;
+        V hi = r->hi ? eval(r->hi, f) : Qnil;
+        if (unwind)
+            return Qnil;
+        V rv = range(lo, hi, r->exclusive);
+        bool lit = (!r->lo || r->lo->kind == N::Int) && (!r->hi || r->hi->kind == N::Int);
+        if (lit)
+        {
+            op(rv)->frozen = true;
+            r->cache = rv;
+        }
+        return rv;
+    }
+    case N::IVar:
+    {
+        auto *v = static_cast<VarNode *>(n);
+        V self = f->c->self;
+        if (!isObj(self))
+            return Qnil;
+        Obj *o = op(self);
+        int i = v->slot;
+        if (i < o->niv && o->ivn[i] == v->name)
+            return o->ivv[i];
+        for (int k = 0; k < o->niv; ++k)
+            if (o->ivn[k] == v->name)
+            {
+                v->slot = k;
+                return o->ivv[k];
+            }
+        return Qnil;
+    }
+    case N::IAsgn:
+    {
+        auto *v = static_cast<VarNode *>(n);
+        V val = eval(v->value, f);
+        if (unwind)
+            return Qnil;
+        V self = f->c->self;
+        if (isObj(self))
+        {
+            Obj *o = op(self);
+            if (o->frozen)
+                frozenError(self);
+            int i = v->slot;
+            if (i < o->niv && o->ivn[i] == v->name)
+            {
+                o->ivv[i] = val;
+                return val;
+            }
+        }
+        ivarSet(self, v->name, val);
+        return val;
+    }
+    case N::GVar:
+    {
+        auto *v = static_cast<VarNode *>(n);
+        if (v->slot == 0)
+        {
+            const std::string &name = symName(v->name);
+            v->slot = name == "$stdout" || name == "$>" ? 1 : name == "$stderr" ? 2 : name == "$0" || name == "$PROGRAM_NAME" ? 3 : name == "$~" ? 4 : 5;
+        }
+        switch (v->slot)
+        {
+        case 1: return vStdout;
+        case 2: return vStderr;
+        case 3: return str(scriptName);
+        case 4: return lastMatch;
+        default: break;
+        }
+        auto it = globals.find(v->name);
+        return it == globals.end() ? Qnil : it->second;
+    }
+    case N::GAsgn:
+    {
+        auto *v = static_cast<VarNode *>(n);
+        V val = eval(v->value, f);
+        if (unwind)
+            return Qnil;
+        const std::string &name = symName(v->name);
+        if (name == "$stdout" || name == "$>")
+        {
+            if (!respondTo(val, intern("write")))
+                raise(cTypeError, "$stdout must have write method, " + className(realClassOf(val)) + " given");
+            vStdout = val;
+        }
+        else if (name == "$stderr")
+            vStderr = val;
+        else if (name == "$~")
+            lastMatch = val;
+        else
+            globals[v->name] = val;
+        return val;
+    }
+    case N::CVar:
+    case N::CAsgn:
+    {
+        auto *v = static_cast<VarNode *>(n);
+        RClass *k = f->c->lex ? f->c->lex->klass : cObject;
+        if (k->isSingleton && isObj(k->attached) && (op(k->attached)->type == T::Class || op(k->attached)->type == T::Module))
+            k = static_cast<RClass *>(op(k->attached));
+        V val = Qnil;
+        if (n->kind == N::CAsgn)
+        {
+            val = eval(v->value, f);
+            if (unwind)
+                return Qnil;
+        }
+        for (RClass *a : ancestors(k))
+        {
+            auto it = a->cvars.find(v->name);
+            if (it != a->cvars.end())
+            {
+                if (n->kind == N::CAsgn)
+                {
+                    it->second = val;
+                    return val;
+                }
+                return it->second;
+            }
+        }
+        if (n->kind == N::CAsgn)
+        {
+            k->cvars[v->name] = val;
+            return val;
+        }
+        raise(cNameError, "uninitialized class variable " + symName(v->name) + " in " + className(k));
+    }
+    case N::ConstAsgn:
+    {
+        auto *c = static_cast<ConstNode *>(n);
+        RClass *k;
+        if (c->top)
+            k = cObject;
+        else if (c->scope)
+        {
+            V sv = eval(c->scope, f);
+            if (!isType(sv, T::Class) && !isType(sv, T::Module))
+                raise(cTypeError, inspect(sv) + " is not a class/module");
+            k = static_cast<RClass *>(op(sv));
+        }
+        else
+            k = f->c->lex ? f->c->lex->klass : cObject;
+        V val = eval(c->value, f);
+        if (unwind)
+            return Qnil;
+        setConst(k, c->name, val);
+        return val;
+    }
+    case N::NthRef:
+    {
+        if (lastMatch == Qnil)
+            return Qnil;
+        auto *m = static_cast<RMatch *>(op(lastMatch));
+        int64_t i = static_cast<LitNode *>(n)->i;
+        if (i * 2 + 1 >= (int64_t)m->caps.size() || m->caps[i * 2] < 0)
+            return Qnil;
+        return str(sref(m->str).substr(m->caps[i * 2], m->caps[i * 2 + 1] - m->caps[i * 2]));
+    }
+    case N::BackRef:
+    {
+        const std::string &which = static_cast<LitNode *>(n)->s;
+        if (which == "$~")
+            return lastMatch;
+        if (lastMatch == Qnil)
+            return Qnil;
+        auto *m = static_cast<RMatch *>(op(lastMatch));
+        const std::string &src = sref(m->str);
+        if (which == "$&")
+            return str(src.substr(m->caps[0], m->caps[1] - m->caps[0]));
+        if (which == "$`")
+            return str(src.substr(0, m->caps[0]));
+        if (which == "$'")
+            return str(src.substr(m->caps[1]));
+        return Qnil;
+    }
+    case N::Super:
+    case N::ZSuper: return evalSuper(static_cast<SuperNode *>(n), f);
+    case N::Not:
+    {
+        V v = eval(static_cast<UnaryNode *>(n)->expr, f);
+        if (unwind)
+            return Qnil;
+        if (isObj(v) && op(v)->type == T::Object)
+        {
+            // a class may define `!`
+            Method *m = findMethod(classOf(v), s.not_);
+            if (m && m->kind != M_NATIVE)
+                return call0(v, s.not_);
+        }
+        return boolv(!truthy(v));
+    }
+    case N::Defined: return evalDefined(static_cast<UnaryNode *>(n)->expr, f);
+    case N::MAsgn:
+    {
+        auto *m = static_cast<MAsgnNode *>(n);
+        V val = eval(m->value, f);
+        if (unwind)
+            return Qnil;
+        massign(m->lhs, val, f);
+        return val;
+    }
+    case N::For: return evalFor(static_cast<ForNode *>(n), f);
+    case N::Case: return evalCase(static_cast<CaseNode *>(n), f);
+    case N::CaseIn: return evalCaseIn(static_cast<CaseInNode *>(n), f);
+    case N::Break:
+    case N::Next:
+    case N::Return:
+    {
+        auto *u = static_cast<UnaryNode *>(n);
+        V v = Qnil;
+        if (u->expr)
+        {
+            v = eval(u->expr, f);
+            if (unwind)
+                return Qnil;
+        }
+        unwindVal = v;
+        unwind = n->kind == N::Break ? U_BREAK : n->kind == N::Next ? U_NEXT : U_RETURN;
+        return Qnil;
+    }
+    case N::Redo:
+        unwind = U_REDO;
+        unwindVal = Qnil;
+        return Qnil;
+    case N::Retry:
+        unwind = U_RETRY;
+        unwindVal = Qnil;
+        return Qnil;
+    case N::Begin: return evalBegin(static_cast<BeginNode *>(n), f);
+    case N::Def: return evalDef(static_cast<DefNode *>(n), f);
+    case N::Class:
+    case N::Module:
+    case N::SClass: return evalClass(static_cast<ClassNode *>(n), f);
+    case N::Alias:
+    {
+        auto *a = static_cast<AliasNode *>(n);
+        if (a->globals)
+        {
+            auto it = globals.find(a->from);
+            globals[a->to] = it == globals.end() ? Qnil : it->second;
+            return Qnil;
+        }
+        RClass *k = f->c->defTarget ? f->c->defTarget : cObject;
+        V av[2] = {symv(a->to), symv(a->from)};
+        call(ov(k), intern("alias_method"), 2, av);
+        return Qnil;
+    }
+    case N::Undef:
+    {
+        auto *a = static_cast<AliasNode *>(n);
+        RClass *k = f->c->defTarget ? f->c->defTarget : cObject;
+        for (Sym nm : a->names)
+        {
+            V av = symv(nm);
+            call(ov(k), intern("undef_method"), 1, &av);
+        }
+        return Qnil;
+    }
+    case N::Lambda:
+    {
+        auto *bn = static_cast<BlockNode *>(static_cast<UnaryNode *>(n)->expr);
+        Blk b;
+        b.kind = B_RUBY;
+        b.node = bn;
+        b.env = f->env;
+        b.ctx = f->c;
+        b.lambda = true;
+        return procFromBlk(&b, true);
+    }
+    case N::MatchP:
+    case N::MatchPBool:
+    {
+        auto *m = static_cast<MatchNode *>(n);
+        V v = eval(m->value, f);
+        if (unwind)
+            return Qnil;
+        bool ok = matchPattern(m->pattern, v, f);
+        if (n->kind == N::MatchPBool)
+            return boolv(ok);
+        if (!ok)
+        {
+            if (m->pattern->kind == N::PHash && isHash(v))
+            {
+                auto *p = static_cast<PatNode *>(m->pattern);
+                for (Sym key : p->keys)
+                {
+                    bool found = false;
+                    hget(href(v), symv(key), &found);
+                    if (!found)
+                    {
+                        V exc = makeExc(cNoMatchingPatternKeyError, inspect(v) + ": key not found: " + inspect(symv(key)));
+                        ivarSet(exc, s.key, symv(key));
+                        ivarSet(exc, s.receiver, v);
+                        raiseExc(exc);
+                    }
+                }
+            }
+            std::string msg = inspect(v);
+            if (m->pattern->kind == N::PValue)
+                msg += ": " + inspect(eval(static_cast<PatNode *>(m->pattern)->value, f)) + " === " + inspect(v) +
+                       " does not return true";
+            raise(cNoMatchingPatternError, msg);
+        }
+        return Qnil;
+    }
+    case N::File: return str(file);
+    case N::Postexe:
+    {
+        Blk b;
+        b.kind = B_RUBY;
+        auto *bn = new BlockNode(n->line);
+        bn->body = static_cast<UnaryNode *>(n)->expr;
+        bn->scope = new Scope();
+        bn->scope->isBlock = true;
+        b.node = bn;
+        b.env = f->env;
+        b.ctx = f->c;
+        atExit.push_back(procFromBlk(&b));
+        return Qnil;
+    }
+    case N::Splat:
+    {
+        V v = eval(static_cast<UnaryNode *>(n)->expr, f);
+        if (unwind)
+            return Qnil;
+        return arrayOf(v);
+    }
+    default: break;
+    }
+    raise(cNotImplementedError, "unsupported syntax");
+}
+
+V Interp::evalDStr(DStrNode *n, Frame *f)
+{
+    std::string out;
+    bool binary = false;
+    for (Node *p : n->parts)
+    {
+        if (p->kind == N::Str)
+        {
+            out += static_cast<LitNode *>(p)->s;
+            continue;
+        }
+        V v = eval(p, f);
+        if (unwind)
+            return Qnil;
+        if (isStr(v))
+        {
+            out += sref(v);
+            if (strBinary(v) && !asciiOnly(sref(v)))
+                binary = true;
+        }
+        else
+            out += toS(v);
+    }
+    V r = str(out);
+    static_cast<RString *>(op(r))->binary = binary;
+    return r;
+}
+
+V Interp::regexLiteral(DStrNode *n, Frame *f)
+{
+    if (n->cache)
+        return n->cache;
+    std::string src;
+    bool dynamic = false;
+    for (Node *p : n->parts)
+    {
+        if (p->kind == N::Str)
+        {
+            src += static_cast<LitNode *>(p)->s;
+            continue;
+        }
+        dynamic = true;
+        V v = eval(p, f);
+        if (unwind)
+            return Qnil;
+        if (isType(v, T::Regexp))
+        {
+            // an embedded regexp keeps its options: (?i-mx:...)
+            auto *r = static_cast<RRegexp *>(op(v));
+            std::string on, offs;
+            on += (r->opts & 4) ? "m" : "";
+            on += (r->opts & 1) ? "i" : "";
+            on += (r->opts & 2) ? "x" : "";
+            offs += (r->opts & 4) ? "" : "m";
+            offs += (r->opts & 1) ? "" : "i";
+            offs += (r->opts & 2) ? "" : "x";
+            src += "(?" + on + (offs.empty() ? "" : "-" + offs) + ":" + r->src + ")";
+        }
+        else
+            src += isStr(v) ? sref(v) : toS(v);
+    }
+    int opts = 0;
+    for (char c : n->flags)
+    {
+        if (c == 'i')
+            opts |= 1;
+        else if (c == 'x')
+            opts |= 2;
+        else if (c == 'm')
+            opts |= 4;
+    }
+    V r = regexp(src, opts);
+    op(r)->frozen = true;
+    if (!dynamic || n->once)
+        n->cache = r;
+    return r;
+}
+
+// ── constants ─────────────────────────────────────────────────────────────
+
+V Interp::evalConst(ConstNode *n, Frame *f)
+{
+    bool cacheable = !n->scope || n->scope->kind == N::Const;
+    if (cacheable && n->cacheVersion == constVersion && n->cacheLex == (void *)f->c->lex)
+        return n->cacheValue;
+    V v;
+    if (n->top)
+        v = constIn(cObject, n->name, true);
+    else if (n->scope)
+    {
+        V sv = eval(n->scope, f);
+        if (unwind)
+            return Qnil;
+        if (!isType(sv, T::Class) && !isType(sv, T::Module))
+            raise(cTypeError, inspect(sv) + " is not a class/module");
+        v = constIn(static_cast<RClass *>(op(sv)), n->name, true);
+    }
+    else
+        v = lookupConst(f->c->lex, n->name);
+    if (cacheable)
+    {
+        n->cacheVersion = constVersion;
+        n->cacheLex = (void *)f->c->lex;
+        n->cacheValue = v;
+    }
+    return v;
+}
+
+V Interp::lookupConst(LexScope *lex, Sym name, bool raiseErr)
+{
+    for (LexScope *l = lex; l; l = l->parent)
+    {
+        if (!l->parent)
+            break; // the top level is Object: searched with the ancestors
+        auto it = l->klass->consts.find(name);
+        if (it != l->klass->consts.end())
+            return it->second;
+    }
+    RClass *k = lex ? lex->klass : cObject;
+    V v = constIn(k, name, true, false);
+    if (v != Qundef)
+        return v;
+    if (k->isModule || k->isSingleton)
+    {
+        v = constIn(cObject, name, true, false);
+        if (v != Qundef)
+            return v;
+    }
+    // standard library constants load on first use
+    const std::string &nm = symName(name);
+    // parts of the core written in Ruby load on first use
+    const char *lib = nm == "Set" ? "set" : nm == "Struct" ? "struct" : nm == "Data" ? "data" : nm == "PP" ? "pp" : nullptr;
+    if (!lib && (nm == "Thread" || nm == "Mutex" || nm == "Queue" || nm == "SizedQueue" || nm == "ConditionVariable" ||
+                 nm == "Monitor" || nm == "MonitorMixin" || nm == "Ractor"))
+        lib = "thread";
+    if (!lib && (nm == "File" || nm == "Dir" || nm == "Errno" || nm == "FileTest"))
+        lib = "file";
+    if (!lib && nm == "Time")
+        lib = "time";
+    if (lib && !loaded.count(lib))
+    {
+        loadLibrary(lib);
+        v = constIn(cObject, name, true, false);
+        if (v != Qundef)
+            return v;
+    }
+    if (!raiseErr)
+        return Qundef;
+    Method *cm = findMethod(classOf(ov(k)), intern("const_missing"));
+    if (cm && cm->kind != M_NATIVE)
+    {
+        V av = symv(name);
+        return call(ov(k), intern("const_missing"), 1, &av);
+    }
+    V exc = makeExc(cNameError, "uninitialized constant " + (k == cObject || !lex || !lex->parent ? nm : className(k) + "::" + nm));
+    ivarSet(exc, s.name, symv(name));
+    raiseExc(exc);
+}
+
+V Interp::constIn(RClass *k, Sym name, bool inherit, bool raiseErr)
+{
+    if (!inherit)
+    {
+        auto it = k->consts.find(name);
+        if (it != k->consts.end())
+            return it->second;
+    }
+    else
+        for (RClass *a : ancestors(k))
+        {
+            auto it = a->consts.find(name);
+            if (it != a->consts.end())
+                return it->second;
+        }
+    if (inherit && k != cObject && !raiseErr)
+        return Qundef;
+    if (!raiseErr)
+        return Qundef;
+    if (k == cObject)
+        return lookupConst(nullptr, name, true);
+    Method *cm = findMethod(classOf(ov(k)), intern("const_missing"));
+    if (cm && cm->kind != M_NATIVE)
+    {
+        V av = symv(name);
+        return call(ov(k), intern("const_missing"), 1, &av);
+    }
+    V exc = makeExc(cNameError, "uninitialized constant " + className(k) + "::" + symName(name));
+    ivarSet(exc, s.name, symv(name));
+    raiseExc(exc);
+}
+
+void Interp::setConst(RClass *k, Sym name, V value)
+{
+    auto it = k->consts.find(name);
+    if (it == k->consts.end())
+        k->constOrder.push_back(name);
+    k->consts[name] = value;
+    if ((isType(value, T::Class) || isType(value, T::Module)))
+    {
+        auto *c = static_cast<RClass *>(op(value));
+        if (c->name.empty())
+            nameClass(c, name, k);
+    }
+    ++constVersion;
+}
+
+// ── calls ─────────────────────────────────────────────────────────────────
+
+int Interp::pushArgs(std::vector<Node *> &args, Frame *f, bool &kw, Blk *&blk, Blk &store)
+{
+    V *base = sp;
+    for (Node *x : args)
+    {
+        if (sp + 1 >= stackEnd)
+            raise(cSystemStackError, "stack level too deep");
+        switch (x->kind)
+        {
+        case N::Splat:
+        {
+            auto *u = static_cast<UnaryNode *>(x);
+            V v;
+            if (u->inBlock || !u->expr)
+            {
+                // foo(...) / foo(*): the method's own rest parameter
+                Env *me = f->c->menv;
+                DefNode *d = f->c->method ? f->c->method->def : nullptr;
+                v = ary();
+                if (d && me)
+                {
+                    for (Param &p : d->params.params)
+                        if (p.kind == Param::Rest)
+                            v = me->slots[p.slot];
+                    if (u->inBlock)
+                    {
+                        for (V e : aref(v))
+                            *sp++ = e;
+                        for (Param &p : d->params.params)
+                        {
+                            if (p.kind == Param::KeyRest && me->slots[p.slot] != Qnil &&
+                                href(me->slots[p.slot])->live > 0)
+                            {
+                                *sp++ = me->slots[p.slot];
+                                kw = true;
+                            }
+                            if (p.kind == Param::Block && me->slots[p.slot] != Qnil)
+                            {
+                                blk = blkFromProc(me->slots[p.slot]);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                v = eval(u->expr, f);
+                if (unwind)
+                    return 0;
+                v = arrayOf(v);
+            }
+            for (V e : aref(v))
+            {
+                if (sp + 1 >= stackEnd)
+                    raise(cSystemStackError, "stack level too deep");
+                *sp++ = e;
+            }
+            break;
+        }
+        case N::Hash:
+        {
+            auto *h = static_cast<HashNode *>(x);
+            if (h->braces)
+            {
+                V v = eval(x, f);
+                if (unwind)
+                    return 0;
+                *sp++ = v;
+                break;
+            }
+            V hv = newHash();
+            RHash *hp = href(hv);
+            for (size_t i = 0; i < h->keys.size(); ++i)
+            {
+                if (!h->keys[i])
+                {
+                    V other;
+                    if (!h->values[i])
+                    {
+                        // f(**): the method's anonymous keyword rest
+                        other = Qnil;
+                        Env *me = f->c->menv;
+                        DefNode *d = f->c->method ? f->c->method->def : nullptr;
+                        if (d && me)
+                            for (Param &p : d->params.params)
+                                if (p.kind == Param::KeyRest)
+                                    other = me->slots[p.slot];
+                    }
+                    else
+                    {
+                        other = eval(h->values[i], f);
+                        if (unwind)
+                            return 0;
+                    }
+                    if (other == Qnil)
+                        continue;
+                    if (!isHash(other))
+                        other = call0(other, s.to_hash);
+                    RHash *oh = href(other);
+                    for (size_t j = 0; j < oh->keys.size(); ++j)
+                        if (oh->keys[j] != Qundef)
+                            hset(hp, oh->keys[j], oh->vals[j]);
+                    continue;
+                }
+                V k = eval(h->keys[i], f);
+                if (unwind)
+                    return 0;
+                V v = eval(h->values[i], f);
+                if (unwind)
+                    return 0;
+                hset(hp, k, v);
+            }
+            if (hp->live == 0 && h->keys.size() > 0 && !h->keys[0])
+                break; // f(**{}) passes nothing
+            *sp++ = hv;
+            kw = true;
+            break;
+        }
+        case N::BlockPass:
+        {
+            auto *u = static_cast<UnaryNode *>(x);
+            V v;
+            if (!u->expr)
+            {
+                // f(&): the method's anonymous block
+                if (f->c->blk)
+                {
+                    blk = f->c->blk;
+                    break;
+                }
+                v = Qnil;
+            }
+            else
+            {
+                v = eval(u->expr, f);
+                if (unwind)
+                    return 0;
+            }
+            if (v == Qnil)
+                break;
+            if (isSymV(v))
+            {
+                store.kind = B_SYM;
+                store.sym = vsym(v);
+                blk = &store;
+                break;
+            }
+            if (!isType(v, T::Proc))
+            {
+                if (isType(v, T::Method))
+                {
+                    auto *m = static_cast<RMethod *>(op(v));
+                    store.kind = B_METHOD;
+                    store.recv = m->recv;
+                    store.meth = m->m;
+                    store.lambda = true;
+                    blk = &store;
+                    break;
+                }
+                V p = call0(v, s.to_proc);
+                if (!isType(p, T::Proc))
+                    raise(cTypeError, "wrong argument type " + className(realClassOf(v)) + " (expected Proc)");
+                v = p;
+            }
+            blk = blkFromProc(v);
+            break;
+        }
+        default:
+        {
+            V v = eval(x, f);
+            if (unwind)
+                return 0;
+            *sp++ = v;
+        }
+        }
+    }
+    return (int)(sp - base);
+}
+
+V Interp::evalCall(CallNode *n, Frame *f)
+{
+    V recv;
+    if (n->recv)
+    {
+        recv = eval(n->recv, f);
+        if (unwind)
+            return Qnil;
+        if (n->safeNav && recv == Qnil)
+            return Qnil;
+    }
+    else
+        recv = f->c->self;
+    if (n->fast != F_NONE)
+    {
+        if (n->fast == 0)
+            n->fast = classifyFast(n);
+        if (n->fast != F_NONE)
+        {
+            if (!n->rawArgs)
+                n->rawArgs = n->args.data();
+            V arg = eval(n->rawArgs[0], f);
+            if (unwind)
+                return Qnil;
+            if (isFix(recv) && isFix(arg))
+            {
+                int64_t x = fixv(recv), y = fixv(arg);
+                switch (n->fast)
+                {
+                case F_PLUS:
+                {
+                    int64_t r = x + y;
+                    if (fixable(r))
+                        return fix(r);
+                    break;
+                }
+                case F_MINUS:
+                {
+                    int64_t r = x - y;
+                    if (fixable(r))
+                        return fix(r);
+                    break;
+                }
+                case F_LT: return boolv(x < y);
+                case F_GT: return boolv(x > y);
+                case F_LE: return boolv(x <= y);
+                case F_GE: return boolv(x >= y);
+                case F_EQ: return boolv(x == y);
+                case F_NEQ: return boolv(x != y);
+                default: break;
+                }
+            }
+            V r = fastBinop(*this, n->fast, recv, arg);
+            if (r != Qundef)
+                return r;
+            f->line = n->line;
+            RClass *k = classOf(recv);
+            Method *m;
+            if (n->cacheClass == (void *)k && n->cacheVersion == methodVersion)
+                m = static_cast<Method *>(n->cacheMethod);
+            else
+            {
+                m = findMethod(k, n->name);
+                n->cacheClass = k;
+                n->cacheVersion = methodVersion;
+                n->cacheMethod = m;
+            }
+            V *base = sp;
+            *sp++ = arg;
+            Args a;
+            a.argv = base;
+            a.argc = 1;
+            V res;
+            if (!m || m->kind == M_UNDEF)
+                res = methodMissing(recv, n->name, a, false, false);
+            else
+            {
+                if (m->vis == V_PRIVATE && n->recv->kind != N::Self)
+                    raise(cNoMethodError, "private method '" + symName(n->name) + "' called for " + describe(recv));
+                res = invoke(m, recv, a, nullptr, f);
+            }
+            sp = base;
+            return res;
+        }
+    }
+    V *base = sp;
+    bool kw = false;
+    Blk store;
+    Blk *blk = nullptr;
+    int argc = 0;
+    if (n->plainArgs < 0)
+    {
+        n->plainArgs = 1;
+        for (Node *x : n->args)
+            if (x->kind == N::Splat || x->kind == N::Hash || x->kind == N::BlockPass)
+                n->plainArgs = 0;
+        n->rawArgs = n->args.data();
+        n->argCount = (int)n->args.size();
+    }
+    if (n->plainArgs)
+    {
+        Node **items = n->rawArgs;
+        int count = n->argCount;
+        if (sp + count + 1 >= stackEnd)
+            raise(cSystemStackError, "stack level too deep");
+        for (int i = 0; i < count; ++i)
+        {
+            V v = eval(items[i], f);
+            if (unwind)
+            {
+                sp = base;
+                return Qnil;
+            }
+            *sp++ = v;
+        }
+        argc = count;
+    }
+    else
+    {
+        argc = pushArgs(n->args, f, kw, blk, store);
+        if (unwind)
+        {
+            sp = base;
+            return Qnil;
+        }
+    }
+    Blk lit;
+    if (n->block)
+    {
+        lit.kind = B_RUBY;
+        lit.node = n->block;
+        lit.env = f->env;
+        lit.ctx = f->c;
+        lit.tag = ++tagCounter;
+        blk = &lit;
+    }
+    f->line = n->line;
+    RClass *k = isObj(recv) ? op(recv)->klass : classOf(recv);
+    Method *m;
+    if (n->cacheClass == (void *)k && n->cacheVersion == methodVersion)
+        m = static_cast<Method *>(n->cacheMethod);
+    else
+    {
+        m = nullptr;
+        if (!activeRefinements.empty())
+        {
+            for (RClass *a : ancestors(k))
+            {
+                for (RClass *ref : activeRefinements)
+                    if (ref->refined == a)
+                    {
+                        auto it = ref->mt.find(n->name);
+                        if (it != ref->mt.end())
+                        {
+                            m = it->second;
+                            break;
+                        }
+                    }
+                if (m)
+                    break;
+            }
+        }
+        if (!m)
+            m = findMethod(k, n->name);
+        n->cacheClass = k;
+        n->cacheVersion = methodVersion;
+        n->cacheMethod = m;
+    }
+    Args a;
+    a.argv = base;
+    a.argc = argc;
+    a.kw = kw;
+    a.blk = blk;
+    V r;
+    if (!m || m->kind == M_UNDEF)
+        r = methodMissing(recv, n->name, a, n->vcall, !n->recv);
+    else
+    {
+        if (m->vis != V_PUBLIC && n->recv && n->recv->kind != N::Self)
+        {
+            if (m->vis == V_PRIVATE && !n->attrAssign)
+                raise(cNoMethodError, "private method '" + symName(n->name) + "' called for " + describe(recv));
+            if (m->vis == V_PROTECTED && !kindOf(f->c->self, realClass(m->owner->isSingleton ? m->owner : m->owner)))
+                raise(cNoMethodError, "protected method '" + symName(n->name) + "' called for " + describe(recv));
+        }
+        if (n->block)
+        {
+            try
+            {
+                r = invoke(m, recv, a, nullptr, f);
+            }
+            catch (BreakEx &e)
+            {
+                if (e.tag != lit.tag)
+                    throw;
+                sp = base;
+                return e.val;
+            }
+        }
+        else
+            r = invoke(m, recv, a, nullptr, f);
+    }
+    sp = base;
+    if (n->attrAssign)
+        return argc ? base[argc - 1] : Qnil; // `x.y = v` is v
+    return r;
+}
+
+V Interp::invoke(Method *m, V self, Args &a, RClass *found, Frame *caller)
+{
+    switch (m->kind)
+    {
+    case M_NATIVE:
+        if (a.argc < m->minArgs || (m->maxArgs >= 0 && a.argc > m->maxArgs))
+            argError(a.argc, m->minArgs, m->maxArgs);
+        return m->fn(*this, self, a);
+    case M_NATIVE_ENUM:
+        if (!a.blk && a.argc == 0)
+            return enumFor(*this, self, symName(m->name).c_str(), a);
+        if (a.argc < m->minArgs || (m->maxArgs >= 0 && a.argc > m->maxArgs))
+            argError(a.argc, m->minArgs, m->maxArgs);
+        return m->fn(*this, self, a);
+    case M_RUBY: return invokeRuby(m, self, a, found, caller);
+    case M_READER:
+        if (a.argc)
+            argError(a.argc, 0, 0);
+        return ivarGet(self, m->ivar);
+    case M_WRITER:
+        if (a.argc != 1)
+            argError(a.argc, 1, 1);
+        checkFrozen(self);
+        ivarSet(self, m->ivar, a.argv[0]);
+        return a.argv[0];
+    case M_PROC:
+    {
+        Blk *b = &m->proc->blk;
+        Ctx c = *b->ctx;
+        c.self = self;
+        c.method = m;
+        c.blk = a.blk;
+        c.margs = &a;
+        c.homeId = ++frameCounter;
+        Blk local = *b;
+        local.ctx = &c;
+        local.lambda = true;
+        try
+        {
+            return callBlock(&local, a.argc, a.argv, a.kw, a.blk);
+        }
+        catch (ReturnEx &e)
+        {
+            if (e.home != c.homeId)
+                throw;
+            return e.val;
+        }
+    }
+    default: break;
+    }
+    raise(cNoMethodError, "undefined method '" + symName(m->name) + "' for " + describe(self));
+}
+
+V Interp::invokeRuby(Method *m, V self, Args &a, RClass *found, Frame *caller)
+{
+    (void)found;
+    DefNode *d = m->def;
+    Ctx c;
+    c.self = self;
+    c.lex = m->lex;
+    c.defTarget = m->lex ? m->lex->klass : cObject;
+    c.method = m;
+    c.blk = a.blk;
+    c.margs = &a;
+    c.homeId = ++frameCounter;
+    Frame fr;
+    fr.c = &c;
+    fr.prev = frame;
+    fr.kind = 1;
+    fr.line = d->line;
+    fr.scope = d->scope;
+    (void)caller;
+    if (d->nslots < 0)
+        d->nslots = (int)d->scope->names.size();
+    int n = d->nslots;
+    V *saveSp = sp;
+    Env stackEnv;
+    Env *e;
+    if (d->scope->captured)
+        e = newEnv(n, nullptr);
+    else
+    {
+        if (sp + n >= stackEnd)
+            raise(cSystemStackError, "stack level too deep");
+        stackEnv.slots = sp;
+        stackEnv.n = n;
+        for (int i = 0; i < n; ++i)
+            sp[i] = Qnil;
+        sp += n;
+        e = &stackEnv;
+    }
+    fr.env = e;
+    c.menv = e;
+    if (++depth > 10000)
+    {
+        depth = 0;
+        sp = saveSp;
+        raise(cSystemStackError, "stack level too deep");
+    }
+    Frame *savedFrame = frame;
+    frame = &fr;
+    V r = Qnil;
+    try
+    {
+        if (preemptOn && --quantum <= 0)
+            preempt();
+        ParamList &pl = d->params;
+        if (pl.simple < 0)
+        {
+            pl.simple = 1;
+            for (size_t i = 0; i < pl.params.size(); ++i)
+                if (pl.params[i].kind != Param::Req || pl.params[i].slot != (int)i)
+                    pl.simple = 0;
+        }
+        if (pl.simple && !a.kw)
+        {
+            if (a.argc != pl.required)
+                argError(a.argc, pl.required, pl.required);
+            for (int i = 0; i < a.argc; ++i)
+                e->slots[i] = a.argv[i];
+        }
+        else
+            bindParams(pl, e, a, &fr, true, false, m->name);
+        if (d->body)
+            r = eval(d->body, &fr);
+        if (unwind)
+        {
+            if (unwind == U_RETURN)
+                r = unwindVal;
+            unwind = U_NONE;
+        }
+    }
+    catch (ReturnEx &ex)
+    {
+        frame = savedFrame;
+        sp = saveSp;
+        --depth;
+        if (ex.home != c.homeId)
+            throw;
+        return ex.val;
+    }
+    catch (...)
+    {
+        frame = savedFrame;
+        sp = saveSp;
+        --depth;
+        throw;
+    }
+    frame = savedFrame;
+    sp = saveSp;
+    --depth;
+    return r;
+}
+
+void Interp::argError(int given, int min, int max)
+{
+    std::string exp;
+    if (max < 0)
+        exp = std::to_string(min) + "+";
+    else if (min == max)
+        exp = std::to_string(min);
+    else
+        exp = std::to_string(min) + ".." + std::to_string(max);
+    raise(cArgumentError, "wrong number of arguments (given " + std::to_string(given) + ", expected " + exp + ")");
+}
+
+void Interp::bindParams(ParamList &pl, Env *e, Args &a, Frame *f, bool strict, bool isProc, Sym name)
+{
+    (void)isProc;
+    (void)name;
+    V *argv = a.argv;
+    int argc = a.argc;
+    RHash *kwh = nullptr;
+    bool acceptsKw = pl.hasKw || pl.hasKwRest;
+    if (a.kw && argc > 0)
+    {
+        if (acceptsKw)
+        {
+            kwh = href(argv[argc - 1]);
+            --argc;
+        }
+    }
+    else if (!strict && acceptsKw && argc > 0 && isHash(argv[argc - 1]) && argc > pl.required + pl.post)
+    {
+        // a proc taking keywords given a trailing hash
+        kwh = href(argv[argc - 1]);
+        --argc;
+    }
+    int req = pl.required + pl.post;
+    if (strict && (argc < req || (!pl.hasRest && argc > req + pl.optional)))
+        argError(argc, req, pl.hasRest ? -1 : req + pl.optional);
+    int optAvail = argc - req;
+    if (optAvail < 0)
+        optAvail = 0;
+    int idx = 0;
+    bool pastRest = false;
+    std::vector<V> unusedKeys;
+    for (Param &p : pl.params)
+    {
+        switch (p.kind)
+        {
+        case Param::Req:
+        case Param::Post:
+        case Param::Destructure:
+        {
+            V v;
+            if (pastRest || p.kind == Param::Post)
+            {
+                v = idx < argc ? argv[idx++] : Qnil;
+            }
+            else
+                v = idx < argc ? argv[idx++] : Qnil;
+            if (p.kind == Param::Destructure)
+                massign(p.destructure, v, f);
+            else
+                e->slots[p.slot] = v;
+            break;
+        }
+        case Param::Opt:
+            if (optAvail > 0 && idx < argc)
+            {
+                e->slots[p.slot] = argv[idx++];
+                --optAvail;
+            }
+            else
+            {
+                e->slots[p.slot] = eval(p.defaultValue, f);
+                if (unwind)
+                    return;
+            }
+            break;
+        case Param::Rest:
+        {
+            int remaining = argc - idx - pl.post;
+            if (remaining < 0)
+                remaining = 0;
+            V r = ary();
+            for (int i = 0; i < remaining; ++i)
+                aref(r).push_back(argv[idx++]);
+            e->slots[p.slot] = r;
+            pastRest = true;
+            break;
+        }
+        case Param::Key:
+        case Param::KeyReq:
+        {
+            bool found = false;
+            V v = Qnil;
+            if (kwh)
+                v = hget(kwh, symv(p.name), &found);
+            if (found)
+                e->slots[p.slot] = v;
+            else if (p.kind == Param::Key)
+            {
+                e->slots[p.slot] = eval(p.defaultValue, f);
+                if (unwind)
+                    return;
+            }
+            else
+                e->slots[p.slot] = Qundef; // reported below
+            break;
+        }
+        case Param::KeyRest:
+        {
+            V h = newHash();
+            if (kwh)
+                for (size_t i = 0; i < kwh->keys.size(); ++i)
+                {
+                    V k = kwh->keys[i];
+                    if (k == Qundef)
+                        continue;
+                    bool named = false;
+                    if (isSymV(k))
+                        for (Param &q : pl.params)
+                            if ((q.kind == Param::Key || q.kind == Param::KeyReq) && q.name == vsym(k))
+                                named = true;
+                    if (!named)
+                        hset(href(h), k, kwh->vals[i]);
+                }
+            e->slots[p.slot] = h;
+            break;
+        }
+        case Param::NoKey: break;
+        case Param::Block: e->slots[p.slot] = a.blk ? procFromBlk(a.blk) : Qnil; break;
+        }
+    }
+    if (pl.hasKw)
+    {
+        std::vector<Sym> missing;
+        for (Param &p : pl.params)
+            if (p.kind == Param::KeyReq && e->slots[p.slot] == Qundef)
+            {
+                missing.push_back(p.name);
+                e->slots[p.slot] = Qnil;
+            }
+        if (!missing.empty())
+        {
+            std::string msg = missing.size() == 1 ? "missing keyword: " : "missing keywords: ";
+            for (size_t i = 0; i < missing.size(); ++i)
+                msg += (i ? ", :" : ":") + symName(missing[i]);
+            raise(cArgumentError, msg);
+        }
+    }
+    if (kwh && !pl.hasKwRest)
+    {
+        std::vector<V> unknown;
+        for (size_t i = 0; i < kwh->keys.size(); ++i)
+        {
+            V k = kwh->keys[i];
+            if (k == Qundef)
+                continue;
+            bool named = false;
+            if (isSymV(k))
+                for (Param &q : pl.params)
+                    if ((q.kind == Param::Key || q.kind == Param::KeyReq) && q.name == vsym(k))
+                        named = true;
+            if (!named)
+                unknown.push_back(k);
+        }
+        if (!unknown.empty())
+        {
+            std::string msg = unknown.size() == 1 ? "unknown keyword: " : "unknown keywords: ";
+            for (size_t i = 0; i < unknown.size(); ++i)
+                msg += (i ? ", " : "") + inspect(unknown[i]);
+            raise(cArgumentError, msg);
+        }
+    }
+}
+
+V Interp::callBlock(Blk *b, int argc, V *argv, bool kw, Blk *passBlk, V selfOverride, RClass *defTarget)
+{
+    if (!b)
+        raise(cLocalJumpError, "no block given (yield)");
+    switch (b->kind)
+    {
+    case B_NATIVE:
+    {
+        Args a;
+        a.argv = argv;
+        a.argc = argc;
+        a.kw = kw;
+        a.blk = passBlk;
+        return (*b->native)(*this, a);
+    }
+    case B_SYM:
+        if (argc < 1)
+            raise(cArgumentError, "no receiver given");
+        return call(argv[0], b->sym, argc - 1, argv + 1, passBlk, false, kw);
+    case B_METHOD:
+    {
+        Args a;
+        a.argv = argv;
+        a.argc = argc;
+        a.kw = kw;
+        a.blk = passBlk;
+        return invoke(b->meth, b->recv, a, nullptr, frame);
+    }
+    default: break;
+    }
+    BlockNode *bn = b->node;
+    Ctx overrideCtx;
+    Frame fr;
+    fr.c = b->ctx;
+    if (selfOverride != Qundef)
+    {
+        overrideCtx = *b->ctx;
+        overrideCtx.self = selfOverride;
+        if (defTarget)
+        {
+            overrideCtx.defTarget = defTarget;
+        }
+        fr.c = &overrideCtx;
+    }
+    fr.prev = frame;
+    fr.kind = 2;
+    fr.block = bn;
+    fr.line = bn->line;
+    fr.scope = bn->scope;
+    if (bn->nslots < 0)
+    {
+        bn->nslots = (int)bn->scope->names.size();
+        bn->soleSlot = bn->params.params.size() == 1 && bn->params.params[0].kind == Param::Req ? bn->params.params[0].slot : -1;
+    }
+    int n = bn->nslots;
+    V *saveSp = sp;
+    Env stackEnv;
+    Env *e;
+    if (bn->scope->captured)
+        e = newEnv(n, b->env);
+    else
+    {
+        if (sp + n + 1 >= stackEnd)
+            raise(cSystemStackError, "stack level too deep");
+        stackEnv.slots = sp;
+        stackEnv.n = n;
+        stackEnv.parent = b->env;
+        for (int i = 0; i < n; ++i)
+            sp[i] = Qnil;
+        sp += n;
+        e = &stackEnv;
+    }
+    fr.env = e;
+    ParamList &pl = bn->params;
+    Frame *savedFrame = frame;
+    frame = &fr;
+    V r = Qnil;
+    try
+    {
+        if (bn->soleSlot >= 0 && !b->lambda)
+            e->slots[bn->soleSlot] = argc > 0 ? argv[0] : Qnil;
+        else if (!pl.params.empty())
+        {
+            Args a;
+            a.argv = argv;
+            a.argc = argc;
+            a.kw = kw;
+            a.blk = passBlk;
+            if (!b->lambda && argc == 1)
+            {
+                int positional = pl.required + pl.post + pl.optional;
+                bool splat = positional > 1 || (pl.hasRest && positional > 0) || pl.trailingComma ||
+                             (positional == 1 && pl.params[0].kind == Param::Destructure && false);
+                if (splat)
+                {
+                    V arr = isAry(argv[0]) ? argv[0] : toAry(argv[0]);
+                    if (arr != Qnil)
+                    {
+                        std::vector<V> &items = aref(arr);
+                        V *copy = sp;
+                        if (sp + items.size() + 1 >= stackEnd)
+                            raise(cSystemStackError, "stack level too deep");
+                        for (V x : items)
+                            *sp++ = x;
+                        a.argv = copy;
+                        a.argc = (int)items.size();
+                        a.kw = false;
+                    }
+                }
+            }
+            bindParams(pl, e, a, &fr, b->lambda, true, 0);
+        }
+        if (!unwind && bn->body)
+            r = eval(bn->body, &fr);
+    }
+    catch (...)
+    {
+        frame = savedFrame;
+        sp = saveSp;
+        throw;
+    }
+    frame = savedFrame;
+    sp = saveSp;
+    if (unwind)
+    {
+        Unwind u = unwind;
+        unwind = U_NONE;
+        V v = unwindVal;
+        if (u == U_NEXT)
+            return v;
+        if (u == U_BREAK)
+        {
+            if (b->lambda)
+                return v;
+            throw BreakEx{b->tag, v};
+        }
+        if (u == U_RETURN)
+        {
+            if (b->lambda)
+                return v;
+            throw ReturnEx{b->ctx->homeId, v};
+        }
+        if (u == U_REDO)
+            return callBlock(b, argc, argv, kw, passBlk, selfOverride, defTarget);
+        unwind = u; // retry: belongs to a rescue further out
+        unwindVal = v;
+    }
+    return r;
+}
+
+V Interp::evalYield(YieldNode *n, Frame *f)
+{
+    Blk *b = f->c->blk;
+    if (!b)
+        raise(cLocalJumpError, "no block given (yield)");
+    V *base = sp;
+    if (n->args.size() == 1 && n->args[0]->kind != N::Splat && n->args[0]->kind != N::Hash &&
+        n->args[0]->kind != N::BlockPass)
+    {
+        V v = eval(n->args[0], f);
+        if (unwind)
+            return Qnil;
+        *sp++ = v;
+        V r = callBlock(b, 1, base);
+        sp = base;
+        return r;
+    }
+    bool kw = false;
+    Blk store;
+    Blk *bp = nullptr;
+    int argc = pushArgs(n->args, f, kw, bp, store);
+    if (unwind)
+    {
+        sp = base;
+        return Qnil;
+    }
+    V r = callBlock(b, argc, base, kw, bp);
+    sp = base;
+    return r;
+}
+
+V Interp::evalSuper(SuperNode *n, Frame *f)
+{
+    Method *m = f->c->method;
+    if (!m)
+        raise(cRuntimeError, "super called outside of method");
+    V self = f->c->self;
+    RClass *k = classOf(self);
+    Sym name = m->name;
+    RClass *foundIn = nullptr;
+    Method *sm = findMethodAfter(k, m->owner, name, &foundIn);
+    V *base = sp;
+    bool kw = false;
+    Blk store;
+    Blk *blk = nullptr;
+    int argc;
+    if (n->kind == N::ZSuper)
+    {
+        // the current values of the method's parameters
+        if (m->kind == M_PROC)
+            raise(cRuntimeError, "implicit argument passing of super from method defined by define_method() is not supported. Specify all arguments explicitly.");
+        Env *me = f->c->menv;
+        DefNode *d = m->def;
+        V kwh = Qnil;
+        if (d && me)
+            for (Param &p : d->params.params)
+            {
+                switch (p.kind)
+                {
+                case Param::Req:
+                case Param::Opt:
+                case Param::Post: *sp++ = me->slots[p.slot]; break;
+                case Param::Rest:
+                    for (V x : aref(me->slots[p.slot]))
+                        *sp++ = x;
+                    break;
+                case Param::Key:
+                case Param::KeyReq:
+                    if (kwh == Qnil)
+                        kwh = newHash();
+                    hset(href(kwh), symv(p.name), me->slots[p.slot]);
+                    break;
+                case Param::KeyRest:
+                    if (kwh == Qnil)
+                        kwh = newHash();
+                    if (isHash(me->slots[p.slot]))
+                    {
+                        RHash *oh = href(me->slots[p.slot]);
+                        for (size_t j = 0; j < oh->keys.size(); ++j)
+                            if (oh->keys[j] != Qundef)
+                                hset(href(kwh), oh->keys[j], oh->vals[j]);
+                    }
+                    break;
+                default: break;
+                }
+            }
+        if (kwh != Qnil)
+        {
+            *sp++ = kwh;
+            kw = true;
+        }
+        argc = (int)(sp - base);
+        blk = f->c->blk;
+    }
+    else
+    {
+        argc = pushArgs(n->args, f, kw, blk, store);
+        if (unwind)
+        {
+            sp = base;
+            return Qnil;
+        }
+        if (!blk)
+            blk = f->c->blk;
+    }
+    Blk lit;
+    if (n->block)
+    {
+        lit.kind = B_RUBY;
+        lit.node = n->block;
+        lit.env = f->env;
+        lit.ctx = f->c;
+        lit.tag = ++tagCounter;
+        blk = &lit;
+    }
+    Args a;
+    a.argv = base;
+    a.argc = argc;
+    a.kw = kw;
+    a.blk = blk;
+    V r;
+    if (!sm)
+    {
+        Method *mm = findMethod(k, s.method_missing);
+        if (mm && mm->kind != M_NATIVE)
+            r = methodMissing(self, name, a, false, true);
+        else
+            raise(cNoMethodError, "super: no superclass method '" + symName(name) + "' for " + describe(self));
+    }
+    else if (n->block)
+    {
+        try
+        {
+            r = invoke(sm, self, a, foundIn, f);
+        }
+        catch (BreakEx &e)
+        {
+            if (e.tag != lit.tag)
+                throw;
+            r = e.val;
+        }
+    }
+    else
+        r = invoke(sm, self, a, foundIn, f);
+    sp = base;
+    return r;
+}
+
+V Interp::methodMissing(V recv, Sym name, Args &a, bool vcall, bool fcall)
+{
+    RClass *k = classOf(recv);
+    if (!loaded.count("core_ext"))
+    {
+        loadLibrary("core_ext");
+        Method *found = findMethod(k, name);
+        if (found && found->kind != M_UNDEF && (found->vis == V_PUBLIC || fcall))
+            return invoke(found, recv, a, nullptr, frame);
+    }
+    Method *mm = findMethod(k, s.method_missing);
+    if (mm && mm->kind != M_NATIVE)
+    {
+        V *base = sp;
+        *sp++ = symv(name);
+        for (int i = 0; i < a.argc; ++i)
+            *sp++ = a.argv[i];
+        Args b;
+        b.argv = base;
+        b.argc = a.argc + 1;
+        b.kw = a.kw;
+        b.blk = a.blk;
+        V r = invoke(mm, recv, b, nullptr, frame);
+        sp = base;
+        return r;
+    }
+    Method *m = findMethod(k, name);
+    if (m && m->kind != M_UNDEF && m->vis == V_PRIVATE && !fcall)
+        raise(cNoMethodError, "private method '" + symName(name) + "' called for " + describe(recv));
+    V exc;
+    if (vcall)
+        exc = makeExc(cNameError, "undefined local variable or method '" + symName(name) + "' for " + describe(recv));
+    else
+        exc = makeExc(cNoMethodError, "undefined method '" + symName(name) + "' for " + describe(recv));
+    ivarSet(exc, s.name, symv(name));
+    ivarSet(exc, s.receiver, recv);
+    raiseExc(exc);
+}
+
+V Interp::call(V recv, Sym m, int argc, V *argv, Blk *blk, bool fcall, bool kw)
+{
+    RClass *k = classOf(recv);
+    Method *me = findMethod(k, m);
+    Args a;
+    a.argv = argv;
+    a.argc = argc;
+    a.kw = kw;
+    a.blk = blk;
+    if (!me || me->kind == M_UNDEF)
+        return methodMissing(recv, m, a, false, fcall);
+    if (!fcall && me->vis != V_PUBLIC)
+        raise(cNoMethodError, std::string(me->vis == V_PRIVATE ? "private" : "protected") + " method '" + symName(m) + "' called for " + describe(recv));
+    return invoke(me, recv, a, nullptr, frame);
+}
+
+V Interp::callArgs(V recv, Sym m, Args &a, bool fcall)
+{
+    RClass *k = classOf(recv);
+    Method *me = findMethod(k, m);
+    if (!me || me->kind == M_UNDEF)
+        return methodMissing(recv, m, a, false, fcall);
+    if (!fcall && me->vis != V_PUBLIC)
+        raise(cNoMethodError, std::string(me->vis == V_PRIVATE ? "private" : "protected") + " method '" + symName(m) + "' called for " + describe(recv));
+    return invoke(me, recv, a, nullptr, frame);
+}
+
+V Interp::callProc(V proc, int argc, V *argv, Blk *blk)
+{
+    auto *p = static_cast<RProc *>(op(proc));
+    if (p->lambda)
+    {
+        Blk *b = &p->blk;
+        try
+        {
+            return callBlock(b, argc, argv, false, blk);
+        }
+        catch (ReturnEx &e)
+        {
+            throw;
+        }
+    }
+    return callBlock(&p->blk, argc, argv, false, blk);
+}
+
+// ── assignment ────────────────────────────────────────────────────────────
+
+void Interp::assignTo(Node *target, V value, Frame *f)
+{
+    switch (target->kind)
+    {
+    case N::LAsgn:
+    case N::LVar: *localRef(static_cast<VarNode *>(target), f) = value; return;
+    case N::IAsgn:
+    case N::IVar:
+        checkFrozen(f->c->self);
+        ivarSet(f->c->self, static_cast<VarNode *>(target)->name, value);
+        return;
+    case N::GAsgn:
+    case N::GVar: globals[static_cast<VarNode *>(target)->name] = value; return;
+    case N::CAsgn:
+    case N::CVar:
+    {
+        auto *v = static_cast<VarNode *>(target);
+        RClass *k = f->c->lex ? f->c->lex->klass : cObject;
+        for (RClass *a : ancestors(k))
+        {
+            auto it = a->cvars.find(v->name);
+            if (it != a->cvars.end())
+            {
+                it->second = value;
+                return;
+            }
+        }
+        k->cvars[v->name] = value;
+        return;
+    }
+    case N::ConstAsgn:
+    case N::Const:
+    {
+        auto *c = static_cast<ConstNode *>(target);
+        setConst(f->c->lex ? f->c->lex->klass : cObject, c->name, value);
+        return;
+    }
+    case N::Call:
+    {
+        auto *c = static_cast<CallNode *>(target);
+        V recv = c->recv ? eval(c->recv, f) : f->c->self;
+        V *base = sp;
+        bool kw = false;
+        Blk store;
+        Blk *blk = nullptr;
+        int argc = pushArgs(c->args, f, kw, blk, store);
+        *sp++ = value;
+        call(recv, c->name, argc + 1, base, nullptr, !c->recv || c->recv->kind == N::Self);
+        sp = base;
+        return;
+    }
+    case N::Mlhs: massign(static_cast<MlhsNode *>(target), value, f); return;
+    case N::Splat:
+    {
+        auto *u = static_cast<UnaryNode *>(target);
+        if (u->expr)
+            assignTo(u->expr, arrayOf(value), f);
+        return;
+    }
+    default: raise(cNotImplementedError, "unsupported assignment target");
+    }
+}
+
+void Interp::massign(MlhsNode *m, V value, Frame *f)
+{
+    V arr = isAry(value) ? value : toAry(value);
+    std::vector<V> items;
+    if (arr == Qnil)
+        items.push_back(value);
+    else
+        items = aref(arr);
+    size_t n = items.size();
+    size_t pre = m->pre.size(), post = m->post.size();
+    for (size_t i = 0; i < pre; ++i)
+        assignTo(m->pre[i], i < n ? items[i] : Qnil, f);
+    if (m->hasSplat)
+    {
+        size_t restLen = n > pre + post ? n - pre - post : 0;
+        V rest = ary();
+        for (size_t i = 0; i < restLen; ++i)
+            aref(rest).push_back(items[pre + i]);
+        auto *u = static_cast<UnaryNode *>(m->splat);
+        if (u && u->expr)
+            assignTo(u->expr, rest, f);
+        for (size_t i = 0; i < post; ++i)
+        {
+            size_t at = pre + restLen + i;
+            assignTo(m->post[i], at < n ? items[at] : Qnil, f);
+        }
+    }
+    else
+        for (size_t i = 0; i < post; ++i)
+            assignTo(m->post[i], pre + i < n ? items[pre + i] : Qnil, f);
+}
+
+V Interp::evalOpAsgn(OpAsgnNode *n, Frame *f)
+{
+    Node *t = n->target;
+    if (t->kind == N::Call)
+    {
+        auto *c = static_cast<CallNode *>(t);
+        V recv = c->recv ? eval(c->recv, f) : f->c->self;
+        if (unwind)
+            return Qnil;
+        if (c->safeNav && recv == Qnil)
+            return Qnil;
+        V *base = sp;
+        bool kw = false;
+        Blk store;
+        Blk *blk = nullptr;
+        int argc = pushArgs(c->args, f, kw, blk, store);
+        if (unwind)
+        {
+            sp = base;
+            return Qnil;
+        }
+        bool fc = !c->recv || c->recv->kind == N::Self;
+        V cur;
+        bool isIndex = c->name == s.aref;
+        Sym setter = isIndex ? s.aset : intern(symName(c->name) + "=");
+        // h[k] ||= v on a plain hash: no default value involved
+        cur = call(recv, c->name, argc, base, nullptr, fc);
+        V val;
+        if (n->op == 0 || n->op == -1)
+        {
+            if ((n->op == 0) == truthy(cur))
+            {
+                sp = base;
+                return cur;
+            }
+            sp = base + argc;
+            val = eval(n->value, f);
+            if (unwind)
+            {
+                sp = base;
+                return Qnil;
+            }
+        }
+        else
+        {
+            sp = base + argc;
+            V rhs = eval(n->value, f);
+            if (unwind)
+            {
+                sp = base;
+                return Qnil;
+            }
+            val = call1(cur, n->op, rhs);
+        }
+        sp = base + argc;
+        *sp++ = val;
+        call(recv, setter, argc + 1, base, nullptr, fc);
+        sp = base;
+        return val;
+    }
+    V cur;
+    switch (t->kind)
+    {
+    case N::LVar:
+    case N::LAsgn: cur = *localRef(static_cast<VarNode *>(t), f); break;
+    case N::IVar:
+    case N::IAsgn: cur = ivarGet(f->c->self, static_cast<VarNode *>(t)->name); break;
+    case N::GVar:
+    case N::GAsgn:
+    {
+        auto it = globals.find(static_cast<VarNode *>(t)->name);
+        cur = it == globals.end() ? Qnil : it->second;
+        break;
+    }
+    case N::CVar:
+    case N::CAsgn:
+    {
+        auto *v = static_cast<VarNode *>(t);
+        RClass *k = f->c->lex ? f->c->lex->klass : cObject;
+        cur = Qundef;
+        for (RClass *a : ancestors(k))
+        {
+            auto it = a->cvars.find(v->name);
+            if (it != a->cvars.end())
+            {
+                cur = it->second;
+                break;
+            }
+        }
+        if (cur == Qundef)
+        {
+            if (n->op != 0)
+                raise(cNameError, "uninitialized class variable " + symName(v->name) + " in " + className(k));
+            cur = Qnil;
+        }
+        break;
+    }
+    case N::Const:
+    case N::ConstAsgn:
+    {
+        auto *c = static_cast<ConstNode *>(t);
+        cur = lookupConst(f->c->lex, c->name, false);
+        if (cur == Qundef)
+            cur = Qnil;
+        break;
+    }
+    default: raise(cNotImplementedError, "unsupported operator assignment");
+    }
+    V val;
+    if (n->op == 0 || n->op == -1)
+    {
+        if ((n->op == 0) == truthy(cur))
+            return cur;
+        val = eval(n->value, f);
+        if (unwind)
+            return Qnil;
+    }
+    else
+    {
+        V rhs = eval(n->value, f);
+        if (unwind)
+            return Qnil;
+        if (!n->fast)
+        {
+            const std::string &o = symName(n->op);
+            n->fast = o == "+" ? F_PLUS : o == "-" ? F_MINUS : o == "*" ? F_MUL : o == "%" ? F_MOD : o == "/" ? F_DIV : F_NONE;
+        }
+        val = n->fast != F_NONE ? fastBinop(*this, n->fast, cur, rhs) : Qundef;
+        if (val == Qundef)
+            val = call1(cur, n->op, rhs);
+    }
+    switch (t->kind)
+    {
+    case N::LVar:
+    case N::LAsgn: *localRef(static_cast<VarNode *>(t), f) = val; break;
+    default: assignTo(t, val, f); break;
+    }
+    return val;
+}
+
+// ── control flow ──────────────────────────────────────────────────────────
+
+V Interp::evalWhile(WhileNode *n, Frame *f)
+{
+    bool first = n->doWhile;
+    for (;;)
+    {
+        if (!first)
+        {
+            V c = eval(n->cond, f);
+            if (unwind)
+                return Qnil;
+            if (truthy(c) == n->until)
+                break;
+        }
+        first = false;
+        if (n->body)
+            eval(n->body, f);
+        if (preemptOn && --quantum <= 0)
+            preempt();
+        if (unwind)
+        {
+            if (unwind == U_BREAK)
+            {
+                unwind = U_NONE;
+                return unwindVal;
+            }
+            if (unwind == U_NEXT || unwind == U_REDO)
+            {
+                unwind = U_NONE;
+                continue;
+            }
+            return Qnil;
+        }
+    }
+    return Qnil;
+}
+
+V Interp::evalFor(ForNode *n, Frame *f)
+{
+    V iter = eval(n->iter, f);
+    if (unwind)
+        return Qnil;
+    auto body = [&](V x) -> int
+    {
+        assignTo(n->var, x, f);
+        if (n->body)
+            eval(n->body, f);
+        if (unwind)
+        {
+            if (unwind == U_NEXT)
+            {
+                unwind = U_NONE;
+                return 0;
+            }
+            if (unwind == U_BREAK)
+            {
+                unwind = U_NONE;
+                return 1;
+            }
+            return 2;
+        }
+        return 0;
+    };
+    if (isType(iter, T::Range) && isFix(static_cast<RRange *>(op(iter))->lo) &&
+        (isFix(static_cast<RRange *>(op(iter))->hi) || static_cast<RRange *>(op(iter))->hi == Qnil))
+    {
+        auto *r = static_cast<RRange *>(op(iter));
+        int64_t lo = fixv(r->lo);
+        bool endless = r->hi == Qnil;
+        int64_t hi = endless ? 0 : fixv(r->hi);
+        if (r->excl)
+            --hi;
+        for (int64_t i = lo; endless || i <= hi; ++i)
+        {
+            int st = body(fix(i));
+            if (st == 1)
+                return unwindVal;
+            if (st == 2)
+                return Qnil;
+        }
+        return iter;
+    }
+    if (isAry(iter))
+    {
+        std::vector<V> &v = aref(iter);
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            int st = body(v[i]);
+            if (st == 1)
+                return unwindVal;
+            if (st == 2)
+                return Qnil;
+        }
+        return iter;
+    }
+    uint64_t tag = ++tagCounter;
+    NativeBlockFn fn = [&](Interp &I, Args &a) -> V
+    {
+        V x = a.argc == 1 ? a.argv[0] : I.ary(std::vector<V>(a.argv, a.argv + a.argc));
+        int st = body(x);
+        if (st == 1)
+            throw BreakEx{tag, I.unwindVal};
+        if (st == 2)
+        {
+            Unwind u = I.unwind;
+            I.unwind = U_NONE;
+            if (u == U_RETURN)
+                throw ReturnEx{f->c->homeId, I.unwindVal};
+        }
+        return Qnil;
+    };
+    Blk b = nativeBlk(&fn);
+    try
+    {
+        call(iter, s.each, 0, nullptr, &b);
+    }
+    catch (BreakEx &e)
+    {
+        if (e.tag != tag)
+            throw;
+        return e.val;
+    }
+    return iter;
+}
+
+V Interp::evalCase(CaseNode *n, Frame *f)
+{
+    V subj = Qundef;
+    if (n->subject)
+    {
+        subj = eval(n->subject, f);
+        if (unwind)
+            return Qnil;
+    }
+    for (WhenClause &w : n->whens)
+    {
+        for (Node *vn : w.values)
+        {
+            if (vn->kind == N::Splat)
+            {
+                V arr = arrayOf(eval(static_cast<UnaryNode *>(vn)->expr, f));
+                if (unwind)
+                    return Qnil;
+                for (V x : aref(arr))
+                    if (subj == Qundef ? truthy(x) : caseEq(x, subj))
+                        return w.body ? eval(w.body, f) : Qnil;
+                continue;
+            }
+            V pat = eval(vn, f);
+            if (unwind)
+                return Qnil;
+            if (subj == Qundef ? truthy(pat) : caseEq(pat, subj))
+                return w.body ? eval(w.body, f) : Qnil;
+        }
+    }
+    if (n->els)
+        return eval(n->els, f);
+    return Qnil;
+}
+
+V Interp::evalCaseIn(CaseInNode *n, Frame *f)
+{
+    V subj = eval(n->subject, f);
+    if (unwind)
+        return Qnil;
+    for (InClause &in : n->ins)
+    {
+        if (!matchPattern(in.pattern, subj, f))
+            continue;
+        if (in.guard)
+        {
+            V g = eval(in.guard, f);
+            if (unwind)
+                return Qnil;
+            if (truthy(g) == in.guardUnless)
+                continue;
+        }
+        return in.body ? eval(in.body, f) : Qnil;
+    }
+    if (n->hasElse)
+        return n->els ? eval(n->els, f) : Qnil;
+    std::string msg = inspect(subj);
+    raise(cNoMatchingPatternError, msg);
+}
+
+bool Interp::matchPattern(Node *p, V v, Frame *f)
+{
+    auto *pn = static_cast<PatNode *>(p);
+    switch (p->kind)
+    {
+    case N::PValue:
+    {
+        V pat = eval(pn->value, f);
+        return caseEq(pat, v);
+    }
+    case N::PPin:
+    {
+        V pat = eval(pn->value, f);
+        return caseEq(pat, v);
+    }
+    case N::PBind:
+        if (pn->var)
+            assignTo(pn->var, v, f);
+        return true;
+    case N::PAlt:
+        for (Node *a : pn->alts)
+            if (matchPattern(a, v, f))
+                return true;
+        return false;
+    case N::PCapture:
+        if (!matchPattern(pn->value, v, f))
+            return false;
+        assignTo(pn->var, v, f);
+        return true;
+    case N::PArray:
+    case N::PFind:
+    {
+        if (pn->constant && !caseEq(eval(pn->constant, f), v))
+            return false;
+        V arr;
+        if (isAry(v))
+            arr = v;
+        else
+        {
+            if (!respondTo(v, s.deconstruct))
+                return false;
+            arr = call0(v, s.deconstruct);
+            if (!isAry(arr))
+                raise(cTypeError, "deconstruct must return Array");
+        }
+        std::vector<V> items = aref(arr);
+        size_t n = items.size();
+        if (p->kind == N::PFind)
+        {
+            size_t k = pn->pre.size();
+            if (n < k)
+                return false;
+            for (size_t start = 0; start + k <= n; ++start)
+            {
+                bool ok = true;
+                for (size_t j = 0; j < k && ok; ++j)
+                    ok = matchPattern(pn->pre[j], items[start + j], f);
+                if (ok)
+                {
+                    if (pn->rest)
+                        assignTo(pn->rest, ary(std::vector<V>(items.begin(), items.begin() + start)), f);
+                    if (pn->rest2)
+                        assignTo(pn->rest2, ary(std::vector<V>(items.begin() + start + k, items.end())), f);
+                    return true;
+                }
+            }
+            return false;
+        }
+        size_t pre = pn->pre.size(), post = pn->post.size();
+        if (pn->hasRest ? n < pre + post : n != pre + post)
+            return false;
+        for (size_t i = 0; i < pre; ++i)
+            if (!matchPattern(pn->pre[i], items[i], f))
+                return false;
+        size_t restLen = n - pre - post;
+        for (size_t i = 0; i < post; ++i)
+            if (!matchPattern(pn->post[i], items[pre + restLen + i], f))
+                return false;
+        if (pn->hasRest && pn->rest)
+            assignTo(pn->rest, ary(std::vector<V>(items.begin() + pre, items.begin() + pre + restLen)), f);
+        return true;
+    }
+    case N::PHash:
+    {
+        if (pn->constant && !caseEq(eval(pn->constant, f), v))
+            return false;
+        V h;
+        if (isHash(v))
+            h = v;
+        else
+        {
+            if (!respondTo(v, s.deconstruct_keys))
+                return false;
+            V keys = Qnil;
+            if (!pn->hashRest)
+            {
+                keys = ary();
+                for (Sym k : pn->keys)
+                    aref(keys).push_back(symv(k));
+            }
+            h = call1(v, s.deconstruct_keys, keys);
+            if (!isHash(h))
+                raise(cTypeError, "deconstruct_keys must return Hash");
+        }
+        RHash *hp = href(h);
+        for (size_t i = 0; i < pn->keys.size(); ++i)
+        {
+            bool found = false;
+            V val = hget(hp, symv(pn->keys[i]), &found);
+            if (!found)
+                return false;
+            if (pn->keyPats[i])
+            {
+                if (!matchPattern(pn->keyPats[i], val, f))
+                    return false;
+            }
+            else if (pn->keyVars[i])
+                assignTo(pn->keyVars[i], val, f);
+        }
+        if (pn->nilRest || pn->hashRest)
+        {
+            V rest = newHash();
+            for (size_t i = 0; i < hp->keys.size(); ++i)
+            {
+                V k = hp->keys[i];
+                if (k == Qundef)
+                    continue;
+                bool named = false;
+                for (Sym key : pn->keys)
+                    if (k == symv(key))
+                        named = true;
+                if (!named)
+                    hset(href(rest), k, hp->vals[i]);
+            }
+            if (pn->nilRest && href(rest)->live > 0)
+                return false;
+            if (pn->hashRestVar)
+                assignTo(pn->hashRestVar, rest, f);
+        }
+        return true;
+    }
+    default: break;
+    }
+    raise(cNotImplementedError, "unsupported pattern");
+}
+
+V Interp::evalBegin(BeginNode *n, Frame *f)
+{
+    if (n->rescues.empty() && !n->ensure && !n->els)
+        return eval(n->body, f);
+    V *saveSp = sp;
+    Frame *saveFrame = frame;
+    int saveDepth = depth;
+    V r = Qnil;
+    if (n->ensure)
+    {
+        int thrown = 0;
+        V ex1 = Qnil, ex2 = Qnil;
+        uint64_t exTag = 0;
+        try
+        {
+            r = n->rescues.empty() && !n->els ? eval(n->body, f) : evalRescue(n, f);
+        }
+        catch (RubyError &e)
+        {
+            thrown = 1;
+            ex1 = e.exc;
+        }
+        catch (BreakEx &e)
+        {
+            thrown = 2;
+            exTag = e.tag;
+            ex1 = e.val;
+        }
+        catch (ReturnEx &e)
+        {
+            thrown = 3;
+            exTag = e.home;
+            ex1 = e.val;
+        }
+        catch (ThrowEx &e)
+        {
+            thrown = 4;
+            ex1 = e.tag;
+            ex2 = e.val;
+        }
+        catch (StopEx &e)
+        {
+            thrown = 5;
+            exTag = e.tag;
+        }
+        // Ruby code never runs inside a catch block: another thread of
+        // control could run and throw there
+        if (thrown)
+        {
+            sp = saveSp;
+            frame = saveFrame;
+            depth = saveDepth;
+            unwind = U_NONE;
+            eval(n->ensure, f);
+            if (unwind)
+                return Qnil; // the ensure clause jumped: the exception is dropped
+            switch (thrown)
+            {
+            case 1: throw RubyError{ex1};
+            case 2: throw BreakEx{exTag, ex1};
+            case 3: throw ReturnEx{exTag, ex1};
+            case 4: throw ThrowEx{ex1, ex2};
+            default: throw StopEx{exTag};
+            }
+        }
+        Unwind su = unwind;
+        V sv = unwindVal;
+        unwind = U_NONE;
+        eval(n->ensure, f);
+        if (!unwind)
+        {
+            unwind = su;
+            unwindVal = sv;
+        }
+        return r;
+    }
+    return evalRescue(n, f);
+}
+
+// begin's body with its rescue and else clauses (ensure is evalBegin's)
+V Interp::evalRescue(BeginNode *n, Frame *f)
+{
+    V *saveSp = sp;
+    Frame *saveFrame = frame;
+    int saveDepth = depth;
+    V r = Qnil;
+    for (;;)
+    {
+        bool ok = false;
+        V caught = Qnil;
+        try
+        {
+            r = eval(n->body, f);
+            ok = true;
+        }
+        catch (RubyError &e)
+        {
+            sp = saveSp;
+            frame = saveFrame;
+            depth = saveDepth;
+            unwind = U_NONE;
+            caught = e.exc;
+        }
+        if (ok)
+        {
+            if (!unwind && n->els)
+                r = eval(n->els, f);
+            return r;
+        }
+        RescueClause *hit = nullptr;
+        for (RescueClause &rc : n->rescues)
+        {
+            if (rc.classes.empty())
+            {
+                if (kindOf(caught, cStandardError))
+                {
+                    hit = &rc;
+                    break;
+                }
+                continue;
+            }
+            for (Node *cn : rc.classes)
+            {
+                std::vector<V> classes;
+                if (cn->kind == N::Splat)
+                {
+                    V arr = arrayOf(eval(static_cast<UnaryNode *>(cn)->expr, f));
+                    classes = aref(arr);
+                }
+                else
+                    classes.push_back(eval(cn, f));
+                for (V c : classes)
+                {
+                    if (!isType(c, T::Class) && !isType(c, T::Module))
+                        raise(cTypeError, "class or module required for rescue clause");
+                    if (caseEq(c, caught))
+                    {
+                        hit = &rc;
+                        break;
+                    }
+                }
+                if (hit)
+                    break;
+            }
+            if (hit)
+                break;
+        }
+        if (!hit)
+            throw RubyError{caught};
+        V savedErr = globals[s.bang];
+        globals[s.bang] = caught;
+        if (hit->var)
+            assignTo(hit->var, caught, f);
+        try
+        {
+            r = hit->body ? eval(hit->body, f) : Qnil;
+        }
+        catch (...)
+        {
+            globals[s.bang] = savedErr;
+            throw;
+        }
+        globals[s.bang] = savedErr;
+        if (unwind == U_RETRY)
+        {
+            unwind = U_NONE;
+            continue;
+        }
+        return r;
+    }
+}
+
+V Interp::evalDefined(Node *e, Frame *f)
+{
+    switch (e->kind)
+    {
+    case N::LVar: return strFrozen("local-variable");
+    case N::IVar: return ivarDefined(f->c->self, static_cast<VarNode *>(e)->name) ? strFrozen("instance-variable") : Qnil;
+    case N::GVar:
+    {
+        auto *v = static_cast<VarNode *>(e);
+        return globals.count(v->name) ? strFrozen("global-variable") : Qnil;
+    }
+    case N::CVar:
+    {
+        auto *v = static_cast<VarNode *>(e);
+        RClass *k = f->c->lex ? f->c->lex->klass : cObject;
+        for (RClass *a : ancestors(k))
+            if (a->cvars.count(v->name))
+                return strFrozen("class variable");
+        return Qnil;
+    }
+    case N::Const:
+    {
+        auto *c = static_cast<ConstNode *>(e);
+        try
+        {
+            if (c->scope)
+            {
+                V sv = eval(c->scope, f);
+                if (!isType(sv, T::Class) && !isType(sv, T::Module))
+                    return Qnil;
+                return constIn(static_cast<RClass *>(op(sv)), c->name, true, false) == Qundef ? Qnil : strFrozen("constant");
+            }
+            return lookupConst(f->c->lex, c->name, false) == Qundef ? Qnil : strFrozen("constant");
+        }
+        catch (RubyError &)
+        {
+            return Qnil;
+        }
+    }
+    case N::Call:
+    {
+        auto *c = static_cast<CallNode *>(e);
+        if (!c->recv)
+            return respondTo(f->c->self, c->name, true) ? strFrozen("method") : Qnil;
+        try
+        {
+            V r = eval(c->recv, f);
+            return respondTo(r, c->name) ? strFrozen("method") : Qnil;
+        }
+        catch (RubyError &)
+        {
+            return Qnil;
+        }
+    }
+    case N::Yield: return f->c->blk ? strFrozen("yield") : Qnil;
+    case N::Super:
+    case N::ZSuper:
+    {
+        Method *m = f->c->method;
+        if (!m)
+            return Qnil;
+        RClass *foundIn = nullptr;
+        return findMethodAfter(classOf(f->c->self), m->owner, m->name, &foundIn) ? strFrozen("super") : Qnil;
+    }
+    case N::Self: return strFrozen("self");
+    case N::Nil: return strFrozen("expression");
+    case N::True: return strFrozen("expression");
+    case N::False: return strFrozen("expression");
+    case N::LAsgn:
+    case N::IAsgn:
+    case N::GAsgn:
+    case N::CAsgn:
+    case N::ConstAsgn:
+    case N::OpAsgn:
+    case N::MAsgn: return strFrozen("assignment");
+    default: return strFrozen("expression");
+    }
+}
+
+// ── definitions ───────────────────────────────────────────────────────────
+
+V Interp::evalDef(DefNode *n, Frame *f)
+{
+    auto *m = new Method();
+    m->name = n->name;
+    m->kind = M_RUBY;
+    m->def = n;
+    m->lex = f->c->lex;
+    if (n->singleton)
+    {
+        V target = eval(n->singleton, f);
+        if (unwind)
+            return Qnil;
+        RClass *k = singletonOf(target);
+        m->owner = k;
+        addMethod(k, n->name, m);
+        Method *hook = findMethod(classOf(target), intern("singleton_method_added"));
+        if (hook && hook->kind != M_NATIVE)
+        {
+            V av = symv(n->name);
+            call(target, intern("singleton_method_added"), 1, &av);
+        }
+        return symv(n->name);
+    }
+    RClass *k = f->c->defTarget ? f->c->defTarget : cObject;
+    m->owner = k;
+    if (f->kind == 0 && k == cObject)
+        m->vis = V_PRIVATE;
+    else
+        m->vis = k->defaultVis;
+    const std::string &nm = symName(n->name);
+    if (nm == "initialize" || nm == "initialize_copy" || nm == "respond_to_missing?")
+        m->vis = V_PRIVATE;
+    addMethod(k, n->name, m);
+    if (k->moduleFunction)
+    {
+        auto *pub = new Method(*m);
+        pub->vis = V_PUBLIC;
+        RClass *sk = singletonOf(ov(k));
+        pub->owner = sk;
+        addMethod(sk, n->name, pub);
+        m->vis = V_PRIVATE;
+    }
+    // Module#method_added hook, when a class defines one
+    if (!k->isSingleton)
+    {
+        Method *hook = findMethod(classOf(ov(k)), s.method_added);
+        if (hook && hook->kind != M_NATIVE)
+        {
+            V av = symv(n->name);
+            call(ov(k), s.method_added, 1, &av);
+        }
+    }
+    return symv(n->name);
+}
+
+V Interp::evalClass(ClassNode *n, Frame *f)
+{
+    RClass *k;
+    if (n->kind == N::SClass)
+    {
+        V target = eval(n->target, f);
+        if (unwind)
+            return Qnil;
+        k = singletonOf(target);
+    }
+    else
+    {
+        RClass *under;
+        ConstNode *path = n->path;
+        if (path->top)
+            under = cObject;
+        else if (path->scope)
+        {
+            V sv = eval(path->scope, f);
+            if (!isType(sv, T::Class) && !isType(sv, T::Module))
+                raise(cTypeError, inspect(sv) + " is not a class/module");
+            under = static_cast<RClass *>(op(sv));
+        }
+        else
+            under = f->c->lex ? f->c->lex->klass : cObject;
+        V existing = Qundef;
+        auto it = under->consts.find(path->name);
+        if (it != under->consts.end())
+            existing = it->second;
+        else if (under == cObject && !path->scope)
+            existing = Qundef;
+        V superV = Qundef;
+        if (n->superclass)
+        {
+            superV = eval(n->superclass, f);
+            if (unwind)
+                return Qnil;
+            if (!isType(superV, T::Class))
+                raise(cTypeError, "superclass must be an instance of Class (given an instance of " +
+                                      className(realClassOf(superV)) + ")");
+        }
+        if (existing == Qundef && under == cObject && !path->scope)
+        {
+            // standard library classes reopened before use: load them first
+            V lib = lookupConst(nullptr, path->name, false);
+            if (lib != Qundef && (isType(lib, T::Class) || isType(lib, T::Module)))
+                existing = lib;
+        }
+        if (existing != Qundef)
+        {
+            bool wantModule = n->kind == N::Module;
+            if (!isType(existing, wantModule ? T::Module : T::Class))
+                raise(cTypeError, symName(path->name) + " is not a " + (wantModule ? "module" : "class"));
+            k = static_cast<RClass *>(op(existing));
+            if (superV != Qundef && k->super && realClass(k->super) != static_cast<RClass *>(op(superV)))
+                raise(cTypeError, "superclass mismatch for class " + symName(path->name));
+        }
+        else
+        {
+            if (n->kind == N::Module)
+                k = newClass(nullptr, true);
+            else
+            {
+                RClass *sup = superV == Qundef ? cObject : static_cast<RClass *>(op(superV));
+                if (sup->isSingleton)
+                    raise(cTypeError, "can't make subclass of singleton class");
+                if (sup == cClass)
+                    raise(cTypeError, "can't make subclass of Class");
+                k = newClass(sup, false);
+            }
+            nameClass(k, path->name, under);
+            setConst(under, path->name, ov(k));
+            if (n->kind == N::Class)
+            {
+                RClass *sup = k->super;
+                Method *hook = findMethod(classOf(ov(sup)), s.inherited);
+                if (hook && hook->kind != M_NATIVE)
+                {
+                    V av = ov(k);
+                    call(ov(sup), s.inherited, 1, &av);
+                }
+            }
+        }
+    }
+    Ctx c;
+    c.self = ov(k);
+    auto *lex = new LexScope();
+    lex->klass = k;
+    lex->parent = f->c->lex;
+    c.lex = lex;
+    c.defTarget = k;
+    c.homeId = ++frameCounter;
+    Frame fr;
+    fr.c = &c;
+    fr.prev = frame;
+    fr.kind = 3;
+    fr.line = n->line;
+    fr.scope = n->scope;
+    fr.env = newEnv((int)n->scope->names.size(), nullptr);
+    Vis savedVis = k->defaultVis;
+    bool savedMf = k->moduleFunction;
+    k->defaultVis = V_PUBLIC;
+    k->moduleFunction = false;
+    Frame *savedFrame = frame;
+    frame = &fr;
+    V r = Qnil;
+    try
+    {
+        if (n->body)
+            r = eval(n->body, &fr);
+    }
+    catch (...)
+    {
+        frame = savedFrame;
+        k->defaultVis = savedVis;
+        k->moduleFunction = savedMf;
+        throw;
+    }
+    frame = savedFrame;
+    k->defaultVis = savedVis;
+    k->moduleFunction = savedMf;
+    if (unwind == U_NEXT || unwind == U_BREAK)
+        unwind = U_NONE;
+    return r;
+}
+
+} // namespace ruby

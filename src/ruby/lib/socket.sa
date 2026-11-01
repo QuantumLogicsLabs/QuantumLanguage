@@ -1,0 +1,221 @@
+# Loopback sockets inside the process: a connection is a pair of queues, so
+# client and server threads talk without the operating system's network.
+class SocketError < StandardError; end
+class IOError; end
+
+class BasicSocket
+  def initialize
+    @in = Queue.new
+    @buf = +""
+    @closed = false
+  end
+
+  def __link(peer)
+    @peer = peer
+    self
+  end
+
+  def __feed(s) = @in.push(s)
+
+  def __fill
+    return false if @eof
+    s = @in.pop
+    if s.nil?
+      @eof = true
+      return false
+    end
+    @buf << s
+    true
+  end
+
+  def write(*items)
+    raise IOError, "closed stream" if @closed
+    n = 0
+    items.each do |x|
+      s = x.to_s
+      @peer&.__feed(s)
+      n += s.bytesize
+    end
+    n
+  end
+  alias syswrite write
+  def send(data, *) = write(data)
+
+  def <<(x)
+    write(x)
+    self
+  end
+
+  def print(*items)
+    write(*items)
+    nil
+  end
+
+  def puts(*items)
+    if items.empty?
+      write("\n")
+      return nil
+    end
+    items.flatten.each do |x|
+      s = x.to_s
+      write(s.end_with?("\n") ? s : s + "\n")
+    end
+    nil
+  end
+
+  def gets(sep = "\n", chomp: false)
+    raise IOError, "closed stream" if @closed
+    until (i = sep && @buf.index(sep))
+      break unless __fill
+    end
+    return nil if @buf.empty?
+    line = i ? @buf.slice!(0, i + sep.size) : @buf.slice!(0, @buf.size)
+    chomp ? line.chomp : line
+  end
+
+  def read(n = nil)
+    if n
+      nil while @buf.bytesize < n && __fill
+      return nil if @buf.empty? && n > 0
+      s = @buf.byteslice(0, n)
+      @buf = @buf.byteslice(s.bytesize, @buf.bytesize) || +""
+      return s
+    end
+    nil while __fill
+    s = @buf
+    @buf = +""
+    s
+  end
+
+  def recv(n, *)
+    __fill if @buf.empty?
+    read([n, @buf.bytesize].min)
+  end
+  alias readpartial recv
+  alias sysread recv
+
+  def readline(*a, **k) = gets(*a, **k) || raise(EOFError, "end of file reached")
+
+  def each_line
+    return to_enum(:each_line) unless block_given?
+    while (l = gets)
+      yield l
+    end
+    self
+  end
+  alias each each_line
+
+  def eof?
+    __fill if @buf.empty?
+    @buf.empty?
+  end
+
+  def close
+    return nil if @closed
+    @closed = true
+    @peer&.__feed(nil)
+    nil
+  end
+
+  def close_write
+    @peer&.__feed(nil)
+    nil
+  end
+
+  def close_read = nil
+  def closed? = @closed
+  def flush = self
+  def sync = true
+  def sync=(v)
+    v
+  end
+  def setsockopt(*) = 0
+  def addr(*) = ["AF_INET", @port || 0, "127.0.0.1", "127.0.0.1"]
+  def peeraddr(*) = ["AF_INET", @peer_port || 0, "127.0.0.1", "127.0.0.1"]
+  def __ports(mine, theirs)
+    @port = mine
+    @peer_port = theirs
+    self
+  end
+end
+
+class IPSocket < BasicSocket; end
+
+class TCPSocket < IPSocket
+  def self.open(*a)
+    s = new(*a)
+    return s unless block_given?
+    begin
+      yield s
+    ensure
+      s.close
+    end
+  end
+
+  def initialize(host = nil, port = nil, *)
+    super()
+    return if host.nil? && port.nil?
+    server = TCPServer.__listeners[port.to_i]
+    raise Errno::ECONNREFUSED, "connect(2) for \"#{host}\" port #{port}" unless server
+    server.__connect(self)
+  end
+end
+
+class TCPServer < IPSocket
+  @listeners = {}
+  @next_port = 49152
+
+  def self.__listeners = @listeners
+  def self.__auto_port = (@next_port += 1)
+
+  def self.open(*a)
+    s = new(*a)
+    return s unless block_given?
+    begin
+      yield s
+    ensure
+      s.close
+    end
+  end
+
+  def initialize(host = nil, port = nil)
+    super()
+    port, host = host, nil if port.nil?
+    @port = port.to_i
+    @port = TCPServer.__auto_port if @port == 0
+    raise Errno::EADDRINUSE, "bind(2) for \"#{host}\" port #{@port}" if TCPServer.__listeners[@port]
+    TCPServer.__listeners[@port] = self
+    @backlog = Queue.new
+  end
+
+  def __connect(client)
+    conn = TCPSocket.new
+    @last_port = (@last_port || 50000) + 1
+    client.__link(conn).__ports(@last_port, @port)
+    conn.__link(client).__ports(@port, @last_port)
+    @backlog.push(conn)
+  end
+
+  def accept
+    raise IOError, "closed stream" if @closed
+    c = @backlog.pop
+    raise IOError, "closed stream" if c.nil?
+    c
+  end
+
+  def accept_nonblock(*)
+    @backlog.pop(true)
+  end
+
+  def listen(*) = 0
+
+  def close
+    return nil if @closed
+    @closed = true
+    TCPServer.__listeners.delete(@port)
+    @backlog.close
+    nil
+  end
+end
+
+Socket = BasicSocket

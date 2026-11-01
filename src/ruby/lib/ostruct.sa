@@ -1,0 +1,28 @@
+class OpenStruct
+  def initialize(hash = nil)
+    @table = {}
+    hash&.each { |k, v| @table[k.to_sym] = v }
+  end
+
+  def [](k) = @table[k.to_sym]
+
+  def []=(k, v)
+    @table[k.to_sym] = v
+  end
+
+  def to_h = @table.dup
+  def each_pair(&b) = @table.each_pair(&b)
+  def respond_to_missing?(n, p = false) = @table.key?(n.to_s.chomp("=").to_sym) || super
+  def dig(k, *r) = r.empty? ? @table[k.to_sym] : @table[k.to_sym]&.dig(*r)
+  def delete_field(k) = @table.delete(k.to_sym)
+
+  def method_missing(n, *a)
+    s = n.to_s
+    return @table[s.chomp("=").to_sym] = a[0] if s.end_with?("=")
+    @table[n]
+  end
+
+  def ==(o) = o.is_a?(OpenStruct) && to_h == o.to_h
+  def inspect = @table.empty? ? "#<OpenStruct>" : "#<OpenStruct #{@table.map { |k, v| "#{k}=#{v.inspect}" }.join(', ')}>"
+  alias to_s inspect
+end

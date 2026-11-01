@@ -1,0 +1,960 @@
+// quantum: cpp
+// Ruby front-end: the object model. Classes and modules, method tables and
+// lookup (with a global method cache), singleton classes, instance
+// variables, exceptions and the basic value constructors.
+#include "RubyRt.h.sa"
+
+#include <cstdio>
+#include <cstring>
+
+namespace ruby
+{
+
+Interp *g_interp = nullptr;
+
+namespace
+{
+
+const int kMethodCache = 4096;
+std::vector<RClass *> g_mcK;
+std::vector<Sym> g_mcS;
+std::vector<Method *> g_mcM;
+std::vector<int> g_mcV;
+int g_hierVersion = 0;
+
+void addChain(RClass *mod, std::vector<RClass *> &out)
+{
+    for (size_t i = mod->prepends.size(); i-- > 0;)
+        addChain(mod->prepends[i], out);
+    out.push_back(mod);
+    for (size_t i = mod->includes.size(); i-- > 0;)
+        addChain(mod->includes[i], out);
+}
+
+} // namespace
+
+Interp::Interp()
+{
+    g_interp = this;
+    g_mcK.assign(kMethodCache, nullptr);
+    g_mcS.assign(kMethodCache, 0);
+    g_mcM.assign(kMethodCache, nullptr);
+    g_mcV.assign(kMethodCache, -1);
+    stack.assign(1 << 20, Qnil);
+    sp = stack.data();
+    stackEnd = stack.data() + stack.size() - 64;
+    s.initialize = intern("initialize");
+    s.inspect = intern("inspect");
+    s.to_s = intern("to_s");
+    s.to_str = intern("to_str");
+    s.to_a = intern("to_a");
+    s.to_ary = intern("to_ary");
+    s.to_h = intern("to_h");
+    s.to_hash = intern("to_hash");
+    s.to_proc = intern("to_proc");
+    s.to_i = intern("to_i");
+    s.to_int = intern("to_int");
+    s.to_f = intern("to_f");
+    s.to_r = intern("to_r");
+    s.to_sym = intern("to_sym");
+    s.call = intern("call");
+    s.each = intern("each");
+    s.eq = intern("==");
+    s.eqq = intern("===");
+    s.eql = intern("eql?");
+    s.hash = intern("hash");
+    s.cmp = intern("<=>");
+    s.lt = intern("<");
+    s.gt = intern(">");
+    s.le = intern("<=");
+    s.ge = intern(">=");
+    s.plus = intern("+");
+    s.minus = intern("-");
+    s.mul = intern("*");
+    s.div = intern("/");
+    s.mod = intern("%");
+    s.pow = intern("**");
+    s.aref = intern("[]");
+    s.aset = intern("[]=");
+    s.not_ = intern("!");
+    s.neq = intern("!=");
+    s.match = intern("=~");
+    s.method_missing = intern("method_missing");
+    s.respond_to_missing = intern("respond_to_missing?");
+    s.respond_to = intern("respond_to?");
+    s.coerce = intern("coerce");
+    s.message = intern("message");
+    s.new_ = intern("new");
+    s.included = intern("included");
+    s.extended = intern("extended");
+    s.inherited = intern("inherited");
+    s.prepended = intern("prepended");
+    s.method_added = intern("method_added");
+    s.initialize_copy = intern("initialize_copy");
+    s.size = intern("size");
+    s.succ = intern("succ");
+    s.deconstruct = intern("deconstruct");
+    s.deconstruct_keys = intern("deconstruct_keys");
+    s.exception = intern("exception");
+    s.backtrace = intern("backtrace");
+    s.key = intern("__key");
+    s.receiver = intern("__receiver");
+    s.name = intern("__name");
+    s.result = intern("__result");
+    s.mesg = intern("__mesg");
+    s.bt = intern("__bt");
+    s.cause = intern("__cause");
+    s.keys = intern("keys");
+    s.values = intern("values");
+    s.members = intern("members");
+    s.it = intern("it");
+    s.bang = intern("$!");
+    s.each_pair = intern("each_pair");
+    s.to_enum = intern("to_enum");
+    s.lambda_ = intern("lambda");
+    s.begin = intern("begin");
+    s.end = intern("end");
+    bootstrap();
+}
+
+// ── values ────────────────────────────────────────────────────────────────
+
+V Interp::flo(double d)
+{
+    V bits = *reinterpret_cast<V *>(&d);
+    int b = (int)((bits >> 60) & 7);
+    if (bits != 0x3000000000000000ULL && !((b - 3) & ~1))
+        return (((bits << 3) | (bits >> 61)) & ~(V)1) | 2;
+    if (bits == 0)
+        return 0x8000000000000002ULL;
+    auto *f = new RFloat();
+    f->klass = cFloat;
+    f->type = T::Float;
+    f->frozen = true;
+    f->d = d;
+    return ov(f);
+}
+
+double Interp::fltv(V v)
+{
+    if (isFlonum(v))
+    {
+        if (v == 0x8000000000000002ULL)
+            return 0.0;
+        V b63 = v >> 63;
+        V t = (2 - b63) | (v & ~(V)3);
+        t = (t >> 3) | (t << 61);
+        return *reinterpret_cast<double *>(&t);
+    }
+    return static_cast<RFloat *>(op(v))->d;
+}
+
+V Interp::str(const std::string &text)
+{
+    auto *r = new RString();
+    r->klass = cString;
+    r->type = T::String;
+    r->s = text;
+    return ov(r);
+}
+
+V strNew(Interp &I, const std::string &s) { return I.str(s); }
+
+V Interp::strFrozen(const std::string &text)
+{
+    V v = str(text);
+    op(v)->frozen = true;
+    return v;
+}
+
+V Interp::ary()
+{
+    auto *a = new RArray();
+    a->klass = cArray;
+    a->type = T::Array;
+    return ov(a);
+}
+
+V Interp::ary(const std::vector<V> &items)
+{
+    auto *a = new RArray();
+    a->klass = cArray;
+    a->type = T::Array;
+    a->a = items;
+    return ov(a);
+}
+
+V Interp::ary2(V x, V y)
+{
+    auto *a = new RArray();
+    a->klass = cArray;
+    a->type = T::Array;
+    a->a.push_back(x);
+    a->a.push_back(y);
+    return ov(a);
+}
+
+void Interp::arrayCompact(RArray *r)
+{
+    r->a.erase(r->a.begin(), r->a.begin() + r->skip);
+    r->skip = 0;
+}
+
+V Interp::newHash()
+{
+    auto *h = new RHash();
+    h->klass = cHash;
+    h->type = T::Hash;
+    return ov(h);
+}
+
+V Interp::range(V lo, V hi, bool excl)
+{
+    auto *r = new RRange();
+    r->klass = cRange;
+    r->type = T::Range;
+    r->lo = lo;
+    r->hi = hi;
+    r->excl = excl;
+    return ov(r);
+}
+
+// ── classes ───────────────────────────────────────────────────────────────
+
+RClass *Interp::classOf(V v)
+{
+    if (isObj(v))
+        return op(v)->klass;
+    if (isFix(v))
+        return cInteger;
+    if (isFlonum(v))
+        return cFloat;
+    if (isSymV(v))
+        return cSymbol;
+    if (v == Qnil)
+        return cNil;
+    if (v == Qtrue)
+        return cTrue;
+    return cFalse;
+}
+
+RClass *Interp::realClass(RClass *k)
+{
+    while (k && k->isSingleton)
+        k = k->super;
+    return k;
+}
+
+std::vector<RClass *> &Interp::ancestors(RClass *k)
+{
+    if (k->ancVersion == g_hierVersion)
+        return k->anc;
+    std::vector<RClass *> out;
+    addChain(k, out);
+    if (k->super)
+    {
+        std::vector<RClass *> &up = ancestors(k->super);
+        for (RClass *a : up)
+            out.push_back(a);
+    }
+    // a module included twice stays at its last (outermost) place
+    std::vector<RClass *> dedup;
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        bool later = false;
+        if (out[i]->isModule)
+            for (size_t j = i + 1; j < out.size(); ++j)
+                if (out[j] == out[i])
+                {
+                    later = true;
+                    break;
+                }
+        if (!later)
+            dedup.push_back(out[i]);
+    }
+    k->anc = dedup;
+    k->ancVersion = g_hierVersion;
+    return k->anc;
+}
+
+Method *Interp::findMethodIn(RClass *k, Sym name, RClass **foundIn)
+{
+    std::vector<RClass *> &anc = ancestors(k);
+    for (size_t i = 0; i < anc.size(); ++i)
+    {
+        RClass *a = anc[i];
+        auto it = a->mt.find(name);
+        if (it != a->mt.end())
+        {
+            if (it->second->kind == M_UNDEF)
+                return nullptr;
+            if (foundIn)
+                *foundIn = a;
+            return it->second;
+        }
+    }
+    return nullptr;
+}
+
+Method *Interp::findMethod(RClass *k, Sym name)
+{
+    size_t h = ((reinterpret_cast<size_t>(k) >> 4) ^ ((size_t)name * 2654435761u)) & (kMethodCache - 1);
+    if (g_mcK[h] == k && g_mcS[h] == name && g_mcV[h] == methodVersion)
+        return g_mcM[h];
+    Method *m = findMethodIn(k, name, nullptr);
+    g_mcK[h] = k;
+    g_mcS[h] = name;
+    g_mcM[h] = m;
+    g_mcV[h] = methodVersion;
+    return m;
+}
+
+Method *Interp::findMethodAfter(RClass *k, RClass *after, Sym name, RClass **foundIn)
+{
+    std::vector<RClass *> &anc = ancestors(k);
+    size_t i = 0;
+    while (i < anc.size() && anc[i] != after)
+        ++i;
+    for (++i; i < anc.size(); ++i)
+    {
+        auto it = anc[i]->mt.find(name);
+        if (it != anc[i]->mt.end())
+        {
+            if (it->second->kind == M_UNDEF)
+                return nullptr;
+            if (foundIn)
+                *foundIn = anc[i];
+            return it->second;
+        }
+    }
+    return nullptr;
+}
+
+bool Interp::respondTo(V v, Sym name, bool priv)
+{
+    Method *m = findMethod(classOf(v), name);
+    if (!m && !loaded.count("core_ext"))
+    {
+        loadLibrary("core_ext");
+        m = findMethod(classOf(v), name);
+    }
+    if (m && m->kind != M_UNDEF)
+        return priv || m->vis == V_PUBLIC;
+    Method *rm = findMethod(classOf(v), s.respond_to_missing);
+    if (rm && rm->kind != M_NATIVE)
+    {
+        V av[2] = {symv(name), boolv(priv)};
+        return truthy(call(v, s.respond_to_missing, 2, av));
+    }
+    return false;
+}
+
+bool Interp::kindOf(V v, RClass *k)
+{
+    RClass *c = classOf(v);
+    if (!k->isModule)
+    {
+        for (RClass *x = c; x; x = x->super)
+            if (x == k)
+                return true;
+        return false;
+    }
+    for (RClass *a : ancestors(c))
+        if (a == k)
+            return true;
+    return false;
+}
+
+bool Interp::isSubclass(RClass *a, RClass *b)
+{
+    for (RClass *x : ancestors(a))
+        if (x == b)
+            return true;
+    return false;
+}
+
+RClass *Interp::newClass(RClass *super, bool module)
+{
+    auto *k = new RClass();
+    k->type = module ? T::Module : T::Class;
+    k->klass = module ? cModule : cClass;
+    k->isModule = module;
+    k->super = super;
+    if (super)
+    {
+        k->instType = super->instType;
+        super->subclasses.push_back(k);
+    }
+    if (!module && cClass)
+    {
+        // every class has its metaclass: class methods are inherited through it
+        auto *meta = new RClass();
+        meta->type = T::Class;
+        meta->klass = cClass;
+        meta->isSingleton = true;
+        meta->attached = ov(k);
+        meta->super = super ? singletonOf(ov(super)) : cClass;
+        k->klass = meta;
+    }
+    return k;
+}
+
+void Interp::nameClass(RClass *k, Sym name, RClass *under)
+{
+    k->baseName = name;
+    if (!under || under == cObject)
+        k->name = symName(name);
+    else
+        k->name = (under->name.empty() ? std::string("") : under->name + "::") + symName(name);
+    k->lexParent = under;
+}
+
+RClass *Interp::defineClass(const std::string &name, RClass *super, RClass *under)
+{
+    RClass *k = newClass(super, false);
+    nameClass(k, intern(name), under ? under : cObject);
+    setConst(under ? under : cObject, intern(name), ov(k));
+    return k;
+}
+
+RClass *Interp::defineModule(const std::string &name, RClass *under)
+{
+    RClass *k = newClass(nullptr, true);
+    nameClass(k, intern(name), under ? under : cObject);
+    setConst(under ? under : cObject, intern(name), ov(k));
+    return k;
+}
+
+RClass *Interp::singletonOf(V v)
+{
+    if (!isObj(v))
+    {
+        if (v == Qnil)
+            return cNil;
+        if (v == Qtrue)
+            return cTrue;
+        if (v == Qfalse)
+            return cFalse;
+        raise(cTypeError, "can't define singleton");
+    }
+    Obj *o = op(v);
+    if (o->klass->isSingleton && o->klass->attached == v)
+        return o->klass;
+    auto *sc = new RClass();
+    sc->type = T::Class;
+    sc->klass = cClass;
+    sc->isSingleton = true;
+    sc->attached = v;
+    if (o->type == T::Class)
+    {
+        auto *k = static_cast<RClass *>(o);
+        sc->super = k->super ? singletonOf(ov(k->super)) : cClass;
+    }
+    else
+        sc->super = o->klass;
+    sc->instType = o->klass->instType;
+    if (o->type != T::Class && o->type != T::Module)
+        sc->klass = o->klass->klass; // class methods reach the object's singleton class
+    o->klass = sc;
+    return sc;
+}
+
+Method *Interp::addMethod(RClass *k, Sym name, Method *m)
+{
+    if (loadingCoreExt && k->mt.count(name))
+        return k->mt[name];
+    m->name = name;
+    if (!m->owner)
+        m->owner = k;
+    if (!k->mt.count(name))
+        k->mtOrder.push_back(name);
+    k->mt[name] = m;
+    ++methodVersion;
+    return m;
+}
+
+Method *Interp::defn(RClass *k, const char *name, NativeFn fn, int minArgs, int maxArgs)
+{
+    auto *m = new Method();
+    m->kind = M_NATIVE;
+    m->fn = fn;
+    m->minArgs = (int16_t)minArgs;
+    m->maxArgs = (int16_t)maxArgs;
+    m->owner = k;
+    return addMethod(k, intern(name), m);
+}
+
+Method *Interp::defs(RClass *k, const char *name, NativeFn fn, int minArgs, int maxArgs)
+{
+    return defn(singletonOf(ov(k)), name, fn, minArgs, maxArgs);
+}
+
+Method *Interp::defnPriv(RClass *k, const char *name, NativeFn fn, int minArgs, int maxArgs)
+{
+    Method *m = defn(k, name, fn, minArgs, maxArgs);
+    m->vis = V_PRIVATE;
+    return m;
+}
+
+void Interp::includeModule(RClass *k, RClass *mod)
+{
+    for (RClass *a : ancestors(k))
+        if (a == mod)
+            return;
+    k->includes.push_back(mod);
+    ++g_hierVersion;
+    ++methodVersion;
+}
+
+void Interp::prependModule(RClass *k, RClass *mod)
+{
+    for (RClass *p : k->prepends)
+        if (p == mod)
+            return;
+    k->prepends.push_back(mod);
+    ++g_hierVersion;
+    ++methodVersion;
+}
+
+void Interp::extendObject(V obj, RClass *mod)
+{
+    includeModule(singletonOf(obj), mod);
+}
+
+// ── objects ───────────────────────────────────────────────────────────────
+
+V Interp::ivarGet(V obj, Sym name)
+{
+    if (!isObj(obj))
+        return Qnil;
+    Obj *o = op(obj);
+    for (int i = 0; i < o->niv; ++i)
+        if (o->ivn[i] == name)
+            return o->ivv[i];
+    return Qnil;
+}
+
+bool Interp::ivarDefined(V obj, Sym name)
+{
+    if (!isObj(obj))
+        return false;
+    Obj *o = op(obj);
+    for (int i = 0; i < o->niv; ++i)
+        if (o->ivn[i] == name)
+            return true;
+    return false;
+}
+
+void Interp::ivarSet(V obj, Sym name, V value)
+{
+    if (!isObj(obj))
+        frozenError(obj);
+    Obj *o = op(obj);
+    for (int i = 0; i < o->niv; ++i)
+        if (o->ivn[i] == name)
+        {
+            o->ivv[i] = value;
+            return;
+        }
+    if (o->niv == o->civ)
+    {
+        int cap = o->civ ? o->civ * 2 : 4;
+        Sym *nn = new Sym[cap];
+        V *nv = new V[cap];
+        for (int i = 0; i < o->niv; ++i)
+        {
+            nn[i] = o->ivn[i];
+            nv[i] = o->ivv[i];
+        }
+        o->ivn = nn;
+        o->ivv = nv;
+        o->civ = cap;
+    }
+    o->ivn[o->niv] = name;
+    o->ivv[o->niv] = value;
+    ++o->niv;
+}
+
+V Interp::allocate(RClass *k)
+{
+    switch (k->instType)
+    {
+    case T::String:
+    {
+        auto *r = new RString();
+        r->klass = k;
+        r->type = T::String;
+        return ov(r);
+    }
+    case T::Array:
+    {
+        auto *r = new RArray();
+        r->klass = k;
+        r->type = T::Array;
+        return ov(r);
+    }
+    case T::Hash:
+    {
+        auto *r = new RHash();
+        r->klass = k;
+        r->type = T::Hash;
+        return ov(r);
+    }
+    case T::Range:
+    {
+        auto *r = new RRange();
+        r->klass = k;
+        r->type = T::Range;
+        return ov(r);
+    }
+    case T::Data:
+    {
+        auto *r = new RData();
+        r->klass = k;
+        r->type = T::Data;
+        return ov(r);
+    }
+    default:
+    {
+        auto *o = new Obj();
+        o->klass = k;
+        return ov(o);
+    }
+    }
+}
+
+V Interp::newObject(RClass *k) { return allocate(k); }
+
+bool Interp::frozen(V v)
+{
+    if (!isObj(v))
+        return true;
+    return op(v)->frozen;
+}
+
+void Interp::checkFrozen(V v)
+{
+    if (!isObj(v) || op(v)->frozen)
+        frozenError(v);
+}
+
+void Interp::frozenError(V v)
+{
+    V exc = makeExc(cFrozenError, "can't modify frozen " + className(realClassOf(v)) + ": " + inspect(v));
+    ivarSet(exc, s.receiver, v);
+    raiseExc(exc);
+}
+
+V Interp::freeze(V v)
+{
+    if (isObj(v))
+        op(v)->frozen = true;
+    return v;
+}
+
+V Interp::dup(V v, bool clone)
+{
+    if (!isObj(v))
+        return v;
+    Obj *o = op(v);
+    V copy;
+    RClass *k = realClass(o->klass);
+    switch (o->type)
+    {
+    case T::String:
+    {
+        copy = allocate(k);
+        sref(copy) = sref(v);
+        static_cast<RString *>(op(copy))->binary = strBinary(v);
+        break;
+    }
+    case T::Array:
+    {
+        copy = allocate(k);
+        aref(copy) = aref(v);
+        break;
+    }
+    case T::Hash:
+    {
+        copy = allocate(k);
+        RHash *a = href(v), *b = href(copy);
+        b->keys = a->keys;
+        b->vals = a->vals;
+        b->hashes = a->hashes;
+        b->index = a->index;
+        b->live = a->live;
+        b->defVal = a->defVal;
+        b->defProc = a->defProc;
+        b->byId = a->byId;
+        break;
+    }
+    case T::Range:
+    {
+        auto *r = static_cast<RRange *>(o);
+        copy = range(r->lo, r->hi, r->excl);
+        break;
+    }
+    case T::Object:
+    {
+        copy = allocate(k);
+        break;
+    }
+    case T::Proc:
+    {
+        auto *p = new RProc(*static_cast<RProc *>(o));
+        p->niv = 0;
+        p->civ = 0;
+        p->ivn = nullptr;
+        p->ivv = nullptr;
+        p->frozen = false;
+        copy = ov(p);
+        break;
+    }
+    case T::Data:
+    {
+        auto *d = new RData(*static_cast<RData *>(o));
+        d->niv = 0;
+        d->civ = 0;
+        d->ivn = nullptr;
+        d->ivv = nullptr;
+        d->frozen = false;
+        copy = ov(d);
+        break;
+    }
+    case T::Class:
+    case T::Module:
+    {
+        auto *src = static_cast<RClass *>(o);
+        RClass *k2 = newClass(src->super, src->isModule);
+        k2->mt = src->mt;
+        k2->consts = src->consts;
+        k2->constOrder = src->constOrder;
+        k2->includes = src->includes;
+        k2->instType = src->instType;
+        copy = ov(k2);
+        break;
+    }
+    default: return v; // numbers, regexps, methods: immutable
+    }
+    Obj *c = op(copy);
+    for (int i = 0; i < o->niv; ++i)
+        ivarSet(copy, o->ivn[i], o->ivv[i]);
+    if (clone)
+    {
+        if (o->klass->isSingleton && o->klass->attached == v && o->type != T::Class)
+        {
+            RClass *sc = singletonOf(copy);
+            sc->mt = o->klass->mt;
+            sc->includes = o->klass->includes;
+            ++g_hierVersion;
+            ++methodVersion;
+        }
+    }
+    Method *ic = findMethod(c->klass, s.initialize_copy);
+    if (ic && ic->kind != M_NATIVE)
+    {
+        V av = v;
+        call(copy, s.initialize_copy, 1, &av);
+    }
+    if (clone && o->frozen)
+        c->frozen = true;
+    return copy;
+}
+
+// ── blocks and procs ──────────────────────────────────────────────────────
+
+V Interp::procFromBlk(Blk *b, bool lambda)
+{
+    if (b->kind == B_RUBY && b->ctx && b->node)
+    {
+        // a block given as &blk twice is the same proc
+    }
+    auto *p = new RProc();
+    p->klass = cProc;
+    p->type = T::Proc;
+    p->blk = *b;
+    p->lambda = lambda || b->lambda;
+    p->blk.lambda = p->lambda;
+    if (b->kind == B_RUBY && b->ctx)
+    {
+        // the defining frame's context outlives it inside the proc
+        Ctx *c = new Ctx(*b->ctx);
+        if (c->blk)
+        {
+            V inner = procFromBlk(c->blk);
+            c->blk = &static_cast<RProc *>(op(inner))->blk;
+        }
+        c->margs = nullptr;
+        p->blk.ctx = c;
+    }
+    if (b->kind == B_NATIVE && b->native)
+        p->blk.native = new NativeBlockFn(*b->native);
+    return ov(p);
+}
+
+Blk *Interp::blkFromProc(V proc)
+{
+    return &static_cast<RProc *>(op(proc))->blk;
+}
+
+Blk Interp::nativeBlk(NativeBlockFn *fn, int arity)
+{
+    Blk b;
+    b.kind = B_NATIVE;
+    b.native = fn;
+    b.arity = arity;
+    return b;
+}
+
+V Interp::methodObj(V recv, Sym name, bool unbound)
+{
+    RClass *k = unbound ? static_cast<RClass *>(op(recv)) : classOf(recv);
+    Method *m = findMethod(k, name);
+    if (!m && !loaded.count("core_ext"))
+    {
+        loadLibrary("core_ext");
+        m = findMethod(k, name);
+    }
+    if (!m)
+    {
+        V exc = makeExc(cNameError, "undefined method '" + symName(name) + "' for " +
+                                        (unbound ? "class '" + className(k) + "'" : describe(recv)));
+        ivarSet(exc, s.name, symv(name));
+        raiseExc(exc);
+    }
+    auto *mo = new RMethod();
+    mo->klass = unbound ? cUMethod : cMethod;
+    mo->type = unbound ? T::UMethod : T::Method;
+    mo->recv = recv;
+    mo->m = m;
+    mo->name = name;
+    mo->lookupClass = k;
+    return ov(mo);
+}
+
+// ── errors ────────────────────────────────────────────────────────────────
+
+std::string addrText(const void *p)
+{
+    static const char digits[] = "0123456789abcdef";
+    uint64_t x = (uint64_t)(uintptr_t)p;
+    std::string out = "0x";
+    for (int shift = 60; shift >= 0; shift -= 4)
+        out += digits[(x >> shift) & 15];
+    return out;
+}
+
+std::string Interp::className(RClass *k)
+{
+    if (!k)
+        return "";
+    if (k->isSingleton)
+    {
+        V a = k->attached;
+        return "#<Class:" + (isType(a, T::Class) || isType(a, T::Module) ? className(static_cast<RClass *>(op(a))) : inspect(a)) + ">";
+    }
+    if (k->name.empty())
+        return std::string(k->isModule ? "#<Module:" : "#<Class:") + addrText(k) + ">";
+    return k->name;
+}
+
+std::string Interp::describe(V v)
+{
+    if (v == Qnil)
+        return "nil";
+    if (v == Qtrue)
+        return "true";
+    if (v == Qfalse)
+        return "false";
+    if (v == mainObj)
+        return "main";
+    if (isType(v, T::Class))
+        return "class " + className(static_cast<RClass *>(op(v)));
+    if (isType(v, T::Module))
+        return "module " + className(static_cast<RClass *>(op(v)));
+    // an object with its own methods is described by itself
+    if (isObj(v) && op(v)->klass->isSingleton)
+        return "#<" + className(realClassOf(v)) + ":" + addrText(op(v)) + ">";
+    return "an instance of " + className(realClassOf(v));
+}
+
+V Interp::makeExc(RClass *k, const std::string &msg)
+{
+    V e = allocate(k);
+    ivarSet(e, s.mesg, str(msg));
+    return e;
+}
+
+void Interp::raise(RClass *k, const std::string &msg) { raiseExc(makeExc(k, msg)); }
+
+void Interp::raiseExc(V exc)
+{
+    if (!ivarDefined(exc, s.bt) || ivarGet(exc, s.bt) == Qnil)
+        ivarSet(exc, s.bt, backtrace(frame));
+    auto it = globals.find(s.bang);
+    if (it != globals.end() && it->second != Qnil && it->second != exc && !ivarDefined(exc, s.cause))
+        ivarSet(exc, s.cause, it->second);
+    throw RubyError{exc};
+}
+
+void Interp::typeError(V v, const char *to)
+{
+    std::string what = v == Qnil ? "nil" : v == Qtrue ? "true" : v == Qfalse ? "false" : className(realClassOf(v));
+    raise(cTypeError, "no implicit conversion of " + what + " into " + to);
+}
+
+V Interp::backtrace(Frame *f)
+{
+    V out = ary();
+    for (Frame *fr = f; fr; fr = fr->prev)
+    {
+        std::string label;
+        if (fr->kind == 0)
+            label = "<main>";
+        else if (fr->kind == 3)
+            label = "<class:" + (isType(fr->c->self, T::Class) || isType(fr->c->self, T::Module)
+                                     ? symName(static_cast<RClass *>(op(fr->c->self))->baseName)
+                                     : std::string("?")) + ">";
+        else
+        {
+            Method *m = fr->c->method;
+            std::string mname;
+            if (m)
+            {
+                RClass *owner = m->owner;
+                if (owner && owner->isSingleton && (isType(owner->attached, T::Class) || isType(owner->attached, T::Module)))
+                    mname = className(static_cast<RClass *>(op(owner->attached))) + "." + symName(m->name);
+                else if (owner)
+                    mname = className(owner) + "#" + symName(m->name);
+                else
+                    mname = symName(m->name);
+            }
+            if (fr->kind == 2)
+                label = "block in " + (m ? mname : std::string("<main>"));
+            else
+                label = mname;
+        }
+        aref(out).push_back(str(file + ":" + std::to_string(fr->line) + ":in '" + label + "'"));
+    }
+    return out;
+}
+
+std::string Interp::excMessage(V exc)
+{
+    V m = call0(exc, s.message);
+    return isStr(m) ? sref(m) : toS(m);
+}
+
+// ── output ────────────────────────────────────────────────────────────────
+
+void Interp::flush()
+{
+    if (!out.empty())
+    {
+        fwrite(out.data(), 1, out.size(), stdout);
+        out.clear();
+    }
+    fflush(stdout);
+}
+
+} // namespace ruby

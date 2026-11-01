@@ -1,0 +1,3309 @@
+// quantum: cpp
+// Ruby front-end: Kernel, BasicObject, Object, Module, Class, nil/true/false,
+// Comparable, Exception, Proc and Method.
+#include "RubyRt.h.sa"
+
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+
+extern bool g_testMode;
+
+namespace ruby
+{
+
+int rbByteCompare(const std::string &a, const std::string &b);
+
+namespace
+{
+
+RClass *asClass(V v) { return static_cast<RClass *>(op(v)); }
+
+bool isModuleV(V v) { return isType(v, T::Class) || isType(v, T::Module); }
+
+Sym symArg(Interp &I, V v)
+{
+    if (isSymV(v))
+        return vsym(v);
+    if (I.isStr(v))
+        return intern(I.sref(v));
+    I.raise(I.cTypeError, I.inspect(v) + " is not a symbol nor a string");
+}
+
+V blockProc(Interp &I, Args &a)
+{
+    if (!a.blk)
+        return Qnil;
+    return I.procFromBlk(a.blk);
+}
+
+// arity and parameters of a parameter list
+int paramArity(ParamList &pl, bool lambda)
+{
+    int req = pl.required + pl.post;
+    bool reqKw = false, optKw = false;
+    for (Param &p : pl.params)
+    {
+        if (p.kind == Param::KeyReq)
+            reqKw = true;
+        if (p.kind == Param::Key || p.kind == Param::KeyRest)
+            optKw = true;
+    }
+    if (reqKw)
+        ++req;
+    if (pl.optional > 0 || pl.hasRest || (!reqKw && optKw && lambda))
+        return -(req + 1);
+    if (!lambda && pl.optional > 0)
+        return -(req + 1);
+    return req;
+}
+
+V paramList(Interp &I, ParamList &pl, bool lambda)
+{
+    V out = I.ary();
+    for (Param &p : pl.params)
+    {
+        const char *kind = "req";
+        switch (p.kind)
+        {
+        case Param::Req:
+        case Param::Post:
+        case Param::Destructure: kind = lambda ? "req" : "opt"; break;
+        case Param::Opt: kind = "opt"; break;
+        case Param::Rest: kind = "rest"; break;
+        case Param::Key: kind = "key"; break;
+        case Param::KeyReq: kind = "keyreq"; break;
+        case Param::KeyRest: kind = "keyrest"; break;
+        case Param::NoKey: kind = "nokey"; break;
+        case Param::Block: kind = "block"; break;
+        }
+        V entry = I.ary();
+        I.aref(entry).push_back(I.sym(kind));
+        if (p.name && p.kind != Param::Destructure)
+        {
+            const std::string &nm = symName(p.name);
+            if (nm != "*" && nm != "**" && nm != "&" && nm[0] != '*' && nm[0] != '&')
+                I.aref(entry).push_back(symv(p.name));
+        }
+        I.aref(out).push_back(entry);
+    }
+    return out;
+}
+
+// ── Kernel ────────────────────────────────────────────────────────────────
+
+V puts_raw(Interp &I, Args &a)
+{
+    if (a.argc == 0)
+        I.write("\n");
+    for (int i = 0; i < a.argc; ++i)
+        I.putsValue(a.argv[i]);
+    return Qnil;
+}
+
+// $stdout was replaced: what the Kernel writes goes to its write method
+void writeRedirected(Interp &I, const std::string &text)
+{
+    V s = I.str(text);
+    I.call(I.vStdout, intern("write"), 1, &s);
+}
+
+V k_puts(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (I.vStdout == I.vStdoutOrig)
+        return puts_raw(I, a);
+    std::string saved;
+    saved.swap(I.out);
+    try
+    {
+        puts_raw(I, a);
+    }
+    catch (...)
+    {
+        I.out.swap(saved);
+        throw;
+    }
+    std::string text;
+    text.swap(I.out);
+    I.out.swap(saved);
+    writeRedirected(I, text);
+    return Qnil;
+}
+
+V k_print(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::string text;
+    for (int i = 0; i < a.argc; ++i)
+        text += I.toS(a.argv[i]);
+    if (I.vStdout == I.vStdoutOrig)
+        I.write(text);
+    else
+        writeRedirected(I, text);
+    return Qnil;
+}
+
+V k_p(Interp &I, V self, Args &a)
+{
+    (void)self;
+    for (int i = 0; i < a.argc; ++i)
+    {
+        std::string text = I.inspect(a.argv[i]) + "\n";
+        if (I.vStdout == I.vStdoutOrig)
+            I.write(text);
+        else
+            writeRedirected(I, text);
+    }
+    if (a.argc == 0)
+        return Qnil;
+    if (a.argc == 1)
+        return a.argv[0];
+    return I.ary(std::vector<V>(a.argv, a.argv + a.argc));
+}
+
+V io_puts(Interp &I, V self, Args &a)
+{
+    if (self != I.vStdoutOrig)
+    {
+        std::string saved;
+        saved.swap(I.out);
+        puts_raw(I, a);
+        std::string text;
+        text.swap(I.out);
+        I.out.swap(saved);
+        I.flush();
+        fwrite(text.data(), 1, text.size(), stderr);
+        return Qnil;
+    }
+    return puts_raw(I, a);
+}
+
+V io_print(Interp &I, V self, Args &a)
+{
+    std::string text;
+    for (int i = 0; i < a.argc; ++i)
+        text += I.toS(a.argv[i]);
+    if (self != I.vStdoutOrig)
+    {
+        I.flush();
+        fwrite(text.data(), 1, text.size(), stderr);
+        return Qnil;
+    }
+    I.write(text);
+    return Qnil;
+}
+
+V io_write(Interp &I, V self, Args &a)
+{
+    int64_t n = 0;
+    std::string text;
+    for (int i = 0; i < a.argc; ++i)
+        text += I.toS(a.argv[i]);
+    n = (int64_t)text.size();
+    if (self != I.vStdoutOrig)
+    {
+        I.flush();
+        fwrite(text.data(), 1, text.size(), stderr);
+    }
+    else
+        I.write(text);
+    return fix(n);
+}
+
+V io_flush(Interp &I, V self, Args &a)
+{
+    (void)a;
+    I.flush();
+    return self;
+}
+
+V io_sync(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qtrue;
+}
+
+V io_printf(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0)
+        return Qnil;
+    std::string text = formatStr(I, I.strOf(a.argv[0]), a.argc - 1, a.argv + 1);
+    if (self != I.vStdoutOrig)
+    {
+        I.flush();
+        fwrite(text.data(), 1, text.size(), stderr);
+    }
+    else
+        I.write(text);
+    return Qnil;
+}
+
+V k_printf_m(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (a.argc == 0)
+        return Qnil;
+    std::string text = formatStr(I, I.strOf(a.argv[0]), a.argc - 1, a.argv + 1);
+    if (I.vStdout == I.vStdoutOrig)
+        I.write(text);
+    else
+        writeRedirected(I, text);
+    return Qnil;
+}
+
+V k_warn(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::string text;
+    int n = a.kw ? a.argc - 1 : a.argc;
+    for (int i = 0; i < n; ++i)
+    {
+        std::string t = I.toS(a.argv[i]);
+        text += t;
+        if (t.empty() || t.back() != '\n')
+            text += "\n";
+    }
+    I.flush();
+    fwrite(text.data(), 1, text.size(), stderr);
+    return Qnil;
+}
+
+V k_printf(Interp &I, V self, Args &a) { return k_printf_m(I, self, a); }
+
+V k_format(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.str(formatStr(I, I.strOf(a.argv[0]), a.argc - 1, a.argv + 1));
+}
+
+// a required file next to the running one, when there is one
+bool requireFile(Interp &I, const std::string &name)
+{
+    size_t dirEnd = I.file.find_last_of("/\\");
+    std::string base = dirEnd == std::string::npos ? "" : I.file.substr(0, dirEnd + 1);
+    std::string path = name;
+    if (name.size() < 3 || name.compare(name.size() - 3, 3, ".rb") != 0)
+        path += ".rb";
+    bool absolute = !path.empty() && (path[0] == '/' || (path.size() > 1 && path[1] == ':'));
+    std::ifstream in(absolute ? path : base + path, std::ios::binary);
+    if (!in)
+        return false;
+    std::string key = absolute ? path : base + path;
+    if (I.loaded.count(key))
+        return true;
+    I.loaded[key] = true;
+    std::stringstream ss;
+    ss << in.rdbuf();
+    I.runSource(ss.str(), key, I.mainObj, I.topLex);
+    return true;
+}
+
+V k_require_relative(Interp &I, V self, Args &a)
+{
+    std::string name = I.strOf(a.argv[0]);
+    if (requireFile(I, name))
+        return Qtrue;
+    (void)self;
+    V exc = I.makeExc(I.cLoadError, "cannot load such file -- " + name);
+    I.raiseExc(exc);
+}
+
+V k_require(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::string name = I.strOf(a.argv[0]);
+    if ((name.rfind("./", 0) == 0 || name.rfind("../", 0) == 0) && requireFile(I, name))
+        return Qtrue;
+    size_t slash = name.rfind('/');
+    if (slash != std::string::npos)
+        name = name.substr(slash + 1);
+    if (name.size() > 3 && name.substr(name.size() - 3) == ".rb")
+        name = name.substr(0, name.size() - 3);
+    if (I.loaded.count(name))
+        return Qfalse;
+    I.loadLibrary(name);
+    return Qtrue;
+}
+
+V k_raise(Interp &I, V self, Args &a)
+{
+    (void)self;
+    static Sym bang = intern("$!");
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    V cause = Qundef;
+    if (kw)
+    {
+        bool found = false;
+        cause = I.hget(kw, I.sym("cause"), &found);
+        if (!found)
+        {
+            cause = Qundef;
+            argc = a.argc;
+        }
+    }
+    V exc;
+    if (argc == 0)
+    {
+        auto it = I.globals.find(bang);
+        if (it != I.globals.end() && it->second != Qnil)
+            exc = it->second;
+        else
+            exc = I.makeExc(I.cRuntimeError, "unhandled exception");
+    }
+    else if (I.isStr(a.argv[0]))
+    {
+        exc = I.makeExc(I.cRuntimeError, I.sref(a.argv[0]));
+    }
+    else
+    {
+        V x = a.argv[0];
+        if (!I.respondTo(x, I.s.exception, true))
+            I.raise(I.cTypeError, "exception class/object expected");
+        if (argc >= 2)
+            exc = I.call(x, I.s.exception, 1, &a.argv[1]);
+        else
+            exc = I.call0(x, I.s.exception);
+        if (!I.kindOf(exc, I.cException))
+            I.raise(I.cTypeError, "exception object expected");
+        if (argc >= 3)
+            I.ivarSet(exc, I.s.bt, a.argv[2]);
+    }
+    if (cause != Qundef)
+        I.ivarSet(exc, I.s.cause, cause);
+    I.ivarSet(exc, I.s.bt, I.backtrace(I.frame));
+    I.raiseExc(exc);
+}
+
+V k_loop(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (!a.blk)
+    {
+        V av = I.sym("loop");
+        return I.call(self, I.s.to_enum, 1, &av);
+    }
+    try
+    {
+        for (;;)
+            I.callBlock(a.blk, 0, nullptr);
+    }
+    catch (RubyError &e)
+    {
+        if (!I.kindOf(e.exc, I.cStopIteration))
+            throw;
+        return I.ivarGet(e.exc, I.s.result);
+    }
+}
+
+V k_lambda(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (!a.blk)
+        I.raise(I.cArgumentError, "tried to create Proc object without a block");
+    if (a.blk->kind == B_RUBY && !a.blk->lambda)
+    {
+        Blk b = *a.blk;
+        b.lambda = true;
+        return I.procFromBlk(&b, true);
+    }
+    return I.procFromBlk(a.blk, a.blk->lambda);
+}
+
+V k_proc(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (!a.blk)
+        I.raise(I.cArgumentError, "tried to create Proc object without a block");
+    return I.procFromBlk(a.blk);
+}
+
+V k_block_given(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return boolv(I.frame && I.frame->c->blk);
+}
+
+V k_method_name(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    if (I.frame && I.frame->c->method)
+        return symv(I.frame->c->method->name);
+    return Qnil;
+}
+
+V k_catch(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V tag = a.argc > 0 ? a.argv[0] : I.newObject(I.cObject);
+    try
+    {
+        return I.yield(a.blk, tag);
+    }
+    catch (ThrowEx &t)
+    {
+        if (t.tag != tag && !(I.isStr(tag) && I.isStr(t.tag) && I.sref(tag) == I.sref(t.tag)))
+            throw;
+        return t.val;
+    }
+}
+
+V k_throw(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)I;
+    throw ThrowEx{a.argv[0], a.argc > 1 ? a.argv[1] : Qnil};
+}
+
+V k_exit(Interp &I, V self, Args &a)
+{
+    (void)self;
+    int status = 0;
+    if (a.argc > 0)
+    {
+        if (a.argv[0] == Qfalse)
+            status = 1;
+        else if (isFix(a.argv[0]))
+            status = (int)fixv(a.argv[0]);
+    }
+    V exc = I.makeExc(I.cSystemExit, "exit");
+    I.ivarSet(exc, intern("__status"), fix(status));
+    I.raiseExc(exc);
+}
+
+V k_abort(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (a.argc > 0)
+    {
+        I.flush();
+        std::string m = I.toS(a.argv[0]) + "\n";
+        fwrite(m.data(), 1, m.size(), stderr);
+    }
+    V exc = I.makeExc(I.cSystemExit, a.argc > 0 ? I.toS(a.argv[0]) : "exit");
+    I.ivarSet(exc, intern("__status"), fix(1));
+    I.raiseExc(exc);
+}
+
+V k_at_exit(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V p = blockProc(I, a);
+    I.atExit.push_back(p);
+    return p;
+}
+
+V k_gets(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    // the test runner has nobody at the keyboard: a line that keeps programs going
+    if (g_testMode)
+        return I.str("1\n");
+    I.flush();
+    std::string line;
+    if (!std::getline(std::cin, line))
+        return Qnil;
+    return I.str(line + "\n");
+}
+
+V io_read_all(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    I.flush();
+    std::string all, line;
+    if (g_testMode)
+        return I.str("");
+    while (std::getline(std::cin, line))
+        all += line + "\n";
+    return I.str(all);
+}
+
+V io_readlines(Interp &I, V self, Args &a)
+{
+    V all = io_read_all(I, self, a);
+    return I.call0(all, intern("lines"));
+}
+
+V k_caller(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    V bt = I.backtrace(I.frame);
+    std::vector<V> &v = I.aref(bt);
+    if (!v.empty())
+        v.erase(v.begin());
+    return bt;
+}
+
+// ── Binding and eval ──────────────────────────────────────────────────────
+
+struct BindingData
+{
+    Ctx *ctx;
+    Scope *scope; // the binding's own: variables eval declares live on here
+    Env *env;
+};
+
+RClass *g_cBinding = nullptr;
+
+V makeBinding(Interp &I, Ctx *c, Scope *outer, Env *outerEnv)
+{
+    auto *d = new RData();
+    d->klass = g_cBinding;
+    d->type = T::Data;
+    auto *b = new BindingData();
+    b->ctx = new Ctx(*c);
+    b->scope = new Scope();
+    b->scope->isBlock = true;
+    b->scope->parent = outer;
+    b->env = new Env();
+    b->env->parent = outerEnv;
+    d->ptr = b;
+    (void)I;
+    return ov(d);
+}
+
+BindingData *bindingOf(V v) { return static_cast<BindingData *>(static_cast<RData *>(op(v))->ptr); }
+
+V k_binding(Interp &I, V self, Args &a)
+{
+    (void)a;
+    (void)self;
+    Frame *f = I.frame;
+    return makeBinding(I, f->c, f->scope, f->env);
+}
+
+V bindingEval(Interp &I, V binding, const std::string &src)
+{
+    BindingData *b = bindingOf(binding);
+    ProgramNode *prog;
+    try
+    {
+        prog = parseEval(src, "(eval)", b->scope->parent, b->scope);
+    }
+    catch (SyntaxError &e)
+    {
+        I.raise(I.cSyntaxError, "(eval):" + std::to_string(e.line) + ": " + e.message);
+    }
+    // variables declared so far keep their values
+    int n = (int)b->scope->names.size();
+    if (n > b->env->n)
+    {
+        V *slots = new V[n];
+        for (int i = 0; i < n; ++i)
+            slots[i] = i < b->env->n ? b->env->slots[i] : Qnil;
+        b->env->slots = slots;
+        b->env->n = n;
+    }
+    Frame fr;
+    fr.c = b->ctx;
+    fr.prev = I.frame;
+    fr.kind = 4;
+    fr.scope = b->scope;
+    fr.env = b->env;
+    Frame *saved = I.frame;
+    I.frame = &fr;
+    V r = Qnil;
+    try
+    {
+        if (prog->body)
+            r = I.eval(prog->body, &fr);
+    }
+    catch (...)
+    {
+        I.frame = saved;
+        throw;
+    }
+    I.frame = saved;
+    if (I.unwind == U_NEXT || I.unwind == U_BREAK)
+    {
+        I.unwind = U_NONE;
+        r = I.unwindVal;
+    }
+    return r;
+}
+
+V k_eval(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::string src = I.strOf(a.argv[0]);
+    if (a.argc > 1 && a.argv[1] != Qnil)
+        return bindingEval(I, a.argv[1], src);
+    Frame *f = I.frame;
+    return I.evalString(src, f->c->self, f->c, f->scope, f->env, nullptr, nullptr);
+}
+
+V bd_eval(Interp &I, V self, Args &a) { return bindingEval(I, self, I.strOf(a.argv[0])); }
+
+V bd_receiver(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return bindingOf(self)->ctx->self;
+}
+
+V scopeNames(Interp &I, Scope *sc)
+{
+    V out = I.ary();
+    for (; sc; sc = sc->parent)
+    {
+        for (Sym n : sc->names)
+        {
+            const std::string &t = symName(n);
+            if (t.empty() || t[0] == '*' || t[0] == '&' || t == "_")
+                continue;
+            bool dup = false;
+            for (V x : I.aref(out))
+                if (x == symv(n))
+                    dup = true;
+            if (!dup)
+                I.aref(out).push_back(symv(n));
+        }
+        if (!sc->isBlock)
+            break;
+    }
+    return out;
+}
+
+V bd_local_variables(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return scopeNames(I, bindingOf(self)->scope);
+}
+
+V k_local_variables(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return scopeNames(I, I.frame->scope);
+}
+
+V k_global_variables(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    V out = I.ary();
+    for (auto &kv : I.globals)
+        I.aref(out).push_back(symv(kv.first));
+    for (const char *g : {"$stdout", "$stderr", "$stdin", "$0", "$PROGRAM_NAME", "$~", "$!"})
+        if (!I.globals.count(intern(g)))
+            I.aref(out).push_back(I.sym(g));
+    return out;
+}
+
+V *bindingSlot(Interp &I, BindingData *b, Sym name)
+{
+    Scope *sc = b->scope;
+    Env *e = b->env;
+    for (; sc; sc = sc->parent, e = e ? e->parent : nullptr)
+    {
+        int i = sc->find(name);
+        if (i >= 0)
+        {
+            if (sc == b->scope && i >= b->env->n)
+            {
+                int n = (int)sc->names.size();
+                V *slots = new V[n];
+                for (int k = 0; k < n; ++k)
+                    slots[k] = k < b->env->n ? b->env->slots[k] : Qnil;
+                b->env->slots = slots;
+                b->env->n = n;
+            }
+            return &e->slots[i];
+        }
+        if (!sc->isBlock)
+            break;
+    }
+    (void)I;
+    return nullptr;
+}
+
+V bd_lv_get(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    V *p = bindingSlot(I, bindingOf(self), name);
+    if (!p)
+    {
+        V exc = I.makeExc(I.cNameError, "local variable '" + symName(name) + "' is not defined for " + I.inspect(self));
+        I.ivarSet(exc, I.s.name, symv(name));
+        I.raiseExc(exc);
+    }
+    return *p;
+}
+
+V bd_lv_set(Interp &I, V self, Args &a)
+{
+    BindingData *b = bindingOf(self);
+    Sym name = symArg(I, a.argv[0]);
+    V *p = bindingSlot(I, b, name);
+    if (!p)
+    {
+        b->scope->names.push_back(name);
+        p = bindingSlot(I, b, name);
+    }
+    *p = a.argv[1];
+    return a.argv[1];
+}
+
+V bd_lv_defined(Interp &I, V self, Args &a)
+{
+    return boolv(bindingSlot(I, bindingOf(self), symArg(I, a.argv[0])) != nullptr);
+}
+
+// ── running other programs ────────────────────────────────────────────────
+
+RClass *g_cStatus = nullptr;
+
+void setStatus(Interp &I, int code)
+{
+    V st = I.newObject(g_cStatus);
+    I.ivarSet(st, intern("__code"), fix(code));
+    I.globals[intern("$?")] = st;
+}
+
+V k_backtick(Interp &I, V self, Args &a)
+{
+    (void)self;
+    I.flush();
+    std::string cmd = I.strOf(a.argv[0]);
+#ifdef _WIN32
+    FILE *p = _popen(cmd.c_str(), "r");
+#else
+    FILE *p = popen(cmd.c_str(), "r");
+#endif
+    if (!p)
+        I.raise(I.cNotImplementedError, "could not run: " + cmd);
+    std::string out;
+    int c;
+    while ((c = fgetc(p)) != EOF)
+        out += (char)c;
+#ifdef _WIN32
+    setStatus(I, _pclose(p));
+#else
+    setStatus(I, pclose(p));
+#endif
+    return I.str(out);
+}
+
+V k_system(Interp &I, V self, Args &a)
+{
+    (void)self;
+    I.flush();
+    int argc = a.kw ? a.argc - 1 : a.argc;
+    std::string cmd;
+    for (int i = 0; i < argc; ++i)
+    {
+        if (I.isHash(a.argv[i]))
+            continue;
+        cmd += (cmd.empty() ? "" : " ") + I.strOf(a.argv[i]);
+    }
+    int code = std::system(cmd.c_str());
+    setStatus(I, code);
+    return boolv(code == 0);
+}
+
+V st_code(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, intern("__code"));
+}
+
+V st_success(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(I.ivarGet(self, intern("__code")) == fix(0));
+}
+
+// Kernel#pp: wide values through src/ruby/lib/pp.sa
+V k_pp(Interp &I, V self, Args &a)
+{
+    for (int i = 0; i < a.argc; ++i)
+    {
+        std::string text = I.inspect(a.argv[i]);
+        if (utf8Len(text) > 79)
+        {
+            I.loadLibrary("pp");
+            V pp = I.constIn(I.cObject, intern("PP"), false);
+            text = I.toS(I.call1(pp, intern("__format"), a.argv[i]));
+        }
+        V line = I.str(text);
+        Args b;
+        b.argv = &line;
+        b.argc = 1;
+        k_puts(I, self, b);
+    }
+    if (a.argc == 0)
+        return Qnil;
+    if (a.argc == 1)
+        return a.argv[0];
+    return I.ary(std::vector<V>(a.argv, a.argv + a.argc));
+}
+
+V o_cmp(Interp &I, V self, Args &a) { return self == a.argv[0] || I.eq(self, a.argv[0]) ? fix(0) : Qnil; }
+
+V mod_subclasses(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    std::vector<RClass *> &list = asClass(self)->subclasses;
+    for (size_t i = list.size(); i-- > 0;)
+        I.aref(out).push_back(ov(list[i]));
+    return out;
+}
+
+V mod_attached_object(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RClass *k = asClass(self);
+    if (!k->isSingleton)
+        I.raise(I.cTypeError, "'" + I.className(k) + "' is not a singleton class");
+    return k->attached;
+}
+
+V mod_nesting(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    V out = I.ary();
+    for (LexScope *l = I.frame->c->lex; l && l->parent; l = l->parent)
+        I.aref(out).push_back(ov(l->klass));
+    return out;
+}
+
+V mod_remove_const(Interp &I, V self, Args &a)
+{
+    RClass *k = asClass(self);
+    Sym name = symArg(I, a.argv[0]);
+    auto it = k->consts.find(name);
+    if (it == k->consts.end())
+        I.raise(I.cNameError, "constant " + I.className(k) + "::" + symName(name) + " not defined");
+    V v = it->second;
+    k->consts.erase(name);
+    std::vector<Sym> order;
+    for (Sym c : k->constOrder)
+        if (c != name)
+            order.push_back(c);
+    k->constOrder = order;
+    ++I.constVersion;
+    return v;
+}
+
+V mod_cvar_remove(Interp &I, V self, Args &a)
+{
+    RClass *k = asClass(self);
+    Sym name = symArg(I, a.argv[0]);
+    V v = k->cvars[name];
+    k->cvars.erase(name);
+    return v;
+}
+
+void callMethodAdded(Interp &I, RClass *k, Sym name)
+{
+    if (k->isSingleton)
+    {
+        Method *hook = I.findMethod(I.classOf(k->attached), intern("singleton_method_added"));
+        if (hook && hook->kind != M_NATIVE)
+        {
+            V av = symv(name);
+            I.call(k->attached, intern("singleton_method_added"), 1, &av);
+        }
+        return;
+    }
+    Method *hook = I.findMethod(I.classOf(ov(k)), I.s.method_added);
+    if (hook && hook->kind != M_NATIVE)
+    {
+        V av = symv(name);
+        I.call(ov(k), I.s.method_added, 1, &av);
+    }
+}
+
+V k_Integer(Interp &I, V self, Args &a)
+{
+    (void)self;
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    bool exc = true;
+    if (kw)
+    {
+        bool found = false;
+        V e = I.hget(kw, I.sym("exception"), &found);
+        if (found)
+            exc = truthy(e);
+    }
+    V v = a.argv[0];
+    int base = argc > 1 && a.argv[1] != Qnil ? (int)I.intOf(a.argv[1]) : 10;
+    if (I.isInt(v))
+        return v;
+    if (I.isFloat(v))
+    {
+        double d = I.fltv(v);
+        if (d != d || d == 1.0 / 0.0 || d == -1.0 / 0.0)
+        {
+            if (!exc)
+                return Qnil;
+            I.raise(I.cFloatDomainError, floatToS(d));
+        }
+        return intFromDouble(I, d);
+    }
+    if (I.isStr(v))
+    {
+        std::string t = I.sref(v);
+        size_t b = 0, e = t.size();
+        while (b < e && (t[b] == ' ' || t[b] == '\t' || t[b] == '\n'))
+            ++b;
+        while (e > b && (t[e - 1] == ' ' || t[e - 1] == '\t' || t[e - 1] == '\n'))
+            --e;
+        std::string body = t.substr(b, e - b);
+        bool neg = false;
+        size_t i = 0;
+        if (i < body.size() && (body[i] == '-' || body[i] == '+'))
+        {
+            neg = body[i] == '-';
+            ++i;
+        }
+        int bb = base;
+        if (i + 1 < body.size() && body[i] == '0')
+        {
+            char p = (char)(body[i + 1] | 32);
+            if (p == 'x' && (bb == 16 || base == 10 && argc < 2))
+            {
+                bb = 16;
+                i += 2;
+            }
+            else if (p == 'b' && (bb == 2 || base == 10 && argc < 2))
+            {
+                bb = 2;
+                i += 2;
+            }
+            else if (p == 'o' && (bb == 8 || base == 10 && argc < 2))
+            {
+                bb = 8;
+                i += 2;
+            }
+            else if (argc < 2 && std::isdigit((unsigned char)body[i + 1]))
+            {
+                bb = 8;
+                i += 1;
+            }
+        }
+        std::string digits;
+        bool ok = i < body.size();
+        bool lastUnderscore = true;
+        for (; i < body.size(); ++i)
+        {
+            char c = body[i];
+            if (c == '_' && !lastUnderscore)
+            {
+                lastUnderscore = true;
+                continue;
+            }
+            int d = c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'z' ? (c | 32) - 'a' + 10 : 99;
+            if (d >= bb)
+            {
+                ok = false;
+                break;
+            }
+            digits += c;
+            lastUnderscore = false;
+        }
+        if (lastUnderscore)
+            ok = false;
+        if (!ok)
+        {
+            if (!exc)
+                return Qnil;
+            I.raise(I.cArgumentError, "invalid value for Integer(): " + I.inspect(v));
+        }
+        V r = bigFromString(I, digits, bb);
+        return neg ? intNeg(I, r) : r;
+    }
+    if (v == Qnil)
+    {
+        if (!exc)
+            return Qnil;
+        I.raise(I.cTypeError, "can't convert nil into Integer");
+    }
+    if (I.respondTo(v, I.s.to_int, true))
+        return I.call0(v, I.s.to_int);
+    if (I.respondTo(v, I.s.to_i, true))
+        return I.call0(v, I.s.to_i);
+    if (!exc)
+        return Qnil;
+    I.raise(I.cTypeError, "can't convert " + I.className(I.realClassOf(v)) + " into Integer");
+}
+
+V k_Float(Interp &I, V self, Args &a)
+{
+    (void)self;
+    RHash *kw = kwArg(a);
+    bool exc = true;
+    if (kw)
+    {
+        bool found = false;
+        V e = I.hget(kw, I.sym("exception"), &found);
+        if (found)
+            exc = truthy(e);
+    }
+    V v = a.argv[0];
+    if (I.isFloat(v))
+        return v;
+    if (I.isNum(v))
+        return I.flo(I.numToF(v));
+    if (I.isStr(v))
+    {
+        std::string t = I.sref(v);
+        size_t b = 0, e = t.size();
+        while (b < e && (t[b] == ' ' || t[b] == '\t' || t[b] == '\n'))
+            ++b;
+        while (e > b && (t[e - 1] == ' ' || t[e - 1] == '\t' || t[e - 1] == '\n'))
+            --e;
+        std::string body;
+        for (size_t i = b; i < e; ++i)
+            if (t[i] != '_')
+                body += t[i];
+        // Ruby's grammar: digits, optional fraction (digits after the dot), optional exponent
+        size_t i = 0;
+        if (i < body.size() && (body[i] == '+' || body[i] == '-'))
+            ++i;
+        size_t intStart = i;
+        while (i < body.size() && std::isdigit((unsigned char)body[i]))
+            ++i;
+        bool ok = i > intStart;
+        if (ok && i < body.size() && body[i] == '.')
+        {
+            ++i;
+            size_t fs = i;
+            while (i < body.size() && std::isdigit((unsigned char)body[i]))
+                ++i;
+            if (i == fs)
+                ok = false;
+        }
+        if (ok && i < body.size() && (body[i] == 'e' || body[i] == 'E'))
+        {
+            ++i;
+            if (i < body.size() && (body[i] == '+' || body[i] == '-'))
+                ++i;
+            size_t es = i;
+            while (i < body.size() && std::isdigit((unsigned char)body[i]))
+                ++i;
+            if (i == es)
+                ok = false;
+        }
+        if (!ok || i != body.size())
+        {
+            if (!exc)
+                return Qnil;
+            I.raise(I.cArgumentError, "invalid value for Float(): " + I.inspect(v));
+        }
+        return I.flo(std::strtod(body.c_str(), nullptr));
+    }
+    if (v == Qnil)
+    {
+        if (!exc)
+            return Qnil;
+        I.raise(I.cTypeError, "can't convert nil into Float");
+    }
+    return I.flo(I.numToF(v));
+}
+
+V k_String(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.toSV(a.argv[0]);
+}
+
+V k_Array(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.arrayOf(a.argv[0]);
+}
+
+V k_Hash(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V v = a.argv[0];
+    if (v == Qnil || (I.isAry(v) && I.aref(v).empty()))
+        return I.newHash();
+    if (I.isHash(v))
+        return v;
+    return I.call0(v, I.s.to_hash);
+}
+
+V k_Rational(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V num = a.argv[0];
+    V den = a.argc > 1 ? a.argv[1] : fix(1);
+    if (I.isStr(num))
+    {
+        std::string t = I.sref(num);
+        size_t slash = t.find('/');
+        V n, d = fix(1);
+        auto parse = [&](const std::string &part) -> V
+        {
+            V av = I.str(part);
+            size_t dot = part.find('.');
+            if (dot == std::string::npos)
+            {
+                Args ia;
+                ia.argv = &av;
+                ia.argc = 1;
+                return k_Integer(I, Qnil, ia);
+            }
+            std::string digits = part.substr(0, dot) + part.substr(dot + 1);
+            bool neg = !digits.empty() && digits[0] == '-';
+            if (neg)
+                digits = digits.substr(1);
+            V nn = bigFromString(I, digits);
+            if (neg)
+                nn = intNeg(I, nn);
+            return makeRational(I, nn, intPow(I, fix(10), fix((int64_t)(part.size() - dot - 1))));
+        };
+        if (slash == std::string::npos)
+            n = parse(t);
+        else
+        {
+            n = parse(t.substr(0, slash));
+            d = parse(t.substr(slash + 1));
+        }
+        return numDiv(I, isType(n, T::Rational) ? n : makeRational(I, n, fix(1)), d);
+    }
+    if (I.isFloat(num) || I.isFloat(den))
+    {
+        V r = I.call0(num, I.s.to_r);
+        if (den != fix(1))
+            r = numDiv(I, r, I.call0(den, I.s.to_r));
+        return r;
+    }
+    if (isType(num, T::Rational) || isType(den, T::Rational))
+        return numDiv(I, isType(num, T::Rational) ? num : makeRational(I, num, fix(1)), den);
+    if (!I.isInt(num) || !I.isInt(den))
+        I.raise(I.cTypeError, "can't convert " + I.className(I.realClassOf(num)) + " into Rational");
+    if (intIsZero(den))
+        I.raise(I.cZeroDivisionError, "divided by 0");
+    return makeRational(I, num, den);
+}
+
+V k_Complex(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return makeComplex(I, a.argv[0], a.argc > 1 ? a.argv[1] : fix(0));
+}
+
+// ── Object / BasicObject ──────────────────────────────────────────────────
+
+V o_init(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qnil;
+}
+
+V o_class(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return ov(I.realClassOf(self));
+}
+
+V o_singleton_class(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return ov(I.singletonOf(self));
+}
+
+V o_eq(Interp &I, V self, Args &a)
+{
+    (void)I;
+    return boolv(self == a.argv[0]);
+}
+
+V o_neq(Interp &I, V self, Args &a) { return boolv(!truthy(I.call1(self, I.s.eq, a.argv[0]))); }
+
+V o_not(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return boolv(!truthy(self));
+}
+
+V o_eqq(Interp &I, V self, Args &a) { return boolv(self == a.argv[0] || I.eq(self, a.argv[0])); }
+
+V o_match(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qnil;
+}
+
+V o_nmatch(Interp &I, V self, Args &a) { return boolv(!truthy(I.call1(self, I.s.match, a.argv[0]))); }
+
+V o_hash(Interp &I, V self, Args &a)
+{
+    (void)a;
+    uint64_t h = I.hashOf(self);
+    return fix((int64_t)(h >> 2));
+}
+
+V o_object_id(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (isFix(self))
+        return fix(fixv(self) * 2 + 1);
+    if (!isObj(self))
+        return fix((int64_t)(self >> 1) & 0x3fffffffffffLL);
+    static Sym idSym = intern("__object_id");
+    static int64_t next = 8;
+    V id = I.ivarGet(self, idSym);
+    if (id == Qnil)
+    {
+        id = fix(next);
+        next += 8;
+        Obj *o = op(self);
+        bool fz = o->frozen;
+        o->frozen = false;
+        I.ivarSet(self, idSym, id);
+        o->frozen = fz;
+    }
+    return id;
+}
+
+V o_nil_p(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return boolv(self == Qnil);
+}
+
+V o_is_a(Interp &I, V self, Args &a)
+{
+    V k = a.argv[0];
+    if (!isModuleV(k))
+        I.raise(I.cTypeError, "class or module required");
+    return boolv(I.kindOf(self, asClass(k)));
+}
+
+V o_instance_of(Interp &I, V self, Args &a)
+{
+    V k = a.argv[0];
+    if (!isModuleV(k))
+        I.raise(I.cTypeError, "class or module required");
+    return boolv(I.realClassOf(self) == asClass(k));
+}
+
+V o_respond_to(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    bool priv = a.argc > 1 && truthy(a.argv[1]);
+    return boolv(I.respondTo(self, name, priv));
+}
+
+V o_respond_to_missing(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qfalse;
+}
+
+V o_send(Interp &I, V self, Args &a)
+{
+    if (a.argc < 1)
+        I.raise(I.cArgumentError, "no method name given");
+    Sym name = symArg(I, a.argv[0]);
+    Args b;
+    b.argv = a.argv + 1;
+    b.argc = a.argc - 1;
+    b.kw = a.kw;
+    b.blk = a.blk;
+    return I.callArgs(self, name, b, true);
+}
+
+V o_public_send(Interp &I, V self, Args &a)
+{
+    if (a.argc < 1)
+        I.raise(I.cArgumentError, "no method name given");
+    Sym name = symArg(I, a.argv[0]);
+    Args b;
+    b.argv = a.argv + 1;
+    b.argc = a.argc - 1;
+    b.kw = a.kw;
+    b.blk = a.blk;
+    return I.callArgs(self, name, b, false);
+}
+
+V o_method(Interp &I, V self, Args &a) { return I.methodObj(self, symArg(I, a.argv[0])); }
+
+// the method names of a class in definition order, initialize last
+std::vector<Sym> methodNames(RClass *k)
+{
+    std::vector<Sym> names;
+    Sym init = intern("initialize");
+    bool hasInit = false;
+    for (Sym n : k->mtOrder)
+    {
+        if (!k->mt.count(n))
+            continue;
+        if (n == init)
+            hasInit = true;
+        else
+            names.push_back(n);
+    }
+    if (hasInit)
+        names.push_back(init);
+    return names;
+}
+
+V o_methods(Interp &I, V self, Args &a)
+{
+    bool all = a.argc == 0 || truthy(a.argv[0]);
+    V out = I.ary();
+    std::vector<Sym> seen;
+    for (RClass *k : I.ancestors(I.classOf(self)))
+    {
+        if (!all && k->isModule)
+            continue;
+        for (Sym n : methodNames(k))
+        {
+            Method *m = k->mt[n];
+            if (m->vis == V_PRIVATE || m->kind == M_UNDEF)
+                continue;
+            bool dup = false;
+            for (Sym s : seen)
+                if (s == n)
+                    dup = true;
+            if (dup)
+                continue;
+            seen.push_back(n);
+            I.aref(out).push_back(symv(n));
+        }
+        if (!all && !k->isSingleton)
+            break;
+    }
+    return out;
+}
+
+V o_singleton_methods(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    RClass *k = I.classOf(self);
+    if (!k->isSingleton)
+        return out;
+    for (Sym n : methodNames(k))
+        if (k->mt[n]->vis != V_PRIVATE && k->mt[n]->kind != M_UNDEF)
+            I.aref(out).push_back(symv(n));
+    for (RClass *m : k->includes)
+        for (Sym n : methodNames(m))
+            if (m->mt[n]->vis != V_PRIVATE)
+                I.aref(out).push_back(symv(n));
+    return out;
+}
+
+V o_define_singleton_method(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    RClass *k = I.singletonOf(self);
+    auto *m = new Method();
+    m->owner = k;
+    if (a.argc > 1 && isType(a.argv[1], T::Method))
+        *m = *static_cast<RMethod *>(op(a.argv[1]))->m;
+    else
+    {
+        V p = a.argc > 1 ? a.argv[1] : blockProc(I, a);
+        if (p == Qnil)
+            I.raise(I.cArgumentError, "tried to create Proc object without a block");
+        m->kind = M_PROC;
+        m->proc = static_cast<RProc *>(op(p));
+    }
+    m->owner = k;
+    I.addMethod(k, name, m);
+    callMethodAdded(I, k, name);
+    return symv(name);
+}
+
+V o_extend(Interp &I, V self, Args &a)
+{
+    for (int i = a.argc - 1; i >= 0; --i)
+    {
+        V m = a.argv[i];
+        if (!isType(m, T::Module))
+            I.raise(I.cTypeError, "wrong argument type " + I.className(I.realClassOf(m)) + " (expected Module)");
+        I.extendObject(self, asClass(m));
+        I.call1(m, I.s.extended, self);
+    }
+    return self;
+}
+
+V o_instance_variables(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    if (!isObj(self))
+        return out;
+    Obj *o = op(self);
+    for (int i = 0; i < o->niv; ++i)
+    {
+        const std::string &n = symName(o->ivn[i]);
+        if (!n.empty() && n[0] == '@')
+            I.aref(out).push_back(symv(o->ivn[i]));
+    }
+    return out;
+}
+
+V o_ivar_get(Interp &I, V self, Args &a) { return I.ivarGet(self, symArg(I, a.argv[0])); }
+
+V o_ivar_set(Interp &I, V self, Args &a)
+{
+    I.checkFrozen(self);
+    I.ivarSet(self, symArg(I, a.argv[0]), a.argv[1]);
+    return a.argv[1];
+}
+
+V o_ivar_defined(Interp &I, V self, Args &a) { return boolv(I.ivarDefined(self, symArg(I, a.argv[0]))); }
+
+V o_remove_ivar(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    if (!isObj(self))
+        return Qnil;
+    Obj *o = op(self);
+    for (int i = 0; i < o->niv; ++i)
+        if (o->ivn[i] == name)
+        {
+            V v = o->ivv[i];
+            for (int j = i + 1; j < o->niv; ++j)
+            {
+                o->ivn[j - 1] = o->ivn[j];
+                o->ivv[j - 1] = o->ivv[j];
+            }
+            --o->niv;
+            return v;
+        }
+    I.raise(I.cNameError, "instance variable " + symName(name) + " not defined");
+}
+
+V o_freeze(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.freeze(self);
+}
+
+V o_frozen(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(I.frozen(self));
+}
+
+V o_dup(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.dup(self, false);
+}
+
+V o_clone(Interp &I, V self, Args &a)
+{
+    RHash *kw = kwArg(a);
+    V c = I.dup(self, true);
+    if (kw)
+    {
+        bool found = false;
+        V fz = I.hget(kw, I.sym("freeze"), &found);
+        if (found && isObj(c))
+            op(c)->frozen = truthy(fz);
+    }
+    return c;
+}
+
+V o_itself(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V o_then(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+    {
+        V av = I.sym("then");
+        return I.call(self, I.s.to_enum, 1, &av);
+    }
+    return I.yield(a.blk, self);
+}
+
+V o_tap(Interp &I, V self, Args &a)
+{
+    I.yield(a.blk, self);
+    return self;
+}
+
+V o_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (self == I.mainObj)
+        return I.str("main");
+    return I.str("#<" + I.className(I.realClassOf(self)) + ":" + addrText(isObj(self) ? op(self) : nullptr) + ">");
+}
+
+V o_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (self == I.mainObj)
+        return I.str("main");
+    std::string out = "#<" + I.className(I.realClassOf(self)) + ":" + addrText(isObj(self) ? op(self) : nullptr);
+    if (isObj(self))
+    {
+        for (V seen : I.inspecting)
+            if (seen == self)
+                return I.str(out + " ...>");
+        I.inspecting.push_back(self);
+        Obj *o = op(self);
+        bool first = true;
+        for (int i = 0; i < o->niv; ++i)
+        {
+            const std::string &n = symName(o->ivn[i]);
+            if (n.empty() || n[0] != '@')
+                continue;
+            out += first ? " " : ", ";
+            first = false;
+            out += n + "=" + I.inspect(o->ivv[i]);
+        }
+        I.inspecting.pop_back();
+    }
+    return I.str(out + ">");
+}
+
+V o_display(Interp &I, V self, Args &a)
+{
+    (void)a;
+    I.write(I.toS(self));
+    return Qnil;
+}
+
+V o_instance_eval(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+    {
+        if (a.argc > 0 && I.isStr(a.argv[0]))
+        {
+            Frame *f = I.frame;
+            RClass *t = isObj(self) ? I.singletonOf(self) : nullptr;
+            return I.evalString(I.sref(a.argv[0]), self, f->c, f->scope, f->env, t, nullptr);
+        }
+        I.raise(I.cArgumentError, "wrong number of arguments (given 0, expected 1..3)");
+    }
+    RClass *target = isObj(self) && op(self)->type != T::Float && op(self)->type != T::Bignum ? I.singletonOf(self) : nullptr;
+    if (isModuleV(self))
+        target = I.singletonOf(self);
+    V arg = self;
+    return I.callBlock(a.blk, 1, &arg, false, nullptr, self, target);
+}
+
+V o_instance_exec(Interp &I, V self, Args &a)
+{
+    RClass *target = isObj(self) ? I.singletonOf(self) : nullptr;
+    return I.callBlock(a.blk, a.argc, a.argv, a.kw, nullptr, self, target);
+}
+
+V o_to_enum(Interp &I, V self, Args &a)
+{
+    auto *e = new REnum();
+    e->klass = I.cEnumerator;
+    e->type = T::Enumerator;
+    e->recv = self;
+    e->meth = a.argc > 0 ? symArg(I, a.argv[0]) : I.s.each;
+    for (int i = 1; i < a.argc; ++i)
+        e->args.push_back(a.argv[i]);
+    e->kw = a.kw;
+    return ov(e);
+}
+
+V bo_method_missing(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    V exc = I.makeExc(I.cNoMethodError, "undefined method '" + symName(name) + "' for " + I.describe(self));
+    I.ivarSet(exc, I.s.name, symv(name));
+    I.ivarSet(exc, I.s.receiver, self);
+    I.raiseExc(exc);
+}
+
+V bo_equal(Interp &I, V self, Args &a)
+{
+    (void)I;
+    return boolv(self == a.argv[0]);
+}
+
+// ── nil, true, false ──────────────────────────────────────────────────────
+
+V nil_to_s(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.strFrozen("");
+}
+V nil_to_a(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.ary();
+}
+V nil_to_h(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.newHash();
+}
+V nil_to_i(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return fix(0);
+}
+V nil_to_f(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.flo(0.0);
+}
+V nil_inspect(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.str("nil");
+}
+V nil_and(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qfalse;
+}
+V nil_or(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    return boolv(truthy(a.argv[0]));
+}
+V true_to_s(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.strFrozen("true");
+}
+V false_to_s(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.strFrozen("false");
+}
+V true_and(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    return boolv(truthy(a.argv[0]));
+}
+V true_or(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qtrue;
+}
+V true_xor(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    return boolv(!truthy(a.argv[0]));
+}
+V false_xor(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    return boolv(truthy(a.argv[0]));
+}
+
+// ── Module / Class ────────────────────────────────────────────────────────
+
+V mod_name(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RClass *k = asClass(self);
+    if (k->name.empty())
+        return Qnil;
+    return I.strFrozen(k->name);
+}
+
+V mod_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(I.className(asClass(self)));
+}
+
+V mod_eqq(Interp &I, V self, Args &a) { return boolv(I.kindOf(a.argv[0], asClass(self))); }
+
+V mod_eq(Interp &I, V self, Args &a)
+{
+    (void)I;
+    return boolv(self == a.argv[0]);
+}
+
+V mod_lt(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (!isModuleV(o))
+        I.raise(I.cTypeError, "compared with non class/module");
+    if (self == o)
+        return Qfalse;
+    if (I.isSubclass(asClass(self), asClass(o)))
+        return Qtrue;
+    if (I.isSubclass(asClass(o), asClass(self)))
+        return Qfalse;
+    return Qnil;
+}
+
+V mod_le(Interp &I, V self, Args &a)
+{
+    if (self == a.argv[0])
+        return Qtrue;
+    return mod_lt(I, self, a);
+}
+
+V mod_gt(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (!isModuleV(o))
+        I.raise(I.cTypeError, "compared with non class/module");
+    if (self == o)
+        return Qfalse;
+    if (I.isSubclass(asClass(o), asClass(self)))
+        return Qtrue;
+    if (I.isSubclass(asClass(self), asClass(o)))
+        return Qfalse;
+    return Qnil;
+}
+
+V mod_ge(Interp &I, V self, Args &a)
+{
+    if (self == a.argv[0])
+        return Qtrue;
+    return mod_gt(I, self, a);
+}
+
+V mod_cmp(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (self == o)
+        return fix(0);
+    if (!isModuleV(o))
+        return Qnil;
+    if (I.isSubclass(asClass(self), asClass(o)))
+        return fix(-1);
+    if (I.isSubclass(asClass(o), asClass(self)))
+        return fix(1);
+    return Qnil;
+}
+
+V mod_ancestors(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    for (RClass *k : I.ancestors(asClass(self)))
+        I.aref(out).push_back(ov(k));
+    return out;
+}
+
+V mod_include(Interp &I, V self, Args &a)
+{
+    for (int i = a.argc - 1; i >= 0; --i)
+    {
+        V m = a.argv[i];
+        if (!isType(m, T::Module))
+            I.raise(I.cTypeError, "wrong argument type " + I.className(I.realClassOf(m)) + " (expected Module)");
+        I.call1(m, intern("append_features"), self);
+        I.call1(m, I.s.included, self);
+    }
+    return self;
+}
+
+V mod_append_features(Interp &I, V self, Args &a)
+{
+    I.includeModule(asClass(a.argv[0]), asClass(self));
+    return self;
+}
+
+V mod_prepend(Interp &I, V self, Args &a)
+{
+    for (int i = a.argc - 1; i >= 0; --i)
+    {
+        V m = a.argv[i];
+        if (!isType(m, T::Module))
+            I.raise(I.cTypeError, "wrong argument type " + I.className(I.realClassOf(m)) + " (expected Module)");
+        I.prependModule(asClass(self), asClass(m));
+        I.call1(m, I.s.prepended, self);
+    }
+    return self;
+}
+
+V mod_hook(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qnil;
+}
+
+V mod_include_p(Interp &I, V self, Args &a)
+{
+    V m = a.argv[0];
+    if (!isType(m, T::Module))
+        return Qfalse;
+    for (RClass *k : I.ancestors(asClass(self)))
+        if (k == asClass(m) && k != asClass(self))
+            return Qtrue;
+    return Qfalse;
+}
+
+V mod_included_modules(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    for (RClass *k : I.ancestors(asClass(self)))
+        if (k->isModule)
+            I.aref(out).push_back(ov(k));
+    return out;
+}
+
+void defineAttr(Interp &I, RClass *k, Sym name, bool reader, bool writer, V out)
+{
+    Sym iv = intern("@" + symName(name));
+    if (reader)
+    {
+        auto *m = new Method();
+        m->kind = M_READER;
+        m->ivar = iv;
+        m->vis = k->defaultVis;
+        m->owner = k;
+        I.addMethod(k, name, m);
+        I.aref(out).push_back(symv(name));
+    }
+    if (writer)
+    {
+        auto *m = new Method();
+        m->kind = M_WRITER;
+        m->ivar = iv;
+        m->vis = k->defaultVis;
+        m->owner = k;
+        Sym setter = intern(symName(name) + "=");
+        I.addMethod(k, setter, m);
+        I.aref(out).push_back(symv(setter));
+    }
+}
+
+void attrHooks(Interp &I, V self, V out)
+{
+    std::vector<V> names = I.aref(out);
+    for (V n : names)
+        callMethodAdded(I, asClass(self), vsym(n));
+}
+
+V mod_attr_reader(Interp &I, V self, Args &a)
+{
+    V out = I.ary();
+    for (int i = 0; i < a.argc; ++i)
+        defineAttr(I, asClass(self), symArg(I, a.argv[i]), true, false, out);
+    attrHooks(I, self, out);
+    return out;
+}
+
+V mod_attr_writer(Interp &I, V self, Args &a)
+{
+    V out = I.ary();
+    for (int i = 0; i < a.argc; ++i)
+        defineAttr(I, asClass(self), symArg(I, a.argv[i]), false, true, out);
+    attrHooks(I, self, out);
+    return out;
+}
+
+V mod_attr_accessor(Interp &I, V self, Args &a)
+{
+    V out = I.ary();
+    for (int i = 0; i < a.argc; ++i)
+        defineAttr(I, asClass(self), symArg(I, a.argv[i]), true, true, out);
+    attrHooks(I, self, out);
+    return out;
+}
+
+V mod_define_method(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    RClass *k = asClass(self);
+    auto *m = new Method();
+    if (a.argc > 1 && (isType(a.argv[1], T::Method) || isType(a.argv[1], T::UMethod)))
+    {
+        *m = *static_cast<RMethod *>(op(a.argv[1]))->m;
+        m->vis = V_PUBLIC;
+    }
+    else
+    {
+        V p = a.argc > 1 ? a.argv[1] : blockProc(I, a);
+        if (p == Qnil)
+            I.raise(I.cArgumentError, "tried to create Proc object without a block");
+        m->kind = M_PROC;
+        m->proc = static_cast<RProc *>(op(p));
+        m->vis = k->defaultVis;
+    }
+    m->owner = k;
+    I.addMethod(k, name, m);
+    callMethodAdded(I, k, name);
+    return symv(name);
+}
+
+V mod_alias_method(Interp &I, V self, Args &a)
+{
+    RClass *k = asClass(self);
+    Sym to = symArg(I, a.argv[0]), from = symArg(I, a.argv[1]);
+    Method *m = I.findMethod(k, from);
+    if (!m && k->isModule)
+        m = I.findMethod(I.cObject, from);
+    if (!m)
+        I.raise(I.cNameError, "undefined method '" + symName(from) + "' for " + std::string(k->isModule ? "module" : "class") + " '" + I.className(k) + "'");
+    auto *copy = new Method(*m);
+    copy->orig = m->orig ? m->orig : m->name;
+    if (!k->mt.count(to))
+        k->mtOrder.push_back(to);
+    k->mt[to] = copy;
+    copy->name = from;
+    ++I.methodVersion;
+    callMethodAdded(I, k, to);
+    return symv(to);
+}
+
+V mod_remove_method(Interp &I, V self, Args &a)
+{
+    RClass *k = asClass(self);
+    for (int i = 0; i < a.argc; ++i)
+    {
+        Sym name = symArg(I, a.argv[i]);
+        if (!k->mt.erase(name))
+            I.raise(I.cNameError, "method '" + symName(name) + "' not defined in " + I.className(k));
+    }
+    ++I.methodVersion;
+    return self;
+}
+
+V mod_undef_method(Interp &I, V self, Args &a)
+{
+    RClass *k = asClass(self);
+    for (int i = 0; i < a.argc; ++i)
+    {
+        auto *m = new Method();
+        m->kind = M_UNDEF;
+        m->owner = k;
+        I.addMethod(k, symArg(I, a.argv[i]), m);
+    }
+    return self;
+}
+
+V setVisibility(Interp &I, V self, Args &a, Vis vis)
+{
+    RClass *k = asClass(self);
+    if (a.argc == 0)
+    {
+        k->defaultVis = vis;
+        k->moduleFunction = false;
+        return Qnil;
+    }
+    std::vector<V> names;
+    for (int i = 0; i < a.argc; ++i)
+    {
+        if (I.isAry(a.argv[i]))
+            for (V x : I.aref(a.argv[i]))
+                names.push_back(x);
+        else
+            names.push_back(a.argv[i]);
+    }
+    for (V nv : names)
+    {
+        Sym name = symArg(I, nv);
+        auto it = k->mt.find(name);
+        if (it != k->mt.end())
+        {
+            it->second->vis = vis;
+            ++I.methodVersion;
+            continue;
+        }
+        Method *m = I.findMethod(k, name);
+        if (!m)
+            I.raise(I.cNameError, "undefined method '" + symName(name) + "' for class '" + I.className(k) + "'");
+        auto *copy = new Method(*m);
+        copy->vis = vis;
+        k->mtOrder.push_back(name);
+        k->mt[name] = copy;
+        ++I.methodVersion;
+    }
+    return a.argc == 1 ? a.argv[0] : I.ary(std::vector<V>(a.argv, a.argv + a.argc));
+}
+
+V mod_private(Interp &I, V self, Args &a) { return setVisibility(I, self, a, V_PRIVATE); }
+V mod_public(Interp &I, V self, Args &a) { return setVisibility(I, self, a, V_PUBLIC); }
+V mod_protected(Interp &I, V self, Args &a) { return setVisibility(I, self, a, V_PROTECTED); }
+
+V mod_module_function(Interp &I, V self, Args &a)
+{
+    RClass *k = asClass(self);
+    if (a.argc == 0)
+    {
+        k->moduleFunction = true;
+        return Qnil;
+    }
+    RClass *sk = I.singletonOf(self);
+    for (int i = 0; i < a.argc; ++i)
+    {
+        Sym name = symArg(I, a.argv[i]);
+        Method *m = I.findMethod(k, name);
+        if (!m)
+            continue;
+        auto *pub = new Method(*m);
+        pub->vis = V_PUBLIC;
+        pub->owner = sk;
+        sk->mt[name] = pub;
+        auto *priv = new Method(*m);
+        priv->vis = V_PRIVATE;
+        k->mt[name] = priv;
+    }
+    ++I.methodVersion;
+    return Qnil;
+}
+
+V mod_private_class_method(Interp &I, V self, Args &a)
+{
+    RClass *sk = I.singletonOf(self);
+    Args b = a;
+    return setVisibility(I, ov(sk), b, V_PRIVATE);
+}
+
+V mod_public_class_method(Interp &I, V self, Args &a)
+{
+    RClass *sk = I.singletonOf(self);
+    Args b = a;
+    return setVisibility(I, ov(sk), b, V_PUBLIC);
+}
+
+V mod_private_constant(Interp &I, V self, Args &a)
+{
+    RClass *k = asClass(self);
+    for (int i = 0; i < a.argc; ++i)
+        k->privateConsts.push_back(symArg(I, a.argv[i]));
+    return Qnil;
+}
+
+V mod_method_defined(Interp &I, V self, Args &a)
+{
+    Method *m = I.findMethod(asClass(self), symArg(I, a.argv[0]));
+    return boolv(m && m->vis != V_PRIVATE);
+}
+
+V mod_public_method_defined(Interp &I, V self, Args &a)
+{
+    Method *m = I.findMethod(asClass(self), symArg(I, a.argv[0]));
+    return boolv(m && m->vis == V_PUBLIC);
+}
+
+V mod_private_method_defined(Interp &I, V self, Args &a)
+{
+    Method *m = I.findMethod(asClass(self), symArg(I, a.argv[0]));
+    return boolv(m && m->vis == V_PRIVATE);
+}
+
+V mod_protected_method_defined(Interp &I, V self, Args &a)
+{
+    Method *m = I.findMethod(asClass(self), symArg(I, a.argv[0]));
+    return boolv(m && m->vis == V_PROTECTED);
+}
+
+V instanceMethods(Interp &I, V self, Args &a, int which)
+{
+    bool inherited = a.argc == 0 || truthy(a.argv[0]);
+    V out = I.ary();
+    std::vector<Sym> seen;
+    RClass *k = asClass(self);
+    std::vector<RClass *> list;
+    if (inherited)
+        list = I.ancestors(k);
+    else
+        list.push_back(k);
+    for (RClass *c : list)
+    {
+        for (Sym name : methodNames(c))
+        {
+            Method *m = c->mt[name];
+            if (m->kind == M_UNDEF)
+                continue;
+            bool ok = which == 0 ? m->vis != V_PRIVATE : which == 1 ? m->vis == V_PRIVATE : m->vis == V_PROTECTED;
+            if (!ok)
+                continue;
+            bool dup = false;
+            for (Sym s : seen)
+                if (s == name)
+                    dup = true;
+            if (dup)
+                continue;
+            seen.push_back(name);
+            I.aref(out).push_back(symv(name));
+        }
+    }
+    return out;
+}
+
+V mod_instance_methods(Interp &I, V self, Args &a) { return instanceMethods(I, self, a, 0); }
+V mod_private_instance_methods(Interp &I, V self, Args &a) { return instanceMethods(I, self, a, 1); }
+V mod_protected_instance_methods(Interp &I, V self, Args &a) { return instanceMethods(I, self, a, 2); }
+
+V mod_instance_method(Interp &I, V self, Args &a) { return I.methodObj(self, symArg(I, a.argv[0]), true); }
+
+V mod_const_get(Interp &I, V self, Args &a)
+{
+    std::string name = isSymV(a.argv[0]) ? symName(vsym(a.argv[0])) : I.strOf(a.argv[0]);
+    RClass *k = asClass(self);
+    size_t start = 0;
+    V cur = self;
+    for (;;)
+    {
+        size_t sep = name.find("::", start);
+        std::string part = name.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+        if (!part.empty())
+        {
+            if (!isModuleV(cur))
+                I.raise(I.cTypeError, I.inspect(cur) + " is not a class/module");
+            k = asClass(cur);
+            V v = I.constIn(k, intern(part), true, false);
+            if (v == Qundef)
+                v = I.lookupConst(nullptr, intern(part), false);
+            if (v == Qundef)
+                I.raise(I.cNameError, "uninitialized constant " + (k == I.cObject ? part : I.className(k) + "::" + part));
+            cur = v;
+        }
+        if (sep == std::string::npos)
+            break;
+        start = sep + 2;
+    }
+    return cur;
+}
+
+V mod_const_set(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    const std::string &n = symName(name);
+    if (n.empty() || !std::isupper((unsigned char)n[0]))
+        I.raise(I.cNameError, "wrong constant name " + n);
+    I.setConst(asClass(self), name, a.argv[1]);
+    return a.argv[1];
+}
+
+V mod_const_defined(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    return boolv(I.constIn(asClass(self), name, true, false) != Qundef);
+}
+
+V mod_constants(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    RClass *k = asClass(self);
+    for (Sym c : k->constOrder)
+        I.aref(out).push_back(symv(c));
+    return out;
+}
+
+V mod_cvar_get(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    for (RClass *k : I.ancestors(asClass(self)))
+    {
+        auto it = k->cvars.find(name);
+        if (it != k->cvars.end())
+            return it->second;
+    }
+    I.raise(I.cNameError, "uninitialized class variable " + symName(name) + " in " + I.className(asClass(self)));
+}
+
+V mod_cvar_set(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    for (RClass *k : I.ancestors(asClass(self)))
+    {
+        auto it = k->cvars.find(name);
+        if (it != k->cvars.end())
+        {
+            it->second = a.argv[1];
+            return a.argv[1];
+        }
+    }
+    asClass(self)->cvars[name] = a.argv[1];
+    return a.argv[1];
+}
+
+V mod_cvar_defined(Interp &I, V self, Args &a)
+{
+    Sym name = symArg(I, a.argv[0]);
+    for (RClass *k : I.ancestors(asClass(self)))
+        if (k->cvars.count(name))
+            return Qtrue;
+    return Qfalse;
+}
+
+V mod_class_variables(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    for (auto &kv : asClass(self)->cvars)
+        I.aref(out).push_back(symv(kv.first));
+    return out;
+}
+
+V mod_class_eval(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+    {
+        Frame *f = I.frame;
+        auto *lex = new LexScope();
+        lex->klass = asClass(self);
+        lex->parent = f->c->lex;
+        return I.evalString(I.strOf(a.argv[0]), self, f->c, f->scope, f->env, asClass(self), lex);
+    }
+    V arg = self;
+    return I.callBlock(a.blk, 1, &arg, false, nullptr, self, asClass(self));
+}
+
+V mod_class_exec(Interp &I, V self, Args &a)
+{
+    return I.callBlock(a.blk, a.argc, a.argv, a.kw, nullptr, self, asClass(self));
+}
+
+V mod_refine(Interp &I, V self, Args &a)
+{
+    V target = a.argv[0];
+    RClass *ref = I.newClass(nullptr, true);
+    ref->isRefinement = true;
+    ref->refined = asClass(target);
+    ref->name = "#<refinement:" + I.className(asClass(target)) + "@" + I.className(asClass(self)) + ">";
+    asClass(self)->refinements.push_back(ref);
+    V arg = ov(ref);
+    I.callBlock(a.blk, 1, &arg, false, nullptr, ov(ref), ref);
+    return ov(ref);
+}
+
+V k_using(Interp &I, V self, Args &a)
+{
+    (void)self;
+    RClass *m = asClass(a.argv[0]);
+    for (RClass *r : m->refinements)
+        I.activeRefinements.push_back(r);
+    ++I.methodVersion;
+    return self;
+}
+
+V mod_freeze(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    op(self)->frozen = true;
+    return self;
+}
+
+V mod_module_new(Interp &I, V self, Args &a)
+{
+    (void)self;
+    RClass *k = I.newClass(nullptr, true);
+    if (a.blk)
+    {
+        V arg = ov(k);
+        I.callBlock(a.blk, 1, &arg, false, nullptr, ov(k), k);
+    }
+    return ov(k);
+}
+
+V cls_new(Interp &I, V self, Args &a)
+{
+    RClass *k = asClass(self);
+    if (k->isSingleton)
+        I.raise(I.cTypeError, "can't create instance of singleton class");
+    V obj = I.allocate(k);
+    Method *init = I.findMethod(k, I.s.initialize);
+    if (init)
+        I.invoke(init, obj, a, nullptr, I.frame);
+    return obj;
+}
+
+V cls_allocate(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.allocate(asClass(self));
+}
+
+V cls_superclass(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RClass *k = asClass(self);
+    if (k->isSingleton)
+        return k->super ? ov(k->super) : Qnil;
+    RClass *s = I.realClass(k->super);
+    return s ? ov(s) : Qnil;
+}
+
+V cls_class_new(Interp &I, V self, Args &a)
+{
+    (void)self;
+    RClass *sup = a.argc > 0 ? asClass(a.argv[0]) : I.cObject;
+    RClass *k = I.newClass(sup, false);
+    Method *hook = I.findMethod(I.classOf(ov(sup)), I.s.inherited);
+    if (hook && hook->kind != M_NATIVE)
+    {
+        V av = ov(k);
+        I.call(ov(sup), I.s.inherited, 1, &av);
+    }
+    if (a.blk)
+    {
+        V arg = ov(k);
+        I.callBlock(a.blk, 1, &arg, false, nullptr, ov(k), k);
+    }
+    return ov(k);
+}
+
+V o_initialize_copy(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V mod_singleton_class_p(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return boolv(asClass(self)->isSingleton);
+}
+
+// ── Comparable ────────────────────────────────────────────────────────────
+
+int cmpOrFail(Interp &I, V self, V other)
+{
+    V r = I.call1(self, I.s.cmp, other);
+    if (r == Qnil)
+    {
+        std::string o = !isObj(other) || I.isFloat(other) ? I.inspect(other) : I.className(I.realClassOf(other));
+        I.raise(I.cArgumentError, "comparison of " + I.className(I.realClassOf(self)) + " with " + o + " failed");
+    }
+    if (isFix(r))
+        return fixv(r) < 0 ? -1 : fixv(r) > 0 ? 1 : 0;
+    double d = I.numToF(r);
+    return d < 0 ? -1 : d > 0 ? 1 : 0;
+}
+
+V cmp_eq(Interp &I, V self, Args &a)
+{
+    if (self == a.argv[0])
+        return Qtrue;
+    V r = I.call1(self, I.s.cmp, a.argv[0]);
+    if (r == Qnil)
+        return Qfalse;
+    return boolv(isFix(r) ? fixv(r) == 0 : I.numToF(r) == 0);
+}
+V cmp_lt(Interp &I, V self, Args &a) { return boolv(cmpOrFail(I, self, a.argv[0]) < 0); }
+V cmp_le(Interp &I, V self, Args &a) { return boolv(cmpOrFail(I, self, a.argv[0]) <= 0); }
+V cmp_gt(Interp &I, V self, Args &a) { return boolv(cmpOrFail(I, self, a.argv[0]) > 0); }
+V cmp_ge(Interp &I, V self, Args &a) { return boolv(cmpOrFail(I, self, a.argv[0]) >= 0); }
+V cmp_between(Interp &I, V self, Args &a)
+{
+    return boolv(cmpOrFail(I, self, a.argv[0]) >= 0 && cmpOrFail(I, self, a.argv[1]) <= 0);
+}
+V cmp_clamp(Interp &I, V self, Args &a)
+{
+    V lo, hi;
+    if (a.argc == 1 && isType(a.argv[0], T::Range))
+    {
+        auto *r = static_cast<RRange *>(op(a.argv[0]));
+        lo = r->lo;
+        hi = r->hi;
+    }
+    else
+    {
+        if (a.argc < 2)
+            I.argError(a.argc, 1, 2);
+        lo = a.argv[0];
+        hi = a.argv[1];
+    }
+    if (lo != Qnil && hi != Qnil && cmpOrFail(I, lo, hi) > 0)
+        I.raise(I.cArgumentError, "min argument must be less than or equal to max argument");
+    if (lo != Qnil && cmpOrFail(I, self, lo) < 0)
+        return lo;
+    if (hi != Qnil && cmpOrFail(I, self, hi) > 0)
+        return hi;
+    return self;
+}
+
+// ── Exception ─────────────────────────────────────────────────────────────
+
+V exc_init(Interp &I, V self, Args &a)
+{
+    I.ivarSet(self, I.s.mesg, a.argc > 0 ? a.argv[0] : Qnil);
+    return Qnil;
+}
+
+V exc_exception_class(Interp &I, V self, Args &a)
+{
+    return I.callArgs(self, I.s.new_, a, true);
+}
+
+V exc_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V m = I.ivarGet(self, I.s.mesg);
+    if (m == Qnil)
+        return I.str(I.className(I.realClassOf(self)));
+    return I.toSV(m);
+}
+
+V exc_message(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.toSV(I.call0(self, I.s.to_s));
+}
+
+V exc_detailed_message(Interp &I, V self, Args &a)
+{
+    (void)a;
+    std::string m = I.excMessage(self);
+    return I.str(m + " (" + I.className(I.realClassOf(self)) + ")");
+}
+
+V exc_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    std::string cls = I.className(I.realClassOf(self));
+    std::string m = I.excMessage(self);
+    if (m.empty())
+        return I.str(cls);
+    if (m.find('\n') != std::string::npos)
+        return I.str("#<" + cls + ": " + strInspect(m) + ">");
+    return I.str("#<" + cls + ": " + m + ">");
+}
+
+V exc_full_message(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(I.uncaughtMessage(self));
+}
+
+V exc_backtrace(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, I.s.bt);
+}
+
+V exc_set_backtrace(Interp &I, V self, Args &a)
+{
+    I.ivarSet(self, I.s.bt, a.argv[0]);
+    return a.argv[0];
+}
+
+V exc_cause(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, I.s.cause);
+}
+
+V exc_exception(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0 || a.argv[0] == self)
+        return self;
+    V copy = I.dup(self, false);
+    I.ivarSet(copy, I.s.mesg, a.argv[0]);
+    I.ivarSet(copy, I.s.bt, Qnil);
+    return copy;
+}
+
+V exc_eq(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (self == o)
+        return Qtrue;
+    if (I.realClassOf(self) != I.realClassOf(o))
+        return Qfalse;
+    return boolv(I.eq(I.call0(self, I.s.message), I.call0(o, I.s.message)) &&
+                 I.eq(I.ivarGet(self, I.s.bt), I.ivarGet(o, I.s.bt)));
+}
+
+V exc_key(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, I.s.key);
+}
+
+V exc_receiver(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, I.s.receiver);
+}
+
+V exc_name(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, I.s.name);
+}
+
+V exc_result(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, I.s.result);
+}
+
+V exc_status(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V st = I.ivarGet(self, intern("__status"));
+    return st == Qnil ? fix(0) : st;
+}
+
+V keyerr_init(Interp &I, V self, Args &a)
+{
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    I.ivarSet(self, I.s.mesg, argc > 0 ? a.argv[0] : Qnil);
+    if (kw)
+    {
+        bool found = false;
+        V k = I.hget(kw, I.sym("key"), &found);
+        if (found)
+            I.ivarSet(self, I.s.key, k);
+        V r = I.hget(kw, I.sym("receiver"), &found);
+        if (found)
+            I.ivarSet(self, I.s.receiver, r);
+    }
+    return Qnil;
+}
+
+V nameerr_init(Interp &I, V self, Args &a)
+{
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    I.ivarSet(self, I.s.mesg, argc > 0 ? a.argv[0] : Qnil);
+    if (argc > 1)
+        I.ivarSet(self, I.s.name, a.argv[1]);
+    if (kw)
+    {
+        bool found = false;
+        V r = I.hget(kw, I.sym("receiver"), &found);
+        if (found)
+            I.ivarSet(self, I.s.receiver, r);
+    }
+    return Qnil;
+}
+
+V frozenerr_init(Interp &I, V self, Args &a)
+{
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    I.ivarSet(self, I.s.mesg, argc > 0 ? a.argv[0] : Qnil);
+    if (kw)
+    {
+        bool found = false;
+        V r = I.hget(kw, I.sym("receiver"), &found);
+        if (found)
+            I.ivarSet(self, I.s.receiver, r);
+    }
+    return Qnil;
+}
+
+// ── Proc / Method ─────────────────────────────────────────────────────────
+
+V proc_new(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (!a.blk)
+        I.raise(I.cArgumentError, "tried to create Proc object without a block");
+    return I.procFromBlk(a.blk);
+}
+
+V proc_call(Interp &I, V self, Args &a)
+{
+    auto *p = static_cast<RProc *>(op(self));
+    return I.callBlock(&p->blk, a.argc, a.argv, a.kw, a.blk);
+}
+
+V proc_to_proc(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V proc_lambda_p(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return boolv(static_cast<RProc *>(op(self))->lambda);
+}
+
+int blkArity(Blk *b, bool lambda)
+{
+    if (b->kind == B_RUBY && b->node)
+    {
+        BlockNode *bn = b->node;
+        if (bn->numbered && bn->params.params.empty())
+            return bn->numberedCount == 0 ? 1 : bn->numberedCount;
+        if (bn->params.params.empty())
+            return lambda ? 0 : 0;
+        ParamList &pl = bn->params;
+        if (!lambda && pl.optional > 0 && !pl.hasRest && pl.required + pl.post == 0)
+            return -1;
+        return paramArity(pl, lambda);
+    }
+    if (b->kind == B_METHOD && b->meth)
+    {
+        if (b->meth->kind == M_RUBY)
+            return paramArity(b->meth->def->params, true);
+        return b->meth->maxArgs == b->meth->minArgs ? b->meth->minArgs : -(b->meth->minArgs + 1);
+    }
+    if (b->kind == B_SYM)
+        return -2;
+    return b->arity;
+}
+
+V proc_arity(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    auto *p = static_cast<RProc *>(op(self));
+    return fix(blkArity(&p->blk, p->lambda));
+}
+
+V proc_parameters(Interp &I, V self, Args &a)
+{
+    (void)a;
+    auto *p = static_cast<RProc *>(op(self));
+    if (p->blk.kind == B_RUBY && p->blk.node)
+        return paramList(I, p->blk.node->params, p->lambda);
+    if (p->blk.kind == B_METHOD && p->blk.meth && p->blk.meth->def)
+        return paramList(I, p->blk.meth->def->params, true);
+    return I.ary();
+}
+
+V makeCurry(Interp &I, V proc, int arity, std::vector<V> got, bool lambda)
+{
+    auto *fn = new NativeBlockFn();
+    *fn = [proc, arity, got, lambda](Interp &J, Args &a) -> V
+    {
+        std::vector<V> all = got;
+        for (int i = 0; i < a.argc; ++i)
+            all.push_back(a.argv[i]);
+        if ((int)all.size() >= arity)
+            return J.callProc(proc, (int)all.size(), all.data());
+        return makeCurry(J, proc, arity, all, lambda);
+    };
+    Blk b = I.nativeBlk(fn, -1);
+    b.lambda = lambda;
+    V p = I.procFromBlk(&b, lambda);
+    return p;
+}
+
+V proc_curry(Interp &I, V self, Args &a)
+{
+    auto *p = static_cast<RProc *>(op(self));
+    int arity = a.argc > 0 ? (int)I.intOf(a.argv[0]) : blkArity(&p->blk, p->lambda);
+    if (arity < 0)
+        arity = -arity - 1;
+    if (a.argc > 0 && p->lambda)
+    {
+        int real = blkArity(&p->blk, true);
+        if (real >= 0 && real != arity)
+            I.raise(I.cArgumentError, "wrong number of arguments (given " + std::to_string(arity) + ", expected " + std::to_string(real) + ")");
+    }
+    if (arity == 0)
+        return self;
+    return makeCurry(I, self, arity, std::vector<V>(), true);
+}
+
+V composeProcs(Interp &I, V first, V second, bool lambda)
+{
+    auto *fn = new NativeBlockFn();
+    *fn = [first, second](Interp &J, Args &a) -> V
+    {
+        V mid;
+        if (isType(first, T::Proc))
+            mid = J.callBlock(&static_cast<RProc *>(op(first))->blk, a.argc, a.argv, a.kw, a.blk);
+        else
+            mid = J.call(first, J.s.call, a.argc, a.argv, a.blk, false, a.kw);
+        if (isType(second, T::Proc))
+            return J.callProc(second, 1, &mid);
+        return J.call(second, J.s.call, 1, &mid, nullptr, false);
+    };
+    Blk b = I.nativeBlk(fn, -1);
+    b.lambda = lambda;
+    return I.procFromBlk(&b, lambda);
+}
+
+V proc_rshift(Interp &I, V self, Args &a)
+{
+    return composeProcs(I, self, a.argv[0], static_cast<RProc *>(op(self))->lambda);
+}
+
+V proc_lshift(Interp &I, V self, Args &a)
+{
+    return composeProcs(I, a.argv[0], self, static_cast<RProc *>(op(self))->lambda);
+}
+
+V proc_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    auto *p = static_cast<RProc *>(op(self));
+    std::string loc;
+    if (p->blk.kind == B_RUBY && p->blk.node)
+        loc = " " + I.file + ":" + std::to_string(p->blk.node->line);
+    if (p->blk.kind == B_SYM)
+        loc = "(&" + symInspect(symName(p->blk.sym)) + ")";
+    return I.str("#<Proc:" + addrText(p) + loc + (p->lambda ? " (lambda)>" : ">"));
+}
+
+V meth_call(Interp &I, V self, Args &a)
+{
+    auto *m = static_cast<RMethod *>(op(self));
+    return I.invoke(m->m, m->recv, a, nullptr, I.frame);
+}
+
+V meth_to_proc(Interp &I, V self, Args &a)
+{
+    (void)a;
+    auto *m = static_cast<RMethod *>(op(self));
+    Blk b;
+    b.kind = B_METHOD;
+    b.recv = m->recv;
+    b.meth = m->m;
+    b.lambda = true;
+    V p = I.procFromBlk(&b, true);
+    static_cast<RProc *>(op(p))->fromMethod = true;
+    static_cast<RProc *>(op(p))->methodObj = self;
+    return p;
+}
+
+V meth_arity(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    Method *m = static_cast<RMethod *>(op(self))->m;
+    switch (m->kind)
+    {
+    case M_RUBY: return fix(paramArity(m->def->params, true));
+    case M_READER: return fix(0);
+    case M_WRITER: return fix(1);
+    case M_PROC: return fix(blkArity(&m->proc->blk, true));
+    default: return fix(m->maxArgs == m->minArgs ? m->minArgs : -(m->minArgs + 1));
+    }
+}
+
+V meth_parameters(Interp &I, V self, Args &a)
+{
+    (void)a;
+    Method *m = static_cast<RMethod *>(op(self))->m;
+    if (m->kind == M_RUBY)
+        return paramList(I, m->def->params, true);
+    if (m->kind == M_PROC && m->proc->blk.node)
+        return paramList(I, m->proc->blk.node->params, true);
+    if (m->kind == M_WRITER)
+    {
+        V e = I.ary();
+        I.aref(e).push_back(I.sym("req"));
+        V out = I.ary();
+        I.aref(out).push_back(e);
+        return out;
+    }
+    V out = I.ary();
+    if (m->kind == M_NATIVE || m->kind == M_NATIVE_ENUM)
+    {
+        if (m->maxArgs < 0)
+        {
+            V e = I.ary();
+            I.aref(e).push_back(I.sym("rest"));
+            I.aref(out).push_back(e);
+        }
+        else
+            for (int i = 0; i < m->maxArgs; ++i)
+            {
+                V e = I.ary();
+                I.aref(e).push_back(I.sym(i < m->minArgs ? "req" : "opt"));
+                I.aref(out).push_back(e);
+            }
+    }
+    return out;
+}
+
+V meth_name(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return symv(static_cast<RMethod *>(op(self))->name);
+}
+
+V meth_owner(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return ov(static_cast<RMethod *>(op(self))->m->owner);
+}
+
+V meth_receiver(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return static_cast<RMethod *>(op(self))->recv;
+}
+
+V meth_unbind(Interp &I, V self, Args &a)
+{
+    (void)a;
+    auto *m = static_cast<RMethod *>(op(self));
+    auto *u = new RMethod(*m);
+    u->klass = I.cUMethod;
+    u->type = T::UMethod;
+    u->recv = Qnil;
+    return ov(u);
+}
+
+V meth_bind(Interp &I, V self, Args &a)
+{
+    auto *m = static_cast<RMethod *>(op(self));
+    RClass *owner = m->m->owner;
+    if (!owner->isModule && !I.kindOf(a.argv[0], I.realClass(owner)))
+        I.raise(I.cTypeError, "bind argument must be an instance of " + I.className(owner));
+    auto *b = new RMethod(*m);
+    b->klass = I.cMethod;
+    b->type = T::Method;
+    b->recv = a.argv[0];
+    return ov(b);
+}
+
+V meth_bind_call(Interp &I, V self, Args &a)
+{
+    auto *m = static_cast<RMethod *>(op(self));
+    Args b;
+    b.argv = a.argv + 1;
+    b.argc = a.argc - 1;
+    b.kw = a.kw;
+    b.blk = a.blk;
+    return I.invoke(m->m, a.argv[0], b, nullptr, I.frame);
+}
+
+V meth_super_method(Interp &I, V self, Args &a)
+{
+    (void)a;
+    auto *m = static_cast<RMethod *>(op(self));
+    RClass *found = nullptr;
+    Method *sm = I.findMethodAfter(I.classOf(m->recv), m->m->owner, m->name, &found);
+    if (!sm)
+        return Qnil;
+    auto *r = new RMethod(*m);
+    r->m = sm;
+    return ov(r);
+}
+
+V meth_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    auto *m = static_cast<RMethod *>(op(self));
+    std::string owner = I.className(m->m->owner);
+    bool unbound = op(self)->type == T::UMethod;
+    std::string recvClass = unbound ? owner : I.className(I.realClassOf(m->recv));
+    std::string head = unbound ? "#<UnboundMethod: " : "#<Method: ";
+    std::string who = recvClass == owner ? owner : recvClass + "(" + owner + ")";
+    return I.str(head + who + "#" + symName(m->name) + "(*)>");
+}
+
+V meth_curry(Interp &I, V self, Args &a)
+{
+    V p = meth_to_proc(I, self, a);
+    Args b;
+    b.argv = a.argv;
+    b.argc = a.argc;
+    return proc_curry(I, p, b);
+}
+
+V meth_compose_r(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return composeProcs(I, self, a.argv[0], true);
+}
+
+V meth_compose_l(Interp &I, V self, Args &a) { return composeProcs(I, a.argv[0], self, true); }
+
+V meth_source_location(Interp &I, V self, Args &a)
+{
+    (void)a;
+    Method *m = static_cast<RMethod *>(op(self))->m;
+    if (m->kind != M_RUBY)
+        return Qnil;
+    return I.ary2(I.str(I.file), fix(m->def->line));
+}
+
+V meth_eq(Interp &I, V self, Args &a)
+{
+    (void)I;
+    V o = a.argv[0];
+    if (!isType(o, T::Method) && !isType(o, T::UMethod))
+        return Qfalse;
+    auto *x = static_cast<RMethod *>(op(self)), *y = static_cast<RMethod *>(op(o));
+    return boolv(x->recv == y->recv && x->m->def == y->m->def && x->m->fn == y->m->fn && x->m->owner == y->m->owner);
+}
+
+} // namespace
+
+void Interp::initKernel()
+{
+    RClass *k = mKernel;
+    auto kfn = [&](const char *name, NativeFn fn, int mn, int mx)
+    {
+        defnPriv(k, name, fn, mn, mx);
+        defs(k, name, fn, mn, mx);
+    };
+    kfn("puts", k_puts, 0, -1);
+    kfn("print", k_print, 0, -1);
+    kfn("p", k_p, 0, -1);
+    kfn("pp", k_pp, 0, -1);
+    kfn("eval", k_eval, 1, 4);
+    kfn("local_variables", k_local_variables, 0, 0);
+    kfn("global_variables", k_global_variables, 0, 0);
+    kfn("`", k_backtick, 1, 1);
+    kfn("system", k_system, 1, -1);
+    kfn("require", k_require, 1, 1);
+    kfn("require_relative", k_require_relative, 1, 1);
+    kfn("load", k_require, 1, 2);
+    kfn("raise", k_raise, 0, 4);
+    kfn("fail", k_raise, 0, 4);
+    kfn("loop", k_loop, 0, 0);
+    kfn("lambda", k_lambda, 0, 0);
+    kfn("proc", k_proc, 0, 0);
+    kfn("block_given?", k_block_given, 0, 0);
+    kfn("__method__", k_method_name, 0, 0);
+    kfn("format", k_format, 1, -1);
+    kfn("sprintf", k_format, 1, -1);
+    kfn("printf", k_printf, 0, -1);
+    kfn("catch", k_catch, 0, 1);
+    kfn("throw", k_throw, 1, 2);
+    kfn("exit", k_exit, 0, 1);
+    kfn("exit!", k_exit, 0, 1);
+    kfn("abort", k_abort, 0, 1);
+    kfn("at_exit", k_at_exit, 0, 0);
+    kfn("gets", k_gets, 0, -1);
+    kfn("caller", k_caller, 0, 2);
+    kfn("binding", k_binding, 0, 0);
+    kfn("warn", k_warn, 0, -1);
+    kfn("Integer", k_Integer, 1, 3);
+    kfn("Float", k_Float, 1, 2);
+    kfn("String", k_String, 1, 1);
+    kfn("Array", k_Array, 1, 1);
+    kfn("Hash", k_Hash, 1, 1);
+    kfn("Rational", k_Rational, 1, 3);
+    kfn("Complex", k_Complex, 1, 3);
+    defs(cObject, "using", k_using, 1, 1);
+    defnPriv(cObject, "using", k_using, 1, 1);
+    RClass *mainSingleton = singletonOf(mainObj);
+    defn(mainSingleton, "using", k_using, 1, 1);
+    defn(mainSingleton, "to_s", o_to_s, 0, 0);
+    defn(mainSingleton, "inspect", o_to_s, 0, 0);
+    defn(mainSingleton, "include", mod_include, 1, -1);
+
+    RClass *b = cBasicObject;
+    defnPriv(b, "initialize", o_init, 0, -1);
+    defn(b, "==", o_eq, 1, 1);
+    defn(b, "equal?", bo_equal, 1, 1);
+    defn(b, "!", o_not, 0, 0);
+    defn(b, "!=", o_neq, 1, 1);
+    defn(b, "__send__", o_send, 1, -1);
+    defn(b, "__id__", o_object_id, 0, 0);
+    defn(b, "instance_eval", o_instance_eval, 0, 3);
+    defn(b, "instance_exec", o_instance_exec, 0, -1);
+    defnPriv(b, "method_missing", bo_method_missing, 1, -1);
+    defnPriv(b, "singleton_method_added", mod_hook, 1, 1);
+
+    RClass *o = mKernel;
+    defnPriv(o, "initialize_copy", o_initialize_copy, 1, 1);
+    defnPriv(o, "initialize_dup", o_initialize_copy, 1, 1);
+    defnPriv(o, "initialize_clone", o_initialize_copy, 1, 2);
+    defn(o, "<=>", o_cmp, 1, 1);
+    defn(o, "class", o_class, 0, 0);
+    defn(o, "singleton_class", o_singleton_class, 0, 0);
+    defn(o, "===", o_eqq, 1, 1);
+    defn(o, "=~", o_match, 1, 1);
+    defn(o, "!~", o_nmatch, 1, 1);
+    defn(o, "eql?", o_eq, 1, 1);
+    defn(o, "hash", o_hash, 0, 0);
+    defn(o, "object_id", o_object_id, 0, 0);
+    defn(o, "nil?", o_nil_p, 0, 0);
+    defn(o, "is_a?", o_is_a, 1, 1);
+    defn(o, "kind_of?", o_is_a, 1, 1);
+    defn(o, "instance_of?", o_instance_of, 1, 1);
+    defn(o, "respond_to?", o_respond_to, 1, 2);
+    defnPriv(o, "respond_to_missing?", o_respond_to_missing, 2, 2);
+    defn(o, "send", o_send, 1, -1);
+    defn(o, "public_send", o_public_send, 1, -1);
+    defn(o, "method", o_method, 1, 1);
+    defn(o, "public_method", o_method, 1, 1);
+    defn(o, "methods", o_methods, 0, 1);
+    defn(o, "public_methods", o_methods, 0, 1);
+    defn(o, "singleton_methods", o_singleton_methods, 0, 1);
+    defn(o, "define_singleton_method", o_define_singleton_method, 1, 2);
+    defn(o, "extend", o_extend, 1, -1);
+    defn(o, "instance_variables", o_instance_variables, 0, 0);
+    defn(o, "instance_variable_get", o_ivar_get, 1, 1);
+    defn(o, "instance_variable_set", o_ivar_set, 2, 2);
+    defn(o, "instance_variable_defined?", o_ivar_defined, 1, 1);
+    defn(o, "remove_instance_variable", o_remove_ivar, 1, 1);
+    defn(o, "freeze", o_freeze, 0, 0);
+    defn(o, "frozen?", o_frozen, 0, 0);
+    defn(o, "dup", o_dup, 0, 0);
+    defn(o, "clone", o_clone, 0, 1);
+    defn(o, "itself", o_itself, 0, 0);
+    defn(o, "then", o_then, 0, 0);
+    defn(o, "yield_self", o_then, 0, 0);
+    defn(o, "tap", o_tap, 0, 0);
+    defn(o, "to_s", o_to_s, 0, 0);
+    defn(o, "inspect", o_inspect, 0, 0);
+    defn(o, "display", o_display, 0, 1);
+    defn(o, "to_enum", o_to_enum, 0, -1);
+    defn(o, "enum_for", o_to_enum, 0, -1);
+
+    RClass *io = cIO;
+    defn(io, "puts", io_puts, 0, -1);
+    defn(io, "print", io_print, 0, -1);
+    defn(io, "write", io_write, 0, -1);
+    defn(io, "<<", io_write, 1, 1);
+    defn(io, "printf", io_printf, 0, -1);
+    defn(io, "flush", io_flush, 0, 0);
+    defn(io, "sync", io_sync, 0, 0);
+    defn(io, "sync=", io_sync, 1, 1);
+    defn(io, "gets", k_gets, 0, -1);
+    defn(io, "read", io_read_all, 0, -1);
+    defn(io, "readlines", io_readlines, 0, -1);
+    defn(io, "tty?", o_respond_to_missing, 0, 0);
+    defn(io, "isatty", o_respond_to_missing, 0, 0);
+
+    defn(cNil, "to_s", nil_to_s, 0, 0);
+    defn(cNil, "to_a", nil_to_a, 0, 0);
+    defn(cNil, "to_h", nil_to_h, 0, 0);
+    defn(cNil, "to_i", nil_to_i, 0, 0);
+    defn(cNil, "to_f", nil_to_f, 0, 0);
+    defn(cNil, "inspect", nil_inspect, 0, 0);
+    defn(cNil, "&", nil_and, 1, 1);
+    defn(cNil, "|", nil_or, 1, 1);
+    defn(cNil, "^", nil_or, 1, 1);
+    defn(cTrue, "to_s", true_to_s, 0, 0);
+    defn(cTrue, "inspect", true_to_s, 0, 0);
+    defn(cTrue, "&", true_and, 1, 1);
+    defn(cTrue, "|", true_or, 1, 1);
+    defn(cTrue, "^", true_xor, 1, 1);
+    defn(cFalse, "to_s", false_to_s, 0, 0);
+    defn(cFalse, "inspect", false_to_s, 0, 0);
+    defn(cFalse, "&", nil_and, 1, 1);
+    defn(cFalse, "|", nil_or, 1, 1);
+    defn(cFalse, "^", false_xor, 1, 1);
+}
+
+void Interp::initModule()
+{
+    g_cBinding = defineClass("Binding", cObject);
+    defn(g_cBinding, "eval", bd_eval, 1, 3);
+    defn(g_cBinding, "receiver", bd_receiver, 0, 0);
+    defn(g_cBinding, "local_variables", bd_local_variables, 0, 0);
+    defn(g_cBinding, "local_variable_get", bd_lv_get, 1, 1);
+    defn(g_cBinding, "local_variable_set", bd_lv_set, 2, 2);
+    defn(g_cBinding, "local_variable_defined?", bd_lv_defined, 1, 1);
+    g_cStatus = defineClass("Status", cObject, mProcess);
+    defn(g_cStatus, "exitstatus", st_code, 0, 0);
+    defn(g_cStatus, "to_i", st_code, 0, 0);
+    defn(g_cStatus, "success?", st_success, 0, 0);
+    RClass *m = cModule;
+    defnPriv(m, "remove_const", mod_remove_const, 1, 1);
+    defn(m, "__cvar_remove", mod_cvar_remove, 1, 1);
+    defs(m, "nesting", mod_nesting, 0, 0);
+    defn(cClass, "subclasses", mod_subclasses, 0, 0);
+    defn(cClass, "attached_object", mod_attached_object, 0, 0);
+    defn(m, "singleton_class?", mod_singleton_class_p, 0, 0);
+    defn(m, "name", mod_name, 0, 0);
+    defn(m, "to_s", mod_to_s, 0, 0);
+    defn(m, "inspect", mod_to_s, 0, 0);
+    defn(m, "===", mod_eqq, 1, 1);
+    defn(m, "==", mod_eq, 1, 1);
+    defn(m, "<", mod_lt, 1, 1);
+    defn(m, "<=", mod_le, 1, 1);
+    defn(m, ">", mod_gt, 1, 1);
+    defn(m, ">=", mod_ge, 1, 1);
+    defn(m, "<=>", mod_cmp, 1, 1);
+    defn(m, "ancestors", mod_ancestors, 0, 0);
+    defn(m, "include", mod_include, 1, -1);
+    defn(m, "append_features", mod_append_features, 1, 1);
+    defn(m, "prepend", mod_prepend, 1, -1);
+    defn(m, "include?", mod_include_p, 1, 1);
+    defn(m, "included_modules", mod_included_modules, 0, 0);
+    defnPriv(m, "included", mod_hook, 1, 1);
+    defnPriv(m, "extended", mod_hook, 1, 1);
+    defnPriv(m, "prepended", mod_hook, 1, 1);
+    defnPriv(m, "method_added", mod_hook, 1, 1);
+    defn(m, "attr_reader", mod_attr_reader, 0, -1);
+    defn(m, "attr_writer", mod_attr_writer, 0, -1);
+    defn(m, "attr_accessor", mod_attr_accessor, 0, -1);
+    defn(m, "attr", mod_attr_reader, 0, -1);
+    defn(m, "define_method", mod_define_method, 1, 2);
+    defn(m, "alias_method", mod_alias_method, 2, 2);
+    defn(m, "remove_method", mod_remove_method, 0, -1);
+    defn(m, "undef_method", mod_undef_method, 0, -1);
+    defn(m, "private", mod_private, 0, -1);
+    defn(m, "public", mod_public, 0, -1);
+    defn(m, "protected", mod_protected, 0, -1);
+    defn(m, "module_function", mod_module_function, 0, -1);
+    defn(m, "private_class_method", mod_private_class_method, 0, -1);
+    defn(m, "public_class_method", mod_public_class_method, 0, -1);
+    defn(m, "private_constant", mod_private_constant, 0, -1);
+    defn(m, "public_constant", mod_hook, 0, -1);
+    defn(m, "method_defined?", mod_method_defined, 1, 2);
+    defn(m, "public_method_defined?", mod_public_method_defined, 1, 2);
+    defn(m, "private_method_defined?", mod_private_method_defined, 1, 2);
+    defn(m, "protected_method_defined?", mod_protected_method_defined, 1, 2);
+    defn(m, "instance_methods", mod_instance_methods, 0, 1);
+    defn(m, "public_instance_methods", mod_instance_methods, 0, 1);
+    defn(m, "private_instance_methods", mod_private_instance_methods, 0, 1);
+    defn(m, "protected_instance_methods", mod_protected_instance_methods, 0, 1);
+    defn(m, "instance_method", mod_instance_method, 1, 1);
+    defn(m, "public_instance_method", mod_instance_method, 1, 1);
+    defn(m, "const_get", mod_const_get, 1, 2);
+    defn(m, "const_set", mod_const_set, 2, 2);
+    defn(m, "const_defined?", mod_const_defined, 1, 2);
+    defn(m, "constants", mod_constants, 0, 1);
+    defn(m, "class_variable_get", mod_cvar_get, 1, 1);
+    defn(m, "class_variable_set", mod_cvar_set, 2, 2);
+    defn(m, "class_variable_defined?", mod_cvar_defined, 1, 1);
+    defn(m, "class_variables", mod_class_variables, 0, 1);
+    defn(m, "class_eval", mod_class_eval, 0, 3);
+    defn(m, "module_eval", mod_class_eval, 0, 3);
+    defn(m, "class_exec", mod_class_exec, 0, -1);
+    defn(m, "module_exec", mod_class_exec, 0, -1);
+    defn(m, "refine", mod_refine, 1, 1);
+    defn(m, "freeze", mod_freeze, 0, 0);
+    defnPriv(m, "using", k_using, 1, 1);
+    defs(m, "new", mod_module_new, 0, 0);
+
+    RClass *c = cClass;
+    defn(c, "new", cls_new, 0, -1);
+    defn(c, "allocate", cls_allocate, 0, 0);
+    defn(c, "superclass", cls_superclass, 0, 0);
+    defnPriv(c, "inherited", mod_hook, 1, 1);
+    defs(c, "new", cls_class_new, 0, 1);
+}
+
+void Interp::initComparable()
+{
+    RClass *c = mComparable;
+    defn(c, "==", cmp_eq, 1, 1);
+    defn(c, "<", cmp_lt, 1, 1);
+    defn(c, "<=", cmp_le, 1, 1);
+    defn(c, ">", cmp_gt, 1, 1);
+    defn(c, ">=", cmp_ge, 1, 1);
+    defn(c, "between?", cmp_between, 2, 2);
+    defn(c, "clamp", cmp_clamp, 1, 2);
+}
+
+void Interp::initException()
+{
+    RClass *e = cException;
+    defs(e, "exception", exc_exception_class, 0, -1);
+    defnPriv(e, "initialize", exc_init, 0, 1);
+    defn(e, "to_s", exc_to_s, 0, 0);
+    defn(e, "message", exc_message, 0, 0);
+    defn(e, "detailed_message", exc_detailed_message, 0, -1);
+    defn(e, "inspect", exc_inspect, 0, 0);
+    defn(e, "full_message", exc_full_message, 0, -1);
+    defn(e, "backtrace", exc_backtrace, 0, 0);
+    defn(e, "backtrace_locations", exc_backtrace, 0, 0);
+    defn(e, "set_backtrace", exc_set_backtrace, 1, 1);
+    defn(e, "cause", exc_cause, 0, 0);
+    defn(e, "exception", exc_exception, 0, 1);
+    defn(e, "==", exc_eq, 1, 1);
+    defnPriv(cKeyError, "initialize", keyerr_init, 0, -1);
+    defn(cKeyError, "key", exc_key, 0, 0);
+    defn(cKeyError, "receiver", exc_receiver, 0, 0);
+    defn(cNoMatchingPatternKeyError, "key", exc_key, 0, 0);
+    defnPriv(cNoMatchingPatternKeyError, "initialize", keyerr_init, 0, -1);
+    defnPriv(cNameError, "initialize", nameerr_init, 0, -1);
+    defn(cNameError, "name", exc_name, 0, 0);
+    defn(cNameError, "receiver", exc_receiver, 0, 0);
+    defnPriv(cFrozenError, "initialize", frozenerr_init, 0, -1);
+    defn(cFrozenError, "receiver", exc_receiver, 0, 0);
+    defn(cStopIteration, "result", exc_result, 0, 0);
+    defn(cSystemExit, "status", exc_status, 0, 0);
+    defn(cUncaughtThrowError, "tag", exc_key, 0, 0);
+}
+
+void Interp::initProc()
+{
+    RClass *p = cProc;
+    defs(p, "new", proc_new, 0, 0);
+    defn(p, "call", proc_call, 0, -1);
+    defn(p, "()", proc_call, 0, -1);
+    defn(p, "yield", proc_call, 0, -1);
+    defn(p, "[]", proc_call, 0, -1);
+    defn(p, "===", proc_call, 0, -1);
+    defn(p, "to_proc", proc_to_proc, 0, 0);
+    defn(p, "lambda?", proc_lambda_p, 0, 0);
+    defn(p, "arity", proc_arity, 0, 0);
+    defn(p, "parameters", proc_parameters, 0, 1);
+    defn(p, "curry", proc_curry, 0, 1);
+    defn(p, ">>", proc_rshift, 1, 1);
+    defn(p, "<<", proc_lshift, 1, 1);
+    defn(p, "inspect", proc_inspect, 0, 0);
+    defn(p, "to_s", proc_inspect, 0, 0);
+
+    RClass *m = cMethod;
+    defn(m, "call", meth_call, 0, -1);
+    defn(m, "[]", meth_call, 0, -1);
+    defn(m, "===", meth_call, 0, -1);
+    defn(m, "to_proc", meth_to_proc, 0, 0);
+    defn(m, "arity", meth_arity, 0, 0);
+    defn(m, "parameters", meth_parameters, 0, 0);
+    defn(m, "name", meth_name, 0, 0);
+    defn(m, "owner", meth_owner, 0, 0);
+    defn(m, "receiver", meth_receiver, 0, 0);
+    defn(m, "unbind", meth_unbind, 0, 0);
+    defn(m, "super_method", meth_super_method, 0, 0);
+    defn(m, "inspect", meth_inspect, 0, 0);
+    defn(m, "to_s", meth_inspect, 0, 0);
+    defn(m, "curry", meth_curry, 0, 1);
+    defn(m, ">>", meth_compose_r, 1, 1);
+    defn(m, "<<", meth_compose_l, 1, 1);
+    defn(m, "source_location", meth_source_location, 0, 0);
+    defn(m, "==", meth_eq, 1, 1);
+    RClass *u = cUMethod;
+    defn(u, "bind", meth_bind, 1, 1);
+    defn(u, "bind_call", meth_bind_call, 1, -1);
+    defn(u, "arity", meth_arity, 0, 0);
+    defn(u, "parameters", meth_parameters, 0, 0);
+    defn(u, "name", meth_name, 0, 0);
+    defn(u, "owner", meth_owner, 0, 0);
+    defn(u, "inspect", meth_inspect, 0, 0);
+    defn(u, "to_s", meth_inspect, 0, 0);
+    defn(u, "source_location", meth_source_location, 0, 0);
+    defn(u, "==", meth_eq, 1, 1);
+}
+
+} // namespace ruby

@@ -1,0 +1,45 @@
+// quantum: cpp
+// Ruby front-end: symbol interning. Every method, variable and symbol name
+// becomes a small integer shared by the parser and the interpreter.
+#include "RubyAst.h.sa"
+
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace ruby
+{
+
+namespace
+{
+
+struct SymTable
+{
+    std::unordered_map<std::string, Sym> ids;
+    std::vector<std::string> names;
+    SymTable() { names.push_back(""); } // 0: no name
+};
+
+SymTable &table()
+{
+    static SymTable t;
+    return t;
+}
+
+} // namespace
+
+Sym intern(const std::string &name)
+{
+    SymTable &t = table();
+    auto it = t.ids.find(name);
+    if (it != t.ids.end())
+        return it->second;
+    Sym s = (Sym)t.names.size();
+    t.names.push_back(name);
+    t.ids.emplace(name, s);
+    return s;
+}
+
+const std::string &symName(Sym s) { return table().names[s]; }
+
+} // namespace ruby

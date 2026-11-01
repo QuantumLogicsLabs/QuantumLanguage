@@ -1,4 +1,5 @@
 // quantum: cpp
+#include "../ruby/RubyMain.h.sa"
 #include "Vm.h.sa"
 #include "Error.h.sa"
 #include <iostream>
@@ -124,6 +125,17 @@ void VM::registerNatives()
         nat->fn = std::move(fn);
         globals->define(name, QuantumValue(nat));
     };
+
+    // A Ruby program (applyDialect): the Ruby front-end runs it to its end
+    reg("__ruby_run__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        ruby::RunFailure failure;
+        int status = ruby::runProgram(args[0].asString(), args[1].asString(), failure);
+        if (failure.failed)
+            throw QuantumError(failure.kind, failure.message, failure.line);
+        if (status != 0)
+            std::exit(status);
+        return QuantumValue(); });
 
     // ── I/O ───────────────────────────────────────────────────────────────
     reg("__input__", [](std::vector<QuantumValue> args) -> QuantumValue

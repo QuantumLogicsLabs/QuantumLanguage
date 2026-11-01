@@ -40,7 +40,15 @@
 //   List.of / Set.of / Map.of, new Object()  __jList_of, ..., __jobject()
 //   class Main { static void main(...) }     Main.main([]) at the end of the file
 // and appends the marker line that makes compileSource() load the Java-style
-// library (System.out, StringBuilder, collections, exceptions, ...).
+// library (System.out, StringBuilder, collections, exceptions, ...). The
+// marker names the file's classes with a `{ ... }` body (Chunk::javaStyle:
+// Java's char arithmetic, fields that hide the file's globals).
+//
+// Ruby in the same file: its syntax is left alone (`class Dog < Animal ...
+// end` has no Java body, `lo...hi` is a range, `Foo.new` and `Mod::Const`
+// stay), Ruby's `private` (alone on its line, or before `def`) is not a sign
+// of Java, and the Ruby pass marks its lines so they keep Ruby's meanings of
+// method names and operators (rubyStyleLines in RubyDialect.sa).
 
 const char *const kJavaStyleMarker = "// quantum: java-style";
 
@@ -140,6 +148,8 @@ std::vector<JTok> tokenize(const std::string &s, std::string &tail)
             {
                 if (s[i] == '.' && i + 1 < n && s[i + 1] == '.')
                     break; // a range: 1..5
+                if (s[i] == '.' && i + 1 < n && identStart(s[i + 1]))
+                    break; // a method of the number: 3.14.round, 5.0.toFixed(2)
                 ++i;
             }
             t.kind = JK::Number;
@@ -239,8 +249,7 @@ class JavaRewriter
                 return true;
             if (x == "import" && (is(i + 1, "java") || is(i + 1, "javax")) && is(i + 2, "."))
                 return true;
-            if ((x == "public" || x == "private" || x == "protected") && i + 1 < t_.size() &&
-                t_[i + 1].kind == JK::Ident)
+            if ((x == "public" || x == "private" || x == "protected") && javaModifier(i))
                 return true;
             if (x == "implements" && i + 1 < t_.size() && t_[i + 1].kind == JK::Ident)
                 return true;
@@ -303,6 +312,21 @@ class JavaRewriter
         return "";
     }
 
+    // The classes / interfaces / enums with a `{ ... }` body, in file order:
+    // a Ruby or Python class has none
+    std::vector<std::string> classNames() const
+    {
+        std::vector<std::string> out;
+        std::set<std::string> seen;
+        for (const auto &kv : classOf_)
+            if (!seen.count(kv.second))
+            {
+                seen.insert(kv.second);
+                out.push_back(kv.second);
+            }
+        return out;
+    }
+
   private:
     static const size_t npos = (size_t)-1;
     std::vector<JTok> &t_;
@@ -317,6 +341,28 @@ class JavaRewriter
     int catchCount_ = 0;
 
     bool is(size_t i, const char *s) const { return i < t_.size() && t_[i].text == s; }
+    bool newlineBefore(size_t i) const { return i < t_.size() && t_[i].pre.find('\n') != std::string::npos; }
+    bool newlineBetween(size_t from, size_t to) const
+    {
+        for (size_t k = from + 1; k <= to && k < t_.size(); ++k)
+            if (newlineBefore(k))
+                return true;
+        return false;
+    }
+    // `private int x`, `public <T> T max(...)`: a Java access modifier, with
+    // what it modifies on its line. Ruby's `private` stands alone on a line
+    // or comes before `def` / `attr_reader` / a `:symbol`; C++'s is `public:`.
+    bool javaModifier(size_t i) const
+    {
+        size_t n = liveNext(i);
+        if (n == npos || newlineBetween(i, n))
+            return false;
+        if (t_[n].text == "<")
+            return true;
+        const std::string &x = t_[n].text;
+        return t_[n].kind == JK::Ident && x != "def" && x.compare(0, 5, "attr_") != 0 && x != "alias_method" &&
+               x != "define_method";
+    }
     bool live(size_t i) const { return i < t_.size() && !t_[i].out.empty(); }
     size_t liveNext(size_t i) const
     {
@@ -374,10 +420,8 @@ class JavaRewriter
                 continue;
             if (i > 0 && t_[i - 1].text == ".")
                 continue; // Foo.class
-            size_t j = i + 2;
-            while (j < t_.size() && t_[j].text != "{" && t_[j].text != ";" && t_[j].text != ":")
-                ++j;
-            if (j >= t_.size() || t_[j].text != "{")
+            size_t j = classBodyOpen(i + 1);
+            if (j == npos)
                 continue;
             classOf_[j] = t_[i + 1].text;
             userClasses_.insert(t_[i + 1].text);
@@ -389,6 +433,29 @@ class JavaRewriter
         }
     }
 
+    // The `{` that opens the body of the class / interface / enum named by
+    // token n, or npos. Its header is type syntax (`<T>`, extends /
+    // implements lists), which goes on to a new line only at `{`, a clause
+    // keyword or after a comma: a Ruby `class Dog < Animal` (a body without
+    // braces, up to `end`) or a Python `class A:` has none.
+    size_t classBodyOpen(size_t n) const
+    {
+        static const std::set<std::string> clauses = {"extends", "implements", "permits"};
+        for (size_t j = n + 1; j < t_.size(); ++j)
+        {
+            const std::string &x = t_[j].text;
+            if (x == "{")
+                return j;
+            if (!(t_[j].kind == JK::Ident || x == "<" || x == ">" || x == "," || x == "." || x == "?" || x == "&" ||
+                  x == "[" || x == "]"))
+                return npos;
+            const std::string &p = t_[j - 1].text;
+            if (newlineBefore(j) && !clauses.count(x) && !clauses.count(p) && p != "," && p != "<" && p != "&")
+                return npos;
+        }
+        return npos;
+    }
+
     bool inClassBody(size_t i) const { return enclosing_[i] != npos && classOf_.count(enclosing_[i]); }
 
     // The start of the statement / member that token i belongs to.
@@ -398,7 +465,10 @@ class JavaRewriter
         if (p == npos)
             return true;
         const std::string &x = t_[p].out;
-        return x == ";" || x == "{" || x == "}" || (x == ")" && t_[i].pre.find('\n') != std::string::npos);
+        // or a new line after a complete one: a Ruby / Python line has no `;`
+        bool lineEnd = x == ")" || x == "]" || t_[p].kind == JK::Ident || t_[p].kind == JK::Number ||
+                       t_[p].kind == JK::String;
+        return x == ";" || x == "{" || x == "}" || (lineEnd && newlineBefore(i));
     }
 
     void removeImportsAndAnnotations()
@@ -476,6 +546,11 @@ class JavaRewriter
             for (; j < t_.size(); ++j)
             {
                 const std::string &x = t_[j].text;
+                if (j > i && newlineBefore(j) && t_[j - 1].text != ",")
+                {
+                    ok = false; // Ruby's `class Dog<Animal` and its body
+                    break;
+                }
                 if (x == "<")
                     ++depth;
                 else if (x == ">")
@@ -532,7 +607,7 @@ class JavaRewriter
     {
         for (size_t i = 0; i + 4 < t_.size(); ++i)
         {
-            if (t_[i].text != "new" || t_[i + 1].kind != JK::Ident)
+            if (t_[i].text != "new" || t_[i + 1].kind != JK::Ident || rubyNew(i))
                 continue;
             size_t open = liveNext(i + 1);
             if (open == npos || t_[open].text != "(" || match_[open] == npos)
@@ -630,6 +705,8 @@ class JavaRewriter
             if (r == npos)
                 continue;
             const std::string &m = t_[i + 1].text;
+            if (isUpperIdent(m))
+                continue; // a constant or class in a Ruby module: Float::INFINITY, Shapes::Circle
             const std::string &recv = t_[r].text;
             bool typeRecv = t_[r].kind == JK::Ident && isUpperIdent(recv) && !(r > 0 && t_[r - 1].text == ".");
             if (m == "new")
@@ -858,6 +935,32 @@ class JavaRewriter
         }
     }
 
+    // `boolean` / `byte` / `short` as a type: before the name it declares on
+    // its line (its `[]` / `...` are gone by now), in `new byte[n]` or in a
+    // cast `(byte) x`. Not a Ruby / Python variable of that name (`puts
+    // byte`, `byte if x`, `buf[byte]`).
+    bool typePosition(size_t i) const
+    {
+        static const std::set<std::string> rubyWords = {"unless", "until", "then", "end", "rescue", "ensure", "when", "is"};
+        size_t n = liveNext(i);
+        if (n == npos || newlineBetween(i, n))
+            return false;
+        const std::string &x = t_[n].text;
+        size_t p = livePrev(i);
+        if (t_[n].kind == JK::Ident)
+            return !keywords().count(x) && !rubyWords.count(x);
+        if (x == "[")
+            return p != npos && t_[p].text == "new";
+        if (x != ")" || p == npos || t_[p].text != "(")
+            return false;
+        size_t callee = livePrev(p);
+        size_t operand = liveNext(n);
+        bool call = callee != npos && t_[callee].kind == JK::Ident && !keywords().count(t_[callee].text);
+        bool negative = is(operand, "-") && operand + 1 < t_.size() && t_[operand + 1].pre.empty(); // (byte) -1
+        return !call && operand != npos && !newlineBefore(operand) &&
+               (t_[operand].kind == JK::Ident || t_[operand].kind == JK::Number || t_[operand].text == "(" || negative);
+    }
+
     void modifiers()
     {
         static const std::set<std::string> drop = {"final", "abstract", "synchronized", "transient", "volatile",
@@ -869,24 +972,24 @@ class JavaRewriter
                 continue;
             if (x == "public" || x == "private" || x == "protected")
             {
-                if (!is(i + 1, ":"))
+                if (javaModifier(i))
                     t_[i].out.clear();
             }
             else if (drop.count(x))
             {
                 size_t n = liveNext(i);
-                if (n != npos && t_[n].kind == JK::Ident)
+                if (n != npos && t_[n].kind == JK::Ident && !newlineBetween(i, n))
                     t_[i].out.clear();
             }
             else if (x == "default" && inClassBody(i))
             {
                 size_t n = liveNext(i);
-                if (n != npos && t_[n].kind == JK::Ident)
+                if (n != npos && t_[n].kind == JK::Ident && !newlineBetween(i, n))
                     t_[i].out.clear(); // an interface's default method
             }
-            else if (x == "boolean")
+            else if (x == "boolean" && typePosition(i))
                 t_[i].out = "bool";
-            else if (x == "byte" || x == "short")
+            else if ((x == "byte" || x == "short") && typePosition(i))
                 t_[i].out = "int";
         }
         // interface constants are static
@@ -909,7 +1012,8 @@ class JavaRewriter
     {
         for (size_t i = 1; i + 1 < t_.size(); ++i)
         {
-            if (t_[i].text == "[" && is(i + 1, "]"))
+            // String[] args: the brackets on the type (not Ruby's `puts []`)
+            if (t_[i].text == "[" && is(i + 1, "]") && t_[i].pre.empty())
             {
                 size_t p = livePrev(i);
                 if (p == npos || !(t_[p].kind == JK::Ident || t_[p].text == "]" || t_[p].out.empty()))
@@ -928,7 +1032,7 @@ class JavaRewriter
                 while (is(j, "[") && is(j + 1, "]"))
                     j += 2;
                 size_t n = liveNext(j - 1);
-                if (n == npos)
+                if (n == npos || newlineBefore(n))
                     continue;
                 if (t_[n].kind == JK::Ident || t_[n].text == "..." || t_[n].text == ")" || t_[n].text == ",")
                 {
@@ -945,9 +1049,14 @@ class JavaRewriter
                 }
             }
         }
+        // `String... args` / `int...xs`, not a Ruby range `lo...hi` / `lo ... hi`
+        static const std::set<std::string> primitives = {"int", "long", "double", "float", "char", "boolean",
+                                                         "byte", "short"};
         for (size_t i = 1; i + 1 < t_.size(); ++i)
             if (t_[i].text == "..." && t_[i + 1].kind == JK::Ident && livePrev(i) != npos &&
-                t_[livePrev(i)].kind == JK::Ident)
+                t_[livePrev(i)].kind == JK::Ident &&
+                (t_[i].pre.empty() != t_[i + 1].pre.empty() ||
+                 (t_[i].pre.empty() && (isUpperIdent(t_[livePrev(i)].text) || primitives.count(t_[livePrev(i)].text)))))
             {
                 // Type... name -> *name
                 size_t ty = livePrev(i);
@@ -990,11 +1099,14 @@ class JavaRewriter
         }
     }
 
+    // Ruby's `Point.new(1, 2)`: a method call, whatever starts the next line
+    bool rubyNew(size_t i) const { return i > 0 && t_[i - 1].text == "."; }
+
     void newExpressions()
     {
         for (size_t i = 0; i + 2 < t_.size(); ++i)
         {
-            if (t_[i].text != "new" || t_[i].out.empty())
+            if (t_[i].text != "new" || t_[i].out.empty() || rubyNew(i))
                 continue;
             size_t ty = liveNext(i);
             if (ty == npos || t_[ty].kind != JK::Ident)
@@ -1081,8 +1193,8 @@ class JavaRewriter
             if (close == npos || close != match_[i])
                 continue;
             size_t operand = liveNext(close);
-            if (operand == npos)
-                continue;
+            if (operand == npos || newlineBefore(operand))
+                continue; // `x = (LIMIT)` ending a line
             const JTok &o = t_[operand];
             bool operandStart = (o.kind == JK::Ident && !keywords().count(o.text)) || o.kind == JK::Number ||
                                 o.kind == JK::String || o.text == "(" || o.text == "this" || o.text == "new";
@@ -1510,6 +1622,8 @@ std::string applyJavaDialect(const std::string &source)
     if (!call.empty())
         out += call + "\n";
     out += kJavaStyleMarker;
+    for (const std::string &c : rw.classNames())
+        out += " " + c;
     out += "\n";
     return out;
 }
@@ -1518,4 +1632,27 @@ bool isJavaStyleSource(const std::string &source)
 {
     size_t at = source.rfind(kJavaStyleMarker);
     return at != std::string::npos && (at == 0 || source[at - 1] == '\n');
+}
+
+std::set<std::string> javaStyleClasses(const std::string &source)
+{
+    std::set<std::string> out;
+    if (!isJavaStyleSource(source))
+        return out;
+    size_t at = source.rfind(kJavaStyleMarker) + std::string(kJavaStyleMarker).size();
+    size_t end = source.find('\n', at);
+    if (end == std::string::npos)
+        end = source.size();
+    std::string name;
+    for (size_t i = at; i <= end; ++i)
+    {
+        if (i < end && !std::isspace((unsigned char)source[i]))
+            name += source[i];
+        else if (!name.empty())
+        {
+            out.insert(name);
+            name.clear();
+        }
+    }
+    return out;
 }

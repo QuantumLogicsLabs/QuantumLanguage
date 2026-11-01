@@ -4,6 +4,11 @@
 #include <limits>
 #include <stdexcept>
 
+// Chunk::javaStyle and Chunk::rubyStyle, stored in the top bits of the
+// upvalue count
+static const uint32_t kJavaStyleBit = 0x80000000u;
+static const uint32_t kRubyStyleBit = 0x40000000u;
+
 enum class ValueType : uint8_t {
     VAL_NIL = 0,
     VAL_BOOL = 1,
@@ -191,8 +196,10 @@ void Serializer::writeChunk(std::vector<uint8_t>& out, std::shared_ptr<Chunk> ch
         writeU8(out, isRef ? 1 : 0);
     }
 
-    // upvalueCount (i32)
-    writeU32(out, static_cast<uint32_t>(chunk->upvalueCount));
+    // upvalueCount (i32), with Chunk::javaStyle / rubyStyle in its top bits
+    // (0 in files written before they existed)
+    writeU32(out, static_cast<uint32_t>(chunk->upvalueCount) | (chunk->javaStyle ? kJavaStyleBit : 0u) |
+                      (chunk->rubyStyle ? kRubyStyleBit : 0u));
 
     // constants
     writeU32(out, static_cast<uint32_t>(chunk->constants.size()));
@@ -230,8 +237,11 @@ std::shared_ptr<Chunk> Serializer::readChunk(const std::vector<uint8_t>& data, s
         chunk->paramIsRef.push_back(readU8(data, offset) != 0);
     }
 
-    // upvalueCount
-    chunk->upvalueCount = static_cast<int>(static_cast<int32_t>(readU32(data, offset)));
+    // upvalueCount, and the javaStyle / rubyStyle bits
+    uint32_t upvalues = readU32(data, offset);
+    chunk->javaStyle = (upvalues & kJavaStyleBit) != 0;
+    chunk->rubyStyle = (upvalues & kRubyStyleBit) != 0;
+    chunk->upvalueCount = static_cast<int>(upvalues & ~(kJavaStyleBit | kRubyStyleBit));
 
     // constants
     uint32_t constSize = readU32(data, offset);

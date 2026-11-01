@@ -1,0 +1,1305 @@
+// quantum: cpp
+// Ruby front-end: the lexer (see RubyLex.h.sa).
+#include "RubyLex.h.sa"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#include <set>
+
+namespace ruby
+{
+
+namespace
+{
+
+bool identStart(int c) { return c == '_' || std::isalpha(c) || c >= 0x80; }
+bool identChar(int c) { return c == '_' || std::isalnum(c) || c >= 0x80; }
+
+const std::set<std::string> &keywords()
+{
+    static const std::set<std::string> k = {
+        "alias", "and", "begin", "BEGIN", "break", "case", "class", "def", "defined?", "do", "else",
+        "elsif", "end", "END", "ensure", "false", "for", "if", "in", "module", "next", "nil", "not",
+        "or", "redo", "rescue", "retry", "return", "self", "super", "then", "true", "undef", "unless",
+        "until", "when", "while", "yield", "__FILE__", "__LINE__"};
+    return k;
+}
+
+Lexer::State keywordState(const std::string &k)
+{
+    if (k == "end" || k == "self" || k == "nil" || k == "true" || k == "false" || k == "__FILE__" ||
+        k == "__LINE__" || k == "redo" || k == "retry")
+        return Lexer::END;
+    if (k == "return" || k == "break" || k == "next" || k == "rescue")
+        return Lexer::MID;
+    if (k == "yield" || k == "super" || k == "defined?")
+        return Lexer::ARG;
+    if (k == "def" || k == "alias" || k == "undef")
+        return Lexer::FNAME;
+    return Lexer::BEG;
+}
+
+int hexValue(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+// one escape sequence of a double-quoted string, at s[i] == '\\'
+size_t readEscape(const std::string &s, size_t i, std::string &out)
+{
+    ++i; // past the backslash
+    if (i >= s.size())
+        return i;
+    char c = s[i];
+    switch (c)
+    {
+    case 'n': out += '\n'; return i + 1;
+    case 't': out += '\t'; return i + 1;
+    case 's': out += ' '; return i + 1;
+    case 'r': out += '\r'; return i + 1;
+    case 'e': out += '\x1b'; return i + 1;
+    case 'a': out += '\a'; return i + 1;
+    case 'b': out += '\b'; return i + 1;
+    case 'f': out += '\f'; return i + 1;
+    case 'v': out += '\v'; return i + 1;
+    case '\n': return i + 1; // line continuation
+    case 'u':
+    {
+        ++i;
+        if (i < s.size() && s[i] == '{')
+        {
+            ++i;
+            while (i < s.size() && s[i] != '}')
+            {
+                while (i < s.size() && s[i] == ' ')
+                    ++i;
+                uint32_t cp = 0;
+                int n = 0;
+                while (i < s.size() && hexValue((unsigned char)s[i]) >= 0)
+                {
+                    cp = cp * 16 + hexValue((unsigned char)s[i]);
+                    ++i;
+                    ++n;
+                }
+                if (n)
+                    appendUtf8(out, cp);
+                else if (i < s.size() && s[i] != '}')
+                    ++i;
+            }
+            return i < s.size() ? i + 1 : i;
+        }
+        uint32_t cp = 0;
+        for (int k = 0; k < 4 && i < s.size() && hexValue((unsigned char)s[i]) >= 0; ++k, ++i)
+            cp = cp * 16 + hexValue((unsigned char)s[i]);
+        appendUtf8(out, cp);
+        return i;
+    }
+    case 'x':
+    {
+        ++i;
+        int v = 0;
+        for (int k = 0; k < 2 && i < s.size() && hexValue((unsigned char)s[i]) >= 0; ++k, ++i)
+            v = v * 16 + hexValue((unsigned char)s[i]);
+        out += (char)v;
+        return i;
+    }
+    default:
+        if (c >= '0' && c <= '7')
+        {
+            int v = 0;
+            for (int k = 0; k < 3 && i < s.size() && s[i] >= '0' && s[i] <= '7'; ++k, ++i)
+                v = v * 8 + (s[i] - '0');
+            out += (char)v;
+            return i;
+        }
+        out += c;
+        return i + 1;
+    }
+}
+
+} // namespace
+
+void appendUtf8(std::string &out, uint32_t cp)
+{
+    if (cp < 0x80)
+        out += (char)cp;
+    else if (cp < 0x800)
+    {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+    else if (cp < 0x10000)
+    {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+    else
+    {
+        out += (char)(0xF0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+size_t skipCode(const std::string &s, size_t i)
+{
+    int depth = 1;
+    while (i < s.size())
+    {
+        char c = s[i];
+        if (c == '{')
+            ++depth;
+        else if (c == '}')
+        {
+            if (--depth == 0)
+                return i;
+        }
+        else if (c == '"' || c == '\'' || c == '`')
+        {
+            char q = c;
+            ++i;
+            while (i < s.size() && s[i] != q)
+            {
+                if (s[i] == '\\')
+                    ++i;
+                else if (q != '\'' && s[i] == '#' && i + 1 < s.size() && s[i + 1] == '{')
+                    i = skipCode(s, i + 2);
+                ++i;
+            }
+        }
+        ++i;
+    }
+    return i;
+}
+
+std::vector<StrPart> splitInterpolated(const std::string &raw, int line, bool interp, bool regex)
+{
+    std::vector<StrPart> parts;
+    std::string text;
+    int textLine = line;
+    size_t i = 0;
+    auto flush = [&]()
+    {
+        if (!text.empty() || parts.empty())
+        {
+            StrPart p;
+            p.text = text;
+            p.line = textLine;
+            parts.push_back(p);
+        }
+        text.clear();
+    };
+    while (i < raw.size())
+    {
+        char c = raw[i];
+        if (c == '\\' && i + 1 < raw.size())
+        {
+            if (regex)
+            {
+                if (raw[i + 1] == '/')
+                    text += '/';
+                else
+                {
+                    text += c;
+                    text += raw[i + 1];
+                }
+                if (raw[i + 1] == '\n')
+                    ++line;
+                i += 2;
+                continue;
+            }
+            if (raw[i + 1] == '\n')
+                ++line;
+            i = readEscape(raw, i, text);
+            continue;
+        }
+        if (interp && c == '#' && i + 1 < raw.size() && raw[i + 1] == '{')
+        {
+            size_t end = skipCode(raw, i + 2);
+            if (!text.empty())
+                flush();
+            StrPart p;
+            p.code = true;
+            p.text = raw.substr(i + 2, end - (i + 2));
+            p.line = line;
+            parts.push_back(p);
+            for (size_t k = i; k < end && k < raw.size(); ++k)
+                if (raw[k] == '\n')
+                    ++line;
+            i = end + 1;
+            textLine = line;
+            continue;
+        }
+        if (interp && c == '#' && i + 1 < raw.size() && (raw[i + 1] == '@' || raw[i + 1] == '$'))
+        {
+            // "#@ivar" / "#$global"
+            size_t j = i + 1;
+            size_t k = j + 1;
+            if (raw[j] == '@' && k < raw.size() && raw[k] == '@')
+                ++k;
+            if (k < raw.size() && (identStart((unsigned char)raw[k]) || (raw[j] == '$' && std::strchr("!~&`'0123456789", raw[k]) && raw[k] != 0)))
+            {
+                if (identStart((unsigned char)raw[k]))
+                    while (k < raw.size() && identChar((unsigned char)raw[k]))
+                        ++k;
+                else
+                    ++k;
+                if (!text.empty())
+                    flush();
+                StrPart p;
+                p.code = true;
+                p.text = raw.substr(j, k - j);
+                p.line = line;
+                parts.push_back(p);
+                i = k;
+                textLine = line;
+                continue;
+            }
+        }
+        if (c == '\n')
+            ++line;
+        text += c;
+        ++i;
+    }
+    if (!text.empty() || parts.empty())
+        flush();
+    return parts;
+}
+
+Lexer::Lexer(const std::string &src, int firstLine) : src_(src), line_(firstLine) {}
+
+void Lexer::error(const std::string &msg) const { throw SyntaxError{line_, msg}; }
+
+bool Lexer::atLineStart() const { return pos_ == 0 || src_[pos_ - 1] == '\n'; }
+
+void Lexer::consumeNewline()
+{
+    if (heredocResume_ != std::string::npos && pos_ == heredocLineEnd_)
+    {
+        pos_ = heredocResume_;
+        line_ = heredocResumeLine_;
+        heredocResume_ = std::string::npos;
+        heredocLineEnd_ = std::string::npos;
+        return;
+    }
+    ++pos_;
+    ++line_;
+}
+
+// After a newline: does the next code line start with .method or &.method?
+bool Lexer::continuationAfterNewline() const
+{
+    size_t i = pos_;
+    while (i < src_.size())
+    {
+        char c = src_[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        {
+            ++i;
+            continue;
+        }
+        if (c == '#')
+        {
+            while (i < src_.size() && src_[i] != '\n')
+                ++i;
+            continue;
+        }
+        if (c == '.' && i + 1 < src_.size() && src_[i + 1] != '.')
+            return true;
+        if (c == '&' && i + 1 < src_.size() && src_[i + 1] == '.')
+            return true;
+        return false;
+    }
+    return false;
+}
+
+void Lexer::finish(Token &t)
+{
+    switch (t.t)
+    {
+    case TT::Ident:
+    {
+        bool name = state == FNAME || state == DOT;
+        state = name ? ARG : (isLocal && isLocal(t.s) ? END : ARG);
+        break;
+    }
+    case TT::Kw:
+        state = keywordState(t.s);
+        break;
+    case TT::Label:
+        state = BEG;
+        break;
+    case TT::Op:
+        if (t.s == ")" || t.s == "]" || t.s == "}")
+            state = END;
+        else if (t.s == "." || t.s == "&." || t.s == "::")
+            state = defName_ ? FNAME : DOT;
+        else
+            state = BEG;
+        break;
+    case TT::NL:
+    case TT::End:
+        state = BEG;
+        break;
+    default:
+        state = END;
+        break;
+    }
+}
+
+Token Lexer::next()
+{
+    Token t;
+    bool space = false;
+    for (;;)
+    {
+        int c = peekc();
+        if (c == -1)
+        {
+            t.t = TT::End;
+            t.line = line_;
+            finish(t);
+            return t;
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v')
+        {
+            ++pos_;
+            space = true;
+            continue;
+        }
+        if (c == '\\' && (peekc(1) == '\n' || (peekc(1) == '\r' && peekc(2) == '\n')))
+        {
+            pos_ += peekc(1) == '\r' ? 2 : 1;
+            consumeNewline();
+            space = true;
+            continue;
+        }
+        if (c == '#')
+        {
+            while (pos_ < src_.size() && src_[pos_] != '\n')
+                ++pos_;
+            continue;
+        }
+        if (c == '=' && atLineStart() && src_.compare(pos_, 6, "=begin") == 0)
+        {
+            while (pos_ < src_.size())
+            {
+                size_t eol = src_.find('\n', pos_);
+                bool isEnd = src_.compare(pos_, 4, "=end") == 0;
+                if (eol == std::string::npos)
+                {
+                    pos_ = src_.size();
+                    break;
+                }
+                pos_ = eol;
+                consumeNewline();
+                if (isEnd)
+                    break;
+            }
+            continue;
+        }
+        if (c == '_' && atLineStart() && src_.compare(pos_, 7, "__END__") == 0 &&
+            (pos_ + 7 >= src_.size() || src_[pos_ + 7] == '\n' || src_[pos_ + 7] == '\r'))
+        {
+            pos_ = src_.size();
+            continue;
+        }
+        if (c == '\n')
+        {
+            int nlLine = line_;
+            consumeNewline();
+            if (state == BEG || state == FNAME || state == DOT)
+            {
+                space = true;
+                continue;
+            }
+            if (continuationAfterNewline())
+            {
+                space = true;
+                continue;
+            }
+            t.t = TT::NL;
+            t.line = nlLine;
+            finish(t);
+            return t;
+        }
+        break;
+    }
+    t.line = line_;
+    t.space = space;
+    int c = peekc();
+    Token r;
+    if (std::isdigit(c))
+        r = number(t);
+    else if (identStart(c))
+        r = identifier(t);
+    else if (c == '@')
+    {
+        size_t start = pos_;
+        ++pos_;
+        bool cvar = peekc() == '@';
+        if (cvar)
+            ++pos_;
+        if (!identStart(peekc()))
+            error("`@' without identifiers is not allowed as an instance variable name");
+        while (identChar(peekc()))
+            ++pos_;
+        t.t = cvar ? TT::CVar : TT::IVar;
+        t.s = src_.substr(start, pos_ - start);
+        r = t;
+    }
+    else if (c == '$')
+    {
+        size_t start = pos_;
+        ++pos_;
+        int d = peekc();
+        if (std::isdigit(d))
+        {
+            while (std::isdigit(peekc()))
+                ++pos_;
+            std::string digits = src_.substr(start + 1, pos_ - start - 1);
+            if (digits == "0")
+            {
+                t.t = TT::GVar;
+                t.s = "$0";
+            }
+            else
+            {
+                t.t = TT::NthRef;
+                t.ival = std::atoll(digits.c_str());
+                t.s = "$" + digits;
+            }
+        }
+        else if (identStart(d))
+        {
+            while (identChar(peekc()))
+                ++pos_;
+            t.t = TT::GVar;
+            t.s = src_.substr(start, pos_ - start);
+        }
+        else if (d == '~' || d == '&' || d == '`' || d == '\'' || d == '+')
+        {
+            ++pos_;
+            t.t = TT::BackRef;
+            t.s = src_.substr(start, 2);
+        }
+        else if (d != -1)
+        {
+            ++pos_;
+            t.t = TT::GVar;
+            t.s = src_.substr(start, 2);
+        }
+        else
+            error("unexpected $");
+        r = t;
+    }
+    else if (c == '"' || c == '`')
+    {
+        ++pos_;
+        r = quoted(t, (char)c, (char)c, true, false);
+        if (c == '`')
+            r.t = TT::XStr;
+    }
+    else if (c == '\'')
+    {
+        ++pos_;
+        r = quoted(t, '\'', '\'', false, false);
+    }
+    else
+        r = op(t);
+    finish(r);
+    return r;
+}
+
+Token Lexer::number(Token t)
+{
+    size_t start = pos_;
+    std::string digits;
+    int base = 10;
+    if (peekc() == '0' && (peekc(1) == 'x' || peekc(1) == 'X'))
+        base = 16;
+    else if (peekc() == '0' && (peekc(1) == 'b' || peekc(1) == 'B'))
+        base = 2;
+    else if (peekc() == '0' && (peekc(1) == 'o' || peekc(1) == 'O'))
+        base = 8;
+    else if (peekc() == '0' && std::isdigit(peekc(1)))
+        base = 8;
+    bool isFloat = false;
+    if (base != 10)
+    {
+        pos_ += (peekc(1) == 'x' || peekc(1) == 'X' || peekc(1) == 'b' || peekc(1) == 'B' || peekc(1) == 'o' || peekc(1) == 'O') ? 2 : 1;
+        while (pos_ < src_.size() && (std::isxdigit(peekc()) || peekc() == '_'))
+        {
+            if (peekc() != '_')
+                digits += (char)peekc();
+            ++pos_;
+        }
+        // to decimal (may be big)
+        std::vector<uint32_t> mag; // base 1e9 little-endian
+        for (char ch : digits)
+        {
+            uint64_t carry = (uint64_t)hexValue((unsigned char)ch);
+            for (auto &limb : mag)
+            {
+                uint64_t v = (uint64_t)limb * base + carry;
+                limb = (uint32_t)(v % 1000000000ULL);
+                carry = v / 1000000000ULL;
+            }
+            while (carry)
+            {
+                mag.push_back((uint32_t)(carry % 1000000000ULL));
+                carry /= 1000000000ULL;
+            }
+        }
+        std::string dec;
+        for (size_t k = mag.size(); k-- > 0;)
+        {
+            std::string part = std::to_string(mag[k]);
+            if (k + 1 != mag.size())
+                part = std::string(9 - part.size(), '0') + part;
+            dec += part;
+        }
+        if (dec.empty())
+            dec = "0";
+        digits = dec;
+    }
+    else
+    {
+        while (pos_ < src_.size() && (std::isdigit(peekc()) || (peekc() == '_' && std::isdigit(peekc(1)))))
+        {
+            if (peekc() != '_')
+                digits += (char)peekc();
+            ++pos_;
+        }
+        if (peekc() == '.' && std::isdigit(peekc(1)))
+        {
+            isFloat = true;
+            digits += '.';
+            ++pos_;
+            while (pos_ < src_.size() && (std::isdigit(peekc()) || (peekc() == '_' && std::isdigit(peekc(1)))))
+            {
+                if (peekc() != '_')
+                    digits += (char)peekc();
+                ++pos_;
+            }
+        }
+        if ((peekc() == 'e' || peekc() == 'E') &&
+            (std::isdigit(peekc(1)) || ((peekc(1) == '+' || peekc(1) == '-') && std::isdigit(peekc(2)))))
+        {
+            isFloat = true;
+            digits += 'e';
+            ++pos_;
+            if (peekc() == '+' || peekc() == '-')
+            {
+                digits += (char)peekc();
+                ++pos_;
+            }
+            while (std::isdigit(peekc()))
+            {
+                digits += (char)peekc();
+                ++pos_;
+            }
+        }
+    }
+    if (peekc() == 'r' && !identChar(peekc(1)))
+    {
+        ++pos_;
+        t.t = TT::Rational;
+        t.s = digits;
+        return t;
+    }
+    if (peekc() == 'i' && !identChar(peekc(1)))
+    {
+        ++pos_;
+        t.t = TT::Imag;
+        t.s = digits;
+        return t;
+    }
+    (void)start;
+    if (isFloat)
+    {
+        t.t = TT::Float;
+        t.fval = std::strtod(digits.c_str(), nullptr);
+        t.s = digits;
+        return t;
+    }
+    // int64 or big
+    std::string trimmed = digits;
+    size_t nz = trimmed.find_first_not_of('0');
+    trimmed = nz == std::string::npos ? "0" : trimmed.substr(nz);
+    if (trimmed.size() > 19 || (trimmed.size() == 19 && trimmed > "9223372036854775807"))
+    {
+        t.t = TT::BigInt;
+        t.s = trimmed;
+        return t;
+    }
+    t.t = TT::Int;
+    t.ival = 0;
+    for (char ch : trimmed)
+        t.ival = t.ival * 10 + (ch - '0');
+    t.s = trimmed;
+    return t;
+}
+
+Token Lexer::identifier(Token t)
+{
+    size_t start = pos_;
+    while (identChar(peekc()))
+        ++pos_;
+    // name? / name! (not before = unless == or =~ or =>)
+    if ((peekc() == '?' || peekc() == '!') && !(peekc(1) == '=' && peekc(2) != '=' && peekc(2) != '~' && peekc(2) != '>'))
+        ++pos_;
+    std::string word = src_.substr(start, pos_ - start);
+    bool nameState = state == FNAME || state == DOT;
+    // label `name:` (not `name::`)
+    if (peekc() == ':' && peekc(1) != ':' && !nameState && word.back() != '?' && word.back() != '!')
+    {
+        ++pos_;
+        t.t = TT::Label;
+        t.s = word;
+        return t;
+    }
+    if (nameState)
+    {
+        // def name= / def self.name=
+        if (state == FNAME && defName_ && peekc() == '=' && peekc(1) != '=' && peekc(1) != '~' &&
+            peekc(1) != '>' && (peekc(1) == '(' || peekc(1) == ' ' || peekc(1) == '\t'))
+        {
+            ++pos_;
+            word += '=';
+        }
+        // alias name= other=
+        if (state == FNAME && !defName_ && peekc() == '=' && (peekc(1) == ' ' || peekc(1) == '\t' || peekc(1) == '\n' || peekc(1) == '\r'))
+        {
+            ++pos_;
+            word += '=';
+        }
+        if (defName_)
+        {
+            // after `def self` / `def obj` comes a dot and the real name
+            size_t p = pos_;
+            while (p < src_.size() && (src_[p] == ' ' || src_[p] == '\t'))
+                ++p;
+            if (!(p < src_.size() && src_[p] == '.' && (p + 1 >= src_.size() || src_[p + 1] != '.')))
+                defName_ = false;
+        }
+        t.t = std::isupper((unsigned char)word[0]) && state != FNAME ? TT::Const : TT::Ident;
+        if (state == FNAME)
+            t.t = TT::Ident;
+        t.s = word;
+        return t;
+    }
+    if (keywords().count(word))
+    {
+        if (word == "def")
+            defName_ = true;
+        t.t = TT::Kw;
+        t.s = word;
+        return t;
+    }
+    t.t = std::isupper((unsigned char)word[0]) ? TT::Const : TT::Ident;
+    t.s = word;
+    return t;
+}
+
+// The end of a literal whose body starts at i: the index of the closing
+// delimiter (nesting for bracket pairs, #{...} skipped when interpolating)
+size_t Lexer::literalEnd(size_t i, char open, char close, bool interp) const
+{
+    int depth = 0;
+    while (i < src_.size())
+    {
+        char c = src_[i];
+        if (c == '\\')
+        {
+            i += 2;
+            continue;
+        }
+        if (interp && c == '#' && i + 1 < src_.size() && src_[i + 1] == '{')
+        {
+            i = skipCode(src_, i + 2) + 1;
+            continue;
+        }
+        if (open != close && c == open)
+            ++depth;
+        else if (c == close)
+        {
+            if (depth == 0)
+                return i;
+            --depth;
+        }
+        ++i;
+    }
+    error("unterminated string meets end of file");
+    return i;
+}
+
+Token Lexer::quoted(Token t, char open, char close, bool interp, bool regex)
+{
+    size_t end = literalEnd(pos_, open, close, interp || regex);
+    std::string raw = src_.substr(pos_, end - pos_);
+    int startLine = line_;
+    for (char c : raw)
+        if (c == '\n')
+            ++line_;
+    pos_ = end + 1;
+    if (!interp && !regex)
+    {
+        // single quotes: only \\ and \<close> are escapes
+        std::string text;
+        for (size_t i = 0; i < raw.size(); ++i)
+        {
+            if (raw[i] == '\\' && i + 1 < raw.size() && (raw[i + 1] == '\\' || raw[i + 1] == close || raw[i + 1] == open))
+            {
+                text += raw[i + 1];
+                ++i;
+            }
+            else
+                text += raw[i];
+        }
+        StrPart p;
+        p.text = text;
+        p.line = startLine;
+        t.parts.push_back(p);
+        t.t = TT::Str;
+        return t;
+    }
+    t.parts = splitInterpolated(raw, startLine, interp || regex, regex);
+    t.t = regex ? TT::Regex : TT::Str;
+    if (regex)
+        while (std::isalpha(peekc()))
+        {
+            t.flags += (char)peekc();
+            ++pos_;
+        }
+    return t;
+}
+
+Token Lexer::words(Token t, char open, char close, bool sym, bool interp)
+{
+    size_t end = literalEnd(pos_, open, close, false);
+    std::string raw = src_.substr(pos_, end - pos_);
+    int lineNo = line_;
+    for (char c : raw)
+        if (c == '\n')
+            ++line_;
+    pos_ = end + 1;
+    std::string word;
+    bool have = false;
+    auto push = [&]()
+    {
+        if (have)
+            t.words.push_back(splitInterpolated(word, lineNo, interp, false));
+        word.clear();
+        have = false;
+    };
+    for (size_t i = 0; i < raw.size(); ++i)
+    {
+        char c = raw[i];
+        if (c == '\\' && i + 1 < raw.size())
+        {
+            if (interp)
+            {
+                word += c;
+                word += raw[i + 1];
+            }
+            else
+                word += raw[i + 1];
+            ++i;
+            have = true;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+        {
+            push();
+            continue;
+        }
+        word += c;
+        have = true;
+    }
+    push();
+    t.t = TT::Words;
+    t.sym = sym;
+    return t;
+}
+
+Token Lexer::heredoc(Token t)
+{
+    // at <<~ / <<- / <<ID ; pos_ is after the <<
+    bool squiggly = false, dash = false;
+    if (peekc() == '~')
+    {
+        squiggly = true;
+        ++pos_;
+    }
+    else if (peekc() == '-')
+    {
+        dash = true;
+        ++pos_;
+    }
+    bool interp = true;
+    std::string id;
+    if (peekc() == '\'' || peekc() == '"' || peekc() == '`')
+    {
+        char q = (char)peekc();
+        interp = q != '\'';
+        ++pos_;
+        while (pos_ < src_.size() && src_[pos_] != q)
+            id += src_[pos_++];
+        ++pos_;
+    }
+    else
+        while (identChar(peekc()))
+            id += (char)src_[pos_++];
+    // the body starts after the current line (or after an earlier heredoc's body)
+    size_t lineEnd = src_.find('\n', pos_);
+    if (lineEnd == std::string::npos)
+        error("can't find string \"" + id + "\" anywhere before EOF");
+    size_t bodyStart = heredocResume_ != std::string::npos ? heredocResume_ : lineEnd + 1;
+    int bodyLine = heredocResume_ != std::string::npos ? heredocResumeLine_ : line_ + 1;
+    std::vector<std::string> lines;
+    size_t p = bodyStart;
+    int lineNo = bodyLine;
+    bool found = false;
+    while (p <= src_.size())
+    {
+        size_t eol = src_.find('\n', p);
+        std::string ln = src_.substr(p, eol == std::string::npos ? std::string::npos : eol - p);
+        std::string bare = ln;
+        if (!bare.empty() && bare.back() == '\r')
+            bare.pop_back();
+        std::string stripped = bare;
+        if (squiggly || dash)
+        {
+            size_t k = stripped.find_first_not_of(" \t");
+            stripped = k == std::string::npos ? "" : stripped.substr(k);
+        }
+        ++lineNo;
+        if (stripped == id)
+        {
+            found = true;
+            p = eol == std::string::npos ? src_.size() : eol + 1;
+            break;
+        }
+        lines.push_back(bare + "\n");
+        if (eol == std::string::npos)
+        {
+            p = src_.size();
+            break;
+        }
+        p = eol + 1;
+    }
+    if (!found)
+        error("can't find string \"" + id + "\" anywhere before EOF");
+    if (squiggly)
+    {
+        size_t indent = std::string::npos;
+        for (auto &l : lines)
+        {
+            size_t k = 0, w = 0;
+            while (k < l.size() && (l[k] == ' ' || l[k] == '\t'))
+            {
+                w = l[k] == '\t' ? (w / 8 + 1) * 8 : w + 1;
+                ++k;
+            }
+            if (k < l.size() && l[k] != '\n')
+                indent = std::min(indent, w);
+        }
+        if (indent == std::string::npos)
+            indent = 0;
+        for (auto &l : lines)
+        {
+            size_t k = 0, w = 0;
+            while (k < l.size() && w < indent && (l[k] == ' ' || l[k] == '\t'))
+            {
+                w = l[k] == '\t' ? (w / 8 + 1) * 8 : w + 1;
+                ++k;
+            }
+            l = l.substr(k);
+        }
+    }
+    std::string raw;
+    for (auto &l : lines)
+        raw += l;
+    if (interp)
+        t.parts = splitInterpolated(raw, bodyLine, true, false);
+    else
+    {
+        StrPart part;
+        part.text = raw;
+        part.line = bodyLine;
+        t.parts.push_back(part);
+    }
+    t.t = TT::Str;
+    heredocResume_ = p;
+    heredocResumeLine_ = lineNo;
+    heredocLineEnd_ = lineEnd;
+    return t;
+}
+
+Token Lexer::percentLiteral(Token t)
+{
+    // pos_ at '%'
+    ++pos_;
+    char kind = 'Q';
+    if (std::isalpha(peekc()))
+        kind = (char)src_[pos_++];
+    char open = (char)peekc();
+    ++pos_;
+    char close = open == '(' ? ')' : open == '[' ? ']' : open == '{' ? '}' : open == '<' ? '>' : open;
+    switch (kind)
+    {
+    case 'w': return words(t, open, close, false, false);
+    case 'W': return words(t, open, close, false, true);
+    case 'i': return words(t, open, close, true, false);
+    case 'I': return words(t, open, close, true, true);
+    case 'q': return quoted(t, open, close, false, false);
+    case 'Q': return quoted(t, open, close, true, false);
+    case 'r': return quoted(t, open, close, true, true);
+    case 's':
+    {
+        Token s = quoted(t, open, close, false, false);
+        s.t = TT::Sym;
+        s.s = s.parts.empty() ? "" : s.parts[0].text;
+        return s;
+    }
+    default:
+        error(std::string("unknown type of %string: ") + kind);
+    }
+    return t;
+}
+
+Token Lexer::symbol(Token t)
+{
+    // pos_ at ':' (not ::)
+    ++pos_;
+    int c = peekc();
+    if (c == '"' || c == '\'')
+    {
+        ++pos_;
+        Token s = quoted(t, (char)c, (char)c, c == '"', false);
+        bool plain = s.parts.size() == 1 && !s.parts[0].code;
+        if (plain)
+        {
+            s.t = TT::Sym;
+            s.s = s.parts[0].text;
+        }
+        else
+            s.t = TT::DSym;
+        return s;
+    }
+    if (c == '@' || c == '$' || identStart(c))
+    {
+        size_t start = pos_;
+        if (c == '@' || c == '$')
+            ++pos_;
+        if (peekc() == '@')
+            ++pos_;
+        while (identChar(peekc()))
+            ++pos_;
+        if ((peekc() == '?' || peekc() == '!' || peekc() == '=') &&
+            !(peekc() == '=' && (peekc(1) == '=' || peekc(1) == '~' || peekc(1) == '>')))
+            ++pos_;
+        t.t = TT::Sym;
+        t.s = src_.substr(start, pos_ - start);
+        return t;
+    }
+    static const char *ops[] = {"[]=", "[]", "<=>", "===", "==", "=~", "!=", "!~", "**", "+@", "-@", "<<", ">>",
+                                "<=", ">=", "+", "-", "*", "/", "%", "<", ">", "!", "&", "|", "^", "~"};
+    for (const char *o : ops)
+    {
+        size_t n = std::string(o).size();
+        if (src_.compare(pos_, n, o) == 0)
+        {
+            pos_ += n;
+            t.t = TT::Sym;
+            t.s = o;
+            return t;
+        }
+    }
+    error("unexpected ':'");
+    return t;
+}
+
+Token Lexer::op(Token t)
+{
+    int c = peekc();
+    bool spaceAfter = peekc(1) == ' ' || peekc(1) == '\t' || peekc(1) == '\n' || peekc(1) == '\r' || peekc(1) == -1;
+    bool beg = state == BEG || state == MID;
+    bool argStart = beg || (state == ARG && t.space && !spaceAfter);
+    auto take = [&](const char *s)
+    {
+        pos_ += std::string(s).size();
+        t.t = TT::Op;
+        t.s = s;
+        return t;
+    };
+    // operator method names after def / .
+    if (state == FNAME || (state == DOT && c != '('))
+    {
+        static const char *names[] = {"[]=", "[]", "<=>", "===", "==", "=~", "!=", "!~", "**", "+@", "-@", "<<", ">>",
+                                      "<=", ">=", "+", "-", "*", "/", "%", "<", ">", "!", "&", "|", "^", "~"};
+        for (const char *o : names)
+        {
+            size_t n = std::string(o).size();
+            if (src_.compare(pos_, n, o) == 0)
+            {
+                pos_ += n;
+                t.t = TT::Ident;
+                t.s = o;
+                defName_ = false;
+                return t;
+            }
+        }
+    }
+    switch (c)
+    {
+    case '%':
+        if (argStart || (state == ARG && t.space && peekc(1) != '=' && !spaceAfter))
+        {
+            int d = peekc(1);
+            if (d == '(' || d == '[' || d == '{' || d == '<' || d == '|' || d == '!' || d == '/' ||
+                (std::strchr("wWiIqQrs", d) && d != 0 && !identChar(peekc(2))))
+                return percentLiteral(t);
+        }
+        return peekc(1) == '=' ? take("%=") : take("%");
+    case '/':
+        if (argStart && !(state == ARG && peekc(1) == '='))
+        {
+            ++pos_;
+            return quoted(t, '/', '/', true, true);
+        }
+        return peekc(1) == '=' ? take("/=") : take("/");
+    case '<':
+        if (src_.compare(pos_, 2, "<<") == 0 && (argStart || (state == ARG && t.space)))
+        {
+            int d = peekc(2);
+            int e = peekc(3);
+            if (((d == '~' || d == '-') && (identChar(e) || e == '\'' || e == '"')) || d == '\'' || d == '"' ||
+                (identStart(d) && std::isupper(d)))
+            {
+                pos_ += 2;
+                return heredoc(t);
+            }
+        }
+        if (src_.compare(pos_, 3, "<=>") == 0)
+            return take("<=>");
+        if (src_.compare(pos_, 3, "<<=") == 0)
+            return take("<<=");
+        if (src_.compare(pos_, 2, "<<") == 0)
+            return take("<<");
+        if (src_.compare(pos_, 2, "<=") == 0)
+            return take("<=");
+        return take("<");
+    case '>':
+        if (src_.compare(pos_, 3, ">>=") == 0)
+            return take(">>=");
+        if (src_.compare(pos_, 2, ">>") == 0)
+            return take(">>");
+        if (src_.compare(pos_, 2, ">=") == 0)
+            return take(">=");
+        return take(">");
+    case '=':
+        if (src_.compare(pos_, 3, "===") == 0)
+            return take("===");
+        if (src_.compare(pos_, 2, "==") == 0)
+            return take("==");
+        if (src_.compare(pos_, 2, "=~") == 0)
+            return take("=~");
+        if (src_.compare(pos_, 2, "=>") == 0)
+            return take("=>");
+        return take("=");
+    case '!':
+        if (src_.compare(pos_, 2, "!=") == 0)
+            return take("!=");
+        if (src_.compare(pos_, 2, "!~") == 0)
+            return take("!~");
+        return take("!");
+    case '+':
+    case '-':
+        if (peekc(1) == '=')
+            return take(c == '+' ? "+=" : "-=");
+        if (c == '-' && peekc(1) == '>')
+            return take("->");
+        if (argStart)
+        {
+            ++pos_;
+            t.t = TT::Op;
+            t.s = c == '+' ? "UPLUS" : "UMINUS";
+            return t;
+        }
+        return take(c == '+' ? "+" : "-");
+    case '*':
+        if (src_.compare(pos_, 3, "**=") == 0)
+            return take("**=");
+        if (src_.compare(pos_, 2, "**") == 0)
+        {
+            if (argStart)
+            {
+                pos_ += 2;
+                t.t = TT::Op;
+                t.s = "DSPLAT";
+                return t;
+            }
+            return take("**");
+        }
+        if (peekc(1) == '=')
+            return take("*=");
+        if (argStart)
+        {
+            ++pos_;
+            t.t = TT::Op;
+            t.s = "SPLAT";
+            return t;
+        }
+        return take("*");
+    case '&':
+        if (src_.compare(pos_, 3, "&&=") == 0)
+            return take("&&=");
+        if (src_.compare(pos_, 2, "&&") == 0)
+            return take("&&");
+        if (src_.compare(pos_, 2, "&.") == 0 && !argStart)
+            return take("&.");
+        if (peekc(1) == '=')
+            return take("&=");
+        if (argStart)
+        {
+            ++pos_;
+            t.t = TT::Op;
+            t.s = "BLOCKPASS";
+            return t;
+        }
+        return take("&");
+    case '|':
+        if (src_.compare(pos_, 3, "||=") == 0)
+            return take("||=");
+        if (src_.compare(pos_, 2, "||") == 0 && state != BEG)
+            return take("||");
+        if (src_.compare(pos_, 2, "||") == 0 && state == BEG)
+        {
+            // `{ || ... }`: an empty block parameter list; `x ||` otherwise
+            return take("||");
+        }
+        if (peekc(1) == '=')
+            return take("|=");
+        return take("|");
+    case '^':
+        if (peekc(1) == '=')
+            return take("^=");
+        return take("^");
+    case '~':
+        return take("~");
+    case '?':
+    {
+        // ?a character literal
+        int d = peekc(1);
+        if (argStart && d != -1 && d != ' ' && d != '\t' && d != '\n' && d != '\r')
+        {
+            if (d == '\\')
+            {
+                std::string out;
+                size_t endp = readEscape(src_, pos_ + 1, out);
+                pos_ = endp;
+                StrPart p;
+                p.text = out;
+                p.line = line_;
+                t.parts.push_back(p);
+                t.t = TT::Str;
+                return t;
+            }
+            // one UTF-8 character not followed by an identifier character
+            size_t n = d < 0x80 ? 1 : d < 0xE0 ? 2 : d < 0xF0 ? 3 : 4;
+            if (!identChar(peekc(1 + n)) || !identChar(d))
+            {
+                StrPart p;
+                p.text = src_.substr(pos_ + 1, n);
+                p.line = line_;
+                t.parts.push_back(p);
+                pos_ += 1 + n;
+                t.t = TT::Str;
+                return t;
+            }
+        }
+        return take("?");
+    }
+    case ':':
+        if (peekc(1) == ':')
+        {
+            if (beg || (state == ARG && t.space))
+            {
+                pos_ += 2;
+                t.t = TT::Op;
+                t.s = "COLON3";
+                return t;
+            }
+            return take("::");
+        }
+        {
+            int d = peekc(1);
+            bool symStart = d == '"' || d == '\'' || d == '@' || d == '$' || identStart(d) ||
+                            (d != -1 && std::strchr("[<=!*+-/%&|^~>", d) != nullptr && d != 0);
+            if (symStart && (state != END || (t.space && d != ' ')))
+                return symbol(t);
+        }
+        return take(":");
+    case '.':
+        if (src_.compare(pos_, 3, "...") == 0)
+            return take("...");
+        if (src_.compare(pos_, 2, "..") == 0)
+            return take("..");
+        if (std::isdigit(peekc(1)) && beg)
+            error("no .<digit> floating literal anymore; put 0 before dot");
+        return take(".");
+    case '(':
+        ++pos_;
+        t.t = TT::Op;
+        if (!t.space && (state == END || state == ARG || state == DOT))
+            t.s = "LPAREN_CALL";
+        else if (state == ARG && t.space)
+            t.s = "LPAREN_ARG";
+        else
+            t.s = "(";
+        return t;
+    case '[':
+        ++pos_;
+        t.t = TT::Op;
+        if (state == END || (state == ARG && !t.space) || state == DOT)
+            t.s = "LBRACK_INDEX";
+        else
+            t.s = "[";
+        return t;
+    case ')':
+    case ']':
+    case '}':
+    case '{':
+    case ',':
+    case ';':
+    {
+        ++pos_;
+        if (c == ';')
+        {
+            t.t = TT::NL;
+            return t;
+        }
+        t.t = TT::Op;
+        t.s = std::string(1, (char)c);
+        return t;
+    }
+    default:
+        break;
+    }
+    error(std::string("unexpected character '") + (char)c + "'");
+    return t;
+}
+
+} // namespace ruby

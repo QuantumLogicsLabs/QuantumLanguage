@@ -438,6 +438,8 @@ Math.addExact = fn(a, b) { return a + b }
 Math.multiplyExact = fn(a, b) { return a * b }
 
 let String = {
+    // String(x) in the file's JavaScript / Ruby code: Quantum's own String()
+    "__call__": String["__call__"],
     "valueOf": fn(v) { return type(v) == "array" ? v.join("") : __jstr(v) },
     "copyValueOf": fn(v) { return v.join("") },
     "format": fn(f, *a) { return __jformat(f, a) },

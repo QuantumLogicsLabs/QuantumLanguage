@@ -1,0 +1,3164 @@
+// quantum: cpp
+// Ruby front-end: numbers. Integers are fixnums or bignums (base 2^32
+// magnitudes); floats print and round the way MRI does.
+#include "RubyRt.h.sa"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace ruby
+{
+
+typedef std::vector<uint32_t> Mag;
+
+namespace
+{
+
+// ── magnitudes ────────────────────────────────────────────────────────────
+
+void trim(Mag &a)
+{
+    while (!a.empty() && a.back() == 0)
+        a.pop_back();
+}
+
+Mag magU64(uint64_t v)
+{
+    Mag m;
+    while (v)
+    {
+        m.push_back((uint32_t)(v & 0xffffffffULL));
+        v >>= 32;
+    }
+    return m;
+}
+
+int magCmp(const Mag &a, const Mag &b)
+{
+    if (a.size() != b.size())
+        return a.size() < b.size() ? -1 : 1;
+    for (size_t i = a.size(); i-- > 0;)
+        if (a[i] != b[i])
+            return a[i] < b[i] ? -1 : 1;
+    return 0;
+}
+
+Mag magAdd(const Mag &a, const Mag &b)
+{
+    Mag r;
+    size_t n = a.size() > b.size() ? a.size() : b.size();
+    r.resize(n + 1);
+    uint64_t carry = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        uint64_t s = carry;
+        if (i < a.size())
+            s += a[i];
+        if (i < b.size())
+            s += b[i];
+        r[i] = (uint32_t)(s & 0xffffffffULL);
+        carry = s >> 32;
+    }
+    r[n] = (uint32_t)carry;
+    trim(r);
+    return r;
+}
+
+// a - b, a >= b
+Mag magSub(const Mag &a, const Mag &b)
+{
+    Mag r(a.size());
+    int64_t borrow = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        int64_t d = (int64_t)a[i] - borrow - (i < b.size() ? (int64_t)b[i] : 0);
+        if (d < 0)
+        {
+            d += 4294967296LL;
+            borrow = 1;
+        }
+        else
+            borrow = 0;
+        r[i] = (uint32_t)d;
+    }
+    trim(r);
+    return r;
+}
+
+Mag magMul(const Mag &a, const Mag &b)
+{
+    if (a.empty() || b.empty())
+        return Mag();
+    Mag r(a.size() + b.size(), 0);
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        uint64_t carry = 0;
+        uint64_t ai = a[i];
+        if (ai == 0)
+            continue;
+        for (size_t j = 0; j < b.size(); ++j)
+        {
+            uint64_t t = ai * b[j] + r[i + j] + carry;
+            r[i + j] = (uint32_t)(t & 0xffffffffULL);
+            carry = t >> 32;
+        }
+        size_t k = i + b.size();
+        while (carry)
+        {
+            uint64_t t = (uint64_t)r[k] + carry;
+            r[k] = (uint32_t)(t & 0xffffffffULL);
+            carry = t >> 32;
+            ++k;
+        }
+    }
+    trim(r);
+    return r;
+}
+
+void magMulSmall(Mag &a, uint32_t m, uint32_t add)
+{
+    uint64_t carry = add;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        uint64_t t = (uint64_t)a[i] * m + carry;
+        a[i] = (uint32_t)(t & 0xffffffffULL);
+        carry = t >> 32;
+    }
+    if (carry)
+        a.push_back((uint32_t)carry);
+}
+
+uint32_t magDivSmall(Mag &a, uint32_t d)
+{
+    uint64_t rem = 0;
+    for (size_t i = a.size(); i-- > 0;)
+    {
+        uint64_t cur = (rem << 32) | a[i];
+        a[i] = (uint32_t)(cur / d);
+        rem = cur % d;
+    }
+    trim(a);
+    return (uint32_t)rem;
+}
+
+Mag magShl(const Mag &a, int64_t bits)
+{
+    if (a.empty())
+        return a;
+    size_t words = (size_t)(bits / 32);
+    int sh = (int)(bits % 32);
+    Mag r(words, 0);
+    uint32_t carry = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        uint64_t v = ((uint64_t)a[i] << sh) | carry;
+        r.push_back((uint32_t)(v & 0xffffffffULL));
+        carry = sh ? (uint32_t)(v >> 32) : 0;
+    }
+    if (carry)
+        r.push_back(carry);
+    trim(r);
+    return r;
+}
+
+Mag magShr(const Mag &a, int64_t bits)
+{
+    size_t words = (size_t)(bits / 32);
+    int sh = (int)(bits % 32);
+    if (words >= a.size())
+        return Mag();
+    Mag r(a.size() - words);
+    for (size_t i = 0; i < r.size(); ++i)
+    {
+        uint64_t v = a[i + words];
+        if (sh && i + words + 1 < a.size())
+            v |= (uint64_t)a[i + words + 1] << 32;
+        r[i] = (uint32_t)((v >> sh) & 0xffffffffULL);
+    }
+    trim(r);
+    return r;
+}
+
+// Knuth's algorithm D: a = q * b + r
+void magDivMod(const Mag &a, const Mag &b, Mag &q, Mag &r)
+{
+    if (magCmp(a, b) < 0)
+    {
+        q.clear();
+        r = a;
+        return;
+    }
+    if (b.size() == 1)
+    {
+        q = a;
+        uint32_t rem = magDivSmall(q, b[0]);
+        r = magU64(rem);
+        return;
+    }
+    int s = 0;
+    uint32_t top = b.back();
+    while (!(top & 0x80000000u))
+    {
+        top <<= 1;
+        ++s;
+    }
+    Mag u = magShl(a, s), v = magShl(b, s);
+    size_t n = v.size();
+    if (u.size() == a.size())
+        u.push_back(0);
+    if (u.size() < a.size() + 1)
+        u.resize(a.size() + 1, 0);
+    size_t m = u.size() - n;
+    q.assign(m, 0);
+    uint64_t vTop = v[n - 1], vNext = v[n - 2];
+    for (size_t jj = m; jj-- > 0;)
+    {
+        uint64_t num = ((uint64_t)u[jj + n] << 32) | u[jj + n - 1];
+        uint64_t qhat = num / vTop;
+        uint64_t rhat = num % vTop;
+        while (qhat > 0xffffffffULL || qhat * vNext > ((rhat << 32) | u[jj + n - 2]))
+        {
+            --qhat;
+            rhat += vTop;
+            if (rhat > 0xffffffffULL)
+                break;
+        }
+        int64_t borrow = 0;
+        uint64_t carry = 0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            uint64_t p = qhat * v[i] + carry;
+            carry = p >> 32;
+            int64_t t = (int64_t)u[i + jj] - borrow - (int64_t)(p & 0xffffffffULL);
+            if (t < 0)
+            {
+                t += 4294967296LL;
+                borrow = 1;
+            }
+            else
+                borrow = 0;
+            u[i + jj] = (uint32_t)t;
+        }
+        int64_t t = (int64_t)u[jj + n] - borrow - (int64_t)carry;
+        if (t < 0)
+        {
+            u[jj + n] = (uint32_t)(t + 4294967296LL);
+            // added back: qhat was one too large
+            --qhat;
+            uint64_t c = 0;
+            for (size_t i = 0; i < n; ++i)
+            {
+                uint64_t sum = (uint64_t)u[i + jj] + v[i] + c;
+                u[i + jj] = (uint32_t)(sum & 0xffffffffULL);
+                c = sum >> 32;
+            }
+            u[jj + n] = (uint32_t)(((uint64_t)u[jj + n] + c) & 0xffffffffULL);
+        }
+        else
+            u[jj + n] = (uint32_t)t;
+        q[jj] = (uint32_t)qhat;
+    }
+    trim(q);
+    u.resize(n);
+    trim(u);
+    r = magShr(u, s);
+}
+
+std::string magToString(Mag a, int base)
+{
+    if (a.empty())
+        return "0";
+    std::string out;
+    if (base == 10)
+    {
+        while (!a.empty())
+        {
+            uint32_t chunk = magDivSmall(a, 1000000000u);
+            for (int i = 0; i < 9; ++i)
+            {
+                out += (char)('0' + chunk % 10);
+                chunk /= 10;
+                if (a.empty() && chunk == 0)
+                    break;
+            }
+        }
+    }
+    else
+    {
+        while (!a.empty())
+        {
+            uint32_t d = magDivSmall(a, (uint32_t)base);
+            out += (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        }
+    }
+    while (out.size() > 1 && out.back() == '0')
+        out.pop_back();
+    std::string r;
+    for (size_t i = out.size(); i-- > 0;)
+        r += out[i];
+    return r;
+}
+
+// a signed integer split into sign and magnitude
+struct SI
+{
+    bool neg = false;
+    Mag mag;
+};
+
+SI toSI(V v)
+{
+    SI r;
+    if (isFix(v))
+    {
+        int64_t x = fixv(v);
+        r.neg = x < 0;
+        r.mag = magU64(x < 0 ? (uint64_t)(-x) : (uint64_t)x);
+        return r;
+    }
+    auto *b = static_cast<RBig *>(op(v));
+    r.neg = b->neg;
+    r.mag = b->mag;
+    return r;
+}
+
+const double tens[] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+                       1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+const double bigtens[] = {1e16, 1e32, 1e64, 1e128, 1e256};
+
+} // namespace
+
+V intFromMag(Interp &I, bool neg, Mag mag)
+{
+    trim(mag);
+    if (mag.size() <= 2)
+    {
+        uint64_t v = 0;
+        if (mag.size() > 0)
+            v = mag[0];
+        if (mag.size() > 1)
+            v |= (uint64_t)mag[1] << 32;
+        if (v <= (uint64_t)FIXMAX)
+            return fix(neg ? -(int64_t)v : (int64_t)v);
+        if (neg && v == (uint64_t)FIXMAX + 1)
+            return fix(FIXMIN);
+    }
+    auto *b = new RBig();
+    b->klass = I.cInteger;
+    b->type = T::Bignum;
+    b->frozen = true;
+    b->neg = neg && !mag.empty();
+    b->mag = mag;
+    return ov(b);
+}
+
+static V fromSI(Interp &I, const SI &s) { return intFromMag(I, s.neg, s.mag); }
+
+V intFromBig(Interp &I, RBig *b) { return intFromMag(I, b->neg, b->mag); }
+
+V bigFromInt64(Interp &I, int64_t v)
+{
+    if (fixable(v))
+        return fix(v);
+    bool neg = v < 0;
+    uint64_t u = neg ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    return intFromMag(I, neg, magU64(u));
+}
+
+V bigFromString(Interp &I, const std::string &digits, int base)
+{
+    Mag m;
+    bool neg = false;
+    size_t i = 0;
+    if (!digits.empty() && (digits[0] == '-' || digits[0] == '+'))
+    {
+        neg = digits[0] == '-';
+        i = 1;
+    }
+    for (; i < digits.size(); ++i)
+    {
+        char c = digits[i];
+        if (c == '_')
+            continue;
+        int d = c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'z' ? (c | 32) - 'a' + 10 : 99;
+        if (d >= base)
+            break;
+        magMulSmall(m, (uint32_t)base, (uint32_t)d);
+    }
+    return intFromMag(I, neg, m);
+}
+
+std::string intToS(Interp &I, V v, int base)
+{
+    (void)I;
+    if (isFix(v) && base == 10)
+        return std::to_string(fixv(v));
+    SI s = toSI(v);
+    return (s.neg ? "-" : "") + magToString(s.mag, base);
+}
+
+bool intIsZero(V a) { return a == fix(0); }
+
+bool intIsNeg(Interp &I, V a)
+{
+    (void)I;
+    if (isFix(a))
+        return fixv(a) < 0;
+    return static_cast<RBig *>(op(a))->neg;
+}
+
+V intNeg(Interp &I, V a)
+{
+    if (isFix(a))
+        return bigFromInt64(I, -fixv(a));
+    SI s = toSI(a);
+    s.neg = !s.neg;
+    return fromSI(I, s);
+}
+
+static SI siAdd(const SI &a, const SI &b)
+{
+    SI r;
+    if (a.neg == b.neg)
+    {
+        r.neg = a.neg;
+        r.mag = magAdd(a.mag, b.mag);
+        return r;
+    }
+    int c = magCmp(a.mag, b.mag);
+    if (c == 0)
+        return r;
+    if (c > 0)
+    {
+        r.neg = a.neg;
+        r.mag = magSub(a.mag, b.mag);
+    }
+    else
+    {
+        r.neg = b.neg;
+        r.mag = magSub(b.mag, a.mag);
+    }
+    return r;
+}
+
+V intAdd(Interp &I, V a, V b)
+{
+    if (isFix(a) && isFix(b))
+        return bigFromInt64(I, fixv(a) + fixv(b));
+    return fromSI(I, siAdd(toSI(a), toSI(b)));
+}
+
+V intSub(Interp &I, V a, V b)
+{
+    if (isFix(a) && isFix(b))
+        return bigFromInt64(I, fixv(a) - fixv(b));
+    SI nb = toSI(b);
+    nb.neg = !nb.neg && !nb.mag.empty();
+    return fromSI(I, siAdd(toSI(a), nb));
+}
+
+V intMul(Interp &I, V a, V b)
+{
+    if (isFix(a) && isFix(b))
+    {
+        int64_t x = fixv(a), y = fixv(b);
+        if (x == 0 || y == 0)
+            return fix(0);
+        uint64_t ux = x < 0 ? (uint64_t)(-x) : (uint64_t)x;
+        uint64_t uy = y < 0 ? (uint64_t)(-y) : (uint64_t)y;
+        if (ux <= 0xffffffffffffffffULL / uy)
+        {
+            uint64_t p = ux * uy;
+            bool neg = (x < 0) != (y < 0);
+            if (p <= (uint64_t)FIXMAX)
+                return fix(neg ? -(int64_t)p : (int64_t)p);
+            return intFromMag(I, neg, magU64(p));
+        }
+    }
+    SI x = toSI(a), y = toSI(b);
+    SI r;
+    r.neg = x.neg != y.neg;
+    r.mag = magMul(x.mag, y.mag);
+    return fromSI(I, r);
+}
+
+// floor division and modulo (Ruby's)
+static void intDivMod(Interp &I, V a, V b, V *q, V *m)
+{
+    if (intIsZero(b))
+        I.raise(I.cZeroDivisionError, "divided by 0");
+    if (isFix(a) && isFix(b))
+    {
+        int64_t x = fixv(a), y = fixv(b);
+        int64_t qq = x / y, rr = x % y;
+        if (rr != 0 && ((rr < 0) != (y < 0)))
+        {
+            --qq;
+            rr += y;
+        }
+        if (q)
+            *q = bigFromInt64(I, qq);
+        if (m)
+            *m = fix(rr);
+        return;
+    }
+    SI x = toSI(a), y = toSI(b);
+    Mag qm, rm;
+    magDivMod(x.mag, y.mag, qm, rm);
+    SI qs, rs;
+    qs.neg = x.neg != y.neg;
+    qs.mag = qm;
+    rs.neg = x.neg;
+    rs.mag = rm;
+    if (!rm.empty() && x.neg != y.neg)
+    {
+        // floor: q -= 1, r += b
+        SI one;
+        one.mag = magU64(1);
+        one.neg = true;
+        qs = siAdd(qs, one);
+        rs = siAdd(rs, y);
+    }
+    if (q)
+        *q = fromSI(I, qs);
+    if (m)
+        *m = fromSI(I, rs);
+}
+
+V intDiv(Interp &I, V a, V b)
+{
+    V q;
+    intDivMod(I, a, b, &q, nullptr);
+    return q;
+}
+
+V intMod(Interp &I, V a, V b)
+{
+    V m;
+    intDivMod(I, a, b, nullptr, &m);
+    return m;
+}
+
+int intCmp(Interp &I, V a, V b)
+{
+    (void)I;
+    if (isFix(a) && isFix(b))
+        return fixv(a) < fixv(b) ? -1 : fixv(a) > fixv(b) ? 1 : 0;
+    SI x = toSI(a), y = toSI(b);
+    if (x.neg != y.neg)
+        return x.neg ? -1 : 1;
+    int c = magCmp(x.mag, y.mag);
+    return x.neg ? -c : c;
+}
+
+double intToDouble(Interp &I, V a)
+{
+    (void)I;
+    if (isFix(a))
+        return (double)fixv(a);
+    SI s = toSI(a);
+    // the top 64 bits, rounded, scaled by the rest
+    size_t n = s.mag.size();
+    double d = 0;
+    if (n <= 2)
+    {
+        uint64_t v = s.mag[0] | (n > 1 ? (uint64_t)s.mag[1] << 32 : 0);
+        d = (double)v;
+    }
+    else
+    {
+        uint64_t hi = ((uint64_t)s.mag[n - 1] << 32) | s.mag[n - 2];
+        bool sticky = false;
+        for (size_t i = 0; i + 2 < n; ++i)
+            if (s.mag[i])
+                sticky = true;
+        uint64_t low = s.mag[n - 3];
+        // keep 64 significant bits plus a sticky bit for correct rounding
+        int lz = 0;
+        while (!(hi & 0x8000000000000000ULL))
+        {
+            hi = (hi << 1) | (low >> 31);
+            low = (low << 1) & 0xffffffffULL;
+            ++lz;
+        }
+        (void)sticky;
+        uint64_t mant = hi;
+        // round to 53 bits by hand: 11 extra bits
+        uint64_t rest = mant & 0x7ff;
+        mant >>= 11;
+        bool restSticky = low != 0 || sticky;
+        if (rest > 0x400 || (rest == 0x400 && (restSticky || (mant & 1))))
+            ++mant;
+        d = std::ldexp((double)mant, (int)((n - 2) * 32 - lz + 11));
+    }
+    return s.neg ? -d : d;
+}
+
+V intFromDouble(Interp &I, double d)
+{
+    if (d != d)
+        I.raise(I.cFloatDomainError, "NaN");
+    if (d == 1.0 / 0.0 || d == -1.0 / 0.0)
+        I.raise(I.cFloatDomainError, d > 0 ? "Infinity" : "-Infinity");
+    double t = d < 0 ? std::ceil(d) : std::floor(d);
+    if (t > -4.0e18 && t < 4.0e18)
+        return bigFromInt64(I, (int64_t)t);
+    bool neg = t < 0;
+    if (neg)
+        t = -t;
+    int e;
+    double m = std::frexp(t, &e); // t = m * 2^e, m in [0.5, 1)
+    uint64_t mant = (uint64_t)std::ldexp(m, 53);
+    Mag mag = magU64(mant);
+    mag = magShl(mag, e - 53);
+    return intFromMag(I, neg, mag);
+}
+
+V intPow(Interp &I, V a, V b)
+{
+    if (!isFix(b))
+        I.raise(I.cArgumentError, "exponent too large");
+    int64_t e = fixv(b);
+    if (e < 0)
+    {
+        V den = intPow(I, a, fix(-e));
+        return makeRational(I, fix(1), den);
+    }
+    V result = fix(1), base = a;
+    while (e > 0)
+    {
+        if (e & 1)
+            result = intMul(I, result, base);
+        e >>= 1;
+        if (e)
+            base = intMul(I, base, base);
+    }
+    return result;
+}
+
+V intGcd(Interp &I, V a, V b)
+{
+    if (isFix(a) && isFix(b))
+    {
+        int64_t x = fixv(a), y = fixv(b);
+        if (x < 0)
+            x = -x;
+        if (y < 0)
+            y = -y;
+        while (y)
+        {
+            int64_t t = x % y;
+            x = y;
+            y = t;
+        }
+        return fix(x);
+    }
+    if (intIsNeg(I, a))
+        a = intNeg(I, a);
+    if (intIsNeg(I, b))
+        b = intNeg(I, b);
+    while (!intIsZero(b))
+    {
+        V t = intMod(I, a, b);
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+// two's complement limbs of an integer, `n` limbs wide
+static Mag twos(const SI &s, size_t n)
+{
+    Mag r = s.mag;
+    r.resize(n, 0);
+    if (!s.neg)
+        return r;
+    for (size_t i = 0; i < n; ++i)
+        r[i] = ~r[i];
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (++r[i] != 0)
+            break;
+    }
+    return r;
+}
+
+V intBitop(Interp &I, V a, V b, char opc)
+{
+    if (isFix(a) && isFix(b))
+    {
+        int64_t x = fixv(a), y = fixv(b);
+        return fix(opc == '&' ? (x & y) : opc == '|' ? (x | y) : (x ^ y));
+    }
+    SI x = toSI(a), y = toSI(b);
+    size_t n = (x.mag.size() > y.mag.size() ? x.mag.size() : y.mag.size()) + 1;
+    Mag p = twos(x, n), q = twos(y, n), r(n);
+    for (size_t i = 0; i < n; ++i)
+        r[i] = opc == '&' ? (p[i] & q[i]) : opc == '|' ? (p[i] | q[i]) : (p[i] ^ q[i]);
+    bool neg = (r[n - 1] & 0x80000000u) != 0;
+    if (neg)
+    {
+        for (size_t i = 0; i < n; ++i)
+            r[i] = ~r[i];
+        for (size_t i = 0; i < n; ++i)
+            if (++r[i] != 0)
+                break;
+    }
+    return intFromMag(I, neg, r);
+}
+
+V intShift(Interp &I, V a, int64_t n)
+{
+    if (n == 0)
+        return a;
+    if (isFix(a) && n > 0 && n < 62)
+    {
+        int64_t x = fixv(a);
+        int64_t lim = (int64_t)1 << (62 - n);
+        if (x > -lim && x < lim)
+            return fix(x * ((int64_t)1 << n));
+    }
+    if (isFix(a) && n < 0)
+    {
+        int64_t x = fixv(a);
+        if (n <= -63)
+            return fix(x < 0 ? -1 : 0);
+        return fix(x >> (-n));
+    }
+    SI s = toSI(a);
+    if (n > 0)
+    {
+        s.mag = magShl(s.mag, n);
+        return fromSI(I, s);
+    }
+    if (!s.neg)
+    {
+        s.mag = magShr(s.mag, -n);
+        return fromSI(I, s);
+    }
+    // floor for negatives: -((|a| - 1) >> n) - 1
+    V m1 = intSub(I, intNeg(I, a), fix(1));
+    V sh = intShift(I, m1, n);
+    return intSub(I, intNeg(I, sh), fix(1));
+}
+
+// ── float formatting ──────────────────────────────────────────────────────
+
+namespace
+{
+
+uint64_t dbits(double d) { return *reinterpret_cast<uint64_t *>(&d); }
+double bitsd(uint64_t b) { return *reinterpret_cast<double *>(&b); }
+
+// MRI's dtoa fast path for modes 2 (ndigits significant) and 3 (ndigits
+// after the point): floating-point digit generation, with a tie in the last
+// place rounded to even. False when MRI would fall back to exact arithmetic.
+bool quickDigits(double d, int mode, int ndigits, std::string &out, int &k)
+{
+    uint64_t bits = dbits(d);
+    int be = (int)((bits >> 52) & 0x7ff);
+    if (be == 0)
+        return false;
+    double d2 = bitsd((bits & 0x000fffffffffffffULL) | 0x3ff0000000000000ULL);
+    int i = be - 1023;
+    double ds = (d2 - 1.5) * 0.289529654602168 + 0.1760912590558 + i * 0.301029995663981;
+    k = (int)ds;
+    if (ds < 0. && ds != k)
+        k--;
+    bool kCheck = true;
+    if (k >= 0 && k <= 22)
+    {
+        if (d < tens[k])
+            k--;
+        kCheck = false;
+    }
+    int ilim, ilim1;
+    if (mode == 2)
+    {
+        if (ndigits <= 0)
+            ndigits = 1;
+        ilim = ilim1 = ndigits;
+    }
+    else
+    {
+        ilim = ndigits + k + 1;
+        ilim1 = ilim - 1;
+    }
+    if (ilim < 0 || ilim > 14)
+        return false;
+    double dd = d;
+    int ieps = 2;
+    if (k > 0)
+    {
+        double dsc = tens[k & 0xf];
+        int j = k >> 4;
+        if (j & 0x10)
+        {
+            j &= 0x0f;
+            dd /= bigtens[4];
+            ieps++;
+        }
+        for (int bi = 0; j; j >>= 1, bi++)
+            if (j & 1)
+            {
+                ieps++;
+                dsc *= bigtens[bi];
+            }
+        dd /= dsc;
+    }
+    else if (k < 0)
+    {
+        int j1 = -k;
+        dd *= tens[j1 & 0xf];
+        for (int j = j1 >> 4, bi = 0; j; j >>= 1, bi++)
+            if (j & 1)
+            {
+                ieps++;
+                dd *= bigtens[bi];
+            }
+    }
+    if (kCheck && dd < 1. && ilim > 0)
+    {
+        if (ilim1 <= 0)
+            return false;
+        ilim = ilim1;
+        k--;
+        dd *= 10.;
+        ieps++;
+    }
+    double eps = ieps * dd + 7.;
+    eps = bitsd(dbits(eps) - ((uint64_t)52 << 52));
+    out.clear();
+    if (ilim == 0)
+    {
+        dd -= 5.;
+        if (dd > eps)
+        {
+            out = "1";
+            k++;
+            return true;
+        }
+        if (dd < -eps)
+        {
+            out = "";
+            k = -1 - ndigits;
+            return true;
+        }
+        return false;
+    }
+    eps *= tens[ilim - 1];
+    for (int n = 1;; n++, dd *= 10.)
+    {
+        int64_t L = (int64_t)dd;
+        dd -= (double)L;
+        if (dd == 0)
+            ilim = n;
+        out += (char)('0' + L);
+        if (n == ilim)
+        {
+            bool up;
+            if (dd > 0.5 + eps)
+                up = true;
+            else if (dd < 0.5 - eps)
+                up = false;
+            else
+                up = ((out.back() - '0') & 1) != 0;
+            if (up)
+            {
+                size_t p = out.size();
+                while (p > 0 && out[p - 1] == '9')
+                    --p;
+                if (p == 0)
+                {
+                    out = "1";
+                    k++;
+                }
+                else
+                {
+                    out.resize(p);
+                    out[p - 1]++;
+                }
+            }
+            while (!out.empty() && out.back() == '0')
+                out.pop_back();
+            return true;
+        }
+    }
+}
+
+std::string libFormat(double v, char conv, int prec)
+{
+    std::vector<char> buf(512 + (prec > 0 ? prec : 0));
+    char fmt[8] = {'%', '.', '*', conv, 0};
+    std::snprintf(buf.data(), buf.size(), fmt, prec, v);
+    return std::string(buf.data());
+}
+
+} // namespace
+
+// The shortest digits that read back as d (d > 0, finite), and the decimal
+// exponent of the first digit
+static void shortest(double d, std::string &digits, int &exp10)
+{
+    char buf[64];
+    int lo = 1, hi = 17;
+    while (lo < hi)
+    {
+        int mid = (lo + hi) / 2;
+        std::snprintf(buf, sizeof buf, "%.*e", mid - 1, d);
+        if (std::strtod(buf, nullptr) == d)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    std::snprintf(buf, sizeof buf, "%.*e", lo - 1, d);
+    digits.clear();
+    const char *s = buf;
+    for (; *s && *s != 'e'; ++s)
+        if (*s >= '0' && *s <= '9')
+            digits += *s;
+    exp10 = *s == 'e' ? std::atoi(s + 1) : 0;
+    while (digits.size() > 1 && digits.back() == '0')
+        digits.pop_back();
+}
+
+std::string floatToS(double d)
+{
+    if (d != d)
+        return "NaN";
+    if (d == 1.0 / 0.0)
+        return "Infinity";
+    if (d == -1.0 / 0.0)
+        return "-Infinity";
+    if (d == 0)
+        return std::signbit(d) ? "-0.0" : "0.0";
+    std::string sign = d < 0 ? "-" : "";
+    double a = d < 0 ? -d : d;
+    std::string digits;
+    int e;
+    shortest(a, digits, e);
+    int decpt = e + 1;
+    int n = (int)digits.size();
+    if (decpt > -4 && decpt < 16)
+    {
+        if (decpt <= 0)
+            return sign + "0." + std::string(-decpt, '0') + digits;
+        if (n <= decpt)
+            return sign + digits + std::string(decpt - n, '0') + ".0";
+        return sign + digits.substr(0, decpt) + "." + digits.substr(decpt);
+    }
+    std::string out = sign + digits.substr(0, 1) + "." + (n > 1 ? digits.substr(1) : "0") + "e";
+    int x = decpt - 1;
+    out += x < 0 ? "-" : "+";
+    int ax = x < 0 ? -x : x;
+    if (ax < 10)
+        out += "0";
+    out += std::to_string(ax);
+    return out;
+}
+
+// printf-style %f / %e / %g of v as MRI's sprintf writes it (no sign, no
+// width): `alt` is the # flag
+std::string fmtDouble(double v, char conv, int prec, bool alt)
+{
+    bool upper = conv == 'E' || conv == 'G';
+    char c = (char)(conv | 32);
+    if (prec < 0)
+        prec = 6;
+    if (v == 0)
+        return libFormat(0.0, conv, prec);
+    std::string digits;
+    int k;
+    if (c == 'f')
+    {
+        if (!quickDigits(v, 3, prec, digits, k))
+            return libFormat(v, 'f', prec);
+        int decpt = k + 1;
+        std::string ip, fp;
+        if (decpt > 0)
+        {
+            for (int i = 0; i < decpt; ++i)
+                ip += i < (int)digits.size() ? digits[i] : '0';
+        }
+        else
+            ip = "0";
+        for (int j = 0; j < prec; ++j)
+        {
+            int idx = decpt + j;
+            fp += idx >= 0 && idx < (int)digits.size() ? digits[idx] : '0';
+        }
+        if (prec == 0)
+            return alt ? ip + "." : ip;
+        return ip + "." + fp;
+    }
+    if (c == 'e')
+    {
+        if (!quickDigits(v, 2, prec + 1, digits, k))
+            return libFormat(v, conv, prec);
+        if (digits.empty())
+            digits = "0";
+        std::string out(1, digits[0]);
+        if (prec > 0 || alt)
+            out += ".";
+        for (int j = 1; j <= prec; ++j)
+            out += j < (int)digits.size() ? digits[j] : '0';
+        out += upper ? "E" : "e";
+        out += k < 0 ? "-" : "+";
+        int ak = k < 0 ? -k : k;
+        if (ak < 10)
+            out += "0";
+        out += std::to_string(ak);
+        return out;
+    }
+    // %g
+    int p = prec == 0 ? 1 : prec;
+    if (!quickDigits(v, 2, p, digits, k))
+        return libFormat(v, conv, prec);
+    std::string out;
+    if (p > k && k >= -4)
+    {
+        int fprec = p - 1 - k;
+        int decpt = k + 1;
+        std::string ip, fp;
+        if (decpt > 0)
+            for (int i = 0; i < decpt; ++i)
+                ip += i < (int)digits.size() ? digits[i] : '0';
+        else
+            ip = "0";
+        for (int j = 0; j < fprec; ++j)
+        {
+            int idx = decpt + j;
+            fp += idx >= 0 && idx < (int)digits.size() ? digits[idx] : '0';
+        }
+        if (!alt)
+            while (!fp.empty() && fp.back() == '0')
+                fp.pop_back();
+        out = fp.empty() ? (alt ? ip + "." : ip) : ip + "." + fp;
+    }
+    else
+    {
+        std::string mant(1, digits.empty() ? '0' : digits[0]);
+        std::string fp;
+        for (int j = 1; j < p; ++j)
+            fp += j < (int)digits.size() ? digits[j] : '0';
+        if (!alt)
+            while (!fp.empty() && fp.back() == '0')
+                fp.pop_back();
+        out = mant + (fp.empty() ? (alt ? "." : "") : "." + fp);
+        out += upper ? "E" : "e";
+        out += k < 0 ? "-" : "+";
+        int ak = k < 0 ? -k : k;
+        if (ak < 10)
+            out += "0";
+        out += std::to_string(ak);
+    }
+    return out;
+}
+
+// ── generic numeric operations ────────────────────────────────────────────
+
+namespace
+{
+
+bool isIntV(Interp &I, V v) { return I.isInt(v); }
+bool isRat(V v) { return isType(v, T::Rational); }
+bool isCpx(V v) { return isType(v, T::Complex); }
+
+RRational *rat(V v) { return static_cast<RRational *>(op(v)); }
+RComplex *cpx(V v) { return static_cast<RComplex *>(op(v)); }
+
+[[noreturn]] void coerceFail(Interp &I, V self, V other)
+{
+    std::string what = other == Qnil ? "nil" : other == Qtrue ? "true" : other == Qfalse ? "false" : I.className(I.realClassOf(other));
+    I.raise(I.cTypeError, what + " can't be coerced into " + I.className(I.realClassOf(self)));
+}
+
+// other.coerce(self) for operands this file does not know
+V coerceBin(Interp &I, V self, V other, Sym opname)
+{
+    if (isObj(other) && I.respondTo(other, I.s.coerce))
+    {
+        V pair = I.call1(other, I.s.coerce, self);
+        if (I.isAry(pair) && I.aref(pair).size() == 2)
+            return I.call1(I.aref(pair)[0], opname, I.aref(pair)[1]);
+    }
+    coerceFail(I, self, other);
+}
+
+} // namespace
+
+V makeRational(Interp &I, V num, V den)
+{
+    if (intIsZero(den))
+        I.raise(I.cZeroDivisionError, "divided by 0");
+    if (intIsNeg(I, den))
+    {
+        num = intNeg(I, num);
+        den = intNeg(I, den);
+    }
+    V g = intGcd(I, num, den);
+    if (g != fix(1) && !intIsZero(g))
+    {
+        num = intDiv(I, num, g);
+        den = intDiv(I, den, g);
+    }
+    auto *r = new RRational();
+    r->klass = I.cRational;
+    r->type = T::Rational;
+    r->frozen = true;
+    r->num = num;
+    r->den = den;
+    return ov(r);
+}
+
+V makeComplex(Interp &I, V re, V im)
+{
+    auto *c = new RComplex();
+    c->klass = I.cComplex;
+    c->type = T::Complex;
+    c->frozen = true;
+    c->re = re;
+    c->im = im;
+    return ov(c);
+}
+
+static V toRat(Interp &I, V v)
+{
+    if (isRat(v))
+        return v;
+    return makeRational(I, v, fix(1));
+}
+
+static double ratToF(Interp &I, V r)
+{
+    V num = rat(r)->num, den = rat(r)->den;
+    double n = intToDouble(I, num), d = intToDouble(I, den);
+    if (std::isinf(n) || std::isinf(d))
+    {
+        // scale both down together
+        V q, m;
+        intDivMod(I, num, den, &q, &m);
+        return intToDouble(I, q) + intToDouble(I, m) / d;
+    }
+    return n / d;
+}
+
+V numAdd(Interp &I, V a, V b)
+{
+    if (isIntV(I, a) && isIntV(I, b))
+        return intAdd(I, a, b);
+    if (isCpx(a) || isCpx(b))
+    {
+        V ar = isCpx(a) ? cpx(a)->re : a, ai = isCpx(a) ? cpx(a)->im : fix(0);
+        V br = isCpx(b) ? cpx(b)->re : b, bi = isCpx(b) ? cpx(b)->im : fix(0);
+        return makeComplex(I, numAdd(I, ar, br), numAdd(I, ai, bi));
+    }
+    if (I.isFloat(a) || I.isFloat(b))
+        return I.flo(I.numToF(a) + I.numToF(b));
+    V x = toRat(I, a), y = toRat(I, b);
+    return makeRational(I, intAdd(I, intMul(I, rat(x)->num, rat(y)->den), intMul(I, rat(y)->num, rat(x)->den)),
+                        intMul(I, rat(x)->den, rat(y)->den));
+}
+
+V numSub(Interp &I, V a, V b)
+{
+    if (isIntV(I, a) && isIntV(I, b))
+        return intSub(I, a, b);
+    if (isCpx(a) || isCpx(b))
+    {
+        V ar = isCpx(a) ? cpx(a)->re : a, ai = isCpx(a) ? cpx(a)->im : fix(0);
+        V br = isCpx(b) ? cpx(b)->re : b, bi = isCpx(b) ? cpx(b)->im : fix(0);
+        return makeComplex(I, numSub(I, ar, br), numSub(I, ai, bi));
+    }
+    if (I.isFloat(a) || I.isFloat(b))
+        return I.flo(I.numToF(a) - I.numToF(b));
+    V x = toRat(I, a), y = toRat(I, b);
+    return makeRational(I, intSub(I, intMul(I, rat(x)->num, rat(y)->den), intMul(I, rat(y)->num, rat(x)->den)),
+                        intMul(I, rat(x)->den, rat(y)->den));
+}
+
+V numMul(Interp &I, V a, V b)
+{
+    if (isIntV(I, a) && isIntV(I, b))
+        return intMul(I, a, b);
+    if (isCpx(a) || isCpx(b))
+    {
+        V ar = isCpx(a) ? cpx(a)->re : a, ai = isCpx(a) ? cpx(a)->im : fix(0);
+        V br = isCpx(b) ? cpx(b)->re : b, bi = isCpx(b) ? cpx(b)->im : fix(0);
+        return makeComplex(I, numSub(I, numMul(I, ar, br), numMul(I, ai, bi)), numAdd(I, numMul(I, ar, bi), numMul(I, ai, br)));
+    }
+    if (I.isFloat(a) || I.isFloat(b))
+        return I.flo(I.numToF(a) * I.numToF(b));
+    V x = toRat(I, a), y = toRat(I, b);
+    return makeRational(I, intMul(I, rat(x)->num, rat(y)->num), intMul(I, rat(x)->den, rat(y)->den));
+}
+
+V numDiv(Interp &I, V a, V b)
+{
+    if (isIntV(I, a) && isIntV(I, b))
+        return intDiv(I, a, b);
+    if (isCpx(a) || isCpx(b))
+    {
+        V ar = isCpx(a) ? cpx(a)->re : a, ai = isCpx(a) ? cpx(a)->im : fix(0);
+        V br = isCpx(b) ? cpx(b)->re : b, bi = isCpx(b) ? cpx(b)->im : fix(0);
+        V den = numAdd(I, numMul(I, br, br), numMul(I, bi, bi));
+        V re = numAdd(I, numMul(I, ar, br), numMul(I, ai, bi));
+        V im = numSub(I, numMul(I, ai, br), numMul(I, ar, bi));
+        auto quo = [&](V x, V y) -> V
+        {
+            if (isIntV(I, x) && isIntV(I, y))
+            {
+                V r = makeRational(I, x, y);
+                return rat(r)->den == fix(1) ? rat(r)->num : r;
+            }
+            return numDiv(I, x, y);
+        };
+        return makeComplex(I, quo(re, den), quo(im, den));
+    }
+    if (I.isFloat(a) || I.isFloat(b))
+        return I.flo(I.numToF(a) / I.numToF(b));
+    V x = toRat(I, a), y = toRat(I, b);
+    if (intIsZero(rat(y)->num))
+        I.raise(I.cZeroDivisionError, "divided by 0");
+    return makeRational(I, intMul(I, rat(x)->num, rat(y)->den), intMul(I, rat(x)->den, rat(y)->num));
+}
+
+V numCmpV(Interp &I, V a, V b)
+{
+    if (isIntV(I, a) && isIntV(I, b))
+        return fix(intCmp(I, a, b));
+    if (isCpx(a) || isCpx(b))
+        return Qnil;
+    if (I.isFloat(a) || I.isFloat(b))
+    {
+        double x = I.numToF(a), y = I.numToF(b);
+        if (x != x || y != y)
+            return Qnil;
+        return fix(x < y ? -1 : x > y ? 1 : 0);
+    }
+    V x = toRat(I, a), y = toRat(I, b);
+    return fix(intCmp(I, intMul(I, rat(x)->num, rat(y)->den), intMul(I, rat(y)->num, rat(x)->den)));
+}
+
+bool numEq(Interp &I, V a, V b)
+{
+    if (isCpx(a) || isCpx(b))
+    {
+        V ar = isCpx(a) ? cpx(a)->re : a, ai = isCpx(a) ? cpx(a)->im : fix(0);
+        V br = isCpx(b) ? cpx(b)->re : b, bi = isCpx(b) ? cpx(b)->im : fix(0);
+        return numEq(I, ar, br) && numEq(I, ai, bi);
+    }
+    V c = numCmpV(I, a, b);
+    return c == fix(0);
+}
+
+// ── Integer ───────────────────────────────────────────────────────────────
+
+namespace
+{
+
+V int_plus(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isIntV(I, b))
+        return intAdd(I, self, b);
+    if (I.isNum(b))
+        return numAdd(I, self, b);
+    return coerceBin(I, self, b, I.s.plus);
+}
+
+V int_minus(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isIntV(I, b))
+        return intSub(I, self, b);
+    if (I.isNum(b))
+        return numSub(I, self, b);
+    return coerceBin(I, self, b, I.s.minus);
+}
+
+V int_mul(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isIntV(I, b))
+        return intMul(I, self, b);
+    if (I.isNum(b))
+        return numMul(I, self, b);
+    return coerceBin(I, self, b, I.s.mul);
+}
+
+V int_div(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isIntV(I, b))
+        return intDiv(I, self, b);
+    if (I.isNum(b))
+        return numDiv(I, self, b);
+    return coerceBin(I, self, b, I.s.div);
+}
+
+V int_mod(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isIntV(I, b))
+        return intMod(I, self, b);
+    if (I.isFloat(b))
+    {
+        double x = I.numToF(self), y = I.fltv(b);
+        double m = std::fmod(x, y);
+        if (m != 0 && ((m < 0) != (y < 0)))
+            m += y;
+        return I.flo(m);
+    }
+    if (isRat(b))
+    {
+        V q = I.call1(numDiv(I, self, b), intern("floor"), fix(0));
+        return numSub(I, self, numMul(I, b, q));
+    }
+    return coerceBin(I, self, b, I.s.mod);
+}
+
+V int_remainder(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isIntV(I, b))
+    {
+        V m = intMod(I, self, b);
+        if (!intIsZero(m) && intIsNeg(I, self) != intIsNeg(I, b))
+            m = intSub(I, m, b);
+        return m;
+    }
+    double x = I.numToF(self), y = I.numToF(b);
+    return I.flo(std::fmod(x, y));
+}
+
+V int_divmod(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isIntV(I, b))
+    {
+        V q, m;
+        intDivMod(I, self, b, &q, &m);
+        return I.ary2(q, m);
+    }
+    double x = I.numToF(self), y = I.numToF(b);
+    if (y == 0)
+        I.raise(I.cZeroDivisionError, "divided by 0");
+    double m = std::fmod(x, y);
+    if (m != 0 && ((m < 0) != (y < 0)))
+        m += y;
+    double q = std::floor((x - m) / y + 0.5);
+    return I.ary2(intFromDouble(I, std::floor(x / y)), I.flo(m));
+    (void)q;
+}
+
+V int_fdiv(Interp &I, V self, Args &a) { return I.flo(I.numToF(self) / I.numToF(a.argv[0])); }
+
+V int_pow(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isFix(b))
+    {
+        if (fixv(b) < 0)
+        {
+            if (intIsZero(self))
+                I.raise(I.cZeroDivisionError, "divided by 0");
+            return intPow(I, self, b);
+        }
+        return intPow(I, self, b);
+    }
+    if (I.isFloat(b))
+    {
+        double x = I.numToF(self), y = I.fltv(b);
+        if (x < 0 && y != std::floor(y))
+            return I.call1(makeComplex(I, self, fix(0)), I.s.pow, b);
+        return I.flo(std::pow(x, y));
+    }
+    if (isRat(b))
+    {
+        if (rat(b)->den == fix(1))
+            return intPow(I, self, rat(b)->num);
+        return I.flo(std::pow(I.numToF(self), ratToF(I, b)));
+    }
+    if (isType(b, T::Bignum))
+        I.raise(I.cArgumentError, "exponent too large");
+    return coerceBin(I, self, b, I.s.pow);
+}
+
+V int_powmod(Interp &I, V self, Args &a)
+{
+    if (a.argc == 1)
+        return int_pow(I, self, a);
+    V e = a.argv[0], m = a.argv[1];
+    V result = fix(1);
+    V base = intMod(I, self, m);
+    while (!intIsZero(e))
+    {
+        if (intMod(I, e, fix(2)) == fix(1))
+            result = intMod(I, intMul(I, result, base), m);
+        e = intDiv(I, e, fix(2));
+        base = intMod(I, intMul(I, base, base), m);
+    }
+    return result;
+}
+
+V int_neg(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return intNeg(I, self);
+}
+
+V int_pos(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V int_abs(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return intIsNeg(I, self) ? intNeg(I, self) : self;
+}
+
+V int_invert(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return intSub(I, intNeg(I, self), fix(1));
+}
+
+V int_and(Interp &I, V self, Args &a)
+{
+    if (!isIntV(I, a.argv[0]))
+        coerceFail(I, self, a.argv[0]);
+    return intBitop(I, self, a.argv[0], '&');
+}
+V int_or(Interp &I, V self, Args &a)
+{
+    if (!isIntV(I, a.argv[0]))
+        coerceFail(I, self, a.argv[0]);
+    return intBitop(I, self, a.argv[0], '|');
+}
+V int_xor(Interp &I, V self, Args &a)
+{
+    if (!isIntV(I, a.argv[0]))
+        coerceFail(I, self, a.argv[0]);
+    return intBitop(I, self, a.argv[0], '^');
+}
+V int_lshift(Interp &I, V self, Args &a) { return intShift(I, self, I.intOf(a.argv[0])); }
+V int_rshift(Interp &I, V self, Args &a) { return intShift(I, self, -I.intOf(a.argv[0])); }
+
+V int_aref(Interp &I, V self, Args &a)
+{
+    int64_t bit = I.intOf(a.argv[0]);
+    if (bit < 0)
+        return fix(0);
+    V sh = intShift(I, self, -bit);
+    return intBitop(I, sh, fix(1), '&');
+}
+
+V int_eq(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isFix(self) && isFix(b))
+        return boolv(self == b);
+    if (I.isNum(b))
+        return boolv(numEq(I, self, b));
+    if (isObj(b) && op(b)->type == T::Object)
+        return boolv(truthy(I.call1(b, I.s.eq, self)));
+    return Qfalse;
+}
+
+V int_cmp(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (I.isNum(b))
+        return numCmpV(I, self, b);
+    if (isObj(b) && I.respondTo(b, I.s.coerce))
+    {
+        V pair = I.call1(b, I.s.coerce, self);
+        return I.call1(I.aref(pair)[0], I.s.cmp, I.aref(pair)[1]);
+    }
+    return Qnil;
+}
+
+int numCompare(Interp &I, V self, V b)
+{
+    if (!I.isNum(b))
+    {
+        if (isObj(b) && I.respondTo(b, I.s.coerce))
+        {
+            V pair = I.call1(b, I.s.coerce, self);
+            return I.cmp(I.aref(pair)[0], I.aref(pair)[1]);
+        }
+        std::string o = !isObj(b) || I.isFloat(b) ? I.inspect(b) : I.className(I.realClassOf(b));
+        I.raise(I.cArgumentError, "comparison of " + I.className(I.realClassOf(self)) + " with " + o + " failed");
+    }
+    V c = numCmpV(I, self, b);
+    if (c == Qnil)
+        return 2; // NaN: every comparison is false
+    return (int)fixv(c);
+}
+
+V num_lt(Interp &I, V self, Args &a)
+{
+    int c = numCompare(I, self, a.argv[0]);
+    return boolv(c != 2 && c < 0);
+}
+V num_le(Interp &I, V self, Args &a)
+{
+    int c = numCompare(I, self, a.argv[0]);
+    return boolv(c != 2 && c <= 0);
+}
+V num_gt(Interp &I, V self, Args &a)
+{
+    int c = numCompare(I, self, a.argv[0]);
+    return boolv(c != 2 && c > 0);
+}
+V num_ge(Interp &I, V self, Args &a)
+{
+    int c = numCompare(I, self, a.argv[0]);
+    return boolv(c != 2 && c >= 0);
+}
+
+V int_eql(Interp &I, V self, Args &a) { return boolv(isIntV(I, a.argv[0]) && intCmp(I, self, a.argv[0]) == 0); }
+
+V int_hash(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix((int64_t)(I.hashOf(self) >> 2));
+}
+
+V int_to_s(Interp &I, V self, Args &a)
+{
+    int base = a.argc > 0 ? (int)I.intOf(a.argv[0]) : 10;
+    if (base < 2 || base > 36)
+        I.raise(I.cArgumentError, "invalid radix " + std::to_string(base));
+    return I.str(intToS(I, self, base));
+}
+
+V int_to_i(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V int_to_f(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(intToDouble(I, self));
+}
+
+V int_to_r(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return makeRational(I, self, fix(1));
+}
+
+V int_to_c(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return makeComplex(I, self, fix(0));
+}
+
+V int_chr(Interp &I, V self, Args &a)
+{
+    int64_t c = I.intOf(self);
+    if (c < 0 || c > 0x10ffff)
+        I.raise(I.cRangeError, std::to_string(c) + " out of char range");
+    std::string s;
+    if (a.argc == 0)
+    {
+        if (c > 255)
+            I.raise(I.cRangeError, std::to_string(c) + " out of char range");
+        s += (char)c;
+        V r = I.str(s);
+        static_cast<RString *>(op(r))->binary = c >= 128;
+        return r;
+    }
+    appendUtf8(s, (uint32_t)c);
+    return I.str(s);
+}
+
+V int_ord(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V int_times(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+    {
+        V av = I.sym("times");
+        return I.call(self, I.s.to_enum, 1, &av);
+    }
+    int64_t n = I.intOf(self);
+    for (int64_t i = 0; i < n; ++i)
+        I.yield(a.blk, fix(i));
+    return self;
+}
+
+V int_upto(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+    {
+        V av[2] = {I.sym("upto"), a.argv[0]};
+        return I.call(self, I.s.to_enum, 2, av);
+    }
+    int64_t from = I.intOf(self);
+    if (I.isFloat(a.argv[0]))
+    {
+        double to = I.fltv(a.argv[0]);
+        for (int64_t i = from; (double)i <= to; ++i)
+            I.yield(a.blk, fix(i));
+        return self;
+    }
+    int64_t to = I.intOf(a.argv[0]);
+    for (int64_t i = from; i <= to; ++i)
+        I.yield(a.blk, fix(i));
+    return self;
+}
+
+V int_downto(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+    {
+        V av[2] = {I.sym("downto"), a.argv[0]};
+        return I.call(self, I.s.to_enum, 2, av);
+    }
+    int64_t from = I.intOf(self);
+    int64_t to = I.intOf(a.argv[0]);
+    for (int64_t i = from; i >= to; --i)
+        I.yield(a.blk, fix(i));
+    return self;
+}
+
+V int_succ(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return intAdd(I, self, fix(1));
+}
+
+V int_pred(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return intSub(I, self, fix(1));
+}
+
+V int_even(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (isFix(self))
+        return boolv((fixv(self) & 1) == 0);
+    return boolv((static_cast<RBig *>(op(self))->mag[0] & 1) == 0);
+    (void)I;
+}
+
+V int_odd(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (isFix(self))
+        return boolv((fixv(self) & 1) != 0);
+    return boolv((static_cast<RBig *>(op(self))->mag[0] & 1) != 0);
+    (void)I;
+}
+
+V num_zero(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (isFix(self))
+        return boolv(self == fix(0));
+    return boolv(I.numToF(self) == 0);
+}
+
+V num_nonzero(Interp &I, V self, Args &a)
+{
+    if (truthy(num_zero(I, self, a)))
+        return Qnil;
+    return self;
+}
+
+V num_positive(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (I.isInt(self))
+        return boolv(!intIsNeg(I, self) && !intIsZero(self));
+    return boolv(I.numToF(self) > 0);
+}
+
+V num_negative(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (I.isInt(self))
+        return boolv(intIsNeg(I, self));
+    double d = I.numToF(self);
+    return boolv(d < 0);
+}
+
+V int_integer_p(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qtrue;
+}
+
+V num_false(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qfalse;
+}
+
+V num_true(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qtrue;
+}
+
+V int_digits(Interp &I, V self, Args &a)
+{
+    V base = a.argc > 0 ? a.argv[0] : fix(10);
+    if (intIsNeg(I, self))
+        I.raise(I.cMathDomainError, "out of domain");
+    V out = I.ary();
+    V n = self;
+    if (intIsZero(n))
+    {
+        I.aref(out).push_back(fix(0));
+        return out;
+    }
+    while (!intIsZero(n))
+    {
+        V q, m;
+        intDivMod(I, n, base, &q, &m);
+        I.aref(out).push_back(m);
+        n = q;
+    }
+    return out;
+}
+
+V int_bit_length(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V n = intIsNeg(I, self) ? intSub(I, intNeg(I, self), fix(1)) : self;
+    int64_t bits = 0;
+    while (!intIsZero(n))
+    {
+        n = intShift(I, n, -1);
+        ++bits;
+    }
+    return fix(bits);
+}
+
+V int_gcd(Interp &I, V self, Args &a) { return intGcd(I, self, a.argv[0]); }
+
+V int_lcm(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (intIsZero(self) || intIsZero(b))
+        return fix(0);
+    V g = intGcd(I, self, b);
+    V r = intMul(I, intDiv(I, self, g), b);
+    return intIsNeg(I, r) ? intNeg(I, r) : r;
+}
+
+V int_round(Interp &I, V self, Args &a)
+{
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    if (argc == 0)
+        return self;
+    int64_t nd = I.intOf(a.argv[0]);
+    if (nd >= 0)
+        return self;
+    V p = intPow(I, fix(10), fix(-nd));
+    V q, m;
+    intDivMod(I, intIsNeg(I, self) ? intNeg(I, self) : self, p, &q, &m);
+    bool even = false;
+    if (kw)
+    {
+        bool found = false;
+        V h = I.hget(kw, I.sym("half"), &found);
+        even = found && h == I.sym("even");
+    }
+    V twice = intMul(I, m, fix(2));
+    int c = intCmp(I, twice, p);
+    if (c > 0 || (c == 0 && (!even || truthy(int_odd(I, q, a)))))
+        q = intAdd(I, q, fix(1));
+    V r = intMul(I, q, p);
+    return intIsNeg(I, self) ? intNeg(I, r) : r;
+}
+
+V int_floor(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0)
+        return self;
+    int64_t nd = I.intOf(a.argv[0]);
+    if (nd >= 0)
+        return self;
+    V p = intPow(I, fix(10), fix(-nd));
+    return intMul(I, intDiv(I, self, p), p);
+}
+
+V int_ceil(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0)
+        return self;
+    int64_t nd = I.intOf(a.argv[0]);
+    if (nd >= 0)
+        return self;
+    V p = intPow(I, fix(10), fix(-nd));
+    return intNeg(I, intMul(I, intDiv(I, intNeg(I, self), p), p));
+}
+
+V int_truncate(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0)
+        return self;
+    return intIsNeg(I, self) ? int_ceil(I, self, a) : int_floor(I, self, a);
+}
+
+V int_size(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (isFix(self))
+        return fix(8);
+    return fix((int64_t)static_cast<RBig *>(op(self))->mag.size() * 4);
+    (void)I;
+}
+
+V int_coerce(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isIntV(I, b))
+        return I.ary2(b, self);
+    return I.ary2(I.flo(I.numToF(b)), I.flo(I.numToF(self)));
+}
+
+V int_sqrt(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V n = a.argv[0];
+    if (!I.isInt(n))
+        n = intFromDouble(I, I.numToF(n));
+    if (intIsNeg(I, n))
+        I.raise(I.cMathDomainError, "Numerical argument is out of domain - \"isqrt\"");
+    if (isFix(n))
+    {
+        int64_t v = fixv(n);
+        int64_t r = (int64_t)std::sqrt((double)v);
+        while (r * r > v)
+            --r;
+        while ((r + 1) * (r + 1) <= v)
+            ++r;
+        return fix(r);
+    }
+    // Newton's method on bignums
+    V x = intFromDouble(I, std::sqrt(intToDouble(I, n)));
+    for (int i = 0; i < 200; ++i)
+    {
+        V y = intDiv(I, intAdd(I, x, intDiv(I, n, x)), fix(2));
+        if (intCmp(I, y, x) >= 0)
+        {
+            // x is within one: settle
+            while (intCmp(I, intMul(I, x, x), n) > 0)
+                x = intSub(I, x, fix(1));
+            while (intCmp(I, intMul(I, intAdd(I, x, fix(1)), intAdd(I, x, fix(1))), n) <= 0)
+                x = intAdd(I, x, fix(1));
+            return x;
+        }
+        x = y;
+    }
+    return x;
+}
+
+V int_allbits(Interp &I, V self, Args &a) { return boolv(intBitop(I, self, a.argv[0], '&') == a.argv[0] || I.eq(intBitop(I, self, a.argv[0], '&'), a.argv[0])); }
+V int_anybits(Interp &I, V self, Args &a) { return boolv(!intIsZero(intBitop(I, self, a.argv[0], '&'))); }
+V int_nobits(Interp &I, V self, Args &a) { return boolv(intIsZero(intBitop(I, self, a.argv[0], '&'))); }
+
+V int_numerator(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V int_denominator(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return fix(1);
+}
+
+// ── Numeric#step, Float stepping ──────────────────────────────────────────
+
+// MRI's float step: the count is computed once, with a tolerance
+void floatStep(Interp &I, double beg, double end, double unit, bool excl, Blk *blk, V *collect)
+{
+    double n = (end - beg) / unit;
+    double err = (std::fabs(beg) + std::fabs(end) + std::fabs(end - beg)) / std::fabs(unit) * 2.220446049250313e-16;
+    if (std::isinf(unit))
+    {
+        if (unit > 0 ? beg <= end : beg >= end)
+        {
+            if (collect)
+                I.aref(*collect).push_back(I.flo(beg));
+            else
+                I.yield(blk, I.flo(beg));
+        }
+        return;
+    }
+    if (unit == 0)
+    {
+        for (;;)
+            I.yield(blk, I.flo(beg));
+    }
+    if (err > 0.5)
+        err = 0.5;
+    if (excl)
+    {
+        if (n <= 0)
+            return;
+        if (n < 1)
+            n = 0;
+        else
+            n = std::floor(n - err);
+        double d = +((n + 1) * unit) + beg;
+        if (beg < end)
+        {
+            if (d < end)
+                n++;
+        }
+        else if (beg > end)
+        {
+            if (d > end)
+                n++;
+        }
+    }
+    else
+    {
+        if (n < 0)
+            return;
+        n = std::floor(n + err);
+    }
+    for (int64_t i = 0; i <= (int64_t)n; i++)
+    {
+        double d = i * unit + beg;
+        if (unit >= 0 ? end < d : d < end)
+            d = end;
+        if (excl && d == end && i == (int64_t)n && false)
+            break;
+        if (collect)
+            I.aref(*collect).push_back(I.flo(d));
+        else
+            I.yield(blk, I.flo(d));
+    }
+}
+
+V num_step(Interp &I, V self, Args &a)
+{
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    V limit = argc > 0 ? a.argv[0] : Qnil;
+    V step = argc > 1 ? a.argv[1] : fix(1);
+    if (kw)
+    {
+        bool found = false;
+        V by = I.hget(kw, I.sym("by"), &found);
+        if (found)
+            step = by;
+        V to = I.hget(kw, I.sym("to"), &found);
+        if (found)
+            limit = to;
+    }
+    if (!a.blk)
+    {
+        // an arithmetic sequence: materialised lazily by Enumerator
+        auto *e = new REnum();
+        e->klass = I.cArith;
+        e->type = T::Enumerator;
+        e->recv = self;
+        e->meth = intern("step");
+        e->args.push_back(limit);
+        e->args.push_back(step);
+        return ov(e);
+    }
+    if (step == fix(0))
+        I.raise(I.cArgumentError, "step can't be 0");
+    if (I.isFloat(self) || I.isFloat(limit) || I.isFloat(step))
+    {
+        double beg = I.numToF(self), unit = I.numToF(step);
+        double end = limit == Qnil ? (unit < 0 ? -1.0 / 0.0 : 1.0 / 0.0) : I.numToF(limit);
+        floatStep(I, beg, end, unit, false, a.blk, nullptr);
+        return self;
+    }
+    V i = self;
+    bool down = intIsNeg(I, step) || (isRat(step) && intIsNeg(I, rat(step)->num));
+    for (;;)
+    {
+        if (limit != Qnil)
+        {
+            V c = numCmpV(I, i, limit);
+            if (down ? fixv(c) < 0 : fixv(c) > 0)
+                break;
+        }
+        I.yield(a.blk, i);
+        i = numAdd(I, i, step);
+    }
+    return self;
+}
+
+// ── Float ─────────────────────────────────────────────────────────────────
+
+double fv(Interp &I, V v) { return I.fltv(v); }
+
+V flo_plus(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (I.isFloat(b) || I.isInt(b) || isRat(b))
+        return I.flo(fv(I, self) + I.numToF(b));
+    if (isCpx(b))
+        return numAdd(I, self, b);
+    return coerceBin(I, self, b, I.s.plus);
+}
+V flo_minus(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (I.isFloat(b) || I.isInt(b) || isRat(b))
+        return I.flo(fv(I, self) - I.numToF(b));
+    if (isCpx(b))
+        return numSub(I, self, b);
+    return coerceBin(I, self, b, I.s.minus);
+}
+V flo_mul(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (I.isFloat(b) || I.isInt(b) || isRat(b))
+        return I.flo(fv(I, self) * I.numToF(b));
+    if (isCpx(b))
+        return numMul(I, self, b);
+    return coerceBin(I, self, b, I.s.mul);
+}
+V flo_div(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (I.isFloat(b) || I.isInt(b) || isRat(b))
+        return I.flo(fv(I, self) / I.numToF(b));
+    if (isCpx(b))
+        return numDiv(I, self, b);
+    return coerceBin(I, self, b, I.s.div);
+}
+V flo_mod(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (!I.isNum(b))
+        return coerceBin(I, self, b, I.s.mod);
+    double x = fv(I, self), y = I.numToF(b);
+    double m = std::fmod(x, y);
+    if (y == 0)
+        return I.flo(0.0 / 0.0);
+    if (m != 0 && ((m < 0) != (y < 0)))
+        m += y;
+    return I.flo(m);
+}
+V flo_divmod(Interp &I, V self, Args &a)
+{
+    double x = fv(I, self), y = I.numToF(a.argv[0]);
+    if (y == 0)
+        I.raise(I.cZeroDivisionError, "divided by 0");
+    double m = std::fmod(x, y);
+    if (m != 0 && ((m < 0) != (y < 0)))
+        m += y;
+    double q = (x - m) / y;
+    q = std::floor(q + 0.5 * (q < 0 ? -1 : 1) * 0) ;
+    return I.ary2(intFromDouble(I, std::floor(x / y)), I.flo(m));
+}
+V flo_pow(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    double x = fv(I, self), y = I.numToF(b);
+    if (x < 0 && y != std::floor(y))
+        return I.call1(makeComplex(I, self, fix(0)), I.s.pow, b);
+    return I.flo(std::pow(x, y));
+}
+V flo_neg(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(-fv(I, self));
+}
+V flo_abs(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(std::fabs(fv(I, self)));
+}
+V flo_eq(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (I.isNum(b))
+        return boolv(numEq(I, self, b));
+    if (isObj(b) && op(b)->type == T::Object)
+        return boolv(truthy(I.call1(b, I.s.eq, self)));
+    return Qfalse;
+}
+V flo_cmp(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (I.isNum(b))
+        return numCmpV(I, self, b);
+    return Qnil;
+}
+V flo_eql(Interp &I, V self, Args &a) { return boolv(I.isFloat(a.argv[0]) && fv(I, self) == fv(I, a.argv[0])); }
+V flo_hash(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix((int64_t)(I.hashOf(self) >> 2));
+}
+V flo_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(floatToS(fv(I, self)));
+}
+V flo_to_f(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+V flo_to_i(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return intFromDouble(I, fv(I, self));
+}
+
+int floatRoundOverflow(int ndigits, int binexp)
+{
+    const int floatDig = 17;
+    return ndigits >= floatDig - (binexp > 0 ? binexp / 4 : binexp / 3 - 1);
+}
+
+int floatRoundUnderflow(int ndigits, int binexp) { return ndigits < -(binexp > 0 ? binexp / 3 + 1 : binexp / 4); }
+
+double roundHalfUp(double x, double s)
+{
+    double f, xs = x * s;
+    f = std::round(xs);
+    if (s == 1.0)
+        return f;
+    if (x > 0)
+    {
+        if ((double)((f + 0.5) / s) <= x)
+            f += 1;
+        x = f;
+    }
+    else
+    {
+        if ((double)((f - 0.5) / s) >= x)
+            f -= 1;
+        x = f;
+    }
+    return x;
+}
+
+double roundHalfEven(double x, double s)
+{
+    double u, v, us, vs, f, uf, xs = x * s;
+    v = std::modf(xs, &u);
+    us = u / s;
+    vs = v / s;
+    (void)us;
+    (void)vs;
+    if (v == 0.5 || v == -0.5)
+    {
+        uf = std::fmod(u, 2.0);
+        f = uf == 0 ? u : u + (x > 0 ? 1 : -1);
+    }
+    else
+        f = std::round(xs);
+    return f;
+}
+
+// is there an exact representation check MRI does for round-to-even: kept simple
+V flo_round(Interp &I, V self, Args &a)
+{
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    int nd = argc > 0 ? (int)I.intOf(a.argv[0]) : 0;
+    bool even = false;
+    if (kw)
+    {
+        bool found = false;
+        V h = I.hget(kw, I.sym("half"), &found);
+        even = found && h == I.sym("even");
+    }
+    double number = fv(I, self);
+    if (number == 0.0)
+        return nd > 0 ? self : fix(0);
+    if (nd > 0)
+    {
+        if (!std::isfinite(number))
+            return self;
+        int binexp;
+        std::frexp(number, &binexp);
+        if (floatRoundOverflow(nd, binexp))
+            return self;
+        if (number > 0.0 && floatRoundUnderflow(nd, binexp))
+            return I.flo(0.0);
+        if (nd > 14)
+        {
+            // MRI rounds through a Rational here
+            V r = I.call0(self, I.s.to_r);
+            V rounded = I.call1(r, intern("round"), fix(nd));
+            return I.flo(I.numToF(rounded));
+        }
+        double s = std::pow(10, nd);
+        double x = even ? roundHalfEven(number, s) : roundHalfUp(number, s);
+        return I.flo(x / s);
+    }
+    if (!std::isfinite(number))
+        I.raise(I.cFloatDomainError, floatToS(number));
+    if (nd == 0)
+        return intFromDouble(I, even ? roundHalfEven(number, 1.0) : roundHalfUp(number, 1.0));
+    V iv = intFromDouble(I, even ? roundHalfEven(number, 1.0) : std::round(number));
+    Args b;
+    b.argv = a.argv;
+    b.argc = 1;
+    return int_round(I, iv, b);
+}
+
+V flo_floor(Interp &I, V self, Args &a)
+{
+    int nd = a.argc > 0 ? (int)I.intOf(a.argv[0]) : 0;
+    double number = fv(I, self);
+    if (number == 0.0)
+        return nd > 0 ? self : fix(0);
+    if (nd > 0)
+    {
+        int binexp;
+        std::frexp(number, &binexp);
+        if (floatRoundOverflow(nd, binexp))
+            return self;
+        if (number > 0.0 && floatRoundUnderflow(nd, binexp))
+            return I.flo(0.0);
+        double f = std::pow(10, nd);
+        double mul = std::floor(number * f);
+        double res = (mul + 1) / f;
+        if (res > number)
+            res = mul / f;
+        return I.flo(res);
+    }
+    V iv = intFromDouble(I, std::floor(number));
+    if (nd < 0)
+    {
+        Args b;
+        b.argv = a.argv;
+        b.argc = 1;
+        return int_floor(I, iv, b);
+    }
+    return iv;
+}
+
+V flo_ceil(Interp &I, V self, Args &a)
+{
+    int nd = a.argc > 0 ? (int)I.intOf(a.argv[0]) : 0;
+    double number = fv(I, self);
+    if (number == 0.0)
+        return nd > 0 ? self : fix(0);
+    if (nd > 0)
+    {
+        int binexp;
+        std::frexp(number, &binexp);
+        if (floatRoundOverflow(nd, binexp))
+            return self;
+        if (number < 0.0 && floatRoundUnderflow(nd, binexp))
+            return I.flo(0.0);
+        double f = std::pow(10, nd);
+        double mul = std::ceil(number * f);
+        double res = (mul - 1) / f;
+        if (res < number)
+            res = mul / f;
+        return I.flo(res);
+    }
+    V iv = intFromDouble(I, std::ceil(number));
+    if (nd < 0)
+    {
+        Args b;
+        b.argv = a.argv;
+        b.argc = 1;
+        return int_ceil(I, iv, b);
+    }
+    return iv;
+}
+
+V flo_truncate(Interp &I, V self, Args &a)
+{
+    if (fv(I, self) < 0)
+        return flo_ceil(I, self, a);
+    return flo_floor(I, self, a);
+}
+
+V flo_nan(Interp &I, V self, Args &a)
+{
+    (void)a;
+    double d = fv(I, self);
+    return boolv(d != d);
+}
+
+V flo_infinite(Interp &I, V self, Args &a)
+{
+    (void)a;
+    double d = fv(I, self);
+    if (d == 1.0 / 0.0)
+        return fix(1);
+    if (d == -1.0 / 0.0)
+        return fix(-1);
+    return Qnil;
+}
+
+V flo_finite(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(std::isfinite(fv(I, self)));
+}
+
+V flo_integer_p(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qfalse;
+}
+
+V flo_to_r(Interp &I, V self, Args &a)
+{
+    (void)a;
+    double d = fv(I, self);
+    if (!std::isfinite(d))
+        I.raise(I.cFloatDomainError, floatToS(d));
+    int e;
+    double m = std::frexp(d, &e);
+    // d = m * 2^e exactly with 53 bits of mantissa
+    V num = intFromDouble(I, std::ldexp(m, 53));
+    int shift = e - 53;
+    if (shift >= 0)
+        return makeRational(I, intShift(I, num, shift), fix(1));
+    return makeRational(I, num, intShift(I, fix(1), -shift));
+}
+
+// the simplest rational between a and b (MRI's nurat_rationalize_internal)
+V rationalizeBetween(Interp &I, V a, V b)
+{
+    V p0 = fix(0), p1 = fix(1), q0 = fix(1), q1 = fix(0), c;
+    V one = makeRational(I, fix(1), fix(1));
+    for (;;)
+    {
+        V n = rat(a)->num, den = rat(a)->den;
+        V fl = intDiv(I, n, den);
+        c = intIsZero(intMod(I, n, den)) ? fl : intAdd(I, fl, fix(1));
+        if (fixv(numCmpV(I, c, b)) < 0)
+            break;
+        V k = intSub(I, c, fix(1));
+        V p2 = intAdd(I, intMul(I, k, p1), p0);
+        V q2 = intAdd(I, intMul(I, k, q1), q0);
+        V t = numDiv(I, one, numSub(I, b, k));
+        b = toRat(I, numDiv(I, one, numSub(I, a, k)));
+        a = toRat(I, t);
+        p0 = p1;
+        q0 = q1;
+        p1 = p2;
+        q1 = q2;
+    }
+    return makeRational(I, intAdd(I, intMul(I, c, p1), p0), intAdd(I, intMul(I, c, q1), q0));
+}
+
+V flo_rationalize(Interp &I, V self, Args &a)
+{
+    double d = fv(I, self);
+    if (!std::isfinite(d))
+        I.raise(I.cFloatDomainError, floatToS(d));
+    if (d == 0)
+        return makeRational(I, fix(0), fix(1));
+    bool neg = d < 0;
+    V abs = I.flo(std::fabs(d));
+    V exact = flo_to_r(I, abs, a);
+    V lo, hi;
+    if (a.argc > 0)
+    {
+        V eps = I.call0(a.argv[0], I.s.to_r);
+        if (intIsNeg(I, rat(eps)->num))
+            eps = makeRational(I, intNeg(I, rat(eps)->num), rat(eps)->den);
+        lo = toRat(I, numSub(I, exact, eps));
+        hi = toRat(I, numAdd(I, exact, eps));
+    }
+    else
+    {
+        int e;
+        double m = std::frexp(std::fabs(d), &e);
+        V f = intFromDouble(I, std::ldexp(m, 53));
+        int n = e - 53;
+        if (n >= 0)
+            return makeRational(I, neg ? intNeg(I, intShift(I, f, n)) : intShift(I, f, n), fix(1));
+        V twoF = intMul(I, f, fix(2));
+        V den = intShift(I, fix(1), 1 - n);
+        lo = makeRational(I, intSub(I, twoF, fix(1)), den);
+        hi = makeRational(I, intAdd(I, twoF, fix(1)), den);
+    }
+    V r = numEq(I, lo, hi) ? exact : rationalizeBetween(I, lo, hi);
+    return neg ? makeRational(I, intNeg(I, rat(r)->num), rat(r)->den) : r;
+}
+
+V flo_coerce(Interp &I, V self, Args &a) { return I.ary2(I.flo(I.numToF(a.argv[0])), self); }
+
+V flo_next_float(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(std::nextafter(fv(I, self), 1.0 / 0.0));
+}
+
+V flo_prev_float(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(std::nextafter(fv(I, self), -1.0 / 0.0));
+}
+
+// ── Rational ──────────────────────────────────────────────────────────────
+
+V rat_num(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return rat(self)->num;
+}
+V rat_den(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return rat(self)->den;
+}
+V rat_plus(Interp &I, V self, Args &a)
+{
+    if (!I.isNum(a.argv[0]))
+        return coerceBin(I, self, a.argv[0], I.s.plus);
+    return numAdd(I, self, a.argv[0]);
+}
+V rat_minus(Interp &I, V self, Args &a)
+{
+    if (!I.isNum(a.argv[0]))
+        return coerceBin(I, self, a.argv[0], I.s.minus);
+    return numSub(I, self, a.argv[0]);
+}
+V rat_mul(Interp &I, V self, Args &a)
+{
+    if (!I.isNum(a.argv[0]))
+        return coerceBin(I, self, a.argv[0], I.s.mul);
+    return numMul(I, self, a.argv[0]);
+}
+V rat_div(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (!I.isNum(b))
+        return coerceBin(I, self, b, I.s.div);
+    if (I.isInt(b) && intIsZero(b))
+        I.raise(I.cZeroDivisionError, "divided by 0");
+    return numDiv(I, self, b);
+}
+V rat_pow(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isFix(b))
+    {
+        int64_t e = fixv(b);
+        V n = rat(self)->num, d = rat(self)->den;
+        if (e >= 0)
+            return makeRational(I, intPow(I, n, b), intPow(I, d, b));
+        if (intIsZero(n))
+            I.raise(I.cZeroDivisionError, "divided by 0");
+        return makeRational(I, intPow(I, d, fix(-e)), intPow(I, n, fix(-e)));
+    }
+    return I.flo(std::pow(ratToF(I, self), I.numToF(b)));
+}
+V rat_neg(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return makeRational(I, intNeg(I, rat(self)->num), rat(self)->den);
+}
+V rat_abs(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return intIsNeg(I, rat(self)->num) ? makeRational(I, intNeg(I, rat(self)->num), rat(self)->den) : self;
+}
+V rat_eq(Interp &I, V self, Args &a)
+{
+    if (!I.isNum(a.argv[0]))
+        return Qfalse;
+    return boolv(numEq(I, self, a.argv[0]));
+}
+V rat_cmp(Interp &I, V self, Args &a)
+{
+    if (!I.isNum(a.argv[0]))
+        return Qnil;
+    return numCmpV(I, self, a.argv[0]);
+}
+V rat_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(intToS(I, rat(self)->num) + "/" + intToS(I, rat(self)->den));
+}
+V rat_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str("(" + intToS(I, rat(self)->num) + "/" + intToS(I, rat(self)->den) + ")");
+}
+V rat_to_f(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(ratToF(I, self));
+}
+V rat_to_i(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V n = rat(self)->num, d = rat(self)->den;
+    if (intIsNeg(I, n))
+        return intNeg(I, intDiv(I, intNeg(I, n), d));
+    return intDiv(I, n, d);
+}
+V rat_to_r(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+V rat_rationalize(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0)
+        return self;
+    bool neg = intIsNeg(I, rat(self)->num);
+    V abs = neg ? makeRational(I, intNeg(I, rat(self)->num), rat(self)->den) : self;
+    V eps = I.call0(a.argv[0], I.s.to_r);
+    if (intIsNeg(I, rat(eps)->num))
+        eps = makeRational(I, intNeg(I, rat(eps)->num), rat(eps)->den);
+    V lo = toRat(I, numSub(I, abs, eps)), hi = toRat(I, numAdd(I, abs, eps));
+    V r = numEq(I, lo, hi) ? abs : rationalizeBetween(I, lo, hi);
+    return neg ? makeRational(I, intNeg(I, rat(r)->num), rat(r)->den) : r;
+}
+V ratRoundTo(Interp &I, V self, Args &a, int mode) // 0 round, 1 floor, 2 ceil, 3 truncate
+{
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    int64_t nd = argc > 0 ? I.intOf(a.argv[0]) : 0;
+    V scale = intPow(I, fix(10), fix(nd < 0 ? -nd : nd));
+    V x = nd >= 0 ? numMul(I, self, scale) : numDiv(I, self, scale);
+    V n = isRat(x) ? rat(x)->num : x, d = isRat(x) ? rat(x)->den : fix(1);
+    V q, m;
+    intDivMod(I, n, d, &q, &m); // floor
+    V r;
+    if (mode == 1)
+        r = q;
+    else if (mode == 2)
+        r = intIsZero(m) ? q : intAdd(I, q, fix(1));
+    else if (mode == 3)
+        r = intIsNeg(I, n) && !intIsZero(m) ? intAdd(I, q, fix(1)) : q;
+    else
+    {
+        // half away from zero
+        V twice = intMul(I, m, fix(2));
+        int c = intCmp(I, twice, d);
+        if (intIsNeg(I, n))
+            r = c >= 0 ? intAdd(I, q, fix(1)) : q;
+        else
+            r = c >= 0 ? intAdd(I, q, fix(1)) : q;
+        if (intIsNeg(I, n) && c == 0)
+            r = q;
+    }
+    if (argc == 0)
+        return r;
+    if (nd >= 0)
+        return makeRational(I, r, scale);
+    return intMul(I, r, scale);
+}
+V rat_round(Interp &I, V self, Args &a) { return ratRoundTo(I, self, a, 0); }
+V rat_floor(Interp &I, V self, Args &a) { return ratRoundTo(I, self, a, 1); }
+V rat_ceil(Interp &I, V self, Args &a) { return ratRoundTo(I, self, a, 2); }
+V rat_truncate(Interp &I, V self, Args &a) { return ratRoundTo(I, self, a, 3); }
+V rat_hash(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix((int64_t)(I.hashOf(self) >> 2));
+}
+V rat_eql(Interp &I, V self, Args &a) { return boolv(isRat(a.argv[0]) && I.eql(self, a.argv[0])); }
+V rat_coerce(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (I.isFloat(b))
+        return I.ary2(b, I.flo(ratToF(I, self)));
+    return I.ary2(toRat(I, b), self);
+}
+V rat_zero(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return boolv(intIsZero(rat(self)->num));
+}
+
+// ── Complex ───────────────────────────────────────────────────────────────
+
+V cpx_real(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return cpx(self)->re;
+}
+V cpx_imag(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return cpx(self)->im;
+}
+V cpx_plus(Interp &I, V self, Args &a) { return numAdd(I, self, a.argv[0]); }
+V cpx_minus(Interp &I, V self, Args &a) { return numSub(I, self, a.argv[0]); }
+V cpx_mul(Interp &I, V self, Args &a) { return numMul(I, self, a.argv[0]); }
+V cpx_div(Interp &I, V self, Args &a) { return numDiv(I, self, a.argv[0]); }
+V cpx_pow(Interp &I, V self, Args &a)
+{
+    V b = a.argv[0];
+    if (isFix(b) && fixv(b) >= 0)
+    {
+        V r = makeComplex(I, fix(1), fix(0));
+        for (int64_t i = 0; i < fixv(b); ++i)
+            r = numMul(I, r, self);
+        return r;
+    }
+    double re = I.numToF(cpx(self)->re), im = I.numToF(cpx(self)->im);
+    double r = std::hypot(re, im), th = std::atan2(im, re);
+    double e = I.numToF(b);
+    double nr = std::pow(r, e), nth = th * e;
+    return makeComplex(I, I.flo(nr * std::cos(nth)), I.flo(nr * std::sin(nth)));
+}
+V cpx_neg(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return makeComplex(I, numSub(I, fix(0), cpx(self)->re), numSub(I, fix(0), cpx(self)->im));
+}
+V cpx_abs(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(std::hypot(I.numToF(cpx(self)->re), I.numToF(cpx(self)->im)));
+}
+V cpx_arg(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(std::atan2(I.numToF(cpx(self)->im), I.numToF(cpx(self)->re)));
+}
+V cpx_conj(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return makeComplex(I, cpx(self)->re, numSub(I, fix(0), cpx(self)->im));
+}
+V cpx_rect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ary2(cpx(self)->re, cpx(self)->im);
+}
+V cpx_polar(Interp &I, V self, Args &a) { return I.ary2(cpx_abs(I, self, a), cpx_arg(I, self, a)); }
+V cpx_eq(Interp &I, V self, Args &a)
+{
+    if (!I.isNum(a.argv[0]))
+        return Qfalse;
+    return boolv(numEq(I, self, a.argv[0]));
+}
+std::string cpxStr(Interp &I, V self)
+{
+    V re = cpx(self)->re, im = cpx(self)->im;
+    std::string out = I.toS(re);
+    bool neg = I.isFloat(im) ? std::signbit(I.fltv(im)) : intIsNeg(I, isRat(im) ? rat(im)->num : im);
+    std::string ims = I.toS(neg ? numSub(I, fix(0), im) : im);
+    return out + (neg ? "-" : "+") + ims + "i";
+}
+V cpx_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(cpxStr(I, self));
+}
+V cpx_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str("(" + cpxStr(I, self) + ")");
+}
+V cpx_rectangular_class(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return makeComplex(I, a.argv[0], a.argc > 1 ? a.argv[1] : fix(0));
+}
+V cpx_polar_class(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double r = I.numToF(a.argv[0]), th = a.argc > 1 ? I.numToF(a.argv[1]) : 0;
+    return makeComplex(I, I.flo(r * std::cos(th)), I.flo(r * std::sin(th)));
+}
+
+// ── Math ──────────────────────────────────────────────────────────────────
+
+double mathArg(Interp &I, V v)
+{
+    if (I.isNum(v))
+        return I.numToF(v);
+    if (v == Qnil)
+        I.raise(I.cTypeError, "can't convert nil into Float");
+    if (I.isStr(v))
+        I.raise(I.cTypeError, "can't convert String into Float");
+    return I.numToF(v);
+}
+
+[[noreturn]] void domainError(Interp &I, const char *name)
+{
+    I.raise(I.cMathDomainError, std::string("Numerical argument is out of domain - \"") + name + "\"");
+}
+
+V m_sqrt(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x < 0)
+        domainError(I, "sqrt");
+    return I.flo(std::sqrt(x));
+}
+V m_cbrt(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    double r = std::cbrt(x);
+    // MRI corrects the last bit for exact cubes
+    double rr = std::round(r);
+    if (rr * rr * rr == x)
+        r = rr;
+    return I.flo(r);
+}
+V m_sin(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::sin(mathArg(I, a.argv[0])));
+}
+V m_cos(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::cos(mathArg(I, a.argv[0])));
+}
+V m_tan(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::tan(mathArg(I, a.argv[0])));
+}
+V m_asin(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x < -1 || x > 1)
+        domainError(I, "asin");
+    return I.flo(std::asin(x));
+}
+V m_acos(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x < -1 || x > 1)
+        domainError(I, "acos");
+    return I.flo(std::acos(x));
+}
+V m_atan(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::atan(mathArg(I, a.argv[0])));
+}
+V m_atan2(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::atan2(mathArg(I, a.argv[0]), mathArg(I, a.argv[1])));
+}
+V m_sinh(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::sinh(mathArg(I, a.argv[0])));
+}
+V m_cosh(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::cosh(mathArg(I, a.argv[0])));
+}
+V m_tanh(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::tanh(mathArg(I, a.argv[0])));
+}
+V m_exp(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::exp(mathArg(I, a.argv[0])));
+}
+V m_log(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V v = a.argv[0];
+    double x;
+    double extra = 0;
+    if (isType(v, T::Bignum))
+    {
+        // log of a huge integer: log of its top bits plus the shift
+        SI s = toSI(v);
+        if (s.neg)
+            domainError(I, "log");
+        size_t n = s.mag.size();
+        int64_t drop = n > 2 ? (int64_t)(n - 2) * 32 : 0;
+        V top = intShift(I, v, -drop);
+        x = intToDouble(I, top);
+        extra = (double)drop * std::log(2.0);
+    }
+    else
+        x = mathArg(I, v);
+    if (x < 0)
+        domainError(I, "log");
+    double r = std::log(x) + extra;
+    if (a.argc > 1)
+        r /= std::log(mathArg(I, a.argv[1]));
+    return I.flo(r);
+}
+V m_log2(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x < 0)
+        domainError(I, "log2");
+    return I.flo(std::log2(x));
+}
+V m_log10(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x < 0)
+        domainError(I, "log10");
+    return I.flo(std::log10(x));
+}
+V m_hypot(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::hypot(mathArg(I, a.argv[0]), mathArg(I, a.argv[1])));
+}
+V m_pow(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::pow(mathArg(I, a.argv[0]), mathArg(I, a.argv[1])));
+}
+V m_acosh(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x < 1)
+        domainError(I, "acosh");
+    return I.flo(std::acosh(x));
+}
+V m_asinh(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::asinh(mathArg(I, a.argv[0])));
+}
+V m_atanh(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x < -1 || x > 1)
+        domainError(I, "atanh");
+    if (x == 1 || x == -1)
+        return I.flo(x / 0.0);
+    return I.flo(std::atanh(x));
+}
+V m_erf(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::erf(mathArg(I, a.argv[0])));
+}
+V m_erfc(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return I.flo(std::erfc(mathArg(I, a.argv[0])));
+}
+V m_frexp(Interp &I, V self, Args &a)
+{
+    (void)self;
+    int e = 0;
+    double f = std::frexp(mathArg(I, a.argv[0]), &e);
+    return I.ary2(I.flo(f), fix(e));
+}
+V m_ldexp(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double f = mathArg(I, a.argv[0]);
+    return I.flo(std::ldexp(f, (int)I.intOf(a.argv[1])));
+}
+V m_lgamma(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x == -1.0 / 0.0)
+        domainError(I, "lgamma");
+    int sign = 1;
+    if (x == 0)
+        sign = std::signbit(x) ? -1 : 1;
+    else if (x < 0 && x != std::floor(x) && std::fmod(std::floor(x), 2.0) != 0)
+        sign = -1;
+    return I.ary2(I.flo(std::lgamma(x)), fix(sign));
+}
+V m_gamma(Interp &I, V self, Args &a)
+{
+    (void)self;
+    double x = mathArg(I, a.argv[0]);
+    if (x == std::floor(x) && x > 0 && x < 24)
+    {
+        double r = 1;
+        for (int i = 2; i < (int)x; ++i)
+            r *= i;
+        return I.flo(r);
+    }
+    return I.flo(std::tgamma(x));
+}
+
+} // namespace
+
+void Interp::initNumeric()
+{
+    RClass *n = cNumeric;
+    defn(n, "step", num_step, 0, 3);
+    defn(n, "zero?", num_zero, 0, 0);
+    defn(n, "nonzero?", num_nonzero, 0, 0);
+    defn(n, "positive?", num_positive, 0, 0);
+    defn(n, "negative?", num_negative, 0, 0);
+    defn(n, "integer?", num_false, 0, 0);
+    defn(n, "real?", num_true, 0, 0);
+    defn(n, "<", num_lt, 1, 1);
+    defn(n, "<=", num_le, 1, 1);
+    defn(n, ">", num_gt, 1, 1);
+    defn(n, ">=", num_ge, 1, 1);
+
+    RClass *i = cInteger;
+    defs(i, "sqrt", int_sqrt, 1, 1);
+    defn(i, "+", int_plus, 1, 1);
+    defn(i, "-", int_minus, 1, 1);
+    defn(i, "*", int_mul, 1, 1);
+    defn(i, "/", int_div, 1, 1);
+    defn(i, "div", int_div, 1, 1);
+    defn(i, "%", int_mod, 1, 1);
+    defn(i, "modulo", int_mod, 1, 1);
+    defn(i, "remainder", int_remainder, 1, 1);
+    defn(i, "divmod", int_divmod, 1, 1);
+    defn(i, "fdiv", int_fdiv, 1, 1);
+    defn(i, "**", int_pow, 1, 1);
+    defn(i, "pow", int_powmod, 1, 2);
+    defn(i, "-@", int_neg, 0, 0);
+    defn(i, "+@", int_pos, 0, 0);
+    defn(i, "abs", int_abs, 0, 0);
+    defn(i, "magnitude", int_abs, 0, 0);
+    defn(i, "~", int_invert, 0, 0);
+    defn(i, "&", int_and, 1, 1);
+    defn(i, "|", int_or, 1, 1);
+    defn(i, "^", int_xor, 1, 1);
+    defn(i, "<<", int_lshift, 1, 1);
+    defn(i, ">>", int_rshift, 1, 1);
+    defn(i, "[]", int_aref, 1, 1);
+    defn(i, "==", int_eq, 1, 1);
+    defn(i, "===", int_eq, 1, 1);
+    defn(i, "<=>", int_cmp, 1, 1);
+    defn(i, "eql?", int_eql, 1, 1);
+    defn(i, "hash", int_hash, 0, 0);
+    defn(i, "to_s", int_to_s, 0, 1);
+    defn(i, "inspect", int_to_s, 0, 1);
+    defn(i, "to_i", int_to_i, 0, 0);
+    defn(i, "to_int", int_to_i, 0, 0);
+    defn(i, "floor", int_floor, 0, 1);
+    defn(i, "ceil", int_ceil, 0, 1);
+    defn(i, "round", int_round, 0, 2);
+    defn(i, "truncate", int_truncate, 0, 1);
+    defn(i, "to_f", int_to_f, 0, 0);
+    defn(i, "to_r", int_to_r, 0, 0);
+    defn(i, "rationalize", int_to_r, 0, 1);
+    defn(i, "to_c", int_to_c, 0, 0);
+    defn(i, "chr", int_chr, 0, 1);
+    defn(i, "ord", int_ord, 0, 0);
+    defn(i, "times", int_times, 0, 0);
+    defn(i, "upto", int_upto, 1, 1);
+    defn(i, "downto", int_downto, 1, 1);
+    defn(i, "succ", int_succ, 0, 0);
+    defn(i, "next", int_succ, 0, 0);
+    defn(i, "pred", int_pred, 0, 0);
+    defn(i, "even?", int_even, 0, 0);
+    defn(i, "odd?", int_odd, 0, 0);
+    defn(i, "integer?", int_integer_p, 0, 0);
+    defn(i, "finite?", num_true, 0, 0);
+    defn(i, "infinite?", flo_integer_p, 0, 0);
+    defn(i, "digits", int_digits, 0, 1);
+    defn(i, "bit_length", int_bit_length, 0, 0);
+    defn(i, "gcd", int_gcd, 1, 1);
+    defn(i, "lcm", int_lcm, 1, 1);
+    defn(i, "size", int_size, 0, 0);
+    defn(i, "coerce", int_coerce, 1, 1);
+    defn(i, "allbits?", int_allbits, 1, 1);
+    defn(i, "anybits?", int_anybits, 1, 1);
+    defn(i, "nobits?", int_nobits, 1, 1);
+    defn(i, "numerator", int_numerator, 0, 0);
+    defn(i, "denominator", int_denominator, 0, 0);
+
+    RClass *f = cFloat;
+    setConst(f, intern("INFINITY"), flo(1.0 / 0.0));
+    setConst(f, intern("NAN"), flo(0.0 / 0.0));
+    setConst(f, intern("EPSILON"), flo(2.220446049250313e-16));
+    setConst(f, intern("MAX"), flo(1.7976931348623157e308));
+    setConst(f, intern("MIN"), flo(2.2250738585072014e-308));
+    setConst(f, intern("DIG"), fix(15));
+    defn(f, "+", flo_plus, 1, 1);
+    defn(f, "-", flo_minus, 1, 1);
+    defn(f, "*", flo_mul, 1, 1);
+    defn(f, "/", flo_div, 1, 1);
+    defn(f, "fdiv", flo_div, 1, 1);
+    defn(f, "quo", flo_div, 1, 1);
+    defn(f, "%", flo_mod, 1, 1);
+    defn(f, "modulo", flo_mod, 1, 1);
+    defn(f, "divmod", flo_divmod, 1, 1);
+    defn(f, "**", flo_pow, 1, 1);
+    defn(f, "-@", flo_neg, 0, 0);
+    defn(f, "+@", int_pos, 0, 0);
+    defn(f, "abs", flo_abs, 0, 0);
+    defn(f, "magnitude", flo_abs, 0, 0);
+    defn(f, "==", flo_eq, 1, 1);
+    defn(f, "===", flo_eq, 1, 1);
+    defn(f, "<=>", flo_cmp, 1, 1);
+    defn(f, "eql?", flo_eql, 1, 1);
+    defn(f, "hash", flo_hash, 0, 0);
+    defn(f, "to_s", flo_to_s, 0, 0);
+    defn(f, "inspect", flo_to_s, 0, 0);
+    defn(f, "to_f", flo_to_f, 0, 0);
+    defn(f, "to_i", flo_to_i, 0, 0);
+    defn(f, "to_int", flo_to_i, 0, 0);
+    defn(f, "round", flo_round, 0, 2);
+    defn(f, "floor", flo_floor, 0, 1);
+    defn(f, "ceil", flo_ceil, 0, 1);
+    defn(f, "truncate", flo_truncate, 0, 1);
+    defn(f, "nan?", flo_nan, 0, 0);
+    defn(f, "infinite?", flo_infinite, 0, 0);
+    defn(f, "finite?", flo_finite, 0, 0);
+    defn(f, "integer?", flo_integer_p, 0, 0);
+    defn(f, "to_r", flo_to_r, 0, 0);
+    defn(f, "rationalize", flo_rationalize, 0, 1);
+    defn(f, "coerce", flo_coerce, 1, 1);
+    defn(f, "next_float", flo_next_float, 0, 0);
+    defn(f, "prev_float", flo_prev_float, 0, 0);
+
+    RClass *r = cRational;
+    defn(r, "numerator", rat_num, 0, 0);
+    defn(r, "denominator", rat_den, 0, 0);
+    defn(r, "+", rat_plus, 1, 1);
+    defn(r, "-", rat_minus, 1, 1);
+    defn(r, "*", rat_mul, 1, 1);
+    defn(r, "/", rat_div, 1, 1);
+    defn(r, "quo", rat_div, 1, 1);
+    defn(r, "**", rat_pow, 1, 1);
+    defn(r, "-@", rat_neg, 0, 0);
+    defn(r, "abs", rat_abs, 0, 0);
+    defn(r, "==", rat_eq, 1, 1);
+    defn(r, "<=>", rat_cmp, 1, 1);
+    defn(r, "to_s", rat_to_s, 0, 0);
+    defn(r, "inspect", rat_inspect, 0, 0);
+    defn(r, "to_f", rat_to_f, 0, 0);
+    defn(r, "to_i", rat_to_i, 0, 0);
+    defn(r, "to_r", rat_to_r, 0, 0);
+    defn(r, "rationalize", rat_rationalize, 0, 1);
+    defn(r, "round", rat_round, 0, 2);
+    defn(r, "floor", rat_floor, 0, 1);
+    defn(r, "ceil", rat_ceil, 0, 1);
+    defn(r, "truncate", rat_truncate, 0, 1);
+    defn(r, "hash", rat_hash, 0, 0);
+    defn(r, "eql?", rat_eql, 1, 1);
+    defn(r, "coerce", rat_coerce, 1, 1);
+    defn(r, "zero?", rat_zero, 0, 0);
+
+    RClass *c = cComplex;
+    defs(c, "rectangular", cpx_rectangular_class, 1, 2);
+    defs(c, "rect", cpx_rectangular_class, 1, 2);
+    defs(c, "polar", cpx_polar_class, 1, 2);
+    defn(c, "real", cpx_real, 0, 0);
+    defn(c, "imaginary", cpx_imag, 0, 0);
+    defn(c, "imag", cpx_imag, 0, 0);
+    defn(c, "+", cpx_plus, 1, 1);
+    defn(c, "-", cpx_minus, 1, 1);
+    defn(c, "*", cpx_mul, 1, 1);
+    defn(c, "/", cpx_div, 1, 1);
+    defn(c, "quo", cpx_div, 1, 1);
+    defn(c, "**", cpx_pow, 1, 1);
+    defn(c, "-@", cpx_neg, 0, 0);
+    defn(c, "abs", cpx_abs, 0, 0);
+    defn(c, "magnitude", cpx_abs, 0, 0);
+    defn(c, "arg", cpx_arg, 0, 0);
+    defn(c, "angle", cpx_arg, 0, 0);
+    defn(c, "phase", cpx_arg, 0, 0);
+    defn(c, "conjugate", cpx_conj, 0, 0);
+    defn(c, "conj", cpx_conj, 0, 0);
+    defn(c, "rectangular", cpx_rect, 0, 0);
+    defn(c, "rect", cpx_rect, 0, 0);
+    defn(c, "polar", cpx_polar, 0, 0);
+    defn(c, "==", cpx_eq, 1, 1);
+    defn(c, "to_s", cpx_to_s, 0, 0);
+    defn(c, "inspect", cpx_inspect, 0, 0);
+    setConst(c, intern("I"), makeComplex(*this, fix(0), fix(1)));
+}
+
+void Interp::initMath()
+{
+    RClass *m = mMath;
+    setConst(m, intern("PI"), flo(3.141592653589793));
+    setConst(m, intern("E"), flo(2.718281828459045));
+    auto mf = [&](const char *name, NativeFn fn, int mn, int mx)
+    {
+        defs(m, name, fn, mn, mx);
+        defnPriv(m, name, fn, mn, mx);
+    };
+    mf("sqrt", m_sqrt, 1, 1);
+    mf("cbrt", m_cbrt, 1, 1);
+    mf("sin", m_sin, 1, 1);
+    mf("cos", m_cos, 1, 1);
+    mf("tan", m_tan, 1, 1);
+    mf("asin", m_asin, 1, 1);
+    mf("acos", m_acos, 1, 1);
+    mf("atan", m_atan, 1, 1);
+    mf("atan2", m_atan2, 2, 2);
+    mf("sinh", m_sinh, 1, 1);
+    mf("cosh", m_cosh, 1, 1);
+    mf("tanh", m_tanh, 1, 1);
+    mf("exp", m_exp, 1, 1);
+    mf("log", m_log, 1, 2);
+    mf("log2", m_log2, 1, 1);
+    mf("log10", m_log10, 1, 1);
+    mf("hypot", m_hypot, 2, 2);
+    mf("pow", m_pow, 2, 2);
+    mf("gamma", m_gamma, 1, 1);
+    mf("acosh", m_acosh, 1, 1);
+    mf("asinh", m_asinh, 1, 1);
+    mf("atanh", m_atanh, 1, 1);
+    mf("erf", m_erf, 1, 1);
+    mf("erfc", m_erfc, 1, 1);
+    mf("frexp", m_frexp, 1, 1);
+    mf("ldexp", m_ldexp, 2, 2);
+    mf("lgamma", m_lgamma, 1, 1);
+}
+
+// float stepping for Range#step (RubyEnum.sa)
+void rubyFloatStep(Interp &I, double beg, double end, double unit, bool excl, Blk *blk, V *collect)
+{
+    floatStep(I, beg, end, unit, excl, blk, collect);
+}
+
+} // namespace ruby

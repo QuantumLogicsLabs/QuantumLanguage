@@ -1,0 +1,121 @@
+// quantum: cpp
+#pragma once
+// Ruby front-end: the lexer. It runs on demand for the parser, because
+// Ruby's tokens depend on what came before: after an operand `/` divides,
+// at the start of an expression it opens a regex; `foo -1` passes -1 while
+// `x -1` subtracts when x is a local variable (the parser answers that).
+#include "RubyAst.h.sa"
+
+#include <functional>
+#include <string>
+#include <vector>
+
+namespace ruby
+{
+
+enum class TT : uint8_t
+{
+    End,
+    NL,      // newline or ;
+    Int,     // ival
+    BigInt,  // s: decimal digits
+    Float,   // fval
+    Rational, // s: the literal without the r
+    Imag,    // s: the literal without the i
+    Str,     // parts (adjacent literals are joined by the parser)
+    XStr,    // `cmd`
+    Sym,     // s
+    DSym,    // parts
+    Regex,   // parts + flags
+    Words,   // words: %w / %i (sym = true)
+    Ident,   // s (may end in ? or !)
+    Const,   // s
+    IVar,    // s: @name
+    GVar,    // s: $name
+    CVar,    // s: @@name
+    NthRef,  // ival: $1
+    BackRef, // s: $~ $& $` $'
+    Label,   // s: name in `name:`
+    Kw,      // s: keyword
+    Op       // s: operator / punctuation
+};
+
+struct StrPart
+{
+    bool code = false; // `text` is Ruby code inside #{...}
+    std::string text;
+    int line = 0;
+};
+
+struct Token
+{
+    TT t = TT::End;
+    std::string s;
+    int line = 0;
+    bool space = false; // whitespace before the token
+    int64_t ival = 0;
+    double fval = 0;
+    std::vector<StrPart> parts;
+    std::vector<std::vector<StrPart>> words;
+    bool sym = false;     // Words: %i
+    std::string flags;    // Regex flags
+};
+
+class Lexer
+{
+  public:
+    enum State : uint8_t
+    {
+        BEG,   // an expression starts here
+        END,   // after an operand
+        ARG,   // after a method name: a command argument may follow
+        MID,   // after return/break/next: an optional value, newline ends it
+        FNAME, // after def / alias / . : a method name, operators allowed
+        DOT    // after . or &. : a method name
+    };
+
+    Lexer(const std::string &src, int firstLine = 1);
+    Token next();
+    // Set by the parser: whether a name is a local variable in scope
+    std::function<bool(const std::string &)> isLocal;
+    State state = BEG;
+    // the parser asks for the lexer to treat the next `do` as a loop's do
+    int condDepth = 0;
+    int parenDepth = 0;
+
+  private:
+    std::string src_;
+    size_t pos_ = 0;
+    int line_;
+    bool defName_ = false; // between `def` and the method name (def self.x=)
+    // heredoc bodies are read when their start is lexed: at the end of that
+    // line the lexer jumps over them, to heredocResume_
+    size_t heredocResume_ = std::string::npos;
+    size_t heredocLineEnd_ = std::string::npos;
+    int heredocResumeLine_ = 0;
+
+    int peekc(size_t k = 0) const { return pos_ + k < src_.size() ? (unsigned char)src_[pos_ + k] : -1; }
+    void error(const std::string &msg) const;
+    bool atLineStart() const;
+    void consumeNewline();
+    bool continuationAfterNewline() const;
+    Token number(Token t);
+    Token identifier(Token t);
+    size_t literalEnd(size_t i, char open, char close, bool interp) const;
+    Token quoted(Token t, char open, char close, bool interp, bool regex);
+    Token words(Token t, char open, char close, bool sym, bool interp);
+    Token heredoc(Token t);
+    Token percentLiteral(Token t);
+    Token symbol(Token t);
+    Token op(Token t);
+    void finish(Token &t);
+};
+
+void appendUtf8(std::string &out, uint32_t cp);
+// Splits the body of a double-quoted literal into text and #{code} parts,
+// processing escapes (regex bodies keep theirs for the regex engine)
+std::vector<StrPart> splitInterpolated(const std::string &raw, int line, bool interp, bool regex);
+// The index of the } that closes the #{ ending just before i
+size_t skipCode(const std::string &s, size_t i);
+
+} // namespace ruby

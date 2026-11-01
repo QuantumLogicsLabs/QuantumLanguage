@@ -65,6 +65,9 @@ CLAUDE.md
 /test_copy.txt
 /test_output.txt
 /test_output.txt.backup.*
+/students.csv
+students.csv
+
 
 !seed/*
 !seed/qrun.exe

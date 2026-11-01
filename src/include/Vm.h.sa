@@ -187,6 +187,16 @@ private:
     // method names on strings / arrays / numbers, functional-interface calls
     // on functions, and Java's string conversion in `+`.
     bool javaStyle_ = false;
+    // Whether the running code gets Java's meanings of method names and `+`:
+    // everything but the file's Ruby code (Chunk::rubyStyle, and the
+    // top-level Ruby statements __ruby_code__() brackets). Ruby code keeps
+    // Quantum's meanings, and a Java method only stands in for a name
+    // Quantum's value lacks.
+    bool javaStyleCode() const;
+    bool scriptRuby_ = false; // set by __ruby_code__()
+    // That stand-in: the Java meaning of method `m`, if it has one
+    QuantumValue javaStyleFallback(const QuantumValue &obj, const std::string &m,
+                                   const std::vector<QuantumValue> &args, bool &handled);
     // The kind of the error a catch block last received (RuntimeError, ...)
     std::string lastErrorKind_;
     // The method `m` of a Java-style value; `handled` false when it has none.

@@ -1,0 +1,19 @@
+module Singleton
+  module SingletonClassMethods
+    def instance = (@singleton__instance__ ||= new)
+
+    def inherited(sub)
+      super
+      sub.instance_variable_set(:@singleton__instance__, nil)
+    end
+  end
+
+  def self.included(base)
+    super
+    base.private_class_method :new, :allocate
+    base.extend(SingletonClassMethods)
+  end
+
+  def clone = raise(TypeError, "can't clone instance of singleton #{self.class}")
+  def dup = raise(TypeError, "can't dup instance of singleton #{self.class}")
+end

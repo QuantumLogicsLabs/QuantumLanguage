@@ -1,0 +1,109 @@
+class StringScanner
+  class Error < StandardError; end
+
+  attr_reader :string
+
+  def initialize(str)
+    @string = str
+    @pos = 0
+    @match = nil
+    @last = 0
+  end
+
+  def string=(s)
+    @string = s
+    @pos = 0
+    @match = nil
+  end
+
+  def pos = @pos
+  alias pointer pos
+
+  def pos=(n)
+    @pos = n
+  end
+  alias pointer= pos=
+
+  def charpos = @string.byteslice(0, @pos).size
+  def eos? = @pos >= @string.bytesize
+  def rest = @string.byteslice(@pos, @string.bytesize - @pos) || ""
+  def rest_size = @string.bytesize - @pos
+  def rest? = !eos?
+  def beginning_of_line? = @pos == 0 || @string.getbyte(@pos - 1) == 10
+  alias bol? beginning_of_line?
+
+  def reset
+    @pos = 0
+    @match = nil
+    self
+  end
+
+  def terminate
+    @pos = @string.bytesize
+    @match = nil
+    self
+  end
+
+  def unscan
+    @pos = @last
+    @match = nil
+    self
+  end
+
+  def __pat(p) = p.is_a?(String) ? Regexp.new(Regexp.escape(p)) : p
+
+  def __finish(m, advance, ret_str)
+    @match = m
+    return nil unless m
+    @last = @pos
+    e = m.__byte_end
+    r = ret_str ? @string.byteslice(@pos, e - @pos) : e - @pos
+    @pos = e if advance
+    r
+  end
+
+  def __at(pat, advance, ret_str) = __finish(__pat(pat).__match_at(@string, @pos), advance, ret_str)
+  def __until(pat, advance, ret_str) = __finish(__pat(pat).__search_at(@string, @pos), advance, ret_str)
+
+  def scan(p) = __at(p, true, true)
+  def match?(p) = __at(p, false, false)
+  def skip(p) = __at(p, true, false)
+  def check(p) = __at(p, false, true)
+  def scan_until(p) = __until(p, true, true)
+  def skip_until(p) = __until(p, true, false)
+  def check_until(p) = __until(p, false, true)
+  def exist?(p) = __until(p, false, false)
+
+  def getch
+    return nil if eos?
+    scan(/./m)
+  end
+
+  def get_byte
+    return nil if eos?
+    @last = @pos
+    @pos += 1
+    @string.byteslice(@pos - 1, 1)
+  end
+
+  def peek(n) = @string.byteslice(@pos, n) || ""
+  def matched = @match && @match[0]
+  def matched? = !@match.nil?
+  def matched_size = @match && @match[0].bytesize
+  def [](i) = @match && @match[i]
+  def pre_match = @match && @string.byteslice(0, @match.__byte_begin)
+  def post_match = @match && @match.post_match
+  def captures = @match && @match.captures
+  def values_at(*i) = @match && @match.values_at(*i)
+  def named_captures = @match ? @match.named_captures : {}
+
+  def inspect
+    return "#<StringScanner fin>" if eos?
+    after = peek(5)
+    after_s = (rest_size > 5 ? after + "..." : after).inspect
+    return "#<StringScanner #{@pos}/#{@string.bytesize} @ #{after_s}>" if @pos == 0
+    before = @string.byteslice([@pos - 5, 0].max, [5, @pos].min)
+    before_s = (@pos > 5 ? "..." + before : before).inspect
+    "#<StringScanner #{@pos}/#{@string.bytesize} #{before_s} @ #{after_s}>"
+  end
+end

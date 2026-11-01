@@ -1,0 +1,203 @@
+# Time, in Ruby, over native clock and time-zone helpers.
+class Time
+  include Comparable
+
+  MONTHS = %w[January February March April May June July August September October November December].freeze
+  DAYS = %w[Sunday Monday Tuesday Wednesday Thursday Friday Saturday].freeze
+
+  def self.__days(y, m, d)
+    a = (14 - m) / 12
+    yy = y + 4800 - a
+    mm = m + 12 * a - 3
+    d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045 - 2440588
+  end
+
+  def self.__civil(days)
+    a = days + 2440588 + 32044
+    b = (4 * a + 3) / 146097
+    c = a - 146097 * b / 4
+    d = (4 * c + 3) / 1461
+    e = c - 1461 * d / 4
+    m = (5 * e + 2) / 153
+    [100 * b + d - 4800 + m / 10, m + 3 - 12 * (m / 10), e - (153 * m + 2) / 5 + 1]
+  end
+
+  def self.now(**) = allocate.__init(Kernel.__wall_clock, nil)
+  def self.at(t, *, **) = allocate.__init(t.is_a?(Time) ? t.to_r : t, nil)
+
+  def self.__build(utc, y, m, d, h, mi, s)
+    m = MONTHS.index { |n| n[0, 3].downcase == m.downcase } + 1 if m.is_a?(String) && m !~ /\A\d+\z/
+    raise ArgumentError, "mon out of range" unless m.to_i.between?(1, 12)
+    raise ArgumentError, "mday out of range" unless d.to_i.between?(1, 31)
+    raise ArgumentError, "hour out of range" unless h.to_i.between?(0, 24)
+    raise ArgumentError, "min out of range" unless mi.to_i.between?(0, 59)
+    raise ArgumentError, "sec out of range" unless s.to_f >= 0 && s.to_f < 61
+    secs = __days(y.to_i, m.to_i, d.to_i) * 86400 + h.to_i * 3600 + mi.to_i * 60 + s
+    return allocate.__init(secs, 0) if utc
+    # the offset in force at that wall-clock moment
+    off = Kernel.__utc_offset(secs)
+    allocate.__init(secs - off, nil)
+  end
+
+  def self.new(y = nil, m = 1, d = 1, h = 0, mi = 0, s = 0, zone = nil, **)
+    return now if y.nil?
+    __build(zone == "UTC" || zone == "Z", y, m, d, h, mi, s)
+  end
+  def self.local(y, m = 1, d = 1, h = 0, mi = 0, s = 0, *) = __build(false, y, m, d, h, mi, s)
+  def self.mktime(*a) = local(*a)
+  def self.utc(y, m = 1, d = 1, h = 0, mi = 0, s = 0, *) = __build(true, y, m, d, h, mi, s)
+  def self.gm(*a) = utc(*a)
+
+  # offset: nil for local time, else seconds east of UTC
+  def __init(secs, offset)
+    @t = secs
+    @fixed = offset
+    @off = offset || Kernel.__utc_offset(secs.floor)
+    wall = secs.floor + @off
+    days = wall.div(86400)
+    rem = wall % 86400
+    @year, @month, @day = Time.__civil(days)
+    @hour = rem / 3600
+    @min = rem % 3600 / 60
+    @sec = rem % 60
+    @wday = (days + 4) % 7
+    @yday = days - Time.__days(@year, 1, 1) + 1
+    self
+  end
+
+  attr_reader :year, :month, :day, :hour, :min, :sec, :wday, :yday
+  alias mon month
+  alias mday day
+
+  def to_i = @t.floor
+  alias tv_sec to_i
+  def to_f = @t.to_f
+  def to_r = @t.to_r
+  def subsec = @t.to_r - @t.floor
+  def usec = (subsec * 1_000_000).floor
+  alias tv_usec usec
+  def nsec = (subsec * 1_000_000_000).floor
+  alias tv_nsec nsec
+  def utc_offset = @off
+  alias gmt_offset utc_offset
+  alias gmtoff utc_offset
+  def utc? = @fixed == 0
+  alias gmt? utc?
+  def zone = utc? ? "UTC" : Kernel.__zone_name
+  def dst? = false
+  alias isdst dst?
+  def utc = __init(@t, 0)
+  alias gmtime utc
+  def getutc = Time.allocate.__init(@t, 0)
+  alias getgm getutc
+  def localtime(*) = __init(@t, nil)
+  def getlocal(*) = Time.allocate.__init(@t, nil)
+  def to_time = self
+  def to_a = [sec, min, hour, day, month, year, wday, yday, dst?, zone]
+
+  def sunday? = @wday == 0
+  def monday? = @wday == 1
+  def tuesday? = @wday == 2
+  def wednesday? = @wday == 3
+  def thursday? = @wday == 4
+  def friday? = @wday == 5
+  def saturday? = @wday == 6
+
+  def +(n)
+    raise TypeError, "time + time?" if n.is_a?(Time)
+    Time.allocate.__init(@t + n, @fixed)
+  end
+
+  def -(o)
+    return (to_r - o.to_r).to_f if o.is_a?(Time)
+    Time.allocate.__init(@t - o, @fixed)
+  end
+
+  def <=>(o) = o.is_a?(Time) ? to_r <=> o.to_r : nil
+  def ==(o) = o.is_a?(Time) && to_r == o.to_r
+  def eql?(o) = self == o
+  def hash = to_r.hash
+
+  def round(n = 0) = Time.allocate.__init(@t.to_r.round(n), @fixed)
+
+  def __zone_str(colon = false)
+    a = @off.abs
+    format("%s%02d%s%02d", @off < 0 ? "-" : "+", a / 3600, colon ? ":" : "", a % 3600 / 60)
+  end
+
+  def to_s = utc? ? strftime("%Y-%m-%d %H:%M:%S UTC") : strftime("%Y-%m-%d %H:%M:%S %z")
+
+  def inspect
+    s = strftime("%Y-%m-%d %H:%M:%S")
+    if subsec != 0
+      digits = format("%09d", nsec).sub(/0+\z/, "")
+      s += ".#{digits}"
+    end
+    s + (utc? ? " UTC" : " #{__zone_str}")
+  end
+
+  def iso8601(n = 0)
+    s = strftime("%Y-%m-%dT%H:%M:%S")
+    s += "." + format("%09d", nsec)[0, n] if n > 0
+    s + (utc? ? "Z" : __zone_str(true))
+  end
+  alias xmlschema iso8601
+
+  def __field(c, flags)
+    case c
+    when "Y" then [@year, "0", 1]
+    when "C" then [@year / 100, "0", 2]
+    when "y" then [@year % 100, "0", 2]
+    when "m" then [@month, "0", 2]
+    when "d" then [@day, "0", 2]
+    when "e" then [@day, " ", 2]
+    when "j" then [@yday, "0", 3]
+    when "H" then [@hour, "0", 2]
+    when "k" then [@hour, " ", 2]
+    when "I" then [(@hour + 11) % 12 + 1, "0", 2]
+    when "l" then [(@hour + 11) % 12 + 1, " ", 2]
+    when "M" then [@min, "0", 2]
+    when "S" then [@sec, "0", 2]
+    when "L" then [(subsec * 1000).floor, "0", 3]
+    when "N" then [nsec, "0", 9]
+    when "u" then [@wday == 0 ? 7 : @wday, "0", 1]
+    when "w" then [@wday, "0", 1]
+    when "s" then [to_i, "0", 1]
+    when "U" then [(@yday + 6 - @wday) / 7, "0", 2]
+    when "W" then [(@yday + 6 - (@wday - 1) % 7) / 7, "0", 2]
+    when "B" then [MONTHS[@month - 1], " ", 0]
+    when "b", "h" then [MONTHS[@month - 1][0, 3], " ", 0]
+    when "A" then [DAYS[@wday], " ", 0]
+    when "a" then [DAYS[@wday][0, 3], " ", 0]
+    when "p" then [@hour < 12 ? "AM" : "PM", " ", 0]
+    when "P" then [@hour < 12 ? "am" : "pm", " ", 0]
+    when "Z" then [zone.to_s, " ", 0]
+    when "z" then [__zone_str(flags.include?(":")), " ", 0]
+    when "F" then [strftime("%Y-%m-%d"), " ", 0]
+    when "D", "x" then [strftime("%m/%d/%y"), " ", 0]
+    when "T", "X" then [strftime("%H:%M:%S"), " ", 0]
+    when "R" then [strftime("%H:%M"), " ", 0]
+    when "r" then [strftime("%I:%M:%S %p"), " ", 0]
+    when "c" then [strftime("%a %b %e %T %Y"), " ", 0]
+    when "n" then ["\n", " ", 0]
+    when "t" then ["\t", " ", 0]
+    when "%" then ["%", " ", 0]
+    end
+  end
+
+  def strftime(fmt)
+    fmt.gsub(/%([-0^#_:]*)(\d*)([A-Za-z%])/) do
+      whole, flags, width, c = $&, $1, $2, $3
+      f = __field(c, flags)
+      next whole unless f
+      v, pad, w = f
+      s = v.to_s
+      s = s.upcase if flags.include?("^")
+      s = s.swapcase if flags.include?("#")
+      pad = "0" if flags.include?("0")
+      pad = " " if flags.include?("_")
+      w = width.to_i unless width.empty?
+      flags.include?("-") ? s : s.rjust(w, pad)
+    end
+  end
+end

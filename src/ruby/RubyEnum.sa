@@ -1,0 +1,1366 @@
+// quantum: cpp
+// Ruby front-end: Range, Enumerable and Enumerator. Enumerable methods
+// stream through `each` when they can stop early (so infinite sources
+// work); the others collect the elements and reuse Array's methods.
+#include "RubyRt.h.sa"
+
+#include <cmath>
+
+namespace ruby
+{
+
+namespace
+{
+
+// runs fn for each element `self` yields; fn returns false to stop
+void eachValue(Interp &I, V self, const std::function<bool(V)> &fn)
+{
+    if (I.isAry(self))
+    {
+        std::vector<V> &v = I.aref(self);
+        for (size_t i = 0; i < v.size(); ++i)
+            if (!fn(v[i]))
+                return;
+        return;
+    }
+    uint64_t tag = ++I.tagCounter;
+    NativeBlockFn nb = [&fn, tag](Interp &J, Args &a) -> V
+    {
+        V x = a.argc == 1 ? a.argv[0] : a.argc == 0 ? Qnil : J.ary(std::vector<V>(a.argv, a.argv + a.argc));
+        if (!fn(x))
+            throw StopEx{tag};
+        return Qnil;
+    };
+    Blk b = I.nativeBlk(&nb);
+    try
+    {
+        I.call(self, I.s.each, 0, nullptr, &b);
+    }
+    catch (StopEx &e)
+    {
+        if (e.tag != tag)
+            throw;
+    }
+}
+
+V viaArray(Interp &I, V self, Args &a, const char *name)
+{
+    V arr = I.ary(I.toList(self));
+    return I.callArgs(arr, intern(name), a);
+}
+
+#define VIA_ARRAY(fname, mname)                                                                                       \
+    V fname(Interp &I, V self, Args &a) { return viaArray(I, self, a, mname); }
+
+VIA_ARRAY(en_to_a, "to_a")
+VIA_ARRAY(en_chunk_while, "chunk_while")
+VIA_ARRAY(en_slice_when, "slice_when")
+VIA_ARRAY(en_chunk, "chunk")
+VIA_ARRAY(en_slice_before, "slice_before")
+VIA_ARRAY(en_slice_after, "slice_after")
+VIA_ARRAY(en_count, "count")
+VIA_ARRAY(en_min, "min")
+VIA_ARRAY(en_max, "max")
+VIA_ARRAY(en_minmax, "minmax")
+VIA_ARRAY(en_min_by, "min_by")
+VIA_ARRAY(en_max_by, "max_by")
+VIA_ARRAY(en_minmax_by, "minmax_by")
+VIA_ARRAY(en_sort, "sort")
+VIA_ARRAY(en_sort_by, "sort_by")
+VIA_ARRAY(en_uniq, "uniq")
+VIA_ARRAY(en_tally, "tally")
+VIA_ARRAY(en_drop, "drop")
+VIA_ARRAY(en_drop_while, "drop_while")
+VIA_ARRAY(en_one, "one?")
+VIA_ARRAY(en_reverse_each, "reverse_each")
+VIA_ARRAY(en_to_h, "to_h")
+VIA_ARRAY(en_sum_arr, "sum")
+VIA_ARRAY(en_zip, "zip")
+
+V en_sum(Interp &I, V self, Args &a) { return en_sum_arr(I, self, a); }
+
+// the block runs while `each` runs: side effects interleave as in Ruby
+V en_map(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "map", a);
+    V out = I.ary();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  I.aref(out).push_back(I.yield(a.blk, x));
+                  return true;
+              });
+    return out;
+}
+
+V en_flat_map(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "flat_map", a);
+    V out = I.ary();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  V r = I.yield(a.blk, x);
+                  V arr = I.toAry(r);
+                  if (arr != Qnil)
+                      I.aref(out).insert(I.aref(out).end(), I.aref(arr).begin(), I.aref(arr).end());
+                  else
+                      I.aref(out).push_back(r);
+                  return true;
+              });
+    return out;
+}
+
+V filterStream(Interp &I, V self, Args &a, bool keep, const char *name)
+{
+    if (!a.blk)
+        return enumFor(I, self, name, a);
+    V out = I.ary();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (truthy(I.yield(a.blk, x)) == keep)
+                      I.aref(out).push_back(x);
+                  return true;
+              });
+    return out;
+}
+
+V en_select(Interp &I, V self, Args &a) { return filterStream(I, self, a, true, "select"); }
+V en_reject(Interp &I, V self, Args &a) { return filterStream(I, self, a, false, "reject"); }
+
+V en_filter_map(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "filter_map", a);
+    V out = I.ary();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  V r = I.yield(a.blk, x);
+                  if (truthy(r))
+                      I.aref(out).push_back(r);
+                  return true;
+              });
+    return out;
+}
+
+V en_partition(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "partition", a);
+    V yes = I.ary(), no = I.ary();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  I.aref(truthy(I.yield(a.blk, x)) ? yes : no).push_back(x);
+                  return true;
+              });
+    return I.ary2(yes, no);
+}
+
+V en_group_by(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "group_by", a);
+    V h = I.newHash();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  V k = I.yield(a.blk, x);
+                  bool found = false;
+                  V list = I.hget(I.href(h), k, &found);
+                  if (!found)
+                  {
+                      list = I.ary();
+                      I.hset(I.href(h), k, list);
+                  }
+                  I.aref(list).push_back(x);
+                  return true;
+              });
+    return h;
+}
+
+V grepStream(Interp &I, V self, Args &a, bool keep)
+{
+    V out = I.ary();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (I.caseEq(a.argv[0], x) == keep)
+                      I.aref(out).push_back(a.blk ? I.yield(a.blk, x) : x);
+                  return true;
+              });
+    return out;
+}
+
+V en_grep(Interp &I, V self, Args &a) { return grepStream(I, self, a, true); }
+V en_grep_v(Interp &I, V self, Args &a) { return grepStream(I, self, a, false); }
+
+V en_entries(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ary(I.toList(self));
+}
+
+V en_first(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0)
+    {
+        V out = Qnil;
+        eachValue(I, self, [&](V x) -> bool
+                  {
+                      out = x;
+                      return false;
+                  });
+        return out;
+    }
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "attempt to take negative size");
+    V out = I.ary();
+    if (n == 0)
+        return out;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  I.aref(out).push_back(x);
+                  return (int64_t)I.aref(out).size() < n;
+              });
+    return out;
+}
+
+V en_take(Interp &I, V self, Args &a)
+{
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "attempt to take negative size");
+    V out = I.ary();
+    if (n == 0)
+        return out;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  I.aref(out).push_back(x);
+                  return (int64_t)I.aref(out).size() < n;
+              });
+    return out;
+}
+
+V en_take_while(Interp &I, V self, Args &a)
+{
+    V out = I.ary();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (!truthy(I.yield(a.blk, x)))
+                      return false;
+                  I.aref(out).push_back(x);
+                  return true;
+              });
+    return out;
+}
+
+V en_find(Interp &I, V self, Args &a)
+{
+    V out = Qnil;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (truthy(I.yield(a.blk, x)))
+                  {
+                      out = x;
+                      return false;
+                  }
+                  return true;
+              });
+    return out;
+}
+
+V en_find_index(Interp &I, V self, Args &a)
+{
+    V out = Qnil;
+    int64_t i = 0;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  bool hit = a.argc > 0 ? I.eq(x, a.argv[0]) : truthy(I.yield(a.blk, x));
+                  if (hit)
+                  {
+                      out = fix(i);
+                      return false;
+                  }
+                  ++i;
+                  return true;
+              });
+    return out;
+}
+
+V en_include(Interp &I, V self, Args &a)
+{
+    bool found = false;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (I.eq(x, a.argv[0]))
+                  {
+                      found = true;
+                      return false;
+                  }
+                  return true;
+              });
+    return boolv(found);
+}
+
+V testOne(Interp &I, Args &a, V x)
+{
+    if (a.argc > 0)
+        return boolv(I.caseEq(a.argv[0], x));
+    if (a.blk)
+        return I.yield(a.blk, x);
+    return x;
+}
+
+V en_any(Interp &I, V self, Args &a)
+{
+    bool r = false;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (truthy(testOne(I, a, x)))
+                  {
+                      r = true;
+                      return false;
+                  }
+                  return true;
+              });
+    return boolv(r);
+}
+
+V en_all(Interp &I, V self, Args &a)
+{
+    bool r = true;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (!truthy(testOne(I, a, x)))
+                  {
+                      r = false;
+                      return false;
+                  }
+                  return true;
+              });
+    return boolv(r);
+}
+
+V en_none(Interp &I, V self, Args &a)
+{
+    bool r = true;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (truthy(testOne(I, a, x)))
+                  {
+                      r = false;
+                      return false;
+                  }
+                  return true;
+              });
+    return boolv(r);
+}
+
+V en_each_with_index(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each_with_index", a);
+    int64_t i = 0;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  I.yield2(a.blk, x, fix(i++));
+                  return true;
+              });
+    return self;
+}
+
+V en_each_with_object(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each_with_object", a);
+    V memo = a.argv[0];
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  I.yield2(a.blk, x, memo);
+                  return true;
+              });
+    return memo;
+}
+
+V en_each_slice(Interp &I, V self, Args &a)
+{
+    int64_t n = I.intOf(a.argv[0]);
+    if (n <= 0)
+        I.raise(I.cArgumentError, "invalid slice size");
+    if (!a.blk)
+        return enumFor(I, self, "each_slice", a);
+    V cur = I.ary();
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  I.aref(cur).push_back(x);
+                  if ((int64_t)I.aref(cur).size() == n)
+                  {
+                      V full = cur;
+                      cur = I.ary();
+                      I.yield(a.blk, full);
+                  }
+                  return true;
+              });
+    if (!I.aref(cur).empty())
+        I.yield(a.blk, cur);
+    return self;
+}
+
+V en_each_cons(Interp &I, V self, Args &a)
+{
+    int64_t n = I.intOf(a.argv[0]);
+    if (n <= 0)
+        I.raise(I.cArgumentError, "invalid size");
+    if (!a.blk)
+        return enumFor(I, self, "each_cons", a);
+    std::vector<V> window;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  window.push_back(x);
+                  if ((int64_t)window.size() > n)
+                      window.erase(window.begin());
+                  if ((int64_t)window.size() == n)
+                      I.yield(a.blk, I.ary(window));
+                  return true;
+              });
+    return self;
+}
+
+V en_each_entry(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each_entry", a);
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  I.yield(a.blk, x);
+                  return true;
+              });
+    return self;
+}
+
+V en_inject(Interp &I, V self, Args &a)
+{
+    V acc = Qundef;
+    Sym opSym = 0;
+    if (a.argc == 2)
+    {
+        acc = a.argv[0];
+        opSym = isSymV(a.argv[1]) ? vsym(a.argv[1]) : intern(I.sref(a.argv[1]));
+    }
+    else if (a.argc == 1 && !a.blk)
+        opSym = isSymV(a.argv[0]) ? vsym(a.argv[0]) : intern(I.sref(a.argv[0]));
+    else if (a.argc == 1)
+        acc = a.argv[0];
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (acc == Qundef)
+                      acc = x;
+                  else if (opSym)
+                      acc = I.call1(acc, opSym, x);
+                  else
+                      acc = I.yield2(a.blk, acc, x);
+                  return true;
+              });
+    return acc == Qundef ? Qnil : acc;
+}
+
+V en_cycle(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "cycle", a);
+    std::vector<V> items = I.toList(self);
+    if (items.empty())
+        return Qnil;
+    if (a.argc > 0 && a.argv[0] != Qnil)
+    {
+        int64_t n = I.intOf(a.argv[0]);
+        for (int64_t k = 0; k < n; ++k)
+            for (V x : items)
+                I.yield(a.blk, x);
+        return Qnil;
+    }
+    for (;;)
+        for (V x : items)
+            I.yield(a.blk, x);
+}
+
+V en_lazy(Interp &I, V self, Args &a)
+{
+    (void)a;
+    I.loadLibrary("lazy");
+    V lazy = I.constIn(I.cEnumerator, intern("Lazy"), false);
+    return I.call1(lazy, I.s.new_, self);
+}
+
+V en_each_index_dummy(Interp &I, V self, Args &a) { return en_each_entry(I, self, a); }
+
+// ── Range ─────────────────────────────────────────────────────────────────
+
+RRange *R(V v) { return static_cast<RRange *>(op(v)); }
+
+V range_s_new(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V lo = a.argv[0], hi = a.argv[1];
+    bool excl = a.argc > 2 && truthy(a.argv[2]);
+    if (!(lo == Qnil || hi == Qnil) && !(I.isNum(lo) && I.isNum(hi)) && I.cmpV(lo, hi) == Qnil)
+        I.raise(I.cArgumentError, "bad value for range");
+    return I.range(lo, hi, excl);
+}
+
+V range_first(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0)
+    {
+        if (R(self)->lo == Qnil)
+            I.raise(I.cRangeError, "cannot get the first element of beginless range");
+        return R(self)->lo;
+    }
+    return en_first(I, self, a);
+}
+
+V range_begin(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return R(self)->lo;
+}
+
+V range_end(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return R(self)->hi;
+}
+
+V range_exclude_end(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return boolv(R(self)->excl);
+}
+
+V range_each(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each", a);
+    RRange *r = R(self);
+    if (isFix(r->lo) && (isFix(r->hi) || r->hi == Qnil))
+    {
+        int64_t lo = fixv(r->lo);
+        if (r->hi == Qnil)
+        {
+            for (int64_t i = lo;; ++i)
+                I.yield(a.blk, fix(i));
+        }
+        int64_t hi = fixv(r->hi);
+        if (r->excl)
+            --hi;
+        for (int64_t i = lo; i <= hi; ++i)
+            I.yield(a.blk, fix(i));
+        return self;
+    }
+    if (I.isInt(r->lo) && I.isFloat(r->hi))
+    {
+        double hi = I.fltv(r->hi);
+        for (int64_t i = fixv(r->lo); r->excl ? (double)i < hi : (double)i <= hi; ++i)
+            I.yield(a.blk, fix(i));
+        return self;
+    }
+    if (I.isInt(r->lo) && (I.isInt(r->hi) || r->hi == Qnil))
+    {
+        V i = r->lo;
+        for (;;)
+        {
+            if (r->hi != Qnil)
+            {
+                int c = intCmp(I, i, r->hi);
+                if (c > 0 || (c == 0 && r->excl))
+                    break;
+            }
+            I.yield(a.blk, i);
+            i = intAdd(I, i, fix(1));
+        }
+        return self;
+    }
+    if (I.isFloat(r->lo))
+        I.raise(I.cTypeError, "can't iterate from Float");
+    if (r->lo == Qnil)
+        I.raise(I.cTypeError, "can't iterate from NilClass");
+    if (I.isStr(r->lo) && I.isStr(r->hi))
+    {
+        V av[2] = {r->hi, boolv(r->excl)};
+        return I.call(r->lo, intern("upto"), 2, av, a.blk);
+    }
+    // generic: succ until the end
+    V cur = r->lo;
+    for (;;)
+    {
+        if (r->hi != Qnil)
+        {
+            int c = I.cmp(cur, r->hi);
+            if (c > 0 || (c == 0 && r->excl))
+                break;
+        }
+        I.yield(a.blk, cur);
+        cur = I.call0(cur, I.s.succ);
+    }
+    return self;
+}
+
+V range_reverse_each(Interp &I, V self, Args &a)
+{
+    RRange *r = R(self);
+    if (isFix(r->lo) && isFix(r->hi))
+    {
+        int64_t hi = fixv(r->hi) - (r->excl ? 1 : 0);
+        for (int64_t i = hi; i >= fixv(r->lo); --i)
+            I.yield(a.blk, fix(i));
+        return self;
+    }
+    return en_reverse_each(I, self, a);
+}
+
+V range_size(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RRange *r = R(self);
+    if (I.isInt(r->lo))
+    {
+        if (r->hi == Qnil)
+            return I.flo(1.0 / 0.0);
+        if (I.isFloat(r->hi))
+        {
+            double hi = I.fltv(r->hi);
+            if (std::isinf(hi))
+                return I.flo(hi);
+            double n = std::floor(hi - I.numToF(r->lo)) + 1;
+            if (r->excl && std::floor(hi) == hi)
+                n -= 1;
+            return n < 0 ? fix(0) : fix((int64_t)n);
+        }
+        if (!I.isInt(r->hi))
+            return Qnil;
+        V n = intSub(I, r->hi, r->lo);
+        if (!r->excl)
+            n = intAdd(I, n, fix(1));
+        return intIsNeg(I, n) ? fix(0) : n;
+    }
+    if (I.isFloat(r->lo))
+        I.raise(I.cTypeError, "can't iterate from Float");
+    return Qnil;
+}
+
+V range_count(Interp &I, V self, Args &a)
+{
+    if (a.argc == 0 && !a.blk && I.isInt(R(self)->lo))
+        return range_size(I, self, a);
+    return en_count(I, self, a);
+}
+
+bool rangeCover(Interp &I, RRange *r, V v)
+{
+    if (r->lo != Qnil)
+    {
+        V c = I.cmpV(r->lo, v);
+        if (c == Qnil || fixv(c) > 0)
+            return false;
+    }
+    if (r->hi != Qnil)
+    {
+        V c = I.cmpV(v, r->hi);
+        if (c == Qnil)
+            return false;
+        if (r->excl ? fixv(c) >= 0 : fixv(c) > 0)
+            return false;
+    }
+    return true;
+}
+
+V range_cover(Interp &I, V self, Args &a)
+{
+    V v = a.argv[0];
+    if (isType(v, T::Range))
+    {
+        RRange *o = R(v);
+        if (!rangeCover(I, R(self), o->lo))
+            return Qfalse;
+        if (o->hi == Qnil)
+            return boolv(R(self)->hi == Qnil);
+        if (R(self)->hi == Qnil)
+            return Qtrue;
+        if (o->excl)
+            return boolv(I.cmp(o->hi, R(self)->hi) <= 0);
+        return boolv(rangeCover(I, R(self), o->hi));
+    }
+    if (!(I.isNum(v) || I.isStr(v)) && !(isObj(v) && op(v)->type == T::Object))
+    {
+        if (!(I.isNum(R(self)->lo) && I.isNum(v)))
+        {
+            if (v == Qnil || isSymV(v))
+                return Qfalse;
+        }
+    }
+    if ((I.isNum(R(self)->lo) || R(self)->lo == Qnil) && (I.isNum(R(self)->hi) || R(self)->hi == Qnil) && !I.isNum(v))
+        return Qfalse;
+    return boolv(rangeCover(I, R(self), v));
+}
+
+V range_include(Interp &I, V self, Args &a)
+{
+    RRange *r = R(self);
+    V v = a.argv[0];
+    if (I.isStr(r->lo) && I.isStr(r->hi) && I.isStr(v))
+    {
+        // a string range: membership by iteration, unless both ends are one character
+        if (I.sref(r->lo).size() == 1 && I.sref(r->hi).size() == 1)
+            return boolv(I.sref(v).size() == 1 && rangeCover(I, r, v));
+        bool found = false;
+        eachValue(I, self, [&](V x) -> bool
+                  {
+                      if (I.eq(x, v))
+                      {
+                          found = true;
+                          return false;
+                      }
+                      return true;
+                  });
+        return boolv(found);
+    }
+    return range_cover(I, self, a);
+}
+
+V range_eqq(Interp &I, V self, Args &a) { return range_cover(I, self, a); }
+
+std::string rangeStr(Interp &I, V self, bool insp)
+{
+    RRange *r = R(self);
+    std::string lo = r->lo == Qnil ? "" : insp ? I.inspect(r->lo) : I.toS(r->lo);
+    std::string hi = r->hi == Qnil ? "" : insp ? I.inspect(r->hi) : I.toS(r->hi);
+    if (insp && r->lo == Qnil && r->hi == Qnil)
+        lo = "nil";
+    return lo + (r->excl ? "..." : "..") + hi;
+}
+
+V range_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(rangeStr(I, self, true));
+}
+
+V range_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(rangeStr(I, self, false));
+}
+
+V range_to_a(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RRange *r = R(self);
+    if (r->hi == Qnil)
+        I.raise(I.cRangeError, "cannot convert endless range to an array");
+    if (isFix(r->lo) && isFix(r->hi))
+    {
+        int64_t lo = fixv(r->lo), hi = fixv(r->hi) - (r->excl ? 1 : 0);
+        V out = I.ary();
+        std::vector<V> &v = I.aref(out);
+        if (hi >= lo)
+            v.reserve((size_t)(hi - lo + 1));
+        for (int64_t i = lo; i <= hi; ++i)
+            v.push_back(fix(i));
+        return out;
+    }
+    return I.ary(I.toList(self));
+}
+
+V range_eq(Interp &I, V self, Args &a) { return boolv(I.eq(self, a.argv[0])); }
+
+V range_eql(Interp &I, V self, Args &a) { return boolv(I.eql(self, a.argv[0])); }
+
+V range_hash(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix((int64_t)(I.hashOf(self) >> 2));
+}
+
+V range_sum(Interp &I, V self, Args &a)
+{
+    RRange *r = R(self);
+    if (!a.blk && I.isInt(r->lo) && I.isInt(r->hi))
+    {
+        V init = a.argc > 0 ? a.argv[0] : fix(0);
+        V hi = r->excl ? intSub(I, r->hi, fix(1)) : r->hi;
+        if (intCmp(I, hi, r->lo) < 0)
+            return init;
+        V n = intAdd(I, intSub(I, hi, r->lo), fix(1));
+        V s = intDiv(I, intMul(I, n, intAdd(I, r->lo, hi)), fix(2));
+        return numAdd(I, init, s);
+    }
+    return en_sum(I, self, a);
+}
+
+V range_min(Interp &I, V self, Args &a)
+{
+    RRange *r = R(self);
+    if (a.blk || a.argc > 0)
+        return en_min(I, self, a);
+    V c = I.cmpV(r->lo, r->hi);
+    if (r->hi != Qnil && (c == Qnil || fixv(c) > 0 || (fixv(c) == 0 && r->excl)))
+        return Qnil;
+    return r->lo;
+}
+
+V range_max(Interp &I, V self, Args &a)
+{
+    RRange *r = R(self);
+    if (a.blk || a.argc > 0)
+        return en_max(I, self, a);
+    if (r->hi == Qnil)
+        I.raise(I.cRangeError, "cannot get the maximum of endless range");
+    V c = I.cmpV(r->lo, r->hi);
+    if (c == Qnil || fixv(c) > 0 || (fixv(c) == 0 && r->excl))
+        return Qnil;
+    if (r->excl)
+    {
+        if (I.isInt(r->hi))
+            return intSub(I, r->hi, fix(1));
+        I.raise(I.cTypeError, "cannot exclude non Integer end value");
+    }
+    return r->hi;
+}
+
+V range_minmax(Interp &I, V self, Args &a)
+{
+    if (a.blk)
+        return en_minmax(I, self, a);
+    return I.ary2(range_min(I, self, a), range_max(I, self, a));
+}
+
+V range_last(Interp &I, V self, Args &a)
+{
+    RRange *r = R(self);
+    if (a.argc == 0)
+        return r->hi;
+    V arr = range_to_a(I, self, a);
+    return I.callArgs(arr, intern("last"), a);
+}
+
+V range_step(Interp &I, V self, Args &a)
+{
+    RRange *r = R(self);
+    V step = a.argc > 0 ? a.argv[0] : fix(1);
+    if (!a.blk)
+    {
+        auto *e = new REnum();
+        e->klass = I.cArith;
+        e->type = T::Enumerator;
+        e->recv = self;
+        e->meth = intern("step");
+        e->args.push_back(step);
+        return ov(e);
+    }
+    if (I.isFloat(r->lo) || I.isFloat(r->hi) || I.isFloat(step))
+    {
+        double beg = I.numToF(r->lo), unit = I.numToF(step);
+        double end = r->hi == Qnil ? 1.0 / 0.0 : I.numToF(r->hi);
+        rubyFloatStep(I, beg, end, unit, r->excl, a.blk, nullptr);
+        return self;
+    }
+    if (I.isInt(r->lo))
+    {
+        if (I.isInt(step) && intIsNeg(I, step))
+            I.raise(I.cArgumentError, "step can't be negative");
+        if (step == fix(0))
+            I.raise(I.cArgumentError, "step can't be 0");
+        V i = r->lo;
+        for (;;)
+        {
+            if (r->hi != Qnil)
+            {
+                V c = numCmpV(I, i, r->hi);
+                if (fixv(c) > 0 || (fixv(c) == 0 && r->excl))
+                    break;
+            }
+            I.yield(a.blk, i);
+            i = numAdd(I, i, step);
+        }
+        return self;
+    }
+    // non-numeric ranges step through each
+    int64_t n = I.intOf(step), k = 0;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  if (k++ % n == 0)
+                      I.yield(a.blk, x);
+                  return true;
+              });
+    return self;
+}
+
+V range_bsearch(Interp &I, V self, Args &a)
+{
+    RRange *r = R(self);
+    if (I.isInt(r->lo) && I.isInt(r->hi))
+    {
+        int64_t lo = I.intOf(r->lo), hi = I.intOf(r->hi) + (r->excl ? 0 : 1);
+        bool found = false;
+        int64_t best = 0;
+        while (lo < hi)
+        {
+            int64_t mid = lo + (hi - lo) / 2;
+            V res = I.yield(a.blk, fix(mid));
+            if (res == Qtrue)
+            {
+                found = true;
+                best = mid;
+                hi = mid;
+            }
+            else if (res == Qfalse || res == Qnil)
+                lo = mid + 1;
+            else
+            {
+                int c = I.cmp(res, fix(0));
+                if (c == 0)
+                    return fix(mid);
+                if (c < 0)
+                    hi = mid;
+                else
+                    lo = mid + 1;
+            }
+        }
+        return found ? fix(best) : Qnil;
+    }
+    double lo = I.numToF(r->lo), hi = I.numToF(r->hi);
+    for (int i = 0; i < 200 && lo < hi; ++i)
+    {
+        double mid = lo + (hi - lo) / 2;
+        V res = I.yield(a.blk, I.flo(mid));
+        if (truthy(res))
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return I.flo(hi);
+}
+
+V range_overlap(Interp &I, V self, Args &a)
+{
+    RRange *x = R(self), *y = R(a.argv[0]);
+    auto before = [&](RRange *p, RRange *q) -> bool
+    {
+        // p ends before q starts
+        if (p->hi == Qnil || q->lo == Qnil)
+            return false;
+        int c = I.cmp(p->hi, q->lo);
+        return c < 0 || (c == 0 && p->excl);
+    };
+    return boolv(!before(x, y) && !before(y, x));
+}
+
+V range_dup(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.range(R(self)->lo, R(self)->hi, R(self)->excl);
+}
+
+// ── Enumerator ────────────────────────────────────────────────────────────
+
+REnum *E(V v) { return static_cast<REnum *>(op(v)); }
+
+V enum_each(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return self;
+    REnum *e = E(self);
+    if (e->gen != Qnil)
+    {
+        // Enumerator.new { |y| ... }: the yielder feeds the block
+        V y = I.newObject(I.cYielder);
+        auto *fn = new NativeBlockFn();
+        Blk *target = a.blk;
+        *fn = [target](Interp &J, Args &b) -> V { return J.callBlock(target, b.argc, b.argv, b.kw); };
+        Blk nb = I.nativeBlk(fn);
+        I.ivarSet(y, intern("__proc"), I.procFromBlk(&nb));
+        return I.callProc(e->gen, 1, &y);
+    }
+    std::vector<V> args = e->args;
+    return I.call(e->recv, e->meth, (int)args.size(), args.data(), a.blk, true, e->kw);
+}
+
+V enum_s_new(Interp &I, V self, Args &a)
+{
+    (void)self;
+    auto *e = new REnum();
+    e->klass = static_cast<RClass *>(op(self));
+    e->type = T::Enumerator;
+    if (!a.blk)
+        I.raise(I.cArgumentError, "no block given");
+    e->gen = I.procFromBlk(a.blk);
+    e->size = a.argc > 0 ? a.argv[0] : Qnil;
+    return ov(e);
+}
+
+V yielder_push(Interp &I, V self, Args &a)
+{
+    V p = I.ivarGet(self, intern("__proc"));
+    I.callProc(p, a.argc, a.argv);
+    return self;
+}
+
+V yielder_yield(Interp &I, V self, Args &a)
+{
+    V p = I.ivarGet(self, intern("__proc"));
+    return I.callProc(p, a.argc, a.argv);
+}
+
+V yielder_to_proc(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, intern("__proc"));
+}
+
+V enum_with_index(Interp &I, V self, Args &a)
+{
+    V off = a.argc > 0 && a.argv[0] != Qnil ? a.argv[0] : fix(0);
+    if (!a.blk)
+    {
+        V av[2] = {I.sym("with_index"), off};
+        auto *e = new REnum();
+        e->klass = I.cEnumerator;
+        e->type = T::Enumerator;
+        e->recv = self;
+        e->meth = intern("with_index");
+        e->args.push_back(off);
+        (void)av;
+        return ov(e);
+    }
+    int64_t i = I.intOf(off);
+    Blk *user = a.blk;
+    NativeBlockFn fn = [&i, user](Interp &J, Args &b) -> V
+    {
+        V x = b.argc == 1 ? b.argv[0] : J.ary(std::vector<V>(b.argv, b.argv + b.argc));
+        return J.yield2(user, x, fix(i++));
+    };
+    Blk nb = I.nativeBlk(&fn);
+    Args c;
+    c.blk = &nb;
+    return enum_each(I, self, c);
+}
+
+V enum_each_with_index(Interp &I, V self, Args &a)
+{
+    Args b;
+    b.blk = a.blk;
+    return enum_with_index(I, self, b);
+}
+
+V enum_with_object(Interp &I, V self, Args &a)
+{
+    V memo = a.argv[0];
+    Blk *user = a.blk;
+    NativeBlockFn fn = [memo, user](Interp &J, Args &b) -> V
+    {
+        V x = b.argc == 1 ? b.argv[0] : J.ary(std::vector<V>(b.argv, b.argv + b.argc));
+        return J.yield2(user, x, memo);
+    };
+    Blk nb = I.nativeBlk(&fn);
+    Args c;
+    c.blk = &nb;
+    enum_each(I, self, c);
+    return memo;
+}
+
+// external iteration: the values up to the cursor are buffered; running
+// the iteration again collects further ones
+void fillTo(Interp &I, REnum *e, V self, size_t want)
+{
+    if (e->done || e->buf.size() > want)
+        return;
+    size_t limit = want + 1 < 16 ? 16 : (want + 1) * 2;
+    std::vector<V> got;
+    bool stopped = false;
+    eachValue(I, self, [&](V x) -> bool
+              {
+                  got.push_back(x);
+                  if (got.size() >= limit)
+                  {
+                      stopped = true;
+                      return false;
+                  }
+                  return true;
+              });
+    e->buf = got;
+    if (!stopped)
+        e->done = true;
+}
+
+V enum_next(Interp &I, V self, Args &a)
+{
+    (void)a;
+    REnum *e = E(self);
+    fillTo(I, e, self, e->pos);
+    if (e->pos >= e->buf.size())
+    {
+        V exc = I.makeExc(I.cStopIteration, "iteration reached an end");
+        I.raiseExc(exc);
+    }
+    return e->buf[e->pos++];
+}
+
+V enum_peek(Interp &I, V self, Args &a)
+{
+    (void)a;
+    REnum *e = E(self);
+    fillTo(I, e, self, e->pos);
+    if (e->pos >= e->buf.size())
+        I.raise(I.cStopIteration, "iteration reached an end");
+    return e->buf[e->pos];
+}
+
+V enum_rewind(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    E(self)->pos = 0;
+    return self;
+}
+
+V enum_size(Interp &I, V self, Args &a)
+{
+    (void)a;
+    REnum *e = E(self);
+    if (e->gen != Qnil)
+        return e->size;
+    V recv = e->recv;
+    const std::string &m = symName(e->meth);
+    int64_t n = -1;
+    if (I.isAry(recv))
+        n = (int64_t)I.aref(recv).size();
+    else if (I.isHash(recv))
+        n = I.href(recv)->live;
+    else if (isType(recv, T::Range))
+    {
+        V s = I.call0(recv, I.s.size);
+        if (!isFix(s))
+            return s;
+        n = fixv(s);
+    }
+    else if (isFix(recv) && m == "times")
+        return recv;
+    if (m == "loop" || m == "cycle")
+        return I.flo(1.0 / 0.0);
+    if (n < 0)
+        return Qnil;
+    if (m == "each_slice" && !e->args.empty())
+    {
+        int64_t k = I.intOf(e->args[0]);
+        return fix((n + k - 1) / k);
+    }
+    if (m == "each_cons" && !e->args.empty())
+    {
+        int64_t k = I.intOf(e->args[0]);
+        return fix(n - k + 1 < 0 ? 0 : n - k + 1);
+    }
+    return fix(n);
+}
+
+V enum_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    REnum *e = E(self);
+    if (op(self)->klass == I.cArith)
+    {
+        if (isType(e->recv, T::Range))
+            return I.str("((" + I.inspect(e->recv) + ").step(" + I.inspect(e->args[0]) + "))");
+        std::string s = "(" + I.inspect(e->recv) + ".step(";
+        for (size_t i = 0; i < e->args.size(); ++i)
+            s += (i ? ", " : "") + I.inspect(e->args[i]);
+        return I.str(s + "))");
+    }
+    if (e->gen != Qnil)
+        return I.str("#<Enumerator: #<Enumerator::Generator:0x0000000000000001>:each>");
+    std::string s = "#<Enumerator: " + I.inspect(e->recv) + ":" + symName(e->meth);
+    if (!e->args.empty())
+    {
+        s += "(";
+        for (size_t i = 0; i < e->args.size(); ++i)
+            s += (i ? ", " : "") + I.inspect(e->args[i]);
+        s += ")";
+    }
+    return I.str(s + ">");
+}
+
+V enum_produce(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V init = a.argc > 0 ? a.argv[0] : Qundef;
+    V step = I.procFromBlk(a.blk);
+    auto *fn = new NativeBlockFn();
+    *fn = [init, step](Interp &J, Args &b) -> V
+    {
+        V y = b.argv[0];
+        V cur = init;
+        if (cur == Qundef)
+            cur = J.callProc(step, 0, nullptr);
+        try
+        {
+            for (;;)
+            {
+                J.call1(y, intern("yield"), cur);
+                cur = J.callProc(step, 1, &cur);
+            }
+        }
+        catch (RubyError &e)
+        {
+            if (!J.kindOf(e.exc, J.cStopIteration))
+                throw;
+        }
+        return Qnil;
+    };
+    Blk nb = I.nativeBlk(fn);
+    auto *e = new REnum();
+    e->klass = I.cEnumerator;
+    e->type = T::Enumerator;
+    e->gen = I.procFromBlk(&nb);
+    e->size = I.flo(1.0 / 0.0);
+    return ov(e);
+}
+
+V arith_to_a(Interp &I, V self, Args &a)
+{
+    (void)a;
+    REnum *e = E(self);
+    if (isType(e->recv, T::Range) && R(e->recv)->hi == Qnil)
+        I.raise(I.cRangeError, "cannot convert endless range to an array");
+    return I.ary(I.toList(self));
+}
+
+V enum_take_dispatch(Interp &I, V self, Args &a) { return en_take(I, self, a); }
+
+} // namespace
+
+void Interp::initRange()
+{
+    RClass *c = cRange;
+    defs(c, "new", range_s_new, 2, 3);
+    defn(c, "first", range_first, 0, 1);
+    defn(c, "begin", range_begin, 0, 0);
+    defn(c, "end", range_end, 0, 0);
+    defn(c, "last", range_last, 0, 1);
+    defn(c, "exclude_end?", range_exclude_end, 0, 0);
+    defn(c, "each", range_each, 0, 0);
+    defn(c, "reverse_each", range_reverse_each, 0, 0);
+    defn(c, "size", range_size, 0, 0);
+    defn(c, "count", range_count, 0, 1);
+    defn(c, "cover?", range_cover, 1, 1);
+    defn(c, "include?", range_include, 1, 1);
+    defn(c, "member?", range_include, 1, 1);
+    defn(c, "===", range_eqq, 1, 1);
+    defn(c, "inspect", range_inspect, 0, 0);
+    defn(c, "to_s", range_to_s, 0, 0);
+    defn(c, "to_a", range_to_a, 0, 0);
+    defn(c, "to_ary", range_to_a, 0, 0);
+    defn(c, "entries", range_to_a, 0, 0);
+    defn(c, "==", range_eq, 1, 1);
+    defn(c, "eql?", range_eql, 1, 1);
+    defn(c, "hash", range_hash, 0, 0);
+    defn(c, "sum", range_sum, 0, 1);
+    defn(c, "min", range_min, 0, 1);
+    defn(c, "max", range_max, 0, 1);
+    defn(c, "minmax", range_minmax, 0, 0);
+    defn(c, "step", range_step, 0, 1);
+    defn(c, "%", range_step, 1, 1);
+    defn(c, "bsearch", range_bsearch, 0, 0);
+    defn(c, "overlap?", range_overlap, 1, 1);
+    defn(c, "dup", range_dup, 0, 0);
+}
+
+void Interp::initEnumerable()
+{
+    RClass *m = mEnumerable;
+    defn(m, "to_a", en_to_a, 0, -1);
+    defn(m, "entries", en_entries, 0, -1);
+    defn(m, "map", en_map, 0, 0);
+    defn(m, "collect", en_map, 0, 0);
+    defn(m, "flat_map", en_flat_map, 0, 0);
+    defn(m, "collect_concat", en_flat_map, 0, 0);
+    defn(m, "select", en_select, 0, 0);
+    defn(m, "filter", en_select, 0, 0);
+    defn(m, "find_all", en_select, 0, 0);
+    defn(m, "reject", en_reject, 0, 0);
+    defn(m, "filter_map", en_filter_map, 0, 0);
+    defn(m, "partition", en_partition, 0, 0);
+    defn(m, "group_by", en_group_by, 0, 0);
+    defn(m, "chunk_while", en_chunk_while, 0, 0);
+    defn(m, "slice_when", en_slice_when, 0, 0);
+    defn(m, "chunk", en_chunk, 0, 0);
+    defn(m, "slice_before", en_slice_before, 0, 1);
+    defn(m, "slice_after", en_slice_after, 0, 1);
+    defn(m, "count", en_count, 0, 1);
+    defn(m, "min", en_min, 0, 1);
+    defn(m, "max", en_max, 0, 1);
+    defn(m, "minmax", en_minmax, 0, 0);
+    defn(m, "min_by", en_min_by, 0, 1);
+    defn(m, "max_by", en_max_by, 0, 1);
+    defn(m, "minmax_by", en_minmax_by, 0, 0);
+    defn(m, "sort", en_sort, 0, 0);
+    defn(m, "sort_by", en_sort_by, 0, 0);
+    defn(m, "uniq", en_uniq, 0, 0);
+    defn(m, "tally", en_tally, 0, 1);
+    defn(m, "drop", en_drop, 1, 1);
+    defn(m, "drop_while", en_drop_while, 0, 0);
+    defn(m, "one?", en_one, 0, 1);
+    defn(m, "reverse_each", en_reverse_each, 0, 0);
+    defn(m, "to_h", en_to_h, 0, 0);
+    defn(m, "sum", en_sum, 0, 1);
+    defn(m, "zip", en_zip, 0, -1);
+    defn(m, "first", en_first, 0, 1);
+    defn(m, "take", en_take, 1, 1);
+    defn(m, "take_while", en_take_while, 0, 0);
+    defn(m, "find", en_find, 0, 1);
+    defn(m, "detect", en_find, 0, 1);
+    defn(m, "find_index", en_find_index, 0, 1);
+    defn(m, "include?", en_include, 1, 1);
+    defn(m, "member?", en_include, 1, 1);
+    defn(m, "any?", en_any, 0, 1);
+    defn(m, "all?", en_all, 0, 1);
+    defn(m, "none?", en_none, 0, 1);
+    defn(m, "each_with_index", en_each_with_index, 0, -1);
+    defn(m, "each_with_object", en_each_with_object, 1, 1);
+    defn(m, "each_slice", en_each_slice, 1, 1);
+    defn(m, "each_cons", en_each_cons, 1, 1);
+    defn(m, "each_entry", en_each_entry, 0, -1);
+    defn(m, "inject", en_inject, 0, 2);
+    defn(m, "reduce", en_inject, 0, 2);
+    defn(m, "cycle", en_cycle, 0, 1);
+    defn(m, "lazy", en_lazy, 0, 0);
+    defn(m, "grep", en_grep, 1, 1);
+    defn(m, "grep_v", en_grep_v, 1, 1);
+    (void)en_each_index_dummy;
+}
+
+void Interp::initEnumerator()
+{
+    RClass *c = cEnumerator;
+    defs(c, "new", enum_s_new, 0, 1);
+    defs(c, "produce", enum_produce, 0, 1);
+    defn(c, "each", enum_each, 0, -1);
+    defn(c, "with_index", enum_with_index, 0, 1);
+    defn(c, "each_with_index", enum_each_with_index, 0, 0);
+    defn(c, "with_object", enum_with_object, 1, 1);
+    defn(c, "each_with_object", enum_with_object, 1, 1);
+    defn(c, "next", enum_next, 0, 0);
+    defn(c, "peek", enum_peek, 0, 0);
+    defn(c, "rewind", enum_rewind, 0, 0);
+    defn(c, "size", enum_size, 0, 0);
+    defn(c, "inspect", enum_inspect, 0, 0);
+    defn(c, "to_s", enum_inspect, 0, 0);
+    defn(c, "take", enum_take_dispatch, 1, 1);
+    defn(cArith, "to_a", arith_to_a, 0, 0);
+    defn(cYielder, "<<", yielder_push, 1, 1);
+    defn(cYielder, "yield", yielder_yield, 0, -1);
+    defn(cYielder, "call", yielder_yield, 0, -1);
+    defn(cYielder, "to_proc", yielder_to_proc, 0, 0);
+}
+
+} // namespace ruby

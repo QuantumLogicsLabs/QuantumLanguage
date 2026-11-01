@@ -193,7 +193,8 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
 
     // Java-style code (applyJavaDialect): the Java-style library goes in
     // front of the program, parsed on its own so the program keeps its line
-    // numbers.
+    // numbers. It and the file's Java classes compile as Java code.
+    std::set<const ASTNode *> javaLibrary;
     if (isJavaStyleSource(source) && ast->is<BlockStmt>())
     {
         std::vector<ASTNodePtr> lib;
@@ -204,7 +205,10 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
             auto part = libParser.parse();
             if (part->is<BlockStmt>())
                 for (auto &s : part->as<BlockStmt>().statements)
+                {
+                    javaLibrary.insert(s.get());
                     lib.push_back(std::move(s));
+                }
         }
         auto &stmts = ast->as<BlockStmt>().statements;
         for (size_t k = 0; k < lib.size(); ++k)
@@ -238,6 +242,8 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
     }
 
     Compiler compiler;
+    if (!javaLibrary.empty())
+        compiler.setJavaStyle(javaStyleClasses(source), javaLibrary, rubyStyleLines(source));
     auto chunk = compiler.compile(*ast);
 
     if (debug)

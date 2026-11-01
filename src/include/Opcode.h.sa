@@ -165,6 +165,15 @@ struct Chunk
     std::vector<bool> paramIsRef;
     int upvalueCount = 0;
     int varargIndex = -2; // the *args parameter (-1: none); -2 until a first call computes it
+    // In a .sa file with Java-style code: a method of one of its Java classes,
+    // a function of the Java-style library, or a lambda inside one. Its
+    // char arithmetic is Java's (c - '0') and its class's fields hide the
+    // file's globals of the same name.
+    bool javaStyle = false;
+    // A function of the same file's Ruby code (a def, a block): it keeps
+    // Quantum's meanings of method names and `+` (s.chars, xs.reduce { },
+    // "#{x}") where the rest of the file gets Java's (VM::javaStyleCode).
+    bool rubyStyle = false;
     // Java: the global each name constant refers to (VM::LOAD_GLOBAL / STORE_GLOBAL)
     std::vector<QuantumValue *> globalSlots;
     // Java: per J_INVOKE instruction, the receiver class last seen and the

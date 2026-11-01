@@ -1,0 +1,156 @@
+# Enumerator::Lazy, in Ruby: each stage is a proc that drives the next block.
+class Enumerator::Lazy
+  def self.new(src = nil, desc = nil, &runner)
+    obj = allocate
+    obj.__setup(src, desc, runner)
+    obj
+  end
+
+  def __setup(src, desc, runner)
+    @src = src
+    @desc = desc
+    @runner = runner
+    self
+  end
+
+  def each(&blk)
+    return self unless blk
+    if @runner
+      @runner.call(blk)
+    else
+      @src.each(&blk)
+    end
+    self
+  end
+
+  def __stage(name, &step)
+    src = self
+    Enumerator::Lazy.new(src, name) do |out|
+      src.each { |*v| step.call(out, v.size <= 1 ? v[0] : v) }
+    end
+  end
+
+  def map(&f) = __stage("map") { |out, x| out.call(f.call(x)) }
+  alias collect map
+  def select(&f) = __stage("select") { |out, x| out.call(x) if f.call(x) }
+  alias filter select
+  alias find_all select
+  def reject(&f) = __stage("reject") { |out, x| out.call(x) unless f.call(x) }
+
+  def filter_map(&f)
+    __stage("filter_map") do |out, x|
+      r = f.call(x)
+      out.call(r) if r
+    end
+  end
+
+  def flat_map(&f)
+    __stage("flat_map") do |out, x|
+      r = f.call(x)
+      if r.is_a?(Array) || r.is_a?(Enumerator::Lazy)
+        r.each { |y| out.call(y) }
+      else
+        out.call(r)
+      end
+    end
+  end
+  alias collect_concat flat_map
+
+  def compact = __stage("compact") { |out, x| out.call(x) unless x.nil? }
+
+  def with_index(offset = 0, &f)
+    src = self
+    Enumerator::Lazy.new(src, "with_index") do |out|
+      i = offset - 1
+      src.each do |x|
+        i += 1
+        if f
+          f.call(x, i)
+          out.call(x)
+        else
+          out.call([x, i])
+        end
+      end
+    end
+  end
+  alias each_with_index with_index
+
+  def take(n)
+    src = self
+    Enumerator::Lazy.new(src, "take(#{n})") do |out|
+      if n > 0
+        i = 0
+        src.each do |x|
+          out.call(x)
+          i += 1
+          break if i >= n
+        end
+      end
+    end
+  end
+
+  def take_while(&f)
+    src = self
+    Enumerator::Lazy.new(src, "take_while") do |out|
+      src.each do |x|
+        break unless f.call(x)
+        out.call(x)
+      end
+    end
+  end
+
+  def drop(n)
+    src = self
+    Enumerator::Lazy.new(src, "drop(#{n})") do |out|
+      i = 0
+      src.each do |x|
+        out.call(x) if i >= n
+        i += 1
+      end
+    end
+  end
+
+  def drop_while(&f)
+    src = self
+    Enumerator::Lazy.new(src, "drop_while") do |out|
+      dropping = true
+      src.each do |x|
+        dropping = false if dropping && !f.call(x)
+        out.call(x) unless dropping
+      end
+    end
+  end
+
+  def uniq(&f)
+    src = self
+    Enumerator::Lazy.new(src, "uniq") do |out|
+      seen = {}
+      src.each do |x|
+        k = f ? f.call(x) : x
+        unless seen.key?(k)
+          seen[k] = true
+          out.call(x)
+        end
+      end
+    end
+  end
+
+  def force(*a) = to_a(*a)
+  def to_a(*) = [].tap { |r| each { |x| r << x } }
+
+  def first(*n)
+    return take(1).to_a.first if n.empty?
+    take(n[0]).to_a
+  end
+
+  def lazy = self
+  def eager = to_a.each
+  def size = nil
+  def rewind = self
+
+  def inspect
+    return "#<Enumerator::Lazy: #{@src.inspect}>" unless @desc
+    "#<Enumerator::Lazy: #{@src.inspect}:#{@desc}>"
+  end
+  alias to_s inspect
+end

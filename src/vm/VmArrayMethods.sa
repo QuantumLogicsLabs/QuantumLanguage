@@ -555,5 +555,10 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr,
     return QuantumValue(true);
   }
 
+  // a java.util name in a program with Java-style code (list.add(x), ...)
+  bool handled = false;
+  QuantumValue r = javaStyleFallback(QuantumValue(arr), m, args, handled);
+  if (handled)
+    return r;
   throw TypeError("Array has no method '" + m + "'");
 }

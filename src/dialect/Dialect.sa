@@ -1,4 +1,5 @@
 // quantum: cpp
+#include "../ruby/RubyMain.h.sa"
 #include "Dialect.h.sa"
 
 #include <algorithm>
@@ -49,6 +50,25 @@ static std::string mainCall(const std::string &source)
 // project: a C-style `int main(` in a file that splices in local headers).
 // Ruby files are first normalized into the common Quantum syntax and then use
 // the normal compiler/VM pipeline.
+// text as a string literal of the Quantum language
+static std::string quantumStringLiteral(const std::string &text)
+{
+    std::string out = "\"";
+    for (char c : text)
+    {
+        switch (c)
+        {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\0': out += "\\0"; break;
+        default: out += c;
+        }
+    }
+    return out + "\"";
+}
+
 std::string applyDialect(std::string source, const std::string &path)
 {
     std::string ext = fileExtLower(path);
@@ -81,7 +101,14 @@ std::string applyDialect(std::string source, const std::string &path)
     }
 
     if (ext == ".rb")
+    {
+        // A .rb file runs on the Ruby front-end (src/ruby) when it can parse
+        // it; the program travels inside the chunk as a string
+        std::string why;
+        if (ruby::canRun(source, path, why))
+            return "__ruby_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
         source = applyRubyDialect(source, /*strict=*/true);
+    }
     else if (ext == ".sa")
         source = applyRubyDialect(source, /*strict=*/false);
     if ((ext == ".rb" || ext == ".sa") && std::getenv("QUANTUM_DEBUG_RUBY"))

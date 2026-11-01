@@ -421,6 +421,15 @@ chaining (each is a parse or runtime error), and inner (non-static) classes that
 object's fields: `outer.new Inner()` compiles but gives wrong values, so use a `static` nested class
 or pass the outer object in.
 
+**Next to Ruby:** Ruby code in the same file keeps Ruby's syntax and meanings. `class Dog < Animal ...
+end`, `lo...hi`, `Point.new` and `Mod::Const` are left to the Ruby pass, and Ruby's `private` does not
+count as Java. Ruby methods, blocks and top-level statements keep Quantum's own `"-" * 10`, `s.chars`,
+`xs.reduce { |a, b| a + b }`, `xs.min` and `"#{x}"`, while the Java classes get Java's (`c - '0'`,
+`chars()` as codes, `Optional`). Ruby can create Java objects (`Desk.new`), call their methods and
+rescue their exceptions, and Java can call Ruby methods. Inside a Java class a field wins over a
+same-named variable of the Ruby code (`count = 3` at the top does not change `this.count`). See
+`conformance/mixed/11_library.sa`.
+
 For exact Java behaviour, put the code in a `.java` file: it goes through a strict front-end that
 follows `javac` and the JDK (`qrun Program.java`; see `src/java/README.md`).
 

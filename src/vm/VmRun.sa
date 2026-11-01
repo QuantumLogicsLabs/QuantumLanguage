@@ -196,8 +196,10 @@ void VM::runFrame(size_t stopDepth)
             }
             const std::string &name = consts[instr.operand].asString();
             // A builtin yields to a field the method's class declares: a
-            // Java / C++ class's `int max;` or `List log;`
-            if (builtinNames_.count(name))
+            // Java / C++ class's `int max;` or `List log;`. In Java code any
+            // global does: a variable of the file's Ruby / Python code does
+            // not hide a Java field.
+            if (builtinNames_.count(name) || frame.closure->chunk->javaStyle)
             {
                 QuantumValue field;
                 if (declaredSelfField(frame, name, field))
@@ -327,7 +329,8 @@ void VM::runFrame(size_t stopDepth)
                             stack_[frame.stackBase].isInstance();
             QuantumValue declared;
             bool notGlobal = !globals->has(name) || weakGlobals_.count(name) ||
-                             (builtinNames_.count(name) && declaredSelfField(frame, name, declared));
+                             ((builtinNames_.count(name) || frame.closure->chunk->javaStyle) &&
+                              declaredSelfField(frame, name, declared));
             // A C++ static data member (or `Cls::member = v`): held by the class
             if (notGlobal && (staticDataMembers_ || name.find("::") != std::string::npos) &&
                 storeCppStaticMember(name, frame, peek(0)))

@@ -1,0 +1,59 @@
+class Delegator < BasicObject
+  def initialize(obj)
+    __setobj__(obj)
+  end
+
+  def method_missing(m, *args, **kw, &blk)
+    target = __getobj__
+    if target.respond_to?(m)
+      target.__send__(m, *args, **kw, &blk)
+    else
+      ::Kernel.raise ::NoMethodError, "undefined method '#{m}' for an instance of #{self.class}"
+    end
+  end
+
+  def respond_to_missing?(m, all = false) = __getobj__.respond_to?(m, all)
+  def respond_to?(m, all = false) = self.class.method_defined?(m) || __getobj__.respond_to?(m, all)
+  def class = (class << self; self; end).superclass
+  def is_a?(k) = self.class <= k || __getobj__.is_a?(k)
+  alias kind_of? is_a?
+  def nil? = false
+  def ==(o) = o.equal?(self) || __getobj__ == o
+  def !=(o) = !(self == o)
+  def to_s = __getobj__.to_s
+  def inspect = __getobj__.inspect
+  def hash = __getobj__.hash
+  def eql?(o) = o.equal?(self) || __getobj__.eql?(o)
+  def object_id = __id__
+  def freeze = self
+  def frozen? = false
+  def send(*a, &b) = __send__(*a, &b)
+  def public_send(*a, &b) = __send__(*a, &b)
+  def instance_of?(k) = self.class == k
+  def itself = self
+  def then = yield(self)
+  def tap
+    yield self
+    self
+  end
+end
+
+class SimpleDelegator < Delegator
+  def __getobj__ = @delegate_sd_obj
+
+  def __setobj__(obj)
+    @delegate_sd_obj = obj
+  end
+end
+
+def DelegateClass(superclass)
+  klass = Class.new(Delegator)
+  klass.class_eval do
+    def __getobj__ = @delegate_dc_obj
+
+    def __setobj__(obj)
+      @delegate_dc_obj = obj
+    end
+  end
+  klass
+end

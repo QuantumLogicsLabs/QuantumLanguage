@@ -1,0 +1,3210 @@
+// quantum: cpp
+// Ruby front-end: the parser. Recursive descent over the lexer's tokens,
+// with Ruby's operator precedence; local variables are resolved to slots
+// as they are declared (by assignment or as parameters).
+#include "RubyLex.h.sa"
+#include "RubyMain.h.sa"
+
+#include <set>
+
+namespace ruby
+{
+
+namespace
+{
+
+bool isOpTok(const Token &t, const char *s) { return t.t == TT::Op && t.s == s; }
+bool isKwTok(const Token &t, const char *s) { return t.t == TT::Kw && t.s == s; }
+
+class Parser
+{
+  public:
+    Parser(const std::string &src, const std::string &file) : file_(file)
+    {
+        lex_ = new Lexer(src, 1);
+        hookLexer();
+        tok_ = lex_->next();
+    }
+
+    ProgramNode *parseEval(Scope *outer, Scope *scope)
+    {
+        auto *prog = new ProgramNode();
+        scope_ = outer;
+        if (scope)
+            scope_ = scope;
+        else
+            pushScope(true);
+        prog->scope = scope_;
+        hookLexer();
+        prog->body = parseStmts();
+        if (tok_.t != TT::End)
+            unexpected();
+        return prog;
+    }
+
+    ProgramNode *parseProgram()
+    {
+        auto *prog = new ProgramNode();
+        scope_ = new Scope();
+        prog->scope = scope_;
+        prog->body = parseStmts();
+        if (tok_.t != TT::End)
+            unexpected();
+        prog->requires = requires_;
+        return prog;
+    }
+
+  private:
+    std::string file_;
+    Lexer *lex_ = nullptr;
+    Token tok_;
+    std::vector<Token> ahead_;
+    Scope *scope_ = nullptr;
+    int noDo_ = 0;
+    int noIn_ = 0;
+    int noPipe_ = 0; // in a block parameter's default: | closes the list
+    std::vector<char> ctx_;              // 'L' loop, 'B' block, 'D' def
+    std::vector<BlockNode *> blocks_;    // blocks being parsed (numbered parameters)
+    std::vector<bool> explicitParams_;
+    std::vector<std::string> requires_;
+
+    // ── tokens ──────────────────────────────────────────────────────────
+    void hookLexer()
+    {
+        lex_->isLocal = [this](const std::string &n) { return isLocalName(intern(n)); };
+    }
+
+    const Token &peek(size_t k = 1)
+    {
+        while (ahead_.size() < k)
+            ahead_.push_back(lex_->next());
+        return ahead_[k - 1];
+    }
+
+    Token take()
+    {
+        Token t = tok_;
+        if (ahead_.empty())
+            tok_ = lex_->next();
+        else
+        {
+            tok_ = ahead_.front();
+            ahead_.erase(ahead_.begin());
+        }
+        return t;
+    }
+
+    bool op(const char *s) const { return isOpTok(tok_, s); }
+    bool kw(const char *s) const { return isKwTok(tok_, s); }
+    bool nl() const { return tok_.t == TT::NL; }
+
+    void skipNL()
+    {
+        while (tok_.t == TT::NL)
+            take();
+    }
+
+    [[noreturn]] void fail(const std::string &msg) { throw SyntaxError{tok_.line, msg}; }
+
+    std::string describe(const Token &t)
+    {
+        switch (t.t)
+        {
+        case TT::End: return "end-of-input";
+        case TT::NL: return "end of line";
+        case TT::Kw: return "'" + t.s + "'";
+        case TT::Op:
+        {
+            std::string s = t.s;
+            if (s == "LPAREN_CALL" || s == "LPAREN_ARG")
+                s = "(";
+            else if (s == "LBRACK_INDEX")
+                s = "[";
+            else if (s == "UMINUS")
+                s = "-";
+            else if (s == "UPLUS")
+                s = "+";
+            else if (s == "SPLAT")
+                s = "*";
+            else if (s == "DSPLAT")
+                s = "**";
+            else if (s == "BLOCKPASS")
+                s = "&";
+            else if (s == "COLON3")
+                s = "::";
+            return "'" + s + "'";
+        }
+        case TT::Ident: return "local variable or method '" + t.s + "'";
+        case TT::Const: return "constant '" + t.s + "'";
+        case TT::Int:
+        case TT::Float: return "integer literal";
+        case TT::Str: return "string literal";
+        default: return "'" + t.s + "'";
+        }
+    }
+
+    [[noreturn]] void unexpected() { fail("syntax error, unexpected " + describe(tok_)); }
+
+    void expectOp(const char *s)
+    {
+        if (!op(s))
+            fail(std::string("syntax error, expected '") + s + "' but found " + describe(tok_));
+        take();
+    }
+
+    void expectKw(const char *s)
+    {
+        if (!kw(s))
+            fail(std::string("syntax error, expected '") + s + "' but found " + describe(tok_));
+        take();
+    }
+
+    bool lparen() const { return op("(") || op("LPAREN_CALL") || op("LPAREN_ARG"); }
+
+    // ── scopes ──────────────────────────────────────────────────────────
+    bool isLocalName(Sym s) const
+    {
+        for (Scope *sc = scope_; sc; sc = sc->parent)
+        {
+            if (sc->find(s) >= 0)
+                return true;
+            if (!sc->isBlock)
+                break;
+        }
+        return false;
+    }
+
+    bool lookup(Sym s, int &depth, int &slot) const
+    {
+        depth = 0;
+        for (Scope *sc = scope_; sc; sc = sc->parent)
+        {
+            int i = sc->find(s);
+            if (i >= 0)
+            {
+                slot = i;
+                return true;
+            }
+            if (!sc->isBlock)
+                break;
+            ++depth;
+        }
+        return false;
+    }
+
+    VarNode *declare(Sym s, int line, N kind = N::LAsgn)
+    {
+        auto *v = new VarNode(kind, line);
+        v->name = s;
+        if (!lookup(s, v->depth, v->slot))
+        {
+            scope_->names.push_back(s);
+            v->depth = 0;
+            v->slot = (int)scope_->names.size() - 1;
+        }
+        return v;
+    }
+
+    // a parameter: always a new slot in the current scope
+    int declareParam(Sym s)
+    {
+        scope_->names.push_back(s);
+        return (int)scope_->names.size() - 1;
+    }
+
+    Scope *pushScope(bool block)
+    {
+        auto *sc = new Scope();
+        sc->isBlock = block;
+        sc->parent = scope_;
+        if (block && scope_)
+            scope_->captured = true; // the block's environment links to ours
+        scope_ = sc;
+        return sc;
+    }
+
+    void popScope() { scope_ = scope_->parent; }
+
+    // ── statements ──────────────────────────────────────────────────────
+    bool atStmtsEnd() const
+    {
+        if (tok_.t == TT::End)
+            return true;
+        if (tok_.t == TT::Op && (tok_.s == "}" || tok_.s == ")" || tok_.s == "]"))
+            return true;
+        if (tok_.t == TT::Kw)
+        {
+            const std::string &k = tok_.s;
+            return k == "end" || k == "else" || k == "elsif" || k == "when" || k == "in" || k == "rescue" ||
+                   k == "ensure" || k == "then";
+        }
+        return false;
+    }
+
+    Node *parseStmts()
+    {
+        auto *seq = new ListNode(N::Seq, tok_.line);
+        for (;;)
+        {
+            skipNL();
+            if (atStmtsEnd())
+                break;
+            seq->items.push_back(parseStmt());
+            if (!nl() && !atStmtsEnd())
+                unexpected();
+        }
+        if (seq->items.size() == 1)
+            return seq->items[0];
+        return seq;
+    }
+
+    Node *parseStmt()
+    {
+        Node *e = parseExprStmt();
+        for (;;)
+        {
+            int line = tok_.line;
+            if (kw("if") || kw("unless"))
+            {
+                bool unless = kw("unless");
+                take();
+                Node *cond = parseExprStmt();
+                auto *n = new IfNode(line);
+                n->cond = cond;
+                if (unless)
+                    n->els = e;
+                else
+                    n->then = e;
+                e = n;
+            }
+            else if (kw("while") || kw("until"))
+            {
+                bool until = kw("until");
+                take();
+                auto *n = new WhileNode(line);
+                n->until = until;
+                n->cond = parseExprStmt();
+                n->body = e;
+                n->doWhile = e->kind == N::Begin && static_cast<BeginNode *>(e)->keyword;
+                e = n;
+            }
+            else if (kw("rescue"))
+            {
+                take();
+                Node *fallback = parseExprStmt();
+                e = rescueModifier(e, fallback, line);
+            }
+            else
+                break;
+        }
+        return e;
+    }
+
+    Node *rescueModifier(Node *e, Node *fallback, int line)
+    {
+        auto wrap = [&](Node *body)
+        {
+            auto *b = new BeginNode(line);
+            b->body = body;
+            RescueClause rc;
+            rc.body = fallback;
+            rc.line = line;
+            b->rescues.push_back(rc);
+            return b;
+        };
+        // `x = a rescue b` rescues the value
+        if (e->kind == N::LAsgn || e->kind == N::IAsgn || e->kind == N::GAsgn || e->kind == N::CAsgn)
+        {
+            auto *v = static_cast<VarNode *>(e);
+            v->value = wrap(v->value);
+            return e;
+        }
+        if (e->kind == N::OpAsgn)
+        {
+            auto *o = static_cast<OpAsgnNode *>(e);
+            o->value = wrap(o->value);
+            return e;
+        }
+        return wrap(e);
+    }
+
+    // expression statement: `and` / `or` / `not`, multiple assignment, `=>` / `in`
+    Node *parseExprStmt()
+    {
+        Node *left = parseNotExpr();
+        while (kw("and") || kw("or"))
+        {
+            bool isAnd = kw("and");
+            int line = tok_.line;
+            take();
+            skipNL();
+            auto *b = new BinNode(isAnd ? N::And : N::Or, line);
+            b->left = left;
+            b->right = parseNotExpr();
+            left = b;
+        }
+        return left;
+    }
+
+    Node *parseNotExpr()
+    {
+        if (kw("not"))
+        {
+            int line = tok_.line;
+            take();
+            auto *n = new UnaryNode(N::Not, line);
+            n->expr = parseNotExpr();
+            return n;
+        }
+        return parseExpr();
+    }
+
+    Node *parseExpr()
+    {
+        int line = tok_.line;
+        if (op("SPLAT") || (op("(") && startsNestedMlhs()))
+            return parseMasgn(nullptr, line);
+        Node *e = parseArg(true);
+        if (op(",") && assignable(e))
+            return parseMasgn(e, line);
+        if (op("=>") && !noIn_)
+        {
+            take();
+            auto *m = new MatchNode(N::MatchP, line);
+            m->value = e;
+            m->pattern = parsePatternTop();
+            return m;
+        }
+        if (kw("in") && !noIn_)
+        {
+            take();
+            auto *m = new MatchNode(N::MatchPBool, line);
+            m->value = e;
+            m->pattern = parsePatternTop();
+            return m;
+        }
+        return e;
+    }
+
+    bool startsNestedMlhs()
+    {
+        // `(a, b), c = ...`: a parenthesized target list
+        size_t k = 1;
+        int depth = 0;
+        for (;; ++k)
+        {
+            const Token &t = peek(k);
+            if (t.t == TT::End || t.t == TT::NL)
+                return false;
+            if (t.t == TT::Op && (t.s == "(" || t.s == "LPAREN_CALL" || t.s == "LPAREN_ARG" || t.s == "[" || t.s == "LBRACK_INDEX"))
+                ++depth;
+            else if (t.t == TT::Op && (t.s == ")" || t.s == "]"))
+            {
+                if (depth == 0)
+                {
+                    const Token &n = peek(k + 1);
+                    return n.t == TT::Op && (n.s == "," || n.s == "=");
+                }
+                --depth;
+            }
+            else if (t.t == TT::Op && t.s == "," && depth == 0)
+                continue;
+        }
+    }
+
+    bool assignable(Node *e) const
+    {
+        switch (e->kind)
+        {
+        case N::LVar:
+        case N::IVar:
+        case N::GVar:
+        case N::CVar:
+        case N::Const:
+        case N::Mlhs:
+            return true;
+        case N::Call:
+        {
+            auto *c = static_cast<CallNode *>(e);
+            if (c->block)
+                return false;
+            if (c->vcall)
+                return true;
+            if (c->name == intern("[]"))
+                return true;
+            return c->recv && c->args.empty() && !c->hasParens;
+        }
+        default:
+            return false;
+        }
+    }
+
+    // turn an expression into an assignment target (value set later)
+    Node *toTarget(Node *e)
+    {
+        switch (e->kind)
+        {
+        case N::LVar:
+        {
+            auto *v = static_cast<VarNode *>(e);
+            v->kind = N::LAsgn;
+            return v;
+        }
+        case N::IVar:
+            e->kind = N::IAsgn;
+            return e;
+        case N::GVar:
+            e->kind = N::GAsgn;
+            return e;
+        case N::CVar:
+            e->kind = N::CAsgn;
+            return e;
+        case N::Const:
+            e->kind = N::ConstAsgn;
+            return e;
+        case N::Mlhs:
+            return e;
+        case N::Call:
+        {
+            auto *c = static_cast<CallNode *>(e);
+            if (c->vcall)
+                return declare(c->name, c->line);
+            if (c->name == intern("[]"))
+            {
+                c->name = intern("[]=");
+                c->attrAssign = true;
+                return c;
+            }
+            c->name = intern(symName(c->name) + "=");
+            c->attrAssign = true;
+            return c;
+        }
+        default:
+            fail("syntax error, can't assign to this expression");
+        }
+    }
+
+    Node *parseMlhsItem()
+    {
+        int line = tok_.line;
+        if (op("(") || op("LPAREN_ARG") || op("LPAREN_CALL"))
+        {
+            take();
+            auto *m = parseMlhsList(")");
+            expectOp(")");
+            return m;
+        }
+        Node *e = parsePrimaryPostfix();
+        if (!assignable(e))
+            fail("syntax error, unexpected assignment target");
+        (void)line;
+        return toTarget(e);
+    }
+
+    MlhsNode *parseMlhsList(const char *close)
+    {
+        auto *m = new MlhsNode(tok_.line);
+        for (;;)
+        {
+            if (op("SPLAT") || op("*"))
+            {
+                int line = tok_.line;
+                take();
+                auto *s = new UnaryNode(N::Splat, line);
+                if (!op(",") && !op("=") && !op(close) && !kw("in") && !op("|"))
+                    s->expr = parseMlhsItem();
+                m->splat = s;
+                m->hasSplat = true;
+            }
+            else
+            {
+                Node *item = parseMlhsItem();
+                (m->hasSplat ? m->post : m->pre).push_back(item);
+            }
+            if (!op(","))
+                break;
+            take();
+            if (op("=") || op(close) || kw("in") || op("|"))
+                break; // trailing comma: a, = list
+        }
+        return m;
+    }
+
+    Node *parseMasgn(Node *first, int line)
+    {
+        auto *m = new MlhsNode(line);
+        if (first)
+        {
+            m->pre.push_back(toTarget(first));
+            if (op(","))
+            {
+                take();
+                if (!op("="))
+                {
+                    MlhsNode *rest = parseMlhsList("=");
+                    for (auto *n : rest->pre)
+                        m->pre.push_back(n);
+                    m->splat = rest->splat;
+                    m->hasSplat = rest->hasSplat;
+                    m->post = rest->post;
+                }
+            }
+        }
+        else
+        {
+            MlhsNode *rest = parseMlhsList("=");
+            m = rest;
+        }
+        expectOp("=");
+        skipNL();
+        auto *a = new MAsgnNode(line);
+        a->lhs = m;
+        a->value = parseMrhs();
+        return a;
+    }
+
+    // right side of a multiple assignment: one value or a list
+    Node *parseMrhs()
+    {
+        int line = tok_.line;
+        Node *first = parseArgItem();
+        if (!op(",") && first->kind != N::Splat)
+            return first;
+        auto *arr = new ListNode(N::Array, line);
+        arr->items.push_back(first);
+        while (op(","))
+        {
+            take();
+            skipNL();
+            arr->items.push_back(parseArgItem());
+        }
+        return arr;
+    }
+
+    Node *parseArgItem()
+    {
+        int line = tok_.line;
+        if (op("SPLAT") || op("*"))
+        {
+            take();
+            auto *s = new UnaryNode(N::Splat, line);
+            s->expr = parseArg(false);
+            return s;
+        }
+        return parseArg(true);
+    }
+
+    // ── expressions (Ruby "arg") ──────────────────────────────────────
+    Node *parseArg(bool allowCommand)
+    {
+        int line = tok_.line;
+        return assignTail(parseTernary(allowCommand), allowCommand, line);
+    }
+
+    // `left = value` / `left op= value` when an assignment follows; an
+    // assignment also ends a binary expression: `a && b = c` is `a && (b = c)`
+    Node *assignTail(Node *left, bool allowCommand, int line)
+    {
+        if (op("=") && assignable(left))
+        {
+            take();
+            skipNL();
+            Node *target = toTarget(left);
+            Node *value;
+            if (op("SPLAT"))
+                value = parseMrhs();
+            else
+            {
+                value = parseArg(true);
+                if (op(",") && allowCommand && target->kind != N::Call)
+                {
+                    // x = 1, 2
+                    auto *arr = new ListNode(N::Array, line);
+                    arr->items.push_back(value);
+                    while (op(","))
+                    {
+                        take();
+                        skipNL();
+                        arr->items.push_back(parseArgItem());
+                    }
+                    value = arr;
+                }
+            }
+            return assign(target, value, line);
+        }
+        if (tok_.t == TT::Op && assignable(left))
+        {
+            static const std::set<std::string> ops = {"+=", "-=", "*=", "/=", "%=", "**=", "||=", "&&=", "<<=", ">>=", "|=", "&=", "^="};
+            if (ops.count(tok_.s))
+            {
+                std::string o = take().s;
+                skipNL();
+                auto *n = new OpAsgnNode(line);
+                Node *target = left;
+                if (left->kind == N::Call && static_cast<CallNode *>(left)->vcall)
+                {
+                    // x += 1 with x not yet a local: Ruby makes it one (value nil)
+                    target = declare(static_cast<CallNode *>(left)->name, line, N::LVar);
+                    target->kind = N::LVar;
+                }
+                n->target = target;
+                if (o == "||=")
+                    n->op = 0;
+                else if (o == "&&=")
+                    n->op = -1;
+                else
+                    n->op = intern(o.substr(0, o.size() - 1));
+                n->value = parseArg(true);
+                return n;
+            }
+        }
+        return left;
+    }
+
+    Node *assign(Node *target, Node *value, int line)
+    {
+        switch (target->kind)
+        {
+        case N::LAsgn:
+        case N::IAsgn:
+        case N::GAsgn:
+        case N::CAsgn:
+            static_cast<VarNode *>(target)->value = value;
+            return target;
+        case N::ConstAsgn:
+            static_cast<ConstNode *>(target)->value = value;
+            return target;
+        case N::Call:
+            static_cast<CallNode *>(target)->args.push_back(value);
+            return target;
+        case N::Mlhs:
+        {
+            auto *a = new MAsgnNode(line);
+            a->lhs = static_cast<MlhsNode *>(target);
+            a->value = value;
+            return a;
+        }
+        default:
+            fail("syntax error, can't assign");
+        }
+    }
+
+    Node *parseTernary(bool allowCommand)
+    {
+        int line = tok_.line;
+        Node *cond = parseRange(allowCommand);
+        if (op("?"))
+        {
+            take();
+            skipNL();
+            auto *n = new IfNode(line);
+            n->cond = cond;
+            n->then = parseTernaryBranch();
+            skipNL();
+            if (tok_.t == TT::Label)
+            {
+                // `a ? b :c` lexed as a label: not supported
+                fail("syntax error, unexpected label in ternary");
+            }
+            expectOp(":");
+            skipNL();
+            n->els = parseTernaryBranch();
+            return n;
+        }
+        return cond;
+    }
+
+    Node *parseTernaryBranch()
+    {
+        // `cond ? x : y` where x is an identifier lexed as a label `x:`
+        return parseArg(false);
+    }
+
+    bool startsOperand(const Token &t) const
+    {
+        switch (t.t)
+        {
+        case TT::End:
+        case TT::NL:
+            return false;
+        case TT::Kw:
+            return t.s == "nil" || t.s == "true" || t.s == "false" || t.s == "self" || t.s == "not" ||
+                   t.s == "defined?" || t.s == "__FILE__" || t.s == "__LINE__";
+        case TT::Op:
+            return t.s == "(" || t.s == "LPAREN_ARG" || t.s == "[" || t.s == "UMINUS" || t.s == "UPLUS" ||
+                   t.s == "!" || t.s == "->" || t.s == "COLON3" || t.s == "{" || t.s == "~";
+        case TT::Label:
+            return false;
+        default:
+            return true;
+        }
+    }
+
+    Node *parseRange(bool allowCommand)
+    {
+        int line = tok_.line;
+        Node *left = parseOrOr(allowCommand);
+        if (op("..") || op("..."))
+        {
+            bool excl = op("...");
+            take();
+            auto *r = new RangeNode(line);
+            r->lo = left;
+            r->exclusive = excl;
+            if (startsOperand(tok_) && !kw("then"))
+                r->hi = parseOrOr(false);
+            return r;
+        }
+        return left;
+    }
+
+    CallNode *binCall(Node *l, const std::string &name, Node *r, int line)
+    {
+        auto *c = new CallNode(line);
+        c->recv = l;
+        c->name = intern(name);
+        c->args.push_back(r);
+        return c;
+    }
+
+    Node *parseOrOr(bool allowCommand)
+    {
+        Node *left = parseAndAnd(allowCommand);
+        while (op("||"))
+        {
+            int line = tok_.line;
+            take();
+            skipNL();
+            auto *b = new BinNode(N::Or, line);
+            b->left = left;
+            b->right = assignTail(parseAndAnd(false), false, line);
+            left = b;
+        }
+        return left;
+    }
+
+    Node *parseAndAnd(bool allowCommand)
+    {
+        Node *left = parseNotOp(allowCommand);
+        while (op("&&"))
+        {
+            int line = tok_.line;
+            take();
+            skipNL();
+            auto *b = new BinNode(N::And, line);
+            b->left = left;
+            b->right = assignTail(parseNotOp(false), false, line);
+            left = b;
+        }
+        return left;
+    }
+
+    Node *parseNotOp(bool allowCommand)
+    {
+        if (kw("defined?"))
+        {
+            int line = tok_.line;
+            take();
+            auto *n = new UnaryNode(N::Defined, line);
+            if (op("LPAREN_CALL") || op("(") || op("LPAREN_ARG"))
+            {
+                take();
+                skipNL();
+                n->expr = parseExprStmt();
+                skipNL();
+                expectOp(")");
+            }
+            else
+                n->expr = parseArg(false);
+            return n;
+        }
+        return parseEquality(allowCommand);
+    }
+
+    Node *parseEquality(bool allowCommand)
+    {
+        Node *left = parseComparison(allowCommand);
+        static const std::set<std::string> ops = {"<=>", "==", "===", "!=", "=~", "!~"};
+        while (tok_.t == TT::Op && ops.count(tok_.s))
+        {
+            int line = tok_.line;
+            std::string o = take().s;
+            skipNL();
+            left = binCall(left, o, parseComparison(false), line);
+        }
+        return left;
+    }
+
+    Node *parseComparison(bool allowCommand)
+    {
+        Node *left = parseBitOr(allowCommand);
+        while (op("<") || op("<=") || op(">") || op(">="))
+        {
+            int line = tok_.line;
+            std::string o = take().s;
+            skipNL();
+            left = binCall(left, o, parseBitOr(false), line);
+        }
+        return left;
+    }
+
+    Node *parseBitOr(bool allowCommand)
+    {
+        Node *left = parseBitAnd(allowCommand);
+        while ((op("|") && !noPipe_) || op("^"))
+        {
+            int line = tok_.line;
+            std::string o = take().s;
+            skipNL();
+            left = binCall(left, o, parseBitAnd(false), line);
+        }
+        return left;
+    }
+
+    Node *parseBitAnd(bool allowCommand)
+    {
+        Node *left = parseShift(allowCommand);
+        while (op("&"))
+        {
+            int line = tok_.line;
+            take();
+            skipNL();
+            left = binCall(left, "&", parseShift(false), line);
+        }
+        return left;
+    }
+
+    Node *parseShift(bool allowCommand)
+    {
+        Node *left = parseAdditive(allowCommand);
+        while (op("<<") || op(">>"))
+        {
+            int line = tok_.line;
+            std::string o = take().s;
+            skipNL();
+            left = binCall(left, o, parseAdditive(false), line);
+        }
+        return left;
+    }
+
+    Node *parseAdditive(bool allowCommand)
+    {
+        Node *left = parseMultiplicative(allowCommand);
+        while (op("+") || op("-"))
+        {
+            int line = tok_.line;
+            std::string o = take().s;
+            skipNL();
+            left = binCall(left, o, parseMultiplicative(false), line);
+        }
+        return left;
+    }
+
+    Node *parseMultiplicative(bool allowCommand)
+    {
+        Node *left = parseUnaryMinus(allowCommand);
+        while (op("*") || op("/") || op("%"))
+        {
+            int line = tok_.line;
+            std::string o = take().s;
+            skipNL();
+            left = binCall(left, o, parseUnaryMinus(false), line);
+        }
+        return left;
+    }
+
+    static bool numericTok(const Token &t)
+    {
+        return t.t == TT::Int || t.t == TT::Float || t.t == TT::BigInt || t.t == TT::Rational || t.t == TT::Imag;
+    }
+
+    Node *parseUnaryMinus(bool allowCommand)
+    {
+        if (op("UMINUS"))
+        {
+            int line = tok_.line;
+            take();
+            if (numericTok(tok_) && !tok_.space)
+            {
+                // -2 is a literal: -2.abs == 2, but -2 ** 2 == -(2 ** 2)
+                Node *lit = parseNumber(true);
+                if (op("**"))
+                {
+                    take();
+                    Node *pos = negateLiteral(lit);
+                    Node *rhs = parseUnaryMinus(false);
+                    auto *c = new CallNode(line);
+                    c->recv = binCall(pos, "**", rhs, line);
+                    c->name = intern("-@");
+                    return c;
+                }
+                return parsePostfix(lit, false);
+            }
+            Node *operand = parseUnaryMinus(false);
+            auto *c = new CallNode(line);
+            c->recv = operand;
+            c->name = intern("-@");
+            return c;
+        }
+        return parsePow(allowCommand);
+    }
+
+    Node *negateLiteral(Node *lit)
+    {
+        auto *l = static_cast<LitNode *>(lit);
+        auto *n = new LitNode(l->kind, l->line);
+        n->i = -l->i;
+        n->f = -l->f;
+        n->s = l->s.empty() ? l->s : (l->s[0] == '-' ? l->s.substr(1) : "-" + l->s);
+        return n;
+    }
+
+    Node *parsePow(bool allowCommand)
+    {
+        Node *base = parseUnary(allowCommand);
+        if (op("**"))
+        {
+            int line = tok_.line;
+            take();
+            skipNL();
+            return binCall(base, "**", parseUnaryMinus(false), line);
+        }
+        return base;
+    }
+
+    Node *parseUnary(bool allowCommand)
+    {
+        int line = tok_.line;
+        if (op("!"))
+        {
+            take();
+            auto *n = new UnaryNode(N::Not, line);
+            n->expr = parseUnary(false);
+            return n;
+        }
+        if (op("~") || op("UPLUS"))
+        {
+            std::string o = take().s == "~" ? "~" : "+@";
+            auto *c = new CallNode(line);
+            c->recv = parseUnary(false);
+            c->name = intern(o);
+            return c;
+        }
+        return parsePostfix(parsePrimary(allowCommand), allowCommand);
+    }
+
+    Node *parsePrimaryPostfix() { return parsePostfix(parsePrimary(false), false); }
+
+    // ── primary expressions ────────────────────────────────────────────
+    Node *parseNumber(bool negative)
+    {
+        Token t = take();
+        auto *n = new LitNode(N::Int, t.line);
+        switch (t.t)
+        {
+        case TT::Int:
+            n->i = negative ? -t.ival : t.ival;
+            break;
+        case TT::BigInt:
+            n->kind = N::BigInt;
+            n->s = (negative ? "-" : "") + t.s;
+            break;
+        case TT::Float:
+            n->kind = N::Float;
+            n->f = negative ? -t.fval : t.fval;
+            break;
+        case TT::Rational:
+            n->kind = N::Rational;
+            n->s = (negative ? "-" : "") + t.s;
+            break;
+        case TT::Imag:
+            n->kind = N::Imaginary;
+            n->s = (negative ? "-" : "") + t.s;
+            break;
+        default:
+            fail("syntax error, expected a number");
+        }
+        return n;
+    }
+
+    Node *strNode(const std::vector<StrPart> &parts, int line, N plain, N interp)
+    {
+        bool simple = parts.size() == 1 && !parts[0].code;
+        if (simple)
+        {
+            auto *n = new LitNode(plain, line);
+            n->s = parts[0].text;
+            return n;
+        }
+        auto *d = new DStrNode(interp, line);
+        for (auto &p : parts)
+        {
+            if (p.code)
+                d->parts.push_back(parseCode(p.text, p.line));
+            else
+            {
+                auto *s = new LitNode(N::Str, p.line);
+                s->s = p.text;
+                d->parts.push_back(s);
+            }
+        }
+        return d;
+    }
+
+    Node *parseCode(const std::string &code, int line)
+    {
+        Lexer *savedLex = lex_;
+        Token savedTok = tok_;
+        std::vector<Token> savedAhead = ahead_;
+        int savedNoDo = noDo_, savedNoIn = noIn_;
+        lex_ = new Lexer(code, line);
+        hookLexer();
+        ahead_.clear();
+        noDo_ = 0;
+        noIn_ = 0;
+        tok_ = lex_->next();
+        Node *body = parseStmts();
+        if (tok_.t != TT::End)
+            unexpected();
+        lex_ = savedLex;
+        tok_ = savedTok;
+        ahead_ = savedAhead;
+        noDo_ = savedNoDo;
+        noIn_ = savedNoIn;
+        auto *seq = new ListNode(N::Seq, line);
+        seq->items.push_back(body);
+        return seq;
+    }
+
+    Node *parseString()
+    {
+        Token t = take();
+        std::vector<StrPart> parts = t.parts;
+        // adjacent literals join: "a" "b", or "a" \ newline "b"
+        while (tok_.t == TT::Str)
+        {
+            Token more = take();
+            for (auto &p : more.parts)
+                parts.push_back(p);
+        }
+        // merge neighbouring text parts
+        std::vector<StrPart> merged;
+        for (auto &p : parts)
+        {
+            if (!p.code && !merged.empty() && !merged.back().code)
+                merged.back().text += p.text;
+            else
+                merged.push_back(p);
+        }
+        return strNode(merged, t.line, N::Str, N::DStr);
+    }
+
+    Node *parsePrimary(bool allowCommand)
+    {
+        int line = tok_.line;
+        switch (tok_.t)
+        {
+        case TT::Int:
+        case TT::BigInt:
+        case TT::Float:
+        case TT::Rational:
+        case TT::Imag:
+            return parseNumber(false);
+        case TT::Str:
+            return parseString();
+        case TT::XStr:
+        {
+            Token t = take();
+            auto *d = new DStrNode(N::XStr, line);
+            for (auto &p : t.parts)
+            {
+                if (p.code)
+                    d->parts.push_back(parseCode(p.text, p.line));
+                else
+                {
+                    auto *s = new LitNode(N::Str, p.line);
+                    s->s = p.text;
+                    d->parts.push_back(s);
+                }
+            }
+            return d;
+        }
+        case TT::Sym:
+        {
+            Token t = take();
+            auto *n = new LitNode(N::Sym, line);
+            n->s = t.s;
+            return n;
+        }
+        case TT::DSym:
+        {
+            Token t = take();
+            return strNode(t.parts, line, N::Sym, N::DSym);
+        }
+        case TT::Regex:
+        {
+            Token t = take();
+            auto *d = new DStrNode(N::Regex, line);
+            for (auto &p : t.parts)
+            {
+                if (p.code)
+                    d->parts.push_back(parseCode(p.text, p.line));
+                else
+                {
+                    auto *s = new LitNode(N::Str, p.line);
+                    s->s = p.text;
+                    d->parts.push_back(s);
+                }
+            }
+            d->flags = t.flags;
+            d->once = t.flags.find('o') != std::string::npos;
+            return d;
+        }
+        case TT::Words:
+        {
+            Token t = take();
+            auto *arr = new ListNode(N::Array, line);
+            for (auto &w : t.words)
+                arr->items.push_back(t.sym ? strNode(w, line, N::Sym, N::DSym) : strNode(w, line, N::Str, N::DStr));
+            return arr;
+        }
+        case TT::Ident:
+            return parseIdentifier(allowCommand);
+        case TT::Const:
+            return parseConstant(allowCommand);
+        case TT::IVar:
+        {
+            Token t = take();
+            auto *v = new VarNode(N::IVar, line);
+            v->name = intern(t.s);
+            return v;
+        }
+        case TT::CVar:
+        {
+            Token t = take();
+            auto *v = new VarNode(N::CVar, line);
+            v->name = intern(t.s);
+            return v;
+        }
+        case TT::GVar:
+        {
+            Token t = take();
+            auto *v = new VarNode(N::GVar, line);
+            v->name = intern(t.s);
+            return v;
+        }
+        case TT::NthRef:
+        {
+            Token t = take();
+            auto *n = new LitNode(N::NthRef, line);
+            n->i = t.ival;
+            return n;
+        }
+        case TT::BackRef:
+        {
+            Token t = take();
+            auto *n = new LitNode(N::BackRef, line);
+            n->s = t.s;
+            return n;
+        }
+        case TT::Label:
+            fail("syntax error, unexpected label");
+        case TT::Kw:
+            return parseKeyword(allowCommand);
+        case TT::Op:
+            break;
+        case TT::NL:
+        case TT::End:
+            unexpected();
+        }
+        // operators that start expressions
+        const std::string &o = tok_.s;
+        if (o == "(" || o == "LPAREN_ARG" || o == "LPAREN_CALL")
+        {
+            take();
+            int saved = noDo_;
+            noDo_ = 0;
+            skipNL();
+            Node *body;
+            if (op(")"))
+            {
+                body = new Node(N::Nil, line);
+            }
+            else
+            {
+                body = parseStmts();
+                skipNL();
+            }
+            noDo_ = saved;
+            expectOp(")");
+            if (body->kind == N::Seq || body->kind == N::Nil)
+                return body;
+            auto *seq = new ListNode(N::Seq, line); // keeps (a; b) grouping distinct from a call
+            seq->items.push_back(body);
+            return seq;
+        }
+        if (o == "[")
+            return parseArrayLiteral();
+        if (o == "{")
+            return parseHashLiteral();
+        if (o == "->")
+            return parseLambda();
+        if (o == ".." || o == "...")
+        {
+            bool excl = o == "...";
+            take();
+            auto *r = new RangeNode(line);
+            r->exclusive = excl;
+            r->hi = parseOrOr(false);
+            return r;
+        }
+        if (o == "COLON3")
+        {
+            take();
+            if (tok_.t != TT::Const)
+                unexpected();
+            Token t = take();
+            auto *c = new ConstNode(N::Const, line);
+            c->top = true;
+            c->name = intern(t.s);
+            return c;
+        }
+        if (o == "SPLAT")
+        {
+            take();
+            auto *s = new UnaryNode(N::Splat, line);
+            s->expr = parseArg(false);
+            return s;
+        }
+        if (o == "!")
+        {
+            take();
+            auto *n = new UnaryNode(N::Not, line);
+            n->expr = parseUnary(false);
+            return n;
+        }
+        if (o == "UMINUS" || o == "UPLUS" || o == "~")
+            return parseUnaryMinus(false);
+        unexpected();
+    }
+
+    // can this token start a command argument (`puts x`, `attr_reader :a`)?
+    bool commandArgStart(const Token &t)
+    {
+        if (!t.space)
+        {
+            // `foo"x"` / `foo:sym` are unusual; only these work without a space
+            return false;
+        }
+        switch (t.t)
+        {
+        case TT::Int:
+        case TT::BigInt:
+        case TT::Float:
+        case TT::Rational:
+        case TT::Imag:
+        case TT::Str:
+        case TT::XStr:
+        case TT::Sym:
+        case TT::DSym:
+        case TT::Regex:
+        case TT::Words:
+        case TT::Ident:
+        case TT::Const:
+        case TT::IVar:
+        case TT::GVar:
+        case TT::CVar:
+        case TT::NthRef:
+        case TT::BackRef:
+        case TT::Label:
+            return true;
+        case TT::Kw:
+            return t.s == "nil" || t.s == "true" || t.s == "false" || t.s == "self" || t.s == "not" ||
+                   t.s == "defined?" || t.s == "def" || t.s == "lambda" || t.s == "proc" || t.s == "case" ||
+                   t.s == "super" || t.s == "yield" || t.s == "__FILE__" || t.s == "__LINE__";
+        case TT::Op:
+            return t.s == "UMINUS" || t.s == "UPLUS" || t.s == "SPLAT" || t.s == "DSPLAT" || t.s == "BLOCKPASS" ||
+                   t.s == "[" || t.s == "LPAREN_ARG" || t.s == "->" || t.s == "!" || t.s == "COLON3" || t.s == "~";
+        default:
+            return false;
+        }
+    }
+
+    Node *parseIdentifier(bool allowCommand)
+    {
+        Token t = take();
+        int line = t.line;
+        Sym s = intern(t.s);
+        int depth = 0, slot = 0;
+        if (lookup(s, depth, slot) && !op("LPAREN_CALL"))
+        {
+            auto *v = new VarNode(N::LVar, line);
+            v->name = s;
+            v->depth = depth;
+            v->slot = slot;
+            return v;
+        }
+        // numbered block parameters: _1, _2 ..., it
+        if (!blocks_.empty() && !explicitParams_.back() && !op("LPAREN_CALL") &&
+            ((t.s.size() == 2 && t.s[0] == '_' && t.s[1] >= '1' && t.s[1] <= '9') ||
+             (t.s == "it" && !commandArgStart(tok_))))
+        {
+            BlockNode *b = blocks_.back();
+            b->numbered = true;
+            int k = t.s == "it" ? 0 : t.s[1] - '0';
+            if (k > b->numberedCount)
+                b->numberedCount = k;
+            VarNode *v = declare(s, line, N::LVar);
+            v->kind = N::LVar;
+            return v;
+        }
+        // a binding keeps this scope's variables alive past the call
+        if (t.s == "binding" || t.s == "local_variables")
+            for (Scope *sc = scope_; sc; sc = sc->parent)
+            {
+                sc->captured = true;
+                if (!sc->isBlock)
+                    break;
+            }
+        auto *c = new CallNode(line);
+        c->name = s;
+        if (t.s == "require" || t.s == "require_relative")
+        {
+            if (tok_.t == TT::Str && tok_.parts.size() == 1 && !tok_.parts[0].code)
+                requires_.push_back(tok_.parts[0].text);
+            else if (op("LPAREN_CALL") && peek().t == TT::Str && peek().parts.size() == 1)
+                requires_.push_back(peek().parts[0].text);
+        }
+        if (op("LPAREN_CALL"))
+        {
+            take();
+            c->hasParens = true;
+            parseCallArgs(c->args, ")");
+            expectOp(")");
+        }
+        else if (allowCommand && commandArgStart(tok_))
+            parseCommandArgs(c);
+        else
+            c->vcall = true;
+        return c;
+    }
+
+    Node *parseConstant(bool allowCommand)
+    {
+        Token t = take();
+        int line = t.line;
+        Sym s = intern(t.s);
+        if (op("LPAREN_CALL"))
+        {
+            // Integer("42"), Rational(1, 3): a method named like the constant
+            auto *c = new CallNode(line);
+            c->name = s;
+            take();
+            c->hasParens = true;
+            parseCallArgs(c->args, ")");
+            expectOp(")");
+            return c;
+        }
+        (void)allowCommand;
+        auto *n = new ConstNode(N::Const, line);
+        n->name = s;
+        return n;
+    }
+
+    // ── call arguments ──────────────────────────────────────────────────
+    // arguments inside ( ) or [ ]: positional, *splat, **kw, &block, key: value, k => v
+    void parseCallArgs(std::vector<Node *> &args, const char *close)
+    {
+        int saved = noDo_;
+        noDo_ = 0;
+        HashNode *kw = nullptr;
+        skipNL();
+        while (!op(close))
+        {
+            int line = tok_.line;
+            if (op("..."))
+            {
+                // argument forwarding foo(...)
+                take();
+                auto *f = new UnaryNode(N::Splat, line);
+                f->inBlock = true; // marks forwarding
+                args.push_back(f);
+            }
+            else if (op("SPLAT") || op("*"))
+            {
+                take();
+                auto *s = new UnaryNode(N::Splat, line);
+                if (!op(",") && !op(close))
+                    s->expr = parseArg(false);
+                args.push_back(s);
+            }
+            else if (op("DSPLAT") || op("**"))
+            {
+                take();
+                if (!kw)
+                {
+                    kw = new HashNode(line);
+                    kw->braces = false;
+                    args.push_back(kw);
+                }
+                kw->keys.push_back(nullptr);
+                Node *value = nullptr; // f(**): anonymous keyword rest
+                if (!op(",") && !op(close))
+                    value = parseArg(false);
+                kw->values.push_back(value);
+            }
+            else if (op("BLOCKPASS") || op("&"))
+            {
+                take();
+                auto *b = new UnaryNode(N::BlockPass, line);
+                if (!op(",") && !op(close))
+                    b->expr = parseArg(false);
+                args.push_back(b);
+            }
+            else if (tok_.t == TT::Label)
+            {
+                Token l = take();
+                if (!kw)
+                {
+                    kw = new HashNode(line);
+                    kw->braces = false;
+                    args.push_back(kw);
+                }
+                auto *key = new LitNode(N::Sym, line);
+                key->s = l.s;
+                kw->keys.push_back(key);
+                skipNL();
+                if (op(",") || op(close))
+                    kw->values.push_back(shorthandValue(l.s, line));
+                else
+                    kw->values.push_back(parseArg(true));
+            }
+            else
+            {
+                Node *e = parseArg(true);
+                if (op("=>"))
+                {
+                    take();
+                    skipNL();
+                    if (!kw)
+                    {
+                        kw = new HashNode(line);
+                        kw->braces = false;
+                        args.push_back(kw);
+                    }
+                    kw->keys.push_back(e);
+                    kw->values.push_back(parseArg(true));
+                }
+                else
+                    args.push_back(e);
+            }
+            skipNL();
+            if (!op(","))
+                break;
+            take();
+            skipNL();
+        }
+        skipNL();
+        noDo_ = saved;
+    }
+
+    Node *shorthandValue(const std::string &name, int line)
+    {
+        // {x:} / f(x:): the value is the local variable or method x
+        Sym s = intern(name);
+        int depth = 0, slot = 0;
+        if (lookup(s, depth, slot))
+        {
+            auto *v = new VarNode(N::LVar, line);
+            v->name = s;
+            v->depth = depth;
+            v->slot = slot;
+            return v;
+        }
+        auto *c = new CallNode(line);
+        c->name = s;
+        c->vcall = true;
+        return c;
+    }
+
+    bool commandArgEnd() const
+    {
+        if (tok_.t == TT::NL || tok_.t == TT::End)
+            return true;
+        if (tok_.t == TT::Kw)
+        {
+            const std::string &k = tok_.s;
+            return k == "if" || k == "unless" || k == "while" || k == "until" || k == "rescue" || k == "and" ||
+                   k == "or" || k == "then" || k == "do" || k == "end" || k == "in";
+        }
+        if (tok_.t == TT::Op)
+            return tok_.s == "}" || tok_.s == ")" || tok_.s == "]" || tok_.s == "{" || tok_.s == "=>" ||
+                   tok_.s == ";" || tok_.s == "|";
+        return false;
+    }
+
+    // `puts a, b`: arguments without parentheses, up to the end of the command
+    void parseCommandArgs(CallNode *c)
+    {
+        ++noDo_;
+        HashNode *kw = nullptr;
+        for (;;)
+        {
+            int line = tok_.line;
+            if (op("SPLAT") || op("*"))
+            {
+                take();
+                auto *s = new UnaryNode(N::Splat, line);
+                s->expr = parseArg(false);
+                c->args.push_back(s);
+            }
+            else if (op("DSPLAT"))
+            {
+                take();
+                if (!kw)
+                {
+                    kw = new HashNode(line);
+                    kw->braces = false;
+                    c->args.push_back(kw);
+                }
+                kw->keys.push_back(nullptr);
+                kw->values.push_back(parseArg(false));
+            }
+            else if (op("BLOCKPASS"))
+            {
+                take();
+                auto *b = new UnaryNode(N::BlockPass, line);
+                b->expr = parseArg(false);
+                c->args.push_back(b);
+            }
+            else if (tok_.t == TT::Label)
+            {
+                Token l = take();
+                if (!kw)
+                {
+                    kw = new HashNode(line);
+                    kw->braces = false;
+                    c->args.push_back(kw);
+                }
+                auto *key = new LitNode(N::Sym, line);
+                key->s = l.s;
+                kw->keys.push_back(key);
+                skipNL();
+                if (op(",") || commandArgEnd())
+                    kw->values.push_back(shorthandValue(l.s, line));
+                else
+                    kw->values.push_back(parseArg(true));
+            }
+            else
+            {
+                Node *e = parseArg(true);
+                if (op("=>"))
+                {
+                    take();
+                    skipNL();
+                    if (!kw)
+                    {
+                        kw = new HashNode(line);
+                        kw->braces = false;
+                        c->args.push_back(kw);
+                    }
+                    kw->keys.push_back(e);
+                    kw->values.push_back(parseArg(true));
+                }
+                else
+                    c->args.push_back(e);
+            }
+            if (!op(","))
+                break;
+            take();
+            skipNL();
+        }
+        --noDo_;
+    }
+
+    // ── postfix: .method, [index], ::Const, blocks ────────────────────
+    bool takesBlock(Node *e) const
+    {
+        if (e->kind == N::Call)
+        {
+            auto *c = static_cast<CallNode *>(e);
+            return !c->block && !c->attrAssign;
+        }
+        if (e->kind == N::Super || e->kind == N::ZSuper)
+            return !static_cast<SuperNode *>(e)->block;
+        return false;
+    }
+
+    Node *parsePostfix(Node *e, bool allowCommand)
+    {
+        for (;;)
+        {
+            int line = tok_.line;
+            if (op(".") || op("&."))
+            {
+                bool safe = op("&.");
+                take();
+                skipNL();
+                auto *c = new CallNode(line);
+                c->recv = e;
+                c->safeNav = safe;
+                if (op("LPAREN_CALL") || op("(") || op("LPAREN_ARG"))
+                {
+                    // obj.(args): obj.call(args)
+                    c->name = intern("call");
+                }
+                else if (tok_.t == TT::Ident || tok_.t == TT::Const || tok_.t == TT::Kw || tok_.t == TT::Label)
+                {
+                    Token n = take();
+                    if (n.t == TT::Label)
+                    {
+                        // a.b: (ternary-free) — re-split label `b:`
+                        fail("syntax error, unexpected label after '.'");
+                    }
+                    c->name = intern(n.s);
+                }
+                else if (tok_.t == TT::Op)
+                {
+                    Token n = take();
+                    c->name = intern(n.s == "UMINUS" ? "-" : n.s == "UPLUS" ? "+" : n.s);
+                }
+                else
+                    unexpected();
+                if (op("LPAREN_CALL") || op("(") && !tok_.space)
+                {
+                    take();
+                    c->hasParens = true;
+                    parseCallArgs(c->args, ")");
+                    expectOp(")");
+                }
+                else if (allowCommand && commandArgStart(tok_))
+                    parseCommandArgs(c);
+                e = c;
+                continue;
+            }
+            if (op("::"))
+            {
+                take();
+                if (tok_.t == TT::Const)
+                {
+                    Token n = take();
+                    if (op("LPAREN_CALL"))
+                    {
+                        auto *c = new CallNode(line);
+                        c->recv = e;
+                        c->name = intern(n.s);
+                        take();
+                        c->hasParens = true;
+                        parseCallArgs(c->args, ")");
+                        expectOp(")");
+                        e = c;
+                        continue;
+                    }
+                    auto *k = new ConstNode(N::Const, line);
+                    k->scope = e;
+                    k->name = intern(n.s);
+                    e = k;
+                    continue;
+                }
+                if (tok_.t == TT::Ident)
+                {
+                    Token n = take();
+                    auto *c = new CallNode(line);
+                    c->recv = e;
+                    c->name = intern(n.s);
+                    if (op("LPAREN_CALL"))
+                    {
+                        take();
+                        c->hasParens = true;
+                        parseCallArgs(c->args, ")");
+                        expectOp(")");
+                    }
+                    e = c;
+                    continue;
+                }
+                unexpected();
+            }
+            if (op("LBRACK_INDEX"))
+            {
+                take();
+                auto *c = new CallNode(line);
+                c->recv = e;
+                c->name = intern("[]");
+                parseCallArgs(c->args, "]");
+                expectOp("]");
+                e = c;
+                continue;
+            }
+            if (op("{") && takesBlock(e))
+            {
+                setBlock(e, parseBraceBlock());
+                continue;
+            }
+            if (kw("do") && noDo_ == 0 && takesBlock(e))
+            {
+                setBlock(e, parseDoBlock());
+                continue;
+            }
+            break;
+        }
+        return e;
+    }
+
+    void setBlock(Node *e, BlockNode *b)
+    {
+        if (e->kind == N::Call)
+        {
+            auto *c = static_cast<CallNode *>(e);
+            c->block = b;
+            c->vcall = false;
+        }
+        else
+            static_cast<SuperNode *>(e)->block = b;
+    }
+
+    // ── literals ────────────────────────────────────────────────────────
+    Node *parseArrayLiteral()
+    {
+        int line = tok_.line;
+        take();
+        auto *arr = new ListNode(N::Array, line);
+        std::vector<Node *> args;
+        parseCallArgs(args, "]");
+        expectOp("]");
+        for (auto *a : args)
+        {
+            if (a->kind == N::Hash && !static_cast<HashNode *>(a)->braces)
+                static_cast<HashNode *>(a)->braces = true; // [a: 1] holds a hash
+            arr->items.push_back(a);
+        }
+        return arr;
+    }
+
+    Node *parseHashLiteral()
+    {
+        int line = tok_.line;
+        take();
+        int saved = noDo_;
+        noDo_ = 0;
+        auto *h = new HashNode(line);
+        skipNL();
+        while (!op("}"))
+        {
+            int l = tok_.line;
+            if (op("DSPLAT") || op("**"))
+            {
+                take();
+                h->keys.push_back(nullptr);
+                h->values.push_back(parseArg(false));
+            }
+            else if (tok_.t == TT::Label)
+            {
+                Token lt = take();
+                auto *key = new LitNode(N::Sym, l);
+                key->s = lt.s;
+                h->keys.push_back(key);
+                skipNL();
+                if (op(",") || op("}"))
+                    h->values.push_back(shorthandValue(lt.s, l));
+                else
+                    h->values.push_back(parseArg(true));
+            }
+            else if (tok_.t == TT::Str && isOpTok(peek(), ":") && !peek().space)
+            {
+                // "string": value
+                Node *k = parseString();
+                take(); // :
+                auto *key = new LitNode(N::Sym, l);
+                key->s = static_cast<LitNode *>(k)->s;
+                h->keys.push_back(key);
+                skipNL();
+                h->values.push_back(parseArg(true));
+            }
+            else
+            {
+                Node *k = parseArg(true);
+                skipNL();
+                expectOp("=>");
+                skipNL();
+                h->keys.push_back(k);
+                h->values.push_back(parseArg(true));
+            }
+            skipNL();
+            if (!op(","))
+                break;
+            take();
+            skipNL();
+        }
+        skipNL();
+        expectOp("}");
+        noDo_ = saved;
+        return h;
+    }
+
+    // ── blocks and lambdas ─────────────────────────────────────────────
+    BlockNode *beginBlock(int line, bool hasParams)
+    {
+        auto *b = new BlockNode(line);
+        b->scope = pushScope(true);
+        blocks_.push_back(b);
+        explicitParams_.push_back(hasParams);
+        ctx_.push_back('B');
+        return b;
+    }
+
+    void endBlock(BlockNode *b)
+    {
+        if (b->numbered && b->params.params.empty())
+        {
+            // _1.._N or it: required parameters in order
+            int n = b->numberedCount == 0 ? 1 : b->numberedCount;
+            for (int k = 1; k <= n; ++k)
+            {
+                Param p;
+                p.kind = Param::Req;
+                p.name = b->numberedCount == 0 ? intern("it") : intern("_" + std::to_string(k));
+                int slot = b->scope->find(p.name);
+                if (slot < 0)
+                {
+                    b->scope->names.push_back(p.name);
+                    slot = (int)b->scope->names.size() - 1;
+                }
+                p.slot = slot;
+                b->params.params.push_back(p);
+                b->params.required++;
+            }
+        }
+        ctx_.pop_back();
+        explicitParams_.pop_back();
+        blocks_.pop_back();
+        popScope();
+    }
+
+    BlockNode *parseBraceBlock()
+    {
+        int line = tok_.line;
+        take(); // {
+        bool hasParams = op("|") || op("||");
+        BlockNode *b = beginBlock(line, hasParams);
+        int saved = noDo_;
+        noDo_ = 0;
+        skipNL();
+        if (op("||"))
+            take();
+        else if (op("|"))
+            parseBlockParams(b->params);
+        b->body = parseStmts();
+        skipNL();
+        expectOp("}");
+        noDo_ = saved;
+        endBlock(b);
+        return b;
+    }
+
+    BlockNode *parseDoBlock()
+    {
+        int line = tok_.line;
+        take(); // do
+        skipNL();
+        bool hasParams = op("|") || op("||");
+        BlockNode *b = beginBlock(line, hasParams);
+        int saved = noDo_;
+        noDo_ = 0;
+        if (op("||"))
+            take();
+        else if (op("|"))
+            parseBlockParams(b->params);
+        b->body = parseBodyWithRescue(line);
+        expectKw("end");
+        noDo_ = saved;
+        endBlock(b);
+        return b;
+    }
+
+    void parseBlockParams(ParamList &pl)
+    {
+        take(); // |
+        parseParamList(pl, "|", true);
+        if (tok_.t == TT::NL && tok_.s.empty())
+        {
+            // `;` block-local variables
+            take();
+            while (tok_.t == TT::Ident)
+            {
+                declareParam(intern(take().s));
+                if (op(","))
+                    take();
+            }
+        }
+        expectOp("|");
+    }
+
+    Node *parseLambda()
+    {
+        int line = tok_.line;
+        take(); // ->
+        BlockNode *b = beginBlock(line, true);
+        if (op("(") || op("LPAREN_CALL") || op("LPAREN_ARG"))
+        {
+            take();
+            parseParamList(b->params, ")", true);
+            expectOp(")");
+        }
+        else if (tok_.t == TT::Ident)
+            parseParamList(b->params, "{", true);
+        int saved = noDo_;
+        noDo_ = 0;
+        if (op("{"))
+        {
+            take();
+            b->body = parseStmts();
+            skipNL();
+            expectOp("}");
+        }
+        else if (kw("do"))
+        {
+            take();
+            b->body = parseBodyWithRescue(line);
+            expectKw("end");
+        }
+        else
+            unexpected();
+        noDo_ = saved;
+        endBlock(b);
+        auto *l = new UnaryNode(N::Lambda, line);
+        l->expr = b;
+        return l;
+    }
+
+    // parameters of a def, block or lambda, up to `close`
+    void parseParamList(ParamList &pl, const char *close, bool block)
+    {
+        // `def name a, b` (no parentheses) ends at the newline
+        bool lineEnds = block || std::string(close) == "\n";
+        if (!lineEnds)
+            skipNL();
+        while (!op(close))
+        {
+            if (tok_.t == TT::NL)
+            {
+                if (lineEnds)
+                    break; // `;` block-locals follow, or the def body starts
+                skipNL();
+                continue;
+            }
+            Param p;
+            if (op("..."))
+            {
+                take();
+                pl.forwarding = true;
+                p.kind = Param::Rest;
+                p.name = intern("*fwd");
+                p.slot = declareParam(p.name);
+                pl.restIndex = (int)pl.params.size();
+                pl.hasRest = true;
+                pl.params.push_back(p);
+                Param b;
+                b.kind = Param::Block;
+                b.name = intern("&fwd");
+                b.slot = declareParam(b.name);
+                pl.hasBlock = true;
+                pl.params.push_back(b);
+                Param kr;
+                kr.kind = Param::KeyRest;
+                kr.name = intern("**fwd");
+                kr.slot = declareParam(kr.name);
+                pl.hasKwRest = true;
+                pl.params.insert(pl.params.end() - 1, kr);
+            }
+            else if (op("SPLAT") || op("*"))
+            {
+                take();
+                p.kind = Param::Rest;
+                p.name = tok_.t == TT::Ident ? intern(take().s) : intern("*");
+                p.slot = declareParam(p.name);
+                pl.hasRest = true;
+                pl.restIndex = (int)pl.params.size();
+                pl.params.push_back(p);
+            }
+            else if (op("DSPLAT") || op("**"))
+            {
+                take();
+                if (kw("nil"))
+                {
+                    take();
+                    p.kind = Param::NoKey;
+                }
+                else
+                {
+                    p.kind = Param::KeyRest;
+                    p.name = tok_.t == TT::Ident ? intern(take().s) : intern("**");
+                    p.slot = declareParam(p.name);
+                    pl.hasKwRest = true;
+                }
+                pl.params.push_back(p);
+            }
+            else if (op("BLOCKPASS") || op("&"))
+            {
+                take();
+                p.kind = Param::Block;
+                p.name = tok_.t == TT::Ident ? intern(take().s) : intern("&");
+                p.slot = declareParam(p.name);
+                pl.hasBlock = true;
+                pl.params.push_back(p);
+            }
+            else if (tok_.t == TT::Label)
+            {
+                Token l = take();
+                p.name = intern(l.s);
+                p.slot = declareParam(p.name);
+                pl.hasKw = true;
+                if (op(",") || op(close) || tok_.t == TT::NL)
+                    p.kind = Param::KeyReq;
+                else
+                {
+                    p.kind = Param::Key;
+                    if (block)
+                        ++noPipe_;
+                    p.defaultValue = parseTernary(false);
+                    if (block)
+                        --noPipe_;
+                }
+                pl.params.push_back(p);
+            }
+            else if (op("(") || op("LPAREN_ARG") || op("LPAREN_CALL"))
+            {
+                take();
+                p.kind = Param::Destructure;
+                p.destructure = parseDestructureParams();
+                expectOp(")");
+                if (pl.hasRest)
+                    pl.post++;
+                else
+                    pl.required++;
+                pl.params.push_back(p);
+            }
+            else if (tok_.t == TT::Ident)
+            {
+                Token n = take();
+                p.name = intern(n.s);
+                p.slot = declareParam(p.name);
+                if (op("="))
+                {
+                    take();
+                    p.kind = Param::Opt;
+                    if (block)
+                        ++noPipe_;
+                    p.defaultValue = parseTernary(false);
+                    if (block)
+                        --noPipe_;
+                    pl.optional++;
+                }
+                else if (pl.hasRest)
+                {
+                    p.kind = Param::Post;
+                    pl.post++;
+                }
+                else
+                {
+                    p.kind = Param::Req;
+                    pl.required++;
+                }
+                pl.params.push_back(p);
+            }
+            else
+                unexpected();
+            if (!lineEnds)
+                skipNL();
+            if (!op(","))
+                break;
+            take();
+            skipNL();
+            if (block && op(close))
+            {
+                pl.trailingComma = true;
+                break;
+            }
+        }
+    }
+
+    // (a, (b, c), *d) in a parameter list
+    MlhsNode *parseDestructureParams()
+    {
+        auto *m = new MlhsNode(tok_.line);
+        for (;;)
+        {
+            int line = tok_.line;
+            if (op("SPLAT") || op("*"))
+            {
+                take();
+                auto *s = new UnaryNode(N::Splat, line);
+                if (tok_.t == TT::Ident)
+                {
+                    VarNode *v = paramVar(intern(take().s), line);
+                    s->expr = v;
+                }
+                m->splat = s;
+                m->hasSplat = true;
+            }
+            else if (op("(") || op("LPAREN_ARG") || op("LPAREN_CALL"))
+            {
+                take();
+                Node *inner = parseDestructureParams();
+                expectOp(")");
+                (m->hasSplat ? m->post : m->pre).push_back(inner);
+            }
+            else if (tok_.t == TT::Ident)
+            {
+                VarNode *v = paramVar(intern(take().s), line);
+                (m->hasSplat ? m->post : m->pre).push_back(v);
+            }
+            else
+                unexpected();
+            if (!op(","))
+                break;
+            take();
+        }
+        return m;
+    }
+
+    VarNode *paramVar(Sym s, int line)
+    {
+        auto *v = new VarNode(N::LAsgn, line);
+        v->name = s;
+        v->depth = 0;
+        v->slot = declareParam(s);
+        return v;
+    }
+
+    // ── keywords ────────────────────────────────────────────────────────
+    Node *parseKeyword(bool allowCommand)
+    {
+        int line = tok_.line;
+        const std::string k = tok_.s;
+        if (k == "nil" || k == "true" || k == "false" || k == "self")
+        {
+            take();
+            return new Node(k == "nil" ? N::Nil : k == "true" ? N::True : k == "false" ? N::False : N::Self, line);
+        }
+        if (k == "__FILE__")
+        {
+            take();
+            return new Node(N::File, line);
+        }
+        if (k == "__LINE__")
+        {
+            take();
+            auto *n = new LitNode(N::Int, line);
+            n->i = line;
+            return n;
+        }
+        if (k == "if" || k == "unless")
+            return parseIf();
+        if (k == "while" || k == "until")
+            return parseWhile();
+        if (k == "case")
+            return parseCase();
+        if (k == "for")
+            return parseFor();
+        if (k == "begin")
+            return parseBegin();
+        if (k == "def")
+            return parseDef();
+        if (k == "class")
+            return parseClass();
+        if (k == "module")
+            return parseModule();
+        if (k == "return" || k == "break" || k == "next")
+            return parseJump();
+        if (k == "redo" || k == "retry")
+        {
+            take();
+            auto *n = new UnaryNode(k == "redo" ? N::Redo : N::Retry, line);
+            n->inBlock = !ctx_.empty() && ctx_.back() == 'B';
+            return n;
+        }
+        if (k == "yield")
+            return parseYield(allowCommand);
+        if (k == "super")
+            return parseSuper(allowCommand);
+        if (k == "defined?")
+            return parseNotOp(false);
+        if (k == "not")
+        {
+            take();
+            auto *n = new UnaryNode(N::Not, line);
+            n->expr = parseExpr();
+            return n;
+        }
+        if (k == "alias")
+            return parseAlias();
+        if (k == "undef")
+        {
+            take();
+            auto *a = new AliasNode(N::Undef, line);
+            for (;;)
+            {
+                a->names.push_back(methodNameToken());
+                if (!op(","))
+                    break;
+                take();
+            }
+            return a;
+        }
+        if (k == "BEGIN" || k == "END")
+        {
+            take();
+            expectOp("{");
+            Node *body = parseStmts();
+            expectOp("}");
+            if (k == "BEGIN")
+                return body;
+            auto *n = new UnaryNode(N::Postexe, line);
+            n->expr = body;
+            return n;
+        }
+        if (k == "then" || k == "do")
+            unexpected();
+        unexpected();
+    }
+
+    Sym methodNameToken()
+    {
+        if (tok_.t == TT::Sym)
+            return intern(take().s);
+        if (tok_.t == TT::Ident || tok_.t == TT::Const || tok_.t == TT::Kw)
+            return intern(take().s);
+        if (tok_.t == TT::Op)
+        {
+            Token t = take();
+            return intern(t.s);
+        }
+        unexpected();
+    }
+
+    Node *parseAlias()
+    {
+        int line = tok_.line;
+        take(); // alias (lexer: FNAME)
+        auto *a = new AliasNode(N::Alias, line);
+        if (tok_.t == TT::GVar)
+        {
+            a->globals = true;
+            a->to = intern(take().s);
+            a->from = intern(take().s);
+            return a;
+        }
+        // the second name is lexed when the first is taken: as a method name
+        lex_->state = Lexer::FNAME;
+        a->to = methodNameToken();
+        a->from = methodNameToken();
+        return a;
+    }
+
+    Node *parseThenBody()
+    {
+        // `if cond then x` / newline
+        if (kw("then"))
+            take();
+        skipNL();
+        if (kw("then"))
+            take();
+        return parseStmts();
+    }
+
+    Node *parseIf()
+    {
+        int line = tok_.line;
+        bool unless = kw("unless");
+        take();
+        auto *n = new IfNode(line);
+        ++noDo_;
+        n->cond = parseExprStmt();
+        --noDo_;
+        Node *body = parseThenBody();
+        if (unless)
+            n->els = body;
+        else
+            n->then = body;
+        IfNode *cur = n;
+        while (kw("elsif"))
+        {
+            int l = tok_.line;
+            take();
+            auto *e = new IfNode(l);
+            e->cond = parseExprStmt();
+            e->then = parseThenBody();
+            cur->els = e;
+            cur = e;
+        }
+        if (kw("else"))
+        {
+            take();
+            Node *els = parseStmts();
+            if (unless)
+                n->then = els;
+            else
+                cur->els = els;
+        }
+        expectKw("end");
+        return n;
+    }
+
+    Node *parseWhile()
+    {
+        int line = tok_.line;
+        bool until = kw("until");
+        take();
+        auto *n = new WhileNode(line);
+        n->until = until;
+        ++noDo_;
+        n->cond = parseExprStmt();
+        --noDo_;
+        if (kw("do"))
+            take();
+        ctx_.push_back('L');
+        n->body = parseStmts();
+        ctx_.pop_back();
+        expectKw("end");
+        return n;
+    }
+
+    Node *parseFor()
+    {
+        int line = tok_.line;
+        take();
+        auto *n = new ForNode(line);
+        MlhsNode *vars = parseMlhsList("in");
+        if (vars->pre.size() == 1 && !vars->hasSplat)
+            n->var = vars->pre[0];
+        else
+            n->var = vars;
+        expectKw("in");
+        ++noDo_;
+        n->iter = parseExprStmt();
+        --noDo_;
+        if (kw("do"))
+            take();
+        ctx_.push_back('L');
+        n->body = parseStmts();
+        ctx_.pop_back();
+        expectKw("end");
+        return n;
+    }
+
+    Node *parseCase()
+    {
+        int line = tok_.line;
+        take();
+        Node *subject = nullptr;
+        if (!nl() && !kw("when"))
+        {
+            ++noIn_;
+            subject = parseExprStmt();
+            --noIn_;
+        }
+        skipNL();
+        if (kw("in"))
+            return parseCaseIn(subject, line);
+        auto *c = new CaseNode(line);
+        c->subject = subject;
+        while (kw("when"))
+        {
+            WhenClause w;
+            w.line = tok_.line;
+            take();
+            for (;;)
+            {
+                int l = tok_.line;
+                if (op("SPLAT") || op("*"))
+                {
+                    take();
+                    auto *s = new UnaryNode(N::Splat, l);
+                    s->expr = parseArg(false);
+                    w.values.push_back(s);
+                }
+                else
+                    w.values.push_back(parseArg(false));
+                if (!op(","))
+                    break;
+                take();
+                skipNL();
+            }
+            w.body = parseThenBody();
+            c->whens.push_back(w);
+        }
+        if (kw("else"))
+        {
+            take();
+            c->hasElse = true;
+            c->els = parseStmts();
+        }
+        expectKw("end");
+        return c;
+    }
+
+    Node *parseCaseIn(Node *subject, int line)
+    {
+        auto *c = new CaseInNode(line);
+        c->subject = subject;
+        while (kw("in"))
+        {
+            InClause in;
+            in.line = tok_.line;
+            take();
+            in.pattern = parsePatternTop();
+            if (kw("if") || kw("unless"))
+            {
+                in.guardUnless = kw("unless");
+                take();
+                in.guard = parseExprStmt();
+            }
+            in.body = parseThenBody();
+            c->ins.push_back(in);
+        }
+        if (kw("else"))
+        {
+            take();
+            c->hasElse = true;
+            c->els = parseStmts();
+        }
+        expectKw("end");
+        return c;
+    }
+
+    // body of begin / def / do-block: stmts with rescue / else / ensure clauses
+    Node *parseBodyWithRescue(int line)
+    {
+        Node *body = parseStmts();
+        if (!kw("rescue") && !kw("ensure") && !kw("else"))
+            return body;
+        auto *b = new BeginNode(line);
+        b->body = body;
+        while (kw("rescue"))
+        {
+            RescueClause rc;
+            rc.line = tok_.line;
+            take();
+            if (!nl() && !kw("then") && !op("=>"))
+            {
+                for (;;)
+                {
+                    int l = tok_.line;
+                    if (op("SPLAT") || op("*"))
+                    {
+                        take();
+                        auto *s = new UnaryNode(N::Splat, l);
+                        s->expr = parseArg(false);
+                        rc.classes.push_back(s);
+                    }
+                    else
+                        rc.classes.push_back(parseTernary(false));
+                    if (!op(","))
+                        break;
+                    take();
+                    skipNL();
+                }
+            }
+            if (op("=>"))
+            {
+                take();
+                Node *target = parsePrimaryPostfix();
+                if (!assignable(target))
+                    unexpected();
+                rc.var = toTarget(target);
+            }
+            rc.body = parseThenBody();
+            b->rescues.push_back(rc);
+        }
+        if (kw("else"))
+        {
+            take();
+            b->els = parseStmts();
+        }
+        if (kw("ensure"))
+        {
+            take();
+            b->ensure = parseStmts();
+        }
+        return b;
+    }
+
+    Node *parseBegin()
+    {
+        int line = tok_.line;
+        take();
+        Node *body = parseBodyWithRescue(line);
+        expectKw("end");
+        BeginNode *b;
+        if (body->kind == N::Begin && !static_cast<BeginNode *>(body)->keyword)
+            b = static_cast<BeginNode *>(body);
+        else
+        {
+            b = new BeginNode(line);
+            b->body = body;
+        }
+        b->keyword = true;
+        return b;
+    }
+
+    Node *parseJump()
+    {
+        int line = tok_.line;
+        Token t = take();
+        N k = t.s == "return" ? N::Return : t.s == "break" ? N::Break : N::Next;
+        auto *n = new UnaryNode(k, line);
+        if (k != N::Return)
+        {
+            // innermost of loop / block decides what break and next leave
+            for (auto it = ctx_.rbegin(); it != ctx_.rend(); ++it)
+            {
+                if (*it == 'L')
+                {
+                    n->inBlock = false;
+                    break;
+                }
+                if (*it == 'B')
+                {
+                    n->inBlock = true;
+                    break;
+                }
+                if (*it == 'D')
+                    break;
+            }
+        }
+        // `return { a: 1 }` returns a hash
+        if ((op("{") || !commandArgEnd()) && !op(":") && !op("?"))
+        {
+            Node *v = parseArgItem();
+            if (op(","))
+            {
+                auto *arr = new ListNode(N::Array, line);
+                arr->items.push_back(v);
+                while (op(","))
+                {
+                    take();
+                    skipNL();
+                    arr->items.push_back(parseArgItem());
+                }
+                v = arr;
+            }
+            else if (v->kind == N::Splat)
+            {
+                auto *arr = new ListNode(N::Array, line);
+                arr->items.push_back(v);
+                v = arr;
+            }
+            n->expr = v;
+        }
+        return n;
+    }
+
+    Node *parseYield(bool allowCommand)
+    {
+        int line = tok_.line;
+        take();
+        auto *y = new YieldNode(line);
+        if (op("LPAREN_CALL"))
+        {
+            take();
+            parseCallArgs(y->args, ")");
+            expectOp(")");
+        }
+        else if (commandArgStart(tok_))
+        {
+            auto *tmp = new CallNode(line);
+            parseCommandArgs(tmp);
+            y->args = tmp->args;
+        }
+        return y;
+    }
+
+    Node *parseSuper(bool allowCommand)
+    {
+        int line = tok_.line;
+        take();
+        if (op("LPAREN_CALL"))
+        {
+            auto *s = new SuperNode(N::Super, line);
+            take();
+            s->hasParens = true;
+            parseCallArgs(s->args, ")");
+            expectOp(")");
+            return s;
+        }
+        if (commandArgStart(tok_))
+        {
+            auto *s = new SuperNode(N::Super, line);
+            auto *tmp = new CallNode(line);
+            parseCommandArgs(tmp);
+            s->args = tmp->args;
+            return s;
+        }
+        (void)allowCommand;
+        return new SuperNode(N::ZSuper, line);
+    }
+
+    Node *parseDef()
+    {
+        int line = tok_.line;
+        take(); // def (lexer: FNAME)
+        auto *d = new DefNode(line);
+        Token name = take();
+        if (op(".") && (name.t == TT::Ident || name.t == TT::Const || name.t == TT::Kw))
+        {
+            // def self.x / def obj.x
+            if (name.s == "self")
+                d->singleton = new Node(N::Self, line);
+            else if (name.t == TT::Const)
+            {
+                auto *c = new ConstNode(N::Const, line);
+                c->name = intern(name.s);
+                d->singleton = c;
+            }
+            else
+            {
+                auto *v = new VarNode(N::LVar, line);
+                v->name = intern(name.s);
+                if (!lookup(v->name, v->depth, v->slot))
+                    fail("undefined local variable in singleton def");
+                d->singleton = v;
+            }
+            take(); // .
+            name = take();
+        }
+        if (name.t == TT::Op || name.t == TT::Kw || name.t == TT::Ident || name.t == TT::Const || name.t == TT::Label)
+            d->name = intern(name.t == TT::Label ? name.s : name.s);
+        else
+            fail("syntax error, unexpected method name");
+        if (name.t == TT::Label)
+        {
+            // def name: never valid
+            fail("syntax error, unexpected label in def");
+        }
+        d->scope = pushScope(false);
+        ctx_.push_back('D');
+        int saved = noDo_;
+        noDo_ = 0;
+        if (op("LPAREN_CALL") || op("(") || op("LPAREN_ARG"))
+        {
+            take();
+            parseParamList(d->params, ")", false);
+            skipNL();
+            expectOp(")");
+        }
+        else if (!nl() && !op("="))
+            parseParamList(d->params, "\n", false);
+        if (op("="))
+        {
+            // endless method
+            take();
+            skipNL();
+            d->endless = true;
+            Node *body = parseStmt();
+            d->body = body;
+        }
+        else
+        {
+            d->body = parseBodyWithRescue(line);
+            expectKw("end");
+        }
+        noDo_ = saved;
+        ctx_.pop_back();
+        popScope();
+        return d;
+    }
+
+    ConstNode *parseCpath()
+    {
+        int line = tok_.line;
+        ConstNode *path = nullptr;
+        if (op("COLON3"))
+        {
+            take();
+            path = new ConstNode(N::Const, line);
+            path->top = true;
+            if (tok_.t != TT::Const)
+                unexpected();
+            path->name = intern(take().s);
+        }
+        else
+        {
+            if (tok_.t != TT::Const)
+                fail("syntax error, class/module name must be CONSTANT");
+            path = new ConstNode(N::Const, line);
+            path->name = intern(take().s);
+        }
+        while (op("::"))
+        {
+            take();
+            auto *next = new ConstNode(N::Const, line);
+            next->scope = path;
+            if (tok_.t != TT::Const)
+                unexpected();
+            next->name = intern(take().s);
+            path = next;
+        }
+        return path;
+    }
+
+    Node *parseClass()
+    {
+        int line = tok_.line;
+        take();
+        if (op("<<"))
+        {
+            take();
+            auto *c = new ClassNode(N::SClass, line);
+            c->target = parseExpr();
+            c->scope = pushScope(false);
+            ctx_.push_back('D');
+            c->body = parseStmts();
+            ctx_.pop_back();
+            popScope();
+            expectKw("end");
+            return c;
+        }
+        auto *c = new ClassNode(N::Class, line);
+        c->path = parseCpath();
+        if (op("<"))
+        {
+            take();
+            c->superclass = parseExpr();
+        }
+        c->scope = pushScope(false);
+        ctx_.push_back('D');
+        c->body = parseBodyWithRescue(line);
+        ctx_.pop_back();
+        popScope();
+        expectKw("end");
+        return c;
+    }
+
+    Node *parseModule()
+    {
+        int line = tok_.line;
+        take();
+        auto *c = new ClassNode(N::Module, line);
+        c->path = parseCpath();
+        c->scope = pushScope(false);
+        ctx_.push_back('D');
+        c->body = parseStmts();
+        ctx_.pop_back();
+        popScope();
+        expectKw("end");
+        return c;
+    }
+
+    // ── patterns (case/in, =>, in) ──────────────────────────────────────
+    bool patternEnd() const
+    {
+        if (tok_.t == TT::NL || tok_.t == TT::End)
+            return true;
+        if (tok_.t == TT::Kw && (tok_.s == "then" || tok_.s == "if" || tok_.s == "unless" || tok_.s == "and" ||
+                                 tok_.s == "or"))
+            return true;
+        return tok_.t == TT::Op && (tok_.s == ")" || tok_.s == "]" || tok_.s == "}");
+    }
+
+    Node *parsePatternTop()
+    {
+        int line = tok_.line;
+        if (tok_.t == TT::Label || op("DSPLAT") || op("**"))
+            return parseHashPatternBody(nullptr, line, "");
+        Node *first = parsePatternItem();
+        if (op(","))
+        {
+            auto *arr = new PatNode(N::PArray, line);
+            std::vector<Node *> items{first};
+            while (op(","))
+            {
+                take();
+                if (patternEnd())
+                    break;
+                items.push_back(parsePatternItem());
+            }
+            return buildArrayPattern(nullptr, items, line);
+        }
+        if (first->kind == N::Splat)
+        {
+            std::vector<Node *> items{first};
+            return buildArrayPattern(nullptr, items, line);
+        }
+        return first;
+    }
+
+    // a pattern or *rest inside an array pattern
+    Node *parsePatternItem()
+    {
+        int line = tok_.line;
+        if (op("SPLAT") || op("*"))
+        {
+            take();
+            auto *s = new UnaryNode(N::Splat, line);
+            if (tok_.t == TT::Ident)
+            {
+                Token n = take();
+                if (n.s != "_")
+                    s->expr = declarePatVar(intern(n.s), line);
+            }
+            return s;
+        }
+        return parsePatternAlt();
+    }
+
+    VarNode *declarePatVar(Sym s, int line)
+    {
+        VarNode *v = declare(s, line);
+        v->kind = N::LAsgn;
+        return v;
+    }
+
+    Node *buildArrayPattern(Node *constant, std::vector<Node *> &items, int line)
+    {
+        int splats = 0;
+        for (auto *i : items)
+            if (i->kind == N::Splat)
+                ++splats;
+        if (splats >= 2 && items.front()->kind == N::Splat && items.back()->kind == N::Splat)
+        {
+            auto *f = new PatNode(N::PFind, line);
+            f->constant = constant;
+            f->rest = static_cast<VarNode *>(static_cast<UnaryNode *>(items.front())->expr);
+            f->rest2 = static_cast<VarNode *>(static_cast<UnaryNode *>(items.back())->expr);
+            for (size_t k = 1; k + 1 < items.size(); ++k)
+                f->pre.push_back(items[k]);
+            return f;
+        }
+        auto *a = new PatNode(N::PArray, line);
+        a->constant = constant;
+        for (auto *i : items)
+        {
+            if (i->kind == N::Splat)
+            {
+                a->hasRest = true;
+                a->rest = static_cast<VarNode *>(static_cast<UnaryNode *>(i)->expr);
+            }
+            else
+                (a->hasRest ? a->post : a->pre).push_back(i);
+        }
+        return a;
+    }
+
+    Node *parsePatternAlt()
+    {
+        int line = tok_.line;
+        Node *p = parsePatternPrimary();
+        if (op("|"))
+        {
+            auto *alt = new PatNode(N::PAlt, line);
+            alt->alts.push_back(p);
+            while (op("|"))
+            {
+                take();
+                alt->alts.push_back(parsePatternPrimary());
+            }
+            p = alt;
+        }
+        while (op("=>"))
+        {
+            take();
+            if (tok_.t != TT::Ident)
+                unexpected();
+            Token n = take();
+            auto *cap = new PatNode(N::PCapture, line);
+            cap->value = p;
+            cap->var = declarePatVar(intern(n.s), line);
+            p = cap;
+        }
+        return p;
+    }
+
+    Node *parsePatternPrimary()
+    {
+        int line = tok_.line;
+        if (op("[") || op("LBRACK_INDEX"))
+        {
+            take();
+            std::vector<Node *> items;
+            skipNL();
+            while (!op("]"))
+            {
+                items.push_back(parsePatternItem());
+                skipNL();
+                if (!op(","))
+                    break;
+                take();
+                skipNL();
+            }
+            expectOp("]");
+            return buildArrayPattern(nullptr, items, line);
+        }
+        if (op("{"))
+        {
+            take();
+            skipNL();
+            Node *h = parseHashPatternBody(nullptr, line, "}");
+            skipNL();
+            expectOp("}");
+            return h;
+        }
+        if (op("^"))
+        {
+            take();
+            auto *p = new PatNode(N::PPin, line);
+            if (tok_.t == TT::Ident)
+            {
+                Token n = take();
+                auto *v = new VarNode(N::LVar, line);
+                v->name = intern(n.s);
+                if (!lookup(v->name, v->depth, v->slot))
+                    fail(n.s + ": no such local variable");
+                p->value = v;
+            }
+            else if (tok_.t == TT::IVar || tok_.t == TT::GVar || tok_.t == TT::CVar)
+                p->value = parsePrimary(false);
+            else if (lparen())
+            {
+                take();
+                p->value = parseExprStmt();
+                expectOp(")");
+            }
+            else
+                unexpected();
+            return p;
+        }
+        if (tok_.t == TT::Ident && peekIsPatternBinding())
+        {
+            Token n = take();
+            auto *b = new PatNode(N::PBind, line);
+            if (n.s != "_")
+                b->var = declarePatVar(intern(n.s), line);
+            return b;
+        }
+        if (tok_.t == TT::Const || op("COLON3"))
+        {
+            Node *c = parsePatternConst();
+            if (op("LPAREN_CALL") || (op("LBRACK_INDEX")))
+            {
+                bool paren = op("LPAREN_CALL");
+                take();
+                const char *close = paren ? ")" : "]";
+                skipNL();
+                if (tok_.t == TT::Label || op("DSPLAT"))
+                {
+                    Node *h = parseHashPatternBody(c, line, close);
+                    skipNL();
+                    expectOp(close);
+                    return h;
+                }
+                std::vector<Node *> items;
+                while (!op(close))
+                {
+                    items.push_back(parsePatternItem());
+                    skipNL();
+                    if (!op(","))
+                        break;
+                    take();
+                    skipNL();
+                }
+                expectOp(close);
+                return buildArrayPattern(c, items, line);
+            }
+            // value pattern: Const (=== match), maybe a range of constants
+            auto *v = new PatNode(N::PValue, line);
+            v->value = c;
+            return v;
+        }
+        if (kw("nil"))
+        {
+            take();
+            auto *v = new PatNode(N::PValue, line);
+            v->value = new Node(N::Nil, line);
+            return v;
+        }
+        if (op("->"))
+        {
+            auto *v = new PatNode(N::PValue, line);
+            v->value = parseLambda();
+            return v;
+        }
+        // literal values and ranges of them
+        auto *v = new PatNode(N::PValue, line);
+        v->value = parsePatternValue();
+        return v;
+    }
+
+    bool peekIsPatternBinding()
+    {
+        // an identifier in a pattern binds, unless it is a method call like x(...)
+        return !op("LPAREN_CALL");
+    }
+
+    Node *parsePatternConst()
+    {
+        int line = tok_.line;
+        Node *c;
+        if (op("COLON3"))
+        {
+            take();
+            auto *k = new ConstNode(N::Const, line);
+            k->top = true;
+            k->name = intern(take().s);
+            c = k;
+        }
+        else
+        {
+            auto *k = new ConstNode(N::Const, line);
+            k->name = intern(take().s);
+            c = k;
+        }
+        while (op("::"))
+        {
+            take();
+            auto *k = new ConstNode(N::Const, line);
+            k->scope = c;
+            k->name = intern(take().s);
+            c = k;
+        }
+        return c;
+    }
+
+    Node *parsePatternPrimitive()
+    {
+        int line = tok_.line;
+        if (op("UMINUS") && numericTok(peek()))
+        {
+            take();
+            return parseNumber(true);
+        }
+        if (numericTok(tok_))
+            return parseNumber(false);
+        if (tok_.t == TT::Str || tok_.t == TT::Sym || tok_.t == TT::DSym || tok_.t == TT::Regex || tok_.t == TT::Words)
+            return parsePrimary(false);
+        if (kw("true") || kw("false") || kw("nil") || kw("self") || kw("__FILE__"))
+            return parsePrimary(false);
+        if (tok_.t == TT::Const)
+            return parsePatternConst();
+        (void)line;
+        unexpected();
+    }
+
+    Node *parsePatternValue()
+    {
+        int line = tok_.line;
+        if (op("..") || op("..."))
+        {
+            bool excl = op("...");
+            take();
+            auto *r = new RangeNode(line);
+            r->exclusive = excl;
+            r->hi = parsePatternPrimitive();
+            return r;
+        }
+        Node *lo = parsePatternPrimitive();
+        if (op("..") || op("..."))
+        {
+            bool excl = op("...");
+            take();
+            auto *r = new RangeNode(line);
+            r->lo = lo;
+            r->exclusive = excl;
+            if (!patternEnd() && !op(",") && !op("|") && !op("=>"))
+                r->hi = parsePatternPrimitive();
+            return r;
+        }
+        return lo;
+    }
+
+    Node *parseHashPatternBody(Node *constant, int line, const char *close)
+    {
+        auto *h = new PatNode(N::PHash, line);
+        h->constant = constant;
+        for (;;)
+        {
+            if (*close && op(close))
+                break;
+            if (op("DSPLAT") || op("**"))
+            {
+                take();
+                if (kw("nil"))
+                {
+                    take();
+                    h->nilRest = true;
+                }
+                else
+                {
+                    h->hashRest = true;
+                    if (tok_.t == TT::Ident)
+                        h->hashRestVar = declarePatVar(intern(take().s), line);
+                }
+            }
+            else if (tok_.t == TT::Label)
+            {
+                Token l = take();
+                Sym key = intern(l.s);
+                h->keys.push_back(key);
+                bool bare = op(",") || patternEnd() || (*close && op(close));
+                if (bare)
+                {
+                    h->keyPats.push_back(nullptr);
+                    h->keyVars.push_back(declarePatVar(key, line));
+                }
+                else
+                {
+                    h->keyPats.push_back(parsePatternAlt());
+                    h->keyVars.push_back(nullptr);
+                }
+            }
+            else if (tok_.t == TT::Str && isOpTok(peek(), ":"))
+            {
+                Token s = take();
+                take();
+                Sym key = intern(s.parts.empty() ? "" : s.parts[0].text);
+                h->keys.push_back(key);
+                h->keyPats.push_back(parsePatternAlt());
+                h->keyVars.push_back(nullptr);
+            }
+            else
+                unexpected();
+            if (*close)
+                skipNL();
+            if (!op(","))
+                break;
+            take();
+            if (*close)
+                skipNL();
+        }
+        return h;
+    }
+};
+
+} // namespace
+
+ProgramNode *parseProgram(const std::string &source, const std::string &file)
+{
+    Parser p(source, file);
+    return p.parseProgram();
+}
+
+ProgramNode *parseEval(const std::string &source, const std::string &file, Scope *outer, Scope *scope)
+{
+    Parser p(source, file);
+    return p.parseEval(outer, scope);
+}
+
+bool canRun(const std::string &source, const std::string &path, std::string &why)
+{
+    try
+    {
+        parseProgram(source, path);
+    }
+    catch (const SyntaxError &e)
+    {
+        why = e.message;
+        return false;
+    }
+    return true;
+}
+
+} // namespace ruby

@@ -1,0 +1,383 @@
+# Thread's synchronisation classes, over Thread.__wait (RubyThread.sa).
+Thread = __thread_class
+
+class Thread
+  class Mutex
+    def initialize
+      @owner = nil
+    end
+
+    def locked? = !@owner.nil?
+    def owned? = @owner.equal?(Thread.current)
+
+    def try_lock
+      return false if @owner
+      @owner = Thread.current
+      true
+    end
+
+    def lock
+      raise ThreadError, "deadlock; recursive locking" if owned?
+      Thread.__wait { @owner.nil? } if @owner
+      @owner = Thread.current
+      self
+    end
+
+    def unlock
+      raise ThreadError, "Attempt to unlock a mutex which is not locked" unless @owner
+      raise ThreadError, "Attempt to unlock a mutex which is locked by another thread/fiber" unless owned?
+      @owner = nil
+      self
+    end
+
+    def synchronize
+      lock
+      begin
+        yield
+      ensure
+        unlock if owned?
+      end
+    end
+
+    def sleep(timeout = nil)
+      unlock
+      begin
+        Kernel.sleep(*[timeout].compact)
+      ensure
+        lock
+      end
+    end
+  end
+
+  class ConditionVariable
+    def initialize
+      @waiters = []
+    end
+
+    def wait(mutex, timeout = nil)
+      token = [false]
+      @waiters << token
+      mutex.unlock
+      begin
+        Thread.__wait(timeout) { token[0] }
+      ensure
+        @waiters.delete_if { |t| t.equal?(token) }
+        mutex.lock
+      end
+      self
+    end
+
+    def signal
+      t = @waiters.shift
+      t[0] = true if t
+      self
+    end
+
+    def broadcast
+      @waiters.each { |t| t[0] = true }
+      @waiters.clear
+      self
+    end
+  end
+
+  class Queue
+    def initialize(items = nil)
+      @items = items ? items.to_a.dup : []
+      @closed = false
+      @waiting = 0
+    end
+
+    def size = @items.size
+    alias length size
+    def empty? = @items.empty?
+    def num_waiting = @waiting
+    def closed? = @closed
+
+    def clear
+      @items.clear
+      self
+    end
+
+    def close
+      @closed = true
+      self
+    end
+
+    def push(x)
+      raise ClosedQueueError, "queue closed" if @closed
+      @items.push(x)
+      self
+    end
+    alias << push
+    alias enq push
+
+    def pop(non_block = false, timeout: nil)
+      if @items.empty?
+        raise ThreadError, "queue empty" if non_block
+        return nil if @closed
+        @waiting += 1
+        begin
+          Thread.__wait(timeout) { !@items.empty? || @closed }
+        ensure
+          @waiting -= 1
+        end
+      end
+      @items.shift
+    end
+    alias shift pop
+    alias deq pop
+
+    def freeze = raise(TypeError, "cannot freeze #<Thread::Queue>")
+  end
+
+  class SizedQueue < Queue
+    attr_reader :max
+
+    def initialize(max)
+      raise ArgumentError, "queue size must be positive" unless max > 0
+      super()
+      @max = max
+    end
+
+    def max=(n)
+      @max = n
+    end
+
+    def push(x, non_block = false, timeout: nil)
+      raise ClosedQueueError, "queue closed" if @closed
+      if @items.size >= @max
+        raise ThreadError, "queue full" if non_block
+        @waiting += 1
+        ok = begin
+          Thread.__wait(timeout) { @items.size < @max || @closed }
+        ensure
+          @waiting -= 1
+        end
+        return nil unless ok
+        raise ClosedQueueError, "queue closed" if @closed
+      end
+      @items.push(x)
+      self
+    end
+    alias << push
+    alias enq push
+  end
+end
+
+Mutex = Thread::Mutex
+Queue = Thread::Queue
+SizedQueue = Thread::SizedQueue
+ConditionVariable = Thread::ConditionVariable
+
+class Monitor
+  def initialize
+    @mon_owner = nil
+    @mon_count = 0
+  end
+
+  def enter
+    me = Thread.current
+    if @mon_owner.equal?(me)
+      @mon_count += 1
+    else
+      Thread.__wait { @mon_owner.nil? } if @mon_owner
+      @mon_owner = me
+      @mon_count = 1
+    end
+    nil
+  end
+  alias mon_enter enter
+
+  def try_enter
+    return false if @mon_owner && !@mon_owner.equal?(Thread.current)
+    enter
+    true
+  end
+  alias mon_try_enter try_enter
+  alias try_mon_enter try_enter
+
+  def exit
+    raise ThreadError, "current thread not owner" unless @mon_owner.equal?(Thread.current)
+    @mon_count -= 1
+    @mon_owner = nil if @mon_count == 0
+    nil
+  end
+  alias mon_exit exit
+
+  def mon_locked? = !@mon_owner.nil?
+  def mon_owned? = @mon_owner.equal?(Thread.current)
+
+  def synchronize
+    enter
+    begin
+      yield
+    ensure
+      self.exit
+    end
+  end
+  alias mon_synchronize synchronize
+
+  def new_cond = MonitorMixin::ConditionVariable.new(self)
+
+  def __release
+    c = @mon_count
+    @mon_owner = nil
+    @mon_count = 0
+    c
+  end
+
+  def __reacquire(count)
+    Thread.__wait { @mon_owner.nil? } if @mon_owner
+    @mon_owner = Thread.current
+    @mon_count = count
+  end
+end
+
+module MonitorMixin
+  class ConditionVariable
+    def initialize(monitor)
+      @monitor = monitor
+      @waiters = []
+    end
+
+    def wait(timeout = nil)
+      token = [false]
+      @waiters << token
+      count = @monitor.__release
+      begin
+        Thread.__wait(timeout) { token[0] }
+      ensure
+        @waiters.delete_if { |t| t.equal?(token) }
+        @monitor.__reacquire(count)
+      end
+      true
+    end
+
+    def wait_while
+      wait while yield
+    end
+
+    def wait_until
+      wait until yield
+    end
+
+    def signal
+      t = @waiters.shift
+      t[0] = true if t
+      self
+    end
+
+    def broadcast
+      @waiters.each { |t| t[0] = true }
+      @waiters.clear
+      self
+    end
+  end
+
+  def __monitor = (@__monitor ||= Monitor.new)
+  def mon_enter = __monitor.enter
+  def mon_exit = __monitor.exit
+  def mon_try_enter = __monitor.try_enter
+  def mon_synchronize(&b) = __monitor.synchronize(&b)
+  alias synchronize mon_synchronize
+  def new_cond = __monitor.new_cond
+  def mon_initialize = @__monitor = Monitor.new
+end
+
+# Ractors, as threads: one interpreter lock, the same message passing
+class Ractor
+  class Error < StandardError; end
+  class ClosedError < StopIteration; end
+  class RemoteError < Error
+    attr_reader :ractor
+    def initialize(msg = nil, ractor: nil)
+      super(msg)
+      @ractor = ractor
+    end
+  end
+  class IsolationError < Error; end
+  class MovedError < Error; end
+
+  attr_reader :name
+
+  def self.current = Thread.current[:__ractor] || (@main ||= allocate.__setup_main)
+  def self.main = @main ||= allocate.__setup_main
+  def self.count = (@live ||= 1)
+  def self.receive = current.__receive
+  def self.recv = receive
+  def self.yield(v)
+    current.__out.push(v)
+    nil
+  end
+
+  def self.make_shareable(x, copy: false)
+    case x
+    when Array then x.each { |e| make_shareable(e) }
+    when Hash then x.each { |k, v| make_shareable(k); make_shareable(v) }
+    when Struct then x.to_a.each { |e| make_shareable(e) }
+    end
+    x.instance_variables.each { |iv| make_shareable(x.instance_variable_get(iv)) }
+    x.freeze
+  end
+
+  def self.shareable?(x)
+    return false unless x.frozen?
+    case x
+    when Array then x.all? { |e| shareable?(e) }
+    when Hash then x.all? { |k, v| shareable?(k) && shareable?(v) }
+    else true
+    end
+  end
+
+  def __setup_main
+    @in = Queue.new
+    @out = Queue.new
+    self
+  end
+
+  def initialize(*args, name: nil, &blk)
+    raise ArgumentError, "must be called with a block" unless blk
+    @name = name
+    @in = Queue.new
+    @out = Queue.new
+    me = self
+    @thread = Thread.new do
+      Thread.current[:__ractor] = me
+      Thread.current.report_on_exception = false
+      me.instance_exec(*args, &blk)
+    end
+  end
+
+  def __receive = @in.pop
+  def __out = @out
+  def send(v, move: false)
+    @in.push(v)
+    self
+  end
+  alias << send
+
+  def take
+    return @out.pop unless @out.empty?
+    Thread.__wait { !@out.empty? || !@thread.alive? }
+    return @out.pop unless @out.empty?
+    if @taken
+      raise ClosedError, "The outgoing-port is already closed"
+    end
+    @taken = true
+    begin
+      @thread.value
+    rescue StandardError => e
+      err = RemoteError.new("thrown by remote Ractor.", ractor: self)
+      raise err, cause: e
+    end
+  end
+  alias value take
+
+  def join
+    @thread.join
+    self
+  end
+
+  def inspect = "#<Ractor:##{__id__}#{@name ? " #{@name}" : ""}>"
+  alias to_s inspect
+end

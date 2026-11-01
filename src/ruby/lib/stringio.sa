@@ -1,0 +1,173 @@
+class StringIO
+  include Enumerable
+
+  attr_accessor :string, :lineno
+
+  def self.open(*a)
+    io = new(*a)
+    return io unless block_given?
+    yield io
+  end
+
+  def initialize(str = +"", mode = nil)
+    @string = str
+    @pos = mode.to_s.start_with?("a") ? str.bytesize : 0
+    @lineno = 0
+    @closed = false
+    @append = mode.to_s.start_with?("a")
+    @string.clear if mode.to_s.start_with?("w") && !str.frozen?
+  end
+
+  def write(*items)
+    raise IOError, "not opened for writing" if @closed || @string.frozen?
+    n = 0
+    items.each do |x|
+      s = x.to_s
+      @pos = @string.bytesize if @append
+      if @pos >= @string.bytesize
+        @string << s
+      else
+        @string.replace(@string.byteslice(0, @pos) + s + (@string.byteslice(@pos + s.bytesize, @string.bytesize) || ""))
+      end
+      @pos += s.bytesize
+      n += s.bytesize
+    end
+    n
+  end
+
+  def <<(x)
+    write(x)
+    self
+  end
+
+  def print(*items)
+    write(*items)
+    nil
+  end
+
+  def puts(*items)
+    if items.empty?
+      write("\n")
+      return nil
+    end
+    items.flatten.each do |x|
+      s = x.nil? ? "" : x.to_s
+      write(s.end_with?("\n") ? s : s + "\n")
+    end
+    nil
+  end
+
+  def printf(fmt, *a)
+    write(format(fmt, *a))
+    nil
+  end
+
+  def putc(c)
+    write(c.is_a?(Integer) ? c.chr : c.to_s[0])
+    c
+  end
+
+  def read(n = nil, *)
+    if n.nil?
+      s = @string.byteslice(@pos, @string.bytesize) || ""
+      @pos = @string.bytesize
+      return s
+    end
+    return nil if @pos >= @string.bytesize && n > 0
+    s = @string.byteslice(@pos, n) || ""
+    @pos += s.bytesize
+    s
+  end
+
+  def gets(sep = "\n", chomp: false)
+    return nil if @pos >= @string.bytesize
+    rest = @string.byteslice(@pos, @string.bytesize)
+    i = sep ? rest.index(sep) : nil
+    line = i ? rest[0, i + sep.size] : rest
+    @pos += line.bytesize
+    @lineno += 1
+    chomp ? line.chomp : line
+  end
+
+  def readline(*a, **k) = gets(*a, **k) || raise(EOFError, "end of file reached")
+
+  def getc
+    return nil if @pos >= @string.bytesize
+    c = @string.byteslice(@pos, @string.bytesize)[0]
+    @pos += c.bytesize
+    c
+  end
+
+  def ungetc(c)
+    @pos -= c.to_s.bytesize if @pos > 0
+    nil
+  end
+
+  def each_line(*a, chomp: false)
+    return to_enum(:each_line, *a, chomp: chomp) unless block_given?
+    while (l = gets(*a, chomp: chomp))
+      yield l
+    end
+    self
+  end
+  alias each each_line
+
+  def each_char
+    return to_enum(:each_char) unless block_given?
+    while (c = getc)
+      yield c
+    end
+    self
+  end
+
+  def readlines(*a, chomp: false) = each_line(*a, chomp: chomp).to_a
+
+  def rewind
+    @pos = 0
+    @lineno = 0
+    0
+  end
+
+  def seek(n, whence = 0)
+    @pos = whence == 0 ? n : whence == 1 ? @pos + n : @string.bytesize + n
+    0
+  end
+
+  def pos = @pos
+  alias tell pos
+  def pos=(n)
+    @pos = n
+  end
+  def eof? = @pos >= @string.bytesize
+  alias eof eof?
+  def size = @string.bytesize
+  alias length size
+  def truncate(n)
+    @string.replace(@string.byteslice(0, n))
+    n
+  end
+  def close
+    @closed = true
+    nil
+  end
+  def close_read = nil
+  def close_write = nil
+  def closed? = @closed
+  def flush = self
+  def sync = true
+  def sync=(v)
+    v
+  end
+  def fsync = 0
+  def tty? = false
+  alias isatty tty?
+  def fileno = nil
+  def binmode = self
+  def set_encoding(*) = self
+  def external_encoding = @string.encoding
+  def reopen(s = +"", *)
+    @string = s
+    @pos = 0
+    self
+  end
+end

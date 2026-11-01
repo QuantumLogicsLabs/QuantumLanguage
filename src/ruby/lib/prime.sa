@@ -1,0 +1,69 @@
+class Prime
+  include Enumerable
+
+  def self.instance = (@instance ||= new)
+  def self.each(limit = nil, &b) = instance.each(limit, &b)
+  def self.prime?(n) = instance.prime?(n)
+  def self.first(n) = instance.first(n)
+  def self.take(n) = instance.first(n)
+  def self.lazy = instance.lazy
+  def self.take_while(&b) = instance.take_while(&b)
+  def self.find(&b) = instance.find(&b)
+  def self.include?(n) = instance.prime?(n)
+  def self.prime_division(n) = instance.prime_division(n)
+  def self.int_from_prime_division(pd) = pd.inject(1) { |v, (p, e)| v * p**e }
+
+  def each(limit = nil)
+    return to_enum(:each, limit) unless block_given?
+    n = 2
+    loop do
+      break if limit && n > limit
+      yield n if prime?(n)
+      n += n == 2 ? 1 : 2
+    end
+    self
+  end
+
+  def prime?(n)
+    raise ArgumentError, "Expected an integer, got #{n}" unless n.is_a?(Integer)
+    return false if n < 2
+    return n == 2 || n == 3 if n < 4
+    return false if n.even? || n % 3 == 0
+    i = 5
+    while i * i <= n
+      return false if n % i == 0 || n % (i + 2) == 0
+      i += 6
+    end
+    true
+  end
+
+  def prime_division(n)
+    raise ZeroDivisionError if n == 0
+    out = []
+    if n < 0
+      out << [-1, 1]
+      n = -n
+    end
+    d = 2
+    while d * d <= n
+      if n % d == 0
+        e = 0
+        while n % d == 0
+          n /= d
+          e += 1
+        end
+        out << [d, e]
+      end
+      d += d == 2 ? 1 : 2
+    end
+    out << [n, 1] if n > 1
+    out
+  end
+end
+
+class Integer
+  def prime? = Prime.prime?(self)
+  def prime_division = Prime.prime_division(self)
+  def self.each_prime(limit, &b) = Prime.each(limit, &b)
+  def self.from_prime_division(pd) = Prime.int_from_prime_division(pd)
+end

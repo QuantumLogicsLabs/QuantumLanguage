@@ -1,0 +1,2456 @@
+// quantum: cpp
+// Ruby front-end: Array, and the sorts MRI uses (the C runtime's qsort for
+// sort, MRI's introsort for sort_by with numeric keys) so ties come out in
+// the same order.
+#include "RubyRt.h.sa"
+
+#include <cmath>
+
+namespace ruby
+{
+
+namespace
+{
+
+std::vector<V> &A(Interp &I, V v) { return I.aref(v); }
+
+void modify(Interp &I, V self)
+{
+    if (op(self)->frozen)
+        I.frozenError(self);
+}
+
+V newAry(Interp &I, V self, const std::vector<V> &items)
+{
+    (void)self;
+    return I.ary(items);
+}
+
+// ── sorting ───────────────────────────────────────────────────────────────
+
+typedef std::function<int(V, V)> CmpFn;
+
+// the Microsoft C runtime's qsort (MRI's ruby_qsort on Windows)
+void msQsort(std::vector<V> &a, const CmpFn &cmp)
+{
+    size_t num = a.size();
+    if (num < 2)
+        return;
+    auto sw = [&](size_t i, size_t j)
+    {
+        V t = a[i];
+        a[i] = a[j];
+        a[j] = t;
+    };
+    std::vector<size_t> loStack, hiStack;
+    size_t lo = 0, hi = num - 1;
+    for (;;)
+    {
+        size_t size = hi - lo + 1;
+        bool recurse = false;
+        if (size <= 8)
+        {
+            size_t h = hi;
+            while (h > lo)
+            {
+                size_t mx = lo;
+                for (size_t p = lo + 1; p <= h; ++p)
+                    if (cmp(a[p], a[mx]) > 0)
+                        mx = p;
+                sw(mx, h);
+                --h;
+            }
+        }
+        else
+        {
+            size_t mid = lo + size / 2;
+            if (cmp(a[lo], a[mid]) > 0)
+                sw(lo, mid);
+            if (cmp(a[lo], a[hi]) > 0)
+                sw(lo, hi);
+            if (cmp(a[mid], a[hi]) > 0)
+                sw(mid, hi);
+            size_t loguy = lo, higuy = hi;
+            for (;;)
+            {
+                if (mid > loguy)
+                {
+                    do
+                        ++loguy;
+                    while (loguy < mid && cmp(a[loguy], a[mid]) <= 0);
+                }
+                if (mid <= loguy)
+                {
+                    do
+                        ++loguy;
+                    while (loguy <= hi && cmp(a[loguy], a[mid]) <= 0);
+                }
+                do
+                    --higuy;
+                while (higuy > mid && cmp(a[higuy], a[mid]) > 0);
+                if (higuy < loguy)
+                    break;
+                sw(loguy, higuy);
+                if (mid == higuy)
+                    mid = loguy;
+            }
+            ++higuy;
+            if (mid < higuy)
+            {
+                do
+                    --higuy;
+                while (higuy > mid && cmp(a[higuy], a[mid]) == 0);
+            }
+            if (mid >= higuy)
+            {
+                do
+                    --higuy;
+                while (higuy > lo && cmp(a[higuy], a[mid]) == 0);
+            }
+            if (higuy - lo >= hi - loguy)
+            {
+                if (lo < higuy)
+                {
+                    loStack.push_back(lo);
+                    hiStack.push_back(higuy);
+                }
+                if (loguy < hi)
+                {
+                    lo = loguy;
+                    recurse = true;
+                }
+            }
+            else
+            {
+                if (loguy < hi)
+                {
+                    loStack.push_back(loguy);
+                    hiStack.push_back(hi);
+                }
+                if (lo < higuy)
+                {
+                    hi = higuy;
+                    recurse = true;
+                }
+            }
+        }
+        if (recurse)
+            continue;
+        if (loStack.empty())
+            return;
+        lo = loStack.back();
+        hi = hiStack.back();
+        loStack.pop_back();
+        hiStack.pop_back();
+    }
+}
+
+// MRI's sort_by for Integer / Float keys: introsort on (key, value) pairs
+struct Uniform
+{
+    Interp *I;
+    std::vector<V> *k;
+    std::vector<V> *v;
+    bool less(V a, V b)
+    {
+        if (isFix(a) && isFix(b))
+            return (int64_t)a < (int64_t)b;
+        return I->numToF(a) < I->numToF(b);
+    }
+    void swap(size_t i, size_t j)
+    {
+        V t = (*k)[i];
+        (*k)[i] = (*k)[j];
+        (*k)[j] = t;
+        t = (*v)[i];
+        (*v)[i] = (*v)[j];
+        (*v)[j] = t;
+    }
+    void insertion(size_t b, size_t e)
+    {
+        if (e - b < 2)
+            return;
+        for (size_t idx = b + 1; idx < e; ++idx)
+        {
+            V tk = (*k)[idx], tv = (*v)[idx];
+            size_t j = idx, kk = idx;
+            if (less(tk, (*k)[b]))
+            {
+                while (b < j)
+                {
+                    --kk;
+                    (*k)[j] = (*k)[kk];
+                    (*v)[j] = (*v)[kk];
+                    j = kk;
+                }
+            }
+            else
+            {
+                for (;;)
+                {
+                    --kk;
+                    if (!less(tk, (*k)[kk]))
+                        break;
+                    (*k)[j] = (*k)[kk];
+                    (*v)[j] = (*v)[kk];
+                    j = kk;
+                }
+            }
+            (*k)[j] = tk;
+            (*v)[j] = tv;
+        }
+    }
+    void heapDown(size_t b, size_t offset, size_t len)
+    {
+        size_t c;
+        V tk = (*k)[b + offset], tv = (*v)[b + offset];
+        while ((c = (offset << 1) + 1) <= len)
+        {
+            if (c < len && less((*k)[b + c], (*k)[b + c + 1]))
+                c++;
+            if (!less(tk, (*k)[b + c]))
+                break;
+            (*k)[b + offset] = (*k)[b + c];
+            (*v)[b + offset] = (*v)[b + c];
+            offset = c;
+        }
+        (*k)[b + offset] = tk;
+        (*v)[b + offset] = tv;
+    }
+    void heapsort(size_t b, size_t e)
+    {
+        size_t n = e - b;
+        if (n < 2)
+            return;
+        for (size_t offset = n >> 1; offset > 0;)
+            heapDown(b, --offset, n - 1);
+        for (size_t offset = n - 1; offset > 0;)
+        {
+            swap(b, b + offset);
+            heapDown(b, 0, --offset);
+        }
+    }
+    V med3(V a, V bb, V c)
+    {
+        if (less(a, bb))
+            return less(bb, c) ? bb : less(c, a) ? a : c;
+        return less(c, bb) ? bb : less(a, c) ? a : c;
+    }
+    void intro(size_t b, size_t e, size_t d)
+    {
+        if (e - b <= 16)
+        {
+            insertion(b, e);
+            return;
+        }
+        if (d == 0)
+        {
+            heapsort(b, e);
+            return;
+        }
+        V x = med3((*k)[b], (*k)[b + ((e - b) >> 1)], (*k)[e - 1]);
+        int64_t i = (int64_t)b, j = (int64_t)e - 1;
+        do
+        {
+            while (less((*k)[i], x))
+                i++;
+            while (less(x, (*k)[j]))
+                j--;
+            if (i <= j)
+            {
+                swap((size_t)i, (size_t)j);
+                i++;
+                j--;
+            }
+        } while (i <= j);
+        j++;
+        if ((int64_t)e - j > 1)
+            intro((size_t)j, e, d - 1);
+        if (i - (int64_t)b > 1)
+            intro(b, (size_t)i, d - 1);
+    }
+};
+
+int cmpFromValue(Interp &I, V r, V a, V b)
+{
+    if (r == Qnil)
+    {
+        std::string o = !isObj(b) || I.isFloat(b) ? I.inspect(b) : I.className(I.realClassOf(b));
+        I.raise(I.cArgumentError, "comparison of " + I.className(I.realClassOf(a)) + " with " + o + " failed");
+    }
+    if (isFix(r))
+        return fixv(r) < 0 ? -1 : fixv(r) > 0 ? 1 : 0;
+    if (I.isFloat(r))
+        return I.fltv(r) < 0 ? -1 : I.fltv(r) > 0 ? 1 : 0;
+    if (I.isInt(r))
+        return intIsNeg(I, r) ? -1 : 1;
+    V z = I.call1(r, I.s.gt, fix(0));
+    if (truthy(z))
+        return 1;
+    return truthy(I.call1(r, I.s.lt, fix(0))) ? -1 : 0;
+}
+
+} // namespace
+
+void rbSort(Interp &I, std::vector<V> &v, Blk *blk)
+{
+    if (blk)
+    {
+        CmpFn f = [&I, blk](V a, V b) -> int
+        {
+            V r = I.yield2(blk, a, b);
+            return cmpFromValue(I, r, a, b);
+        };
+        msQsort(v, f);
+        return;
+    }
+    CmpFn f = [&I](V a, V b) -> int { return I.cmp(a, b); };
+    msQsort(v, f);
+}
+
+void rbSortBy(Interp &I, std::vector<V> &v, Blk *blk)
+{
+    std::vector<V> keys(v.size());
+    bool uniform = true;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        keys[i] = I.yield(blk, v[i]);
+        if (!isFix(keys[i]) && !I.isFloat(keys[i]))
+            uniform = false;
+    }
+    if (v.size() <= 1)
+        return;
+    if (uniform)
+    {
+        Uniform u;
+        u.I = &I;
+        u.k = &keys;
+        u.v = &v;
+        bool sorted = true;
+        for (size_t i = 1; i < keys.size(); ++i)
+            if (u.less(keys[i], keys[i - 1]))
+            {
+                sorted = false;
+                break;
+            }
+        if (sorted)
+            return;
+        size_t n = keys.size(), d = 0;
+        while ((n >> (d + 1)) != 0)
+            ++d;
+        u.intro(0, n, d << 1);
+        return;
+    }
+    // pairs sorted by key with the runtime's qsort
+    std::vector<V> idx(v.size());
+    for (size_t i = 0; i < v.size(); ++i)
+        idx[i] = fix((int64_t)i);
+    CmpFn f = [&I, &keys](V a, V b) -> int { return I.cmp(keys[fixv(a)], keys[fixv(b)]); };
+    msQsort(idx, f);
+    std::vector<V> out(v.size());
+    for (size_t i = 0; i < idx.size(); ++i)
+        out[i] = v[fixv(idx[i])];
+    v = out;
+}
+
+V enumFor(Interp &I, V recv, const char *meth, Args &a)
+{
+    auto *e = new REnum();
+    e->klass = I.cEnumerator;
+    e->type = T::Enumerator;
+    e->recv = recv;
+    e->meth = intern(meth);
+    for (int i = 0; i < a.argc; ++i)
+        e->args.push_back(a.argv[i]);
+    e->kw = a.kw;
+    return ov(e);
+}
+
+V aryInspect(Interp &I, V self)
+{
+    for (V seen : I.inspecting)
+        if (seen == self)
+            return I.str("[...]");
+    I.inspecting.push_back(self);
+    std::string out = "[";
+    std::vector<V> &v = A(I, self);
+    try
+    {
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            if (i)
+                out += ", ";
+            out += I.inspect(v[i]);
+        }
+    }
+    catch (...)
+    {
+        I.inspecting.pop_back();
+        throw;
+    }
+    I.inspecting.pop_back();
+    return I.str(out + "]");
+}
+
+// Array#sum / Enumerable#sum: exact for integers and rationals, Kahan-Babuska
+// for floats, `+` for anything else (MRI's algorithm)
+V arySum(Interp &I, std::vector<V> &items, V init, bool hasInit, Blk *blk)
+{
+    (void)hasInit;
+    V v = init;
+    size_t i = 0;
+    size_t n = items.size();
+    auto elem = [&](size_t k) -> V { return blk ? I.yield(blk, items[k]) : items[k]; };
+    if (n == 0)
+        return v;
+    bool exact = I.isInt(v) || isType(v, T::Rational);
+    if (exact)
+    {
+        V e = Qnil;
+        for (; i < n; ++i)
+        {
+            e = elem(i);
+            if (I.isInt(e) || isType(e, T::Rational))
+            {
+                v = numAdd(I, v, e);
+                continue;
+            }
+            break;
+        }
+        if (i == n)
+            return v;
+        if (I.isFloat(e))
+        {
+            double f = I.numToF(v), c = 0.0;
+            bool first = true;
+            for (; i < n; ++i)
+            {
+                V x0 = first ? e : elem(i);
+                first = false;
+                double x;
+                if (I.isFloat(x0))
+                    x = I.fltv(x0);
+                else if (I.isInt(x0) || isType(x0, T::Rational))
+                    x = I.numToF(x0);
+                else
+                {
+                    v = I.flo(f + c);
+                    v = I.call1(v, I.s.plus, x0);
+                    for (++i; i < n; ++i)
+                        v = I.call1(v, I.s.plus, elem(i));
+                    return v;
+                }
+                if (std::isnan(f))
+                    continue;
+                if (std::isnan(x))
+                {
+                    f = x;
+                    continue;
+                }
+                if (std::isinf(x))
+                {
+                    if (std::isinf(f) && std::signbit(x) != std::signbit(f))
+                        f = 0.0 / 0.0;
+                    else
+                        f = x;
+                    continue;
+                }
+                if (std::isinf(f))
+                    continue;
+                double t = f + x;
+                if (std::fabs(f) >= std::fabs(x))
+                    c += ((f - t) + x);
+                else
+                    c += ((x - t) + f);
+                f = t;
+            }
+            return I.flo(f + c);
+        }
+        v = I.call1(v, I.s.plus, e);
+        ++i;
+    }
+    for (; i < n; ++i)
+        v = I.call1(v, I.s.plus, elem(i));
+    return v;
+}
+
+namespace
+{
+
+// ── Array methods ─────────────────────────────────────────────────────────
+
+int64_t normIndex(int64_t i, size_t n) { return i < 0 ? i + (int64_t)n : i; }
+
+V ary_s_new(Interp &I, V self, Args &a)
+{
+    V arr = I.allocate(static_cast<RClass *>(op(self)));
+    Method *init = I.findMethod(op(arr)->klass, I.s.initialize);
+    I.invoke(init, arr, a, nullptr, I.frame);
+    return arr;
+}
+
+V ary_initialize(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    v.clear();
+    if (a.argc == 0)
+        return self;
+    if (a.argc == 1 && I.isAry(a.argv[0]))
+    {
+        v = A(I, a.argv[0]);
+        return self;
+    }
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "negative array size");
+    V fill = a.argc > 1 ? a.argv[1] : Qnil;
+    for (int64_t i = 0; i < n; ++i)
+        v.push_back(a.blk ? I.yield(a.blk, fix(i)) : fill);
+    return self;
+}
+
+V ary_s_aref(Interp &I, V self, Args &a)
+{
+    V arr = I.allocate(static_cast<RClass *>(op(self)));
+    A(I, arr).assign(a.argv, a.argv + a.argc);
+    return arr;
+}
+
+V ary_aref(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    V k = a.argv[0];
+    if (a.argc == 2)
+    {
+        int64_t st = normIndex(I.intOf(k), v.size());
+        int64_t len = I.intOf(a.argv[1]);
+        if (st < 0 || st > (int64_t)v.size() || len < 0)
+            return Qnil;
+        int64_t e = st + len > (int64_t)v.size() ? (int64_t)v.size() : st + len;
+        return I.ary(std::vector<V>(v.begin() + st, v.begin() + e));
+    }
+    if (isFix(k))
+    {
+        int64_t i = normIndex(fixv(k), v.size());
+        if (i < 0 || i >= (int64_t)v.size())
+            return Qnil;
+        return v[i];
+    }
+    if (isType(k, T::Range))
+    {
+        auto *r = static_cast<RRange *>(op(k));
+        int64_t n = (int64_t)v.size();
+        int64_t b = r->lo == Qnil ? 0 : I.intOf(r->lo);
+        int64_t e = r->hi == Qnil ? n : I.intOf(r->hi);
+        if (b < 0)
+            b += n;
+        if (e < 0)
+            e += n;
+        if (b < 0 || b > n)
+            return Qnil;
+        if (!r->excl && r->hi != Qnil)
+            ++e;
+        if (e > n)
+            e = n;
+        if (e < b)
+            e = b;
+        return I.ary(std::vector<V>(v.begin() + b, v.begin() + e));
+    }
+    if (isType(k, T::Enumerator) && op(k)->klass == I.cArith)
+    {
+        // arr[(0..).step(2)]
+        V idxs = I.call0(k, I.s.to_a);
+        V out = I.ary();
+        for (V x : A(I, idxs))
+        {
+            int64_t i = normIndex(I.intOf(x), v.size());
+            if (i >= 0 && i < (int64_t)v.size())
+                A(I, out).push_back(v[i]);
+        }
+        return out;
+    }
+    int64_t i = normIndex(I.intOf(k), v.size());
+    if (i < 0 || i >= (int64_t)v.size())
+        return Qnil;
+    return v[i];
+}
+
+V ary_aset(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    V k = a.argv[0];
+    V val = a.argv[a.argc - 1];
+    int64_t st, len;
+    if (a.argc == 3)
+    {
+        st = I.intOf(k);
+        len = I.intOf(a.argv[1]);
+        if (st < 0)
+        {
+            st += (int64_t)v.size();
+            if (st < 0)
+                I.raise(I.cIndexError, "index " + std::to_string(I.intOf(k)) + " too small for array; minimum: -" + std::to_string(v.size()));
+        }
+    }
+    else if (isType(k, T::Range))
+    {
+        auto *r = static_cast<RRange *>(op(k));
+        int64_t n = (int64_t)v.size();
+        st = r->lo == Qnil ? 0 : I.intOf(r->lo);
+        int64_t e = r->hi == Qnil ? n : I.intOf(r->hi);
+        if (st < 0)
+            st += n;
+        if (e < 0)
+            e += n;
+        if (!r->excl && r->hi != Qnil)
+            ++e;
+        len = e - st < 0 ? 0 : e - st;
+    }
+    else
+    {
+        int64_t i = I.intOf(k);
+        if (i < 0)
+        {
+            i += (int64_t)v.size();
+            if (i < 0)
+                I.raise(I.cIndexError, "index " + std::to_string(I.intOf(k)) + " too small for array; minimum: -" + std::to_string(v.size()));
+        }
+        if (i >= (int64_t)v.size())
+            v.resize(i + 1, Qnil);
+        v[i] = val;
+        return val;
+    }
+    if (st > (int64_t)v.size())
+        v.resize(st, Qnil);
+    if (st + len > (int64_t)v.size())
+        len = (int64_t)v.size() - st;
+    std::vector<V> rep;
+    if (I.isAry(val))
+        rep = A(I, val);
+    else
+        rep.push_back(val);
+    v.erase(v.begin() + st, v.begin() + st + len);
+    v.insert(v.begin() + st, rep.begin(), rep.end());
+    return val;
+}
+
+V ary_at(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    int64_t i = normIndex(I.intOf(a.argv[0]), v.size());
+    if (i < 0 || i >= (int64_t)v.size())
+        return Qnil;
+    return v[i];
+}
+
+V ary_fetch(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    int64_t orig = I.intOf(a.argv[0]);
+    int64_t i = normIndex(orig, v.size());
+    if (i < 0 || i >= (int64_t)v.size())
+    {
+        if (a.blk)
+            return I.yield(a.blk, a.argv[0]);
+        if (a.argc > 1)
+            return a.argv[1];
+        I.raise(I.cIndexError, "index " + std::to_string(orig) + " outside of array bounds: " + std::to_string(-(int64_t)v.size()) + "..." + std::to_string(v.size()));
+    }
+    return v[i];
+}
+
+V ary_dig(Interp &I, V self, Args &a)
+{
+    V cur = self;
+    for (int i = 0; i < a.argc; ++i)
+    {
+        if (cur == Qnil)
+            return Qnil;
+        cur = I.call1(cur, I.s.aref, a.argv[i]);
+    }
+    return cur;
+}
+
+V ary_first(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    if (a.argc == 0)
+        return v.empty() ? Qnil : v[0];
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "negative array size");
+    if (n > (int64_t)v.size())
+        n = (int64_t)v.size();
+    return I.ary(std::vector<V>(v.begin(), v.begin() + n));
+}
+
+V ary_last(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    if (a.argc == 0)
+        return v.empty() ? Qnil : v.back();
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "negative array size");
+    if (n > (int64_t)v.size())
+        n = (int64_t)v.size();
+    return I.ary(std::vector<V>(v.end() - n, v.end()));
+}
+
+V ary_push(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = static_cast<RArray *>(op(self))->a; // shifted elements may stay
+    for (int i = 0; i < a.argc; ++i)
+        v.push_back(a.argv[i]);
+    return self;
+}
+
+V ary_pop(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    if (a.argc == 0)
+    {
+        if (v.empty())
+            return Qnil;
+        V x = v.back();
+        v.pop_back();
+        return x;
+    }
+    int64_t n = I.intOf(a.argv[0]);
+    if (n > (int64_t)v.size())
+        n = (int64_t)v.size();
+    V out = I.ary(std::vector<V>(v.end() - n, v.end()));
+    v.resize(v.size() - n);
+    return out;
+}
+
+V ary_shift(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    if (a.argc == 0)
+    {
+        auto *r = static_cast<RArray *>(op(self));
+        size_t n = r->a.size();
+        if (r->skip >= n)
+            return Qnil;
+        V x = r->a.data()[r->skip];
+        if (++r->skip == n)
+        {
+            r->a.clear();
+            r->skip = 0;
+        }
+        else if (r->skip > 64 && r->skip * 2 > n)
+            I.arrayCompact(r);
+        return x;
+    }
+    std::vector<V> &v = A(I, self);
+    int64_t n = I.intOf(a.argv[0]);
+    if (n > (int64_t)v.size())
+        n = (int64_t)v.size();
+    V out = I.ary(std::vector<V>(v.begin(), v.begin() + n));
+    v.erase(v.begin(), v.begin() + n);
+    return out;
+}
+
+V ary_unshift(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    v.insert(v.begin(), a.argv, a.argv + a.argc);
+    return self;
+}
+
+V ary_insert(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    int64_t i = I.intOf(a.argv[0]);
+    if (i < 0)
+        i += (int64_t)v.size() + 1;
+    if (i < 0)
+        I.raise(I.cIndexError, "index " + std::to_string(I.intOf(a.argv[0])) + " too small for array");
+    if (i > (int64_t)v.size())
+        v.resize(i, Qnil);
+    v.insert(v.begin() + i, a.argv + 1, a.argv + a.argc);
+    return self;
+}
+
+V ary_concat(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> add;
+    for (int i = 0; i < a.argc; ++i)
+    {
+        V o = I.toAry(a.argv[i]);
+        if (o == Qnil)
+            I.typeError(a.argv[i], "Array");
+        for (V x : A(I, o))
+            add.push_back(x);
+    }
+    std::vector<V> &v = A(I, self);
+    v.insert(v.end(), add.begin(), add.end());
+    return self;
+}
+
+V ary_plus(Interp &I, V self, Args &a)
+{
+    V o = I.toAry(a.argv[0]);
+    if (o == Qnil)
+        I.typeError(a.argv[0], "Array");
+    std::vector<V> out = A(I, self);
+    for (V x : A(I, o))
+        out.push_back(x);
+    return I.ary(out);
+}
+
+V hashSetOf(Interp &I, std::vector<V> &v)
+{
+    V h = I.newHash();
+    for (V x : v)
+        I.hset(I.href(h), x, Qtrue);
+    return h;
+}
+
+V ary_minus(Interp &I, V self, Args &a)
+{
+    V o = I.toAry(a.argv[0]);
+    if (o == Qnil)
+        I.typeError(a.argv[0], "Array");
+    V h = hashSetOf(I, A(I, o));
+    std::vector<V> out;
+    for (V x : A(I, self))
+    {
+        bool found = false;
+        I.hget(I.href(h), x, &found);
+        if (!found)
+            out.push_back(x);
+    }
+    return I.ary(out);
+}
+
+V ary_difference(Interp &I, V self, Args &a)
+{
+    V cur = self;
+    for (int i = 0; i < a.argc; ++i)
+    {
+        Args b;
+        b.argv = &a.argv[i];
+        b.argc = 1;
+        cur = ary_minus(I, cur, b);
+    }
+    if (a.argc == 0)
+        return I.ary(A(I, self));
+    return cur;
+}
+
+V ary_and(Interp &I, V self, Args &a)
+{
+    V o = I.toAry(a.argv[0]);
+    if (o == Qnil)
+        I.typeError(a.argv[0], "Array");
+    V h = hashSetOf(I, A(I, o));
+    V seen = I.newHash();
+    std::vector<V> out;
+    for (V x : A(I, self))
+    {
+        bool found = false;
+        I.hget(I.href(h), x, &found);
+        bool dup = false;
+        I.hget(I.href(seen), x, &dup);
+        if (found && !dup)
+        {
+            out.push_back(x);
+            I.hset(I.href(seen), x, Qtrue);
+        }
+    }
+    return I.ary(out);
+}
+
+V ary_intersection(Interp &I, V self, Args &a)
+{
+    V cur = self;
+    for (int i = 0; i < a.argc; ++i)
+    {
+        Args b;
+        b.argv = &a.argv[i];
+        b.argc = 1;
+        cur = ary_and(I, cur, b);
+    }
+    return cur == self ? I.ary(A(I, self)) : cur;
+}
+
+V ary_or(Interp &I, V self, Args &a)
+{
+    V seen = I.newHash();
+    std::vector<V> out;
+    auto add = [&](std::vector<V> &v)
+    {
+        for (V x : v)
+        {
+            bool dup = false;
+            I.hget(I.href(seen), x, &dup);
+            if (!dup)
+            {
+                out.push_back(x);
+                I.hset(I.href(seen), x, Qtrue);
+            }
+        }
+    };
+    add(A(I, self));
+    for (int i = 0; i < a.argc; ++i)
+    {
+        V o = I.toAry(a.argv[i]);
+        if (o == Qnil)
+            I.typeError(a.argv[i], "Array");
+        add(A(I, o));
+    }
+    return I.ary(out);
+}
+
+V ary_intersect_p(Interp &I, V self, Args &a)
+{
+    V r = ary_and(I, self, a);
+    return boolv(!A(I, r).empty());
+}
+
+V ary_mul(Interp &I, V self, Args &a)
+{
+    if (I.isStr(a.argv[0]))
+    {
+        V sep = a.argv[0];
+        V av = sep;
+        return I.call(self, intern("join"), 1, &av);
+    }
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "negative argument");
+    std::vector<V> out;
+    std::vector<V> &v = A(I, self);
+    for (int64_t i = 0; i < n; ++i)
+        out.insert(out.end(), v.begin(), v.end());
+    return I.ary(out);
+}
+
+V ary_eq(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (!I.isAry(o))
+    {
+        if (isObj(o) && op(o)->type == T::Object && I.respondTo(o, I.s.to_ary))
+            return boolv(truthy(I.call1(o, I.s.eq, self)));
+        return Qfalse;
+    }
+    return boolv(I.eq(self, o));
+}
+
+V ary_eql(Interp &I, V self, Args &a) { return boolv(I.eql(self, a.argv[0])); }
+
+V ary_hash(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix((int64_t)(I.hashOf(self) >> 2));
+}
+
+V ary_cmp(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (!I.isAry(o))
+        return Qnil;
+    std::vector<V> &x = A(I, self), &y = A(I, o);
+    size_t n = x.size() < y.size() ? x.size() : y.size();
+    for (size_t i = 0; i < n; ++i)
+    {
+        V c = I.cmpV(x[i], y[i]);
+        if (c == Qnil)
+            return Qnil;
+        if (c != fix(0))
+            return c;
+    }
+    return fix(x.size() < y.size() ? -1 : x.size() > y.size() ? 1 : 0);
+}
+
+V ary_length(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    auto *r = static_cast<RArray *>(op(self));
+    return fix((int64_t)(r->a.size() - r->skip));
+}
+
+V ary_empty(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    auto *r = static_cast<RArray *>(op(self));
+    return boolv(r->a.size() == r->skip);
+}
+
+V ary_include(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    V x = a.argv[0];
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i] == x || I.eq(v[i], x))
+            return Qtrue;
+    return Qfalse;
+}
+
+V ary_index(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    if (a.argc == 0 && !a.blk)
+        return enumFor(I, self, "index", a);
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        bool hit = a.argc > 0 ? I.eq(v[i], a.argv[0]) : truthy(I.yield(a.blk, v[i]));
+        if (hit)
+            return fix((int64_t)i);
+    }
+    return Qnil;
+}
+
+V ary_rindex(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    for (size_t i = v.size(); i-- > 0;)
+    {
+        if (i >= v.size())
+            continue;
+        bool hit = a.argc > 0 ? I.eq(v[i], a.argv[0]) : truthy(I.yield(a.blk, v[i]));
+        if (hit)
+            return fix((int64_t)i);
+    }
+    return Qnil;
+}
+
+V ary_count(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    if (a.argc == 0 && !a.blk)
+        return fix((int64_t)v.size());
+    int64_t n = 0;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        bool hit = a.argc > 0 ? I.eq(v[i], a.argv[0]) : truthy(I.yield(a.blk, v[i]));
+        if (hit)
+            ++n;
+    }
+    return fix(n);
+}
+
+V ary_delete(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    V found = Qundef;
+    std::vector<V> out;
+    for (V x : v)
+    {
+        if (I.eq(x, a.argv[0]))
+            found = x;
+        else
+            out.push_back(x);
+    }
+    v = out;
+    if (found == Qundef)
+        return a.blk ? I.yield(a.blk, a.argv[0]) : Qnil;
+    return found;
+}
+
+V ary_delete_at(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    int64_t i = normIndex(I.intOf(a.argv[0]), v.size());
+    if (i < 0 || i >= (int64_t)v.size())
+        return Qnil;
+    V x = v[i];
+    v.erase(v.begin() + i);
+    return x;
+}
+
+V ary_slice_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    V r = ary_aref(I, self, a);
+    std::vector<V> &v = A(I, self);
+    if (r == Qnil)
+        return Qnil;
+    V k = a.argv[0];
+    if (a.argc == 2 || isType(k, T::Range))
+    {
+        int64_t st, len;
+        if (a.argc == 2)
+        {
+            st = normIndex(I.intOf(k), v.size());
+            len = (int64_t)A(I, r).size();
+        }
+        else
+        {
+            auto *rg = static_cast<RRange *>(op(k));
+            st = rg->lo == Qnil ? 0 : normIndex(I.intOf(rg->lo), v.size());
+            len = (int64_t)A(I, r).size();
+        }
+        v.erase(v.begin() + st, v.begin() + st + len);
+        return r;
+    }
+    int64_t i = normIndex(I.intOf(k), v.size());
+    v.erase(v.begin() + i);
+    return r;
+}
+
+V ary_select_bang(Interp &I, V self, Args &a, bool keep, bool returnNilIfSame)
+{
+    modify(I, self);
+    std::vector<V> src = A(I, self);
+    std::vector<V> out;
+    for (V x : src)
+        if (truthy(I.yield(a.blk, x)) == keep)
+            out.push_back(x);
+    bool changed = out.size() != src.size();
+    A(I, self) = out;
+    if (returnNilIfSame && !changed)
+        return Qnil;
+    return self;
+}
+
+V ary_delete_if(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "delete_if", a);
+    return ary_select_bang(I, self, a, false, false);
+}
+V ary_reject_bang(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "reject!", a);
+    return ary_select_bang(I, self, a, false, true);
+}
+V ary_keep_if(Interp &I, V self, Args &a) { return ary_select_bang(I, self, a, true, false); }
+V ary_filter_bang(Interp &I, V self, Args &a) { return ary_select_bang(I, self, a, true, true); }
+
+V ary_compact(Interp &I, V self, Args &a)
+{
+    (void)a;
+    std::vector<V> out;
+    for (V x : A(I, self))
+        if (x != Qnil)
+            out.push_back(x);
+    return I.ary(out);
+}
+
+V ary_compact_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    V r = ary_compact(I, self, a);
+    bool same = A(I, r).size() == A(I, self).size();
+    A(I, self) = A(I, r);
+    return same ? Qnil : self;
+}
+
+void flattenInto(Interp &I, std::vector<V> &out, std::vector<V> &v, int64_t depth, std::vector<V> &stack)
+{
+    for (V x : v)
+    {
+        V arr = I.isAry(x) ? x : Qnil;
+        if (arr != Qnil && depth != 0)
+        {
+            for (V s : stack)
+                if (s == arr)
+                    I.raise(I.cArgumentError, "tried to flatten recursive array");
+            stack.push_back(arr);
+            flattenInto(I, out, A(I, arr), depth - 1, stack);
+            stack.pop_back();
+        }
+        else
+            out.push_back(x);
+    }
+}
+
+V ary_flatten(Interp &I, V self, Args &a)
+{
+    int64_t depth = a.argc > 0 && a.argv[0] != Qnil ? I.intOf(a.argv[0]) : -1;
+    std::vector<V> out, stack;
+    stack.push_back(self);
+    flattenInto(I, out, A(I, self), depth, stack);
+    return I.ary(out);
+}
+
+V ary_flatten_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    V r = ary_flatten(I, self, a);
+    bool same = A(I, r).size() == A(I, self).size();
+    A(I, self) = A(I, r);
+    return same ? Qnil : self;
+}
+
+V ary_uniq(Interp &I, V self, Args &a)
+{
+    V seen = I.newHash();
+    std::vector<V> out;
+    for (V x : A(I, self))
+    {
+        V key = a.blk ? I.yield(a.blk, x) : x;
+        bool dup = false;
+        I.hget(I.href(seen), key, &dup);
+        if (!dup)
+        {
+            I.hset(I.href(seen), key, Qtrue);
+            out.push_back(x);
+        }
+    }
+    return I.ary(out);
+}
+
+V ary_uniq_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    V r = ary_uniq(I, self, a);
+    bool same = A(I, r).size() == A(I, self).size();
+    A(I, self) = A(I, r);
+    return same ? Qnil : self;
+}
+
+V ary_reverse(Interp &I, V self, Args &a)
+{
+    (void)a;
+    std::vector<V> &v = A(I, self);
+    return I.ary(std::vector<V>(v.rbegin(), v.rend()));
+}
+
+V ary_reverse_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    std::vector<V> r(v.rbegin(), v.rend());
+    v = r;
+    return self;
+}
+
+V ary_rotate(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    if (v.empty())
+        return I.ary();
+    int64_t n = a.argc > 0 ? I.intOf(a.argv[0]) : 1;
+    int64_t sz = (int64_t)v.size();
+    n = ((n % sz) + sz) % sz;
+    std::vector<V> out(v.begin() + n, v.end());
+    out.insert(out.end(), v.begin(), v.begin() + n);
+    return I.ary(out);
+}
+
+V ary_rotate_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    V r = ary_rotate(I, self, a);
+    A(I, self) = A(I, r);
+    return self;
+}
+
+V ary_sort(Interp &I, V self, Args &a)
+{
+    std::vector<V> v = A(I, self);
+    rbSort(I, v, a.blk);
+    return I.ary(v);
+}
+
+V ary_sort_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> v = A(I, self);
+    rbSort(I, v, a.blk);
+    A(I, self) = v;
+    return self;
+}
+
+V ary_sort_by(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "sort_by", a);
+    std::vector<V> v = A(I, self);
+    rbSortBy(I, v, a.blk);
+    return I.ary(v);
+}
+
+V ary_sort_by_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> v = A(I, self);
+    rbSortBy(I, v, a.blk);
+    A(I, self) = v;
+    return self;
+}
+
+// min / max: the first of equal elements wins
+V minmaxOne(Interp &I, std::vector<V> &v, Blk *blk, int sign)
+{
+    if (v.empty())
+        return Qnil;
+    V best = v[0];
+    for (size_t i = 1; i < v.size(); ++i)
+    {
+        int c;
+        if (blk)
+            c = cmpFromValue(I, I.yield2(blk, v[i], best), v[i], best);
+        else
+            c = I.cmp(v[i], best);
+        if (c * sign > 0)
+            best = v[i];
+    }
+    return best;
+}
+
+V minmaxN(Interp &I, std::vector<V> &v, Blk *blk, int64_t n, int sign)
+{
+    std::vector<V> s = v;
+    if (blk)
+    {
+        if (sign > 0)
+        {
+            CmpFn f = [&I, blk](V x, V y) -> int { return -cmpFromValue(I, I.yield2(blk, x, y), x, y); };
+            msQsort(s, f);
+        }
+        else
+            rbSort(I, s, blk);
+    }
+    else
+    {
+        CmpFn f = [&I, sign](V x, V y) -> int { return sign > 0 ? I.cmp(y, x) : I.cmp(x, y); };
+        msQsort(s, f);
+    }
+    if (n < (int64_t)s.size())
+        s.resize(n);
+    return I.ary(s);
+}
+
+V ary_min(Interp &I, V self, Args &a)
+{
+    if (a.argc > 0)
+        return minmaxN(I, A(I, self), a.blk, I.intOf(a.argv[0]), -1);
+    return minmaxOne(I, A(I, self), a.blk, -1);
+}
+
+V ary_max(Interp &I, V self, Args &a)
+{
+    if (a.argc > 0)
+        return minmaxN(I, A(I, self), a.blk, I.intOf(a.argv[0]), 1);
+    return minmaxOne(I, A(I, self), a.blk, 1);
+}
+
+V ary_minmax(Interp &I, V self, Args &a)
+{
+    return I.ary2(minmaxOne(I, A(I, self), a.blk, -1), minmaxOne(I, A(I, self), a.blk, 1));
+}
+
+V byExtreme(Interp &I, V self, Args &a, int sign, const char *name)
+{
+    if (!a.blk)
+        return enumFor(I, self, name, a);
+    std::vector<V> &v = A(I, self);
+    if (a.argc > 0)
+    {
+        int64_t n = I.intOf(a.argv[0]);
+        std::vector<V> s = v;
+        std::vector<V> keys;
+        for (V x : s)
+            keys.push_back(I.yield(a.blk, x));
+        std::vector<V> idx;
+        for (size_t i = 0; i < s.size(); ++i)
+            idx.push_back(fix((int64_t)i));
+        CmpFn g = [&I, &keys, sign](V x, V y) -> int
+        {
+            int c = I.cmp(keys[fixv(x)], keys[fixv(y)]);
+            return sign > 0 ? -c : c;
+        };
+        msQsort(idx, g);
+        V out = I.ary();
+        for (size_t i = 0; i < idx.size() && (int64_t)i < n; ++i)
+            A(I, out).push_back(s[fixv(idx[i])]);
+        return out;
+    }
+    if (v.empty())
+        return Qnil;
+    V best = v[0];
+    V bestKey = I.yield(a.blk, v[0]);
+    for (size_t i = 1; i < v.size(); ++i)
+    {
+        V k = I.yield(a.blk, v[i]);
+        if (I.cmp(k, bestKey) * sign > 0)
+        {
+            best = v[i];
+            bestKey = k;
+        }
+    }
+    return best;
+}
+
+V ary_min_by(Interp &I, V self, Args &a) { return byExtreme(I, self, a, -1, "min_by"); }
+V ary_max_by(Interp &I, V self, Args &a) { return byExtreme(I, self, a, 1, "max_by"); }
+
+V ary_minmax_by(Interp &I, V self, Args &a)
+{
+    Args b = a;
+    b.argc = 0;
+    return I.ary2(byExtreme(I, self, b, -1, "minmax_by"), byExtreme(I, self, b, 1, "minmax_by"));
+}
+
+V ary_sum(Interp &I, V self, Args &a)
+{
+    V init = a.argc > 0 ? a.argv[0] : fix(0);
+    std::vector<V> items = A(I, self);
+    return arySum(I, items, init, a.argc > 0, a.blk);
+}
+
+V ary_take(Interp &I, V self, Args &a)
+{
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "attempt to take negative size");
+    std::vector<V> &v = A(I, self);
+    if (n > (int64_t)v.size())
+        n = (int64_t)v.size();
+    return I.ary(std::vector<V>(v.begin(), v.begin() + n));
+}
+
+V ary_drop(Interp &I, V self, Args &a)
+{
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "attempt to drop negative size");
+    std::vector<V> &v = A(I, self);
+    if (n > (int64_t)v.size())
+        n = (int64_t)v.size();
+    return I.ary(std::vector<V>(v.begin() + n, v.end()));
+}
+
+V ary_take_while(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "take_while", a);
+    std::vector<V> out;
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        if (!truthy(I.yield(a.blk, v[i])))
+            break;
+        out.push_back(v[i]);
+    }
+    return I.ary(out);
+}
+
+V ary_drop_while(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "drop_while", a);
+    std::vector<V> &v = A(I, self);
+    size_t i = 0;
+    while (i < v.size() && truthy(I.yield(a.blk, v[i])))
+        ++i;
+    return I.ary(std::vector<V>(v.begin() + i, v.end()));
+}
+
+V ary_each(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each", a);
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        I.yield(a.blk, v[i]);
+    return self;
+}
+
+V ary_each_index(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each_index", a);
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        I.yield(a.blk, fix((int64_t)i));
+    return self;
+}
+
+V ary_each_with_index(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each_with_index", a);
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        I.yield2(a.blk, v[i], fix((int64_t)i));
+    return self;
+}
+
+V ary_reverse_each(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "reverse_each", a);
+    std::vector<V> &v = A(I, self);
+    for (size_t i = v.size(); i-- > 0;)
+    {
+        if (i >= v.size())
+            continue;
+        I.yield(a.blk, v[i]);
+    }
+    return self;
+}
+
+V ary_map(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "map", a);
+    std::vector<V> &v = A(I, self);
+    V outv = I.ary();
+    std::vector<V> &out = A(I, outv);
+    out.reserve(v.size());
+    for (size_t i = 0; i < v.size(); ++i)
+        out.push_back(I.yield(a.blk, v[i]));
+    return outv;
+}
+
+V ary_map_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = I.yield(a.blk, v[i]);
+    return self;
+}
+
+V ary_select(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "select", a);
+    std::vector<V> &v = A(I, self);
+    std::vector<V> out;
+    for (size_t i = 0; i < v.size(); ++i)
+        if (truthy(I.yield(a.blk, v[i])))
+            out.push_back(v[i]);
+    return I.ary(out);
+}
+
+V ary_reject(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "reject", a);
+    std::vector<V> &v = A(I, self);
+    std::vector<V> out;
+    for (size_t i = 0; i < v.size(); ++i)
+        if (!truthy(I.yield(a.blk, v[i])))
+            out.push_back(v[i]);
+    return I.ary(out);
+}
+
+V ary_filter_map(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "filter_map", a);
+    std::vector<V> &v = A(I, self);
+    std::vector<V> out;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        V r = I.yield(a.blk, v[i]);
+        if (truthy(r))
+            out.push_back(r);
+    }
+    return I.ary(out);
+}
+
+V ary_flat_map(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "flat_map", a);
+    std::vector<V> &v = A(I, self);
+    std::vector<V> out;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        V r = I.yield(a.blk, v[i]);
+        V arr = I.isAry(r) ? r : I.toAry(r);
+        if (arr != Qnil)
+            out.insert(out.end(), A(I, arr).begin(), A(I, arr).end());
+        else
+            out.push_back(r);
+    }
+    return I.ary(out);
+}
+
+V ary_partition(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "partition", a);
+    std::vector<V> yes, no;
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        (truthy(I.yield(a.blk, v[i])) ? yes : no).push_back(v[i]);
+    return I.ary2(I.ary(yes), I.ary(no));
+}
+
+V ary_group_by(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "group_by", a);
+    V h = I.newHash();
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        V k = I.yield(a.blk, v[i]);
+        bool found = false;
+        V list = I.hget(I.href(h), k, &found);
+        if (!found)
+        {
+            list = I.ary();
+            I.hset(I.href(h), k, list);
+        }
+        A(I, list).push_back(v[i]);
+    }
+    return h;
+}
+
+V ary_tally(Interp &I, V self, Args &a)
+{
+    V h = a.argc > 0 ? a.argv[0] : I.newHash();
+    for (V x : A(I, self))
+    {
+        bool found = false;
+        V c = I.hget(I.href(h), x, &found);
+        I.hset(I.href(h), x, found ? intAdd(I, c, fix(1)) : fix(1));
+    }
+    return h;
+}
+
+V ary_each_slice(Interp &I, V self, Args &a)
+{
+    int64_t n = I.intOf(a.argv[0]);
+    if (n <= 0)
+        I.raise(I.cArgumentError, "invalid slice size");
+    if (!a.blk)
+        return enumFor(I, self, "each_slice", a);
+    std::vector<V> v = A(I, self);
+    for (size_t i = 0; i < v.size(); i += n)
+    {
+        size_t e = i + n < v.size() ? i + n : v.size();
+        I.yield(a.blk, I.ary(std::vector<V>(v.begin() + i, v.begin() + e)));
+    }
+    return self;
+}
+
+V ary_each_cons(Interp &I, V self, Args &a)
+{
+    int64_t n = I.intOf(a.argv[0]);
+    if (n <= 0)
+        I.raise(I.cArgumentError, "invalid size");
+    if (!a.blk)
+        return enumFor(I, self, "each_cons", a);
+    std::vector<V> v = A(I, self);
+    for (size_t i = 0; i + n <= v.size(); ++i)
+        I.yield(a.blk, I.ary(std::vector<V>(v.begin() + i, v.begin() + i + n)));
+    return self;
+}
+
+V ary_each_with_object(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each_with_object", a);
+    V memo = a.argv[0];
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        I.yield2(a.blk, v[i], memo);
+    return memo;
+}
+
+V ary_zip(Interp &I, V self, Args &a)
+{
+    std::vector<std::vector<V>> others;
+    for (int i = 0; i < a.argc; ++i)
+        others.push_back(I.isAry(a.argv[i]) ? A(I, a.argv[i]) : I.toList(a.argv[i]));
+    std::vector<V> &v = A(I, self);
+    V out = I.ary();
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        V row = I.ary();
+        A(I, row).push_back(v[i]);
+        for (auto &o : others)
+            A(I, row).push_back(i < o.size() ? o[i] : Qnil);
+        if (a.blk)
+            I.yield(a.blk, row);
+        else
+            A(I, out).push_back(row);
+    }
+    return a.blk ? Qnil : out;
+}
+
+V ary_product(Interp &I, V self, Args &a)
+{
+    std::vector<std::vector<V>> lists;
+    lists.push_back(A(I, self));
+    for (int i = 0; i < a.argc; ++i)
+        lists.push_back(A(I, a.argv[i]));
+    std::vector<V> out;
+    std::vector<size_t> idx(lists.size(), 0);
+    for (auto &l : lists)
+        if (l.empty())
+            return I.ary();
+    for (;;)
+    {
+        V row = I.ary();
+        for (size_t k = 0; k < lists.size(); ++k)
+            A(I, row).push_back(lists[k][idx[k]]);
+        out.push_back(row);
+        size_t k = lists.size();
+        while (k > 0)
+        {
+            --k;
+            if (++idx[k] < lists[k].size())
+                break;
+            idx[k] = 0;
+            if (k == 0)
+            {
+                if (a.blk)
+                {
+                    for (V r : out)
+                        I.yield(a.blk, r);
+                    return self;
+                }
+                return I.ary(out);
+            }
+        }
+    }
+}
+
+V ary_combination(Interp &I, V self, Args &a)
+{
+    int64_t k = I.intOf(a.argv[0]);
+    if (!a.blk)
+        return enumFor(I, self, "combination", a);
+    std::vector<V> v = A(I, self);
+    int64_t n = (int64_t)v.size();
+    if (k < 0 || k > n)
+        return self;
+    std::vector<int64_t> idx(k);
+    for (int64_t i = 0; i < k; ++i)
+        idx[i] = i;
+    for (;;)
+    {
+        V row = I.ary();
+        for (int64_t i = 0; i < k; ++i)
+            A(I, row).push_back(v[idx[i]]);
+        I.yield(a.blk, row);
+        int64_t i = k - 1;
+        while (i >= 0 && idx[i] == n - k + i)
+            --i;
+        if (i < 0)
+            break;
+        ++idx[i];
+        for (int64_t j = i + 1; j < k; ++j)
+            idx[j] = idx[j - 1] + 1;
+    }
+    return self;
+}
+
+void permuteRec(Interp &I, std::vector<V> &v, int64_t k, std::vector<int64_t> &cur, std::vector<bool> &used, Blk *blk, bool repeat)
+{
+    if ((int64_t)cur.size() == k)
+    {
+        V row = I.ary();
+        for (int64_t i : cur)
+            A(I, row).push_back(v[i]);
+        I.yield(blk, row);
+        return;
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        if (!repeat && used[i])
+            continue;
+        used[i] = true;
+        cur.push_back((int64_t)i);
+        permuteRec(I, v, k, cur, used, blk, repeat);
+        cur.pop_back();
+        used[i] = false;
+    }
+}
+
+V ary_permutation(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "permutation", a);
+    std::vector<V> v = A(I, self);
+    int64_t k = a.argc > 0 ? I.intOf(a.argv[0]) : (int64_t)v.size();
+    if (k < 0 || k > (int64_t)v.size())
+        return self;
+    std::vector<int64_t> cur;
+    std::vector<bool> used(v.size(), false);
+    permuteRec(I, v, k, cur, used, a.blk, false);
+    return self;
+}
+
+V ary_repeated_permutation(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "repeated_permutation", a);
+    std::vector<V> v = A(I, self);
+    int64_t k = I.intOf(a.argv[0]);
+    if (k < 0)
+        return self;
+    std::vector<int64_t> cur;
+    std::vector<bool> used(v.size(), false);
+    permuteRec(I, v, k, cur, used, a.blk, true);
+    return self;
+}
+
+void combRec(Interp &I, std::vector<V> &v, int64_t k, size_t start, std::vector<int64_t> &cur, Blk *blk)
+{
+    if ((int64_t)cur.size() == k)
+    {
+        V row = I.ary();
+        for (int64_t i : cur)
+            A(I, row).push_back(v[i]);
+        I.yield(blk, row);
+        return;
+    }
+    for (size_t i = start; i < v.size(); ++i)
+    {
+        cur.push_back((int64_t)i);
+        combRec(I, v, k, i, cur, blk);
+        cur.pop_back();
+    }
+}
+
+V ary_repeated_combination(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "repeated_combination", a);
+    std::vector<V> v = A(I, self);
+    int64_t k = I.intOf(a.argv[0]);
+    if (k < 0)
+        return self;
+    std::vector<int64_t> cur;
+    combRec(I, v, k, 0, cur, a.blk);
+    return self;
+}
+
+V ary_transpose(Interp &I, V self, Args &a)
+{
+    (void)a;
+    std::vector<V> &v = A(I, self);
+    if (v.empty())
+        return I.ary();
+    size_t w = A(I, v[0]).size();
+    for (V row : v)
+        if (A(I, row).size() != w)
+            I.raise(I.cIndexError, "element size differs (" + std::to_string(A(I, row).size()) + " should be " + std::to_string(w) + ")");
+    V out = I.ary();
+    for (size_t c = 0; c < w; ++c)
+    {
+        V col = I.ary();
+        for (V row : v)
+            A(I, col).push_back(A(I, row)[c]);
+        A(I, out).push_back(col);
+    }
+    return out;
+}
+
+V ary_inject(Interp &I, V self, Args &a)
+{
+    std::vector<V> v = A(I, self);
+    V acc;
+    size_t i = 0;
+    Sym opSym = 0;
+    if (a.argc == 2)
+    {
+        acc = a.argv[0];
+        opSym = isSymV(a.argv[1]) ? vsym(a.argv[1]) : intern(I.sref(a.argv[1]));
+    }
+    else if (a.argc == 1 && !a.blk)
+    {
+        opSym = isSymV(a.argv[0]) ? vsym(a.argv[0]) : intern(I.sref(a.argv[0]));
+        if (v.empty())
+            return Qnil;
+        acc = v[0];
+        i = 1;
+    }
+    else if (a.argc == 1)
+        acc = a.argv[0];
+    else
+    {
+        if (v.empty())
+            return Qnil;
+        acc = v[0];
+        i = 1;
+    }
+    for (; i < v.size(); ++i)
+    {
+        if (opSym)
+        {
+            if (isFix(acc) && isFix(v[i]) && opSym == I.s.plus)
+                acc = intAdd(I, acc, v[i]);
+            else
+                acc = I.call1(acc, opSym, v[i]);
+        }
+        else
+            acc = I.yield2(a.blk, acc, v[i]);
+    }
+    return acc;
+}
+
+std::string joinStr(Interp &I, V self, const std::string &sep, std::vector<V> &stack)
+{
+    std::string out;
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        if (i)
+            out += sep;
+        V x = v[i];
+        if (I.isStr(x))
+            out += I.sref(x);
+        else if (I.isAry(x))
+        {
+            for (V s : stack)
+                if (s == x)
+                    I.raise(I.cArgumentError, "recursive array join");
+            stack.push_back(x);
+            out += joinStr(I, x, sep, stack);
+            stack.pop_back();
+        }
+        else
+            out += I.toS(x);
+    }
+    return out;
+}
+
+V ary_join(Interp &I, V self, Args &a)
+{
+    std::string sep = a.argc > 0 && a.argv[0] != Qnil ? I.strOf(a.argv[0]) : "";
+    std::vector<V> stack;
+    stack.push_back(self);
+    return I.str(joinStr(I, self, sep, stack));
+}
+
+V ary_to_a(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (I.realClassOf(self) != I.cArray)
+        return I.ary(A(I, self));
+    return self;
+}
+
+V ary_to_h(Interp &I, V self, Args &a)
+{
+    V h = I.newHash();
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        V pair = a.blk ? I.yield(a.blk, v[i]) : v[i];
+        V arr = I.toAry(pair);
+        if (arr == Qnil)
+            I.raise(I.cTypeError, "wrong element type " + I.className(I.realClassOf(pair)) + " at " + std::to_string(i) + " (expected array)");
+        if (A(I, arr).size() != 2)
+            I.raise(I.cArgumentError, "wrong array length at " + std::to_string(i) + " (expected 2, was " + std::to_string(A(I, arr).size()) + ")");
+        I.hset(I.href(h), A(I, arr)[0], A(I, arr)[1]);
+    }
+    return h;
+}
+
+V ary_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return aryInspect(I, self);
+}
+
+V ary_assoc(Interp &I, V self, Args &a)
+{
+    for (V x : A(I, self))
+        if (I.isAry(x) && !A(I, x).empty() && I.eq(A(I, x)[0], a.argv[0]))
+            return x;
+    return Qnil;
+}
+
+V ary_rassoc(Interp &I, V self, Args &a)
+{
+    for (V x : A(I, self))
+        if (I.isAry(x) && A(I, x).size() > 1 && I.eq(A(I, x)[1], a.argv[0]))
+            return x;
+    return Qnil;
+}
+
+V ary_fill(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::vector<V> &v = A(I, self);
+    int argc = a.argc;
+    V val = Qnil;
+    int pos = 0;
+    if (!a.blk)
+    {
+        val = a.argv[0];
+        pos = 1;
+    }
+    int64_t st = 0, len = (int64_t)v.size();
+    if (argc > pos)
+    {
+        if (isType(a.argv[pos], T::Range))
+        {
+            auto *r = static_cast<RRange *>(op(a.argv[pos]));
+            st = I.intOf(r->lo);
+            int64_t e = r->hi == Qnil ? (int64_t)v.size() : I.intOf(r->hi) + (r->excl ? 0 : 1);
+            len = e - st;
+        }
+        else
+        {
+            st = a.argv[pos] == Qnil ? 0 : normIndex(I.intOf(a.argv[pos]), v.size());
+            len = argc > pos + 1 ? I.intOf(a.argv[pos + 1]) : (int64_t)v.size() - st;
+        }
+    }
+    if (st + len > (int64_t)v.size())
+        v.resize(st + len, Qnil);
+    for (int64_t i = st; i < st + len; ++i)
+        v[i] = a.blk ? I.yield(a.blk, fix(i)) : val;
+    return self;
+}
+
+V ary_clear(Interp &I, V self, Args &a)
+{
+    (void)a;
+    modify(I, self);
+    A(I, self).clear();
+    return self;
+}
+
+V ary_replace(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    V o = I.toAry(a.argv[0]);
+    A(I, self) = A(I, o);
+    return self;
+}
+
+V ary_values_at(Interp &I, V self, Args &a)
+{
+    V out = I.ary();
+    for (int i = 0; i < a.argc; ++i)
+    {
+        Args b;
+        b.argv = &a.argv[i];
+        b.argc = 1;
+        V r = ary_aref(I, self, b);
+        if (isType(a.argv[i], T::Range) && I.isAry(r))
+            for (V x : A(I, r))
+                A(I, out).push_back(x);
+        else
+            A(I, out).push_back(r);
+    }
+    return out;
+}
+
+V bsearchImpl(Interp &I, V self, Args &a, bool wantIndex)
+{
+    std::vector<V> &v = A(I, self);
+    size_t lo = 0, hi = v.size();
+    bool found = false;
+    size_t best = 0;
+    while (lo < hi)
+    {
+        size_t mid = lo + (hi - lo) / 2;
+        V r = I.yield(a.blk, v[mid]);
+        if (r == Qtrue)
+        {
+            found = true;
+            best = mid;
+            hi = mid;
+        }
+        else if (r == Qfalse || r == Qnil)
+            lo = mid + 1;
+        else if (I.isNum(r))
+        {
+            int c = I.cmp(r, fix(0));
+            if (c == 0)
+                return wantIndex ? fix((int64_t)mid) : v[mid];
+            if (c < 0)
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        else
+            I.raise(I.cTypeError, "wrong argument type " + I.className(I.realClassOf(r)) + " (must be numeric, true, false or nil)");
+    }
+    if (!found)
+        return Qnil;
+    return wantIndex ? fix((int64_t)best) : v[best];
+}
+
+V ary_bsearch(Interp &I, V self, Args &a) { return bsearchImpl(I, self, a, false); }
+V ary_bsearch_index(Interp &I, V self, Args &a) { return bsearchImpl(I, self, a, true); }
+
+V ary_cycle(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "cycle", a);
+    if (a.argc > 0 && a.argv[0] != Qnil)
+    {
+        int64_t n = I.intOf(a.argv[0]);
+        for (int64_t k = 0; k < n; ++k)
+            for (size_t i = 0; i < A(I, self).size(); ++i)
+                I.yield(a.blk, A(I, self)[i]);
+        return Qnil;
+    }
+    if (A(I, self).empty())
+        return Qnil;
+    for (;;)
+        for (size_t i = 0; i < A(I, self).size(); ++i)
+            I.yield(a.blk, A(I, self)[i]);
+}
+
+V grepImpl(Interp &I, V self, Args &a, bool keep)
+{
+    V out = I.ary();
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        if (I.caseEq(a.argv[0], v[i]) == keep)
+            A(I, out).push_back(a.blk ? I.yield(a.blk, v[i]) : v[i]);
+    return out;
+}
+
+V ary_grep(Interp &I, V self, Args &a) { return grepImpl(I, self, a, true); }
+V ary_grep_v(Interp &I, V self, Args &a) { return grepImpl(I, self, a, false); }
+
+V ary_find(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "find", a);
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        if (truthy(I.yield(a.blk, v[i])))
+            return v[i];
+    return Qnil;
+}
+
+V predicateTest(Interp &I, Args &a, V x)
+{
+    if (a.argc > 0)
+        return boolv(I.caseEq(a.argv[0], x));
+    if (a.blk)
+        return I.yield(a.blk, x);
+    return x;
+}
+
+V ary_any(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        if (truthy(predicateTest(I, a, v[i])))
+            return Qtrue;
+    return Qfalse;
+}
+
+V ary_all(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        if (!truthy(predicateTest(I, a, v[i])))
+            return Qfalse;
+    return Qtrue;
+}
+
+V ary_none(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    for (size_t i = 0; i < v.size(); ++i)
+        if (truthy(predicateTest(I, a, v[i])))
+            return Qfalse;
+    return Qtrue;
+}
+
+V ary_one(Interp &I, V self, Args &a)
+{
+    std::vector<V> &v = A(I, self);
+    int n = 0;
+    for (size_t i = 0; i < v.size(); ++i)
+        if (truthy(predicateTest(I, a, v[i])))
+            if (++n > 1)
+                return Qfalse;
+    return boolv(n == 1);
+}
+
+V ary_chunk_while(Interp &I, V self, Args &a, bool sliceWhen)
+{
+    std::vector<V> &v = A(I, self);
+    V out = I.ary();
+    if (v.empty())
+        return out;
+    V cur = I.ary();
+    A(I, cur).push_back(v[0]);
+    for (size_t i = 1; i < v.size(); ++i)
+    {
+        bool together = truthy(I.yield2(a.blk, v[i - 1], v[i]));
+        if (sliceWhen)
+            together = !together;
+        if (!together)
+        {
+            A(I, out).push_back(cur);
+            cur = I.ary();
+        }
+        A(I, cur).push_back(v[i]);
+    }
+    A(I, out).push_back(cur);
+    return out;
+}
+
+V ary_chunk_while_m(Interp &I, V self, Args &a)
+{
+    V r = ary_chunk_while(I, self, a, false);
+    Args b;
+    return enumFor(I, r, "each", b);
+}
+
+V ary_slice_when(Interp &I, V self, Args &a)
+{
+    V r = ary_chunk_while(I, self, a, true);
+    Args b;
+    return enumFor(I, r, "each", b);
+}
+
+V ary_chunk(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "chunk", a);
+    std::vector<V> &v = A(I, self);
+    V out = I.ary();
+    V curKey = Qundef;
+    V cur = Qnil;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        V k = I.yield(a.blk, v[i]);
+        if (k == Qnil || (isSymV(k) && symName(vsym(k)) == "_separator"))
+        {
+            if (cur != Qnil)
+                A(I, out).push_back(I.ary2(curKey, cur));
+            cur = Qnil;
+            curKey = Qundef;
+            continue;
+        }
+        bool alone = isSymV(k) && symName(vsym(k)) == "_alone";
+        if (cur != Qnil && !alone && I.eq(k, curKey))
+            A(I, cur).push_back(v[i]);
+        else
+        {
+            if (cur != Qnil)
+                A(I, out).push_back(I.ary2(curKey, cur));
+            cur = I.ary();
+            A(I, cur).push_back(v[i]);
+            curKey = k;
+        }
+    }
+    if (cur != Qnil)
+        A(I, out).push_back(I.ary2(curKey, cur));
+    Args b;
+    return enumFor(I, out, "each", b);
+}
+
+V ary_slice_before(Interp &I, V self, Args &a, bool after)
+{
+    std::vector<V> &v = A(I, self);
+    V out = I.ary();
+    V cur = Qnil;
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        bool hit = a.argc > 0 ? I.caseEq(a.argv[0], v[i]) : truthy(I.yield(a.blk, v[i]));
+        if (!after && hit && cur != Qnil)
+        {
+            A(I, out).push_back(cur);
+            cur = Qnil;
+        }
+        if (cur == Qnil)
+            cur = I.ary();
+        A(I, cur).push_back(v[i]);
+        if (after && hit)
+        {
+            A(I, out).push_back(cur);
+            cur = Qnil;
+        }
+    }
+    if (cur != Qnil)
+        A(I, out).push_back(cur);
+    Args b;
+    return enumFor(I, out, "each", b);
+}
+
+V ary_slice_before_m(Interp &I, V self, Args &a) { return ary_slice_before(I, self, a, false); }
+V ary_slice_after_m(Interp &I, V self, Args &a) { return ary_slice_before(I, self, a, true); }
+
+V ary_frozen_dup(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ary(A(I, self));
+}
+
+V ary_sample(Interp &I, V self, Args &a)
+{
+    (void)a;
+    std::vector<V> &v = A(I, self);
+    return v.empty() ? Qnil : v[0];
+}
+
+V ary_shuffle(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ary(A(I, self));
+}
+
+V ary_each_entry(Interp &I, V self, Args &a) { return ary_each(I, self, a); }
+
+V ary_step_dummy(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+} // namespace
+
+void Interp::initArray()
+{
+    RClass *c = cArray;
+    defs(c, "new", ary_s_new, 0, 2);
+    defs(c, "[]", ary_s_aref, 0, -1);
+    defnPriv(c, "initialize", ary_initialize, 0, 2);
+    defn(c, "[]", ary_aref, 1, 2);
+    defn(c, "slice", ary_aref, 1, 2);
+    defn(c, "[]=", ary_aset, 2, 3);
+    defn(c, "at", ary_at, 1, 1);
+    defn(c, "fetch", ary_fetch, 1, 2);
+    defn(c, "dig", ary_dig, 1, -1);
+    defn(c, "first", ary_first, 0, 1);
+    defn(c, "last", ary_last, 0, 1);
+    defn(c, "push", ary_push, 0, -1);
+    defn(c, "append", ary_push, 0, -1);
+    defn(c, "<<", ary_push, 1, 1);
+    defn(c, "pop", ary_pop, 0, 1);
+    defn(c, "shift", ary_shift, 0, 1);
+    defn(c, "unshift", ary_unshift, 0, -1);
+    defn(c, "prepend", ary_unshift, 0, -1);
+    defn(c, "insert", ary_insert, 1, -1);
+    defn(c, "concat", ary_concat, 0, -1);
+    defn(c, "+", ary_plus, 1, 1);
+    defn(c, "-", ary_minus, 1, 1);
+    defn(c, "difference", ary_difference, 0, -1);
+    defn(c, "&", ary_and, 1, 1);
+    defn(c, "intersection", ary_intersection, 0, -1);
+    defn(c, "|", ary_or, 1, 1);
+    defn(c, "union", ary_or, 0, -1);
+    defn(c, "intersect?", ary_intersect_p, 1, 1);
+    defn(c, "*", ary_mul, 1, 1);
+    defn(c, "==", ary_eq, 1, 1);
+    defn(c, "eql?", ary_eql, 1, 1);
+    defn(c, "hash", ary_hash, 0, 0);
+    defn(c, "<=>", ary_cmp, 1, 1);
+    defn(c, "length", ary_length, 0, 0);
+    defn(c, "size", ary_length, 0, 0);
+    defn(c, "empty?", ary_empty, 0, 0);
+    defn(c, "include?", ary_include, 1, 1);
+    defn(c, "member?", ary_include, 1, 1);
+    defn(c, "index", ary_index, 0, 1);
+    defn(c, "find_index", ary_index, 0, 1);
+    defn(c, "rindex", ary_rindex, 0, 1);
+    defn(c, "count", ary_count, 0, 1);
+    defn(c, "delete", ary_delete, 1, 1);
+    defn(c, "delete_at", ary_delete_at, 1, 1);
+    defn(c, "slice!", ary_slice_bang, 1, 2);
+    defn(c, "delete_if", ary_delete_if, 0, 0);
+    defn(c, "reject!", ary_reject_bang, 0, 0);
+    defn(c, "select!", ary_filter_bang, 0, 0);
+    defn(c, "filter!", ary_filter_bang, 0, 0);
+    defn(c, "keep_if", ary_keep_if, 0, 0);
+    defn(c, "compact", ary_compact, 0, 0);
+    defn(c, "compact!", ary_compact_bang, 0, 0);
+    defn(c, "flatten", ary_flatten, 0, 1);
+    defn(c, "flatten!", ary_flatten_bang, 0, 1);
+    defn(c, "uniq", ary_uniq, 0, 0);
+    defn(c, "uniq!", ary_uniq_bang, 0, 0);
+    defn(c, "reverse", ary_reverse, 0, 0);
+    defn(c, "reverse!", ary_reverse_bang, 0, 0);
+    defn(c, "rotate", ary_rotate, 0, 1);
+    defn(c, "rotate!", ary_rotate_bang, 0, 1);
+    defn(c, "sort", ary_sort, 0, 0);
+    defn(c, "sort!", ary_sort_bang, 0, 0);
+    defn(c, "sort_by", ary_sort_by, 0, 0);
+    defn(c, "sort_by!", ary_sort_by_bang, 0, 0);
+    defn(c, "min", ary_min, 0, 1);
+    defn(c, "max", ary_max, 0, 1);
+    defn(c, "minmax", ary_minmax, 0, 0);
+    defn(c, "min_by", ary_min_by, 0, 1);
+    defn(c, "max_by", ary_max_by, 0, 1);
+    defn(c, "minmax_by", ary_minmax_by, 0, 0);
+    defn(c, "sum", ary_sum, 0, 1);
+    defn(c, "take", ary_take, 1, 1);
+    defn(c, "drop", ary_drop, 1, 1);
+    defn(c, "take_while", ary_take_while, 0, 0);
+    defn(c, "drop_while", ary_drop_while, 0, 0);
+    defn(c, "each", ary_each, 0, 0);
+    defn(c, "each_entry", ary_each_entry, 0, 0);
+    defn(c, "each_index", ary_each_index, 0, 0);
+    defn(c, "each_with_index", ary_each_with_index, 0, 0);
+    defn(c, "reverse_each", ary_reverse_each, 0, 0);
+    defn(c, "map", ary_map, 0, 0);
+    defn(c, "collect", ary_map, 0, 0);
+    defn(c, "map!", ary_map_bang, 0, 0);
+    defn(c, "collect!", ary_map_bang, 0, 0);
+    defn(c, "select", ary_select, 0, 0);
+    defn(c, "filter", ary_select, 0, 0);
+    defn(c, "find_all", ary_select, 0, 0);
+    defn(c, "reject", ary_reject, 0, 0);
+    defn(c, "filter_map", ary_filter_map, 0, 0);
+    defn(c, "flat_map", ary_flat_map, 0, 0);
+    defn(c, "collect_concat", ary_flat_map, 0, 0);
+    defn(c, "partition", ary_partition, 0, 0);
+    defn(c, "group_by", ary_group_by, 0, 0);
+    defn(c, "tally", ary_tally, 0, 1);
+    defn(c, "each_slice", ary_each_slice, 1, 1);
+    defn(c, "each_cons", ary_each_cons, 1, 1);
+    defn(c, "each_with_object", ary_each_with_object, 1, 1);
+    defn(c, "zip", ary_zip, 0, -1);
+    defn(c, "product", ary_product, 0, -1);
+    defn(c, "combination", ary_combination, 1, 1);
+    defn(c, "permutation", ary_permutation, 0, 1);
+    defn(c, "repeated_permutation", ary_repeated_permutation, 1, 1);
+    defn(c, "repeated_combination", ary_repeated_combination, 1, 1);
+    defn(c, "transpose", ary_transpose, 0, 0);
+    defn(c, "inject", ary_inject, 0, 2);
+    defn(c, "reduce", ary_inject, 0, 2);
+    defn(c, "join", ary_join, 0, 1);
+    defn(c, "to_a", ary_to_a, 0, 0);
+    defn(c, "entries", ary_frozen_dup, 0, 0);
+    defn(c, "to_ary", ary_to_a, 0, 0);
+    defn(c, "to_h", ary_to_h, 0, 0);
+    defn(c, "inspect", ary_inspect, 0, 0);
+    defn(c, "to_s", ary_inspect, 0, 0);
+    defn(c, "assoc", ary_assoc, 1, 1);
+    defn(c, "rassoc", ary_rassoc, 1, 1);
+    defn(c, "fill", ary_fill, 0, 3);
+    defn(c, "clear", ary_clear, 0, 0);
+    defn(c, "replace", ary_replace, 1, 1);
+    defn(c, "values_at", ary_values_at, 0, -1);
+    defn(c, "bsearch", ary_bsearch, 0, 0);
+    defn(c, "bsearch_index", ary_bsearch_index, 0, 0);
+    defn(c, "cycle", ary_cycle, 0, 1);
+    defn(c, "grep", ary_grep, 1, 1);
+    defn(c, "grep_v", ary_grep_v, 1, 1);
+    defn(c, "find", ary_find, 0, 1);
+    defn(c, "detect", ary_find, 0, 1);
+    defn(c, "any?", ary_any, 0, 1);
+    defn(c, "all?", ary_all, 0, 1);
+    defn(c, "none?", ary_none, 0, 1);
+    defn(c, "one?", ary_one, 0, 1);
+    defn(c, "chunk_while", ary_chunk_while_m, 0, 0);
+    defn(c, "slice_when", ary_slice_when, 0, 0);
+    defn(c, "chunk", ary_chunk, 0, 0);
+    defn(c, "slice_before", ary_slice_before_m, 0, 1);
+    defn(c, "slice_after", ary_slice_after_m, 0, 1);
+    defn(c, "sample", ary_sample, 0, 1);
+    defn(c, "shuffle", ary_shuffle, 0, 1);
+}
+
+} // namespace ruby

@@ -5589,6 +5589,20 @@ NT Gen::call(const cpp::ExprP &e, const ThisSrc *result)
             a.byte(0x11);
             return tInt(K_I64);
         }
+        if (fn == "__eh_top" && args.empty())
+        {
+            // the newest exception handler record of the running thread of control
+            a.leaData(RCX, ehTop_);
+            a.loadRcx(8, false);
+            return tInt(K_I64);
+        }
+        if (fn == "__eh_top_set" && args.size() == 1)
+        {
+            expr(args[0]);
+            a.leaData(RCX, ehTop_);
+            a.storeRcx(8);
+            return tInt(K_I64);
+        }
         if (fn == "__native_thread_entry" && args.empty())
         {
             // a thread's start address: a thunk keeping the registers Windows

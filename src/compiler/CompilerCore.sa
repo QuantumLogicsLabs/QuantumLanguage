@@ -361,6 +361,12 @@ void Compiler::endLoop() {
 
 void Compiler::compileNode(ASTNode &node) {
   int ln = node.line;
+  // Java-style code: a statement of the Java-style library, or a Java class
+  bool java = (!javaLibrary_.empty() && javaLibrary_.count(&node)) ||
+              (!javaClasses_.empty() && node.is<ClassDecl>() &&
+               javaClasses_.count(node.as<ClassDecl>().name));
+  if (java)
+    ++javaDepth_;
   std::visit(
       [&](auto &n) {
         using T = std::decay_t<decltype(n)>;
@@ -407,6 +413,8 @@ void Compiler::compileNode(ASTNode &node) {
         }
       },
       node.node);
+  if (java)
+    --javaDepth_;
 }
 
 void Compiler::compileBlock(BlockStmt &b) {
@@ -424,8 +432,24 @@ void Compiler::compileBlock(BlockStmt &b) {
     }
   }
 
-  for (auto &stmt : b.statements)
+  // A file with Java-style and Ruby code: the program's top-level Ruby
+  // statements run with Ruby's meanings (VM::javaStyleCode), switched on
+  // and off where they start and end
+  bool script = current_->enclosing == nullptr && current_->scopeDepth == 0 && !rubyLines_.empty();
+  bool ruby = false;
+  for (auto &stmt : b.statements) {
+    if (script) {
+      bool r = rubyLines_.count(stmt->line) > 0 && !javaLibrary_.count(stmt.get());
+      if (r != ruby) {
+        emitLoad("__ruby_code__", stmt->line);
+        emit(r ? Op::LOAD_TRUE : Op::LOAD_FALSE, 0, stmt->line);
+        emit(Op::CALL, 1, stmt->line);
+        emit(Op::POP, 0, stmt->line);
+        ruby = r;
+      }
+    }
     compileNode(*stmt);
+  }
 }
 
 void Compiler::compileExpr(ASTNode &node) {

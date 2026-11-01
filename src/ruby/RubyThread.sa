@@ -1,0 +1,876 @@
+// quantum: cpp
+// Ruby front-end: Thread and Fiber. Each one has its own OS thread and native
+// stack, but only one ever runs: control passes by hand-off, at blocking
+// operations and at safepoints, so programs stay deterministic. `sleep`
+// advances a virtual clock when nothing else can run.
+#include "RubyRt.h.sa"
+
+#include <chrono>
+#include <thread>
+
+// A compiler older than these intrinsics (the seed, on the way to building
+// the real one) never runs this code
+#ifndef __QUANTUM_EH_TOP__
+#define __eh_top() ((int64_t)0)
+#define __eh_top_set(x) ((void)(x))
+#endif
+
+namespace __dll_kernel32
+{
+void *CreateEventA(void *security, int manualReset, int initialState, const char *name);
+int SetEvent(void *event);
+unsigned long WaitForSingleObject(void *handle, unsigned long ms);
+} // namespace __dll_kernel32
+
+namespace ruby
+{
+
+namespace
+{
+
+enum CoState : uint8_t
+{
+    S_RUNNABLE, // running, or ready to
+    S_WAITING,  // blocked: a condition, or the clock
+    S_IDLE,     // a fiber not resumed; a thread inside its fiber
+    S_DONE
+};
+
+struct Co
+{
+    V obj = Qnil;
+    bool isFiber = false;
+    bool started = false;
+    void *event = nullptr;
+    CoState state = S_RUNNABLE;
+    // saved interpreter state
+    V *stackBase = nullptr;
+    V *sp = nullptr, *stackEnd = nullptr;
+    Frame *frame = nullptr;
+    int depth = 0;
+    int64_t eh = 0;
+    V lastMatch = Qnil, bang = Qnil;
+    std::vector<V> inspecting;
+    // waiting
+    V waitProc = Qnil;
+    double wakeAt = -1;
+    bool timedOut = false;
+    bool woken = false;
+    // the body and its outcome
+    V proc = Qnil;
+    std::vector<V> args;
+    V result = Qnil;
+    V exc = Qnil;
+    V pending = Qnil;   // an exception to raise when it next runs
+    bool killed = false;
+    bool sleepForever = false;
+    // fibers
+    Co *resumer = nullptr;
+    V transfer = Qnil;
+    Co *owner = nullptr; // the thread a fiber belongs to
+    V locals = Qnil;
+    V threadVars = Qnil;
+    V name = Qnil;
+    bool reportOnException = true;
+};
+
+struct KillEx
+{
+    int unused;
+};
+
+std::vector<Co *> g_all;
+Co *g_cur = nullptr, *g_main = nullptr;
+double g_skew = 0;
+size_t g_next = 0;
+bool g_reportDefault = true;
+bool g_abortOnException = false;
+RClass *cThread = nullptr, *cFiber = nullptr;
+const int kCoStack = 1 << 16;
+
+Sym symCo() { static Sym s = intern("__co"); return s; }
+
+Co *coOf(Interp &I, V obj)
+{
+    V p = I.ivarGet(obj, symCo());
+    return reinterpret_cast<Co *>((uint64_t)fixv(p) << 1);
+}
+
+V coWrap(Interp &I, V obj, Co *co)
+{
+    I.ivarSet(obj, symCo(), fix((int64_t)(reinterpret_cast<uint64_t>(co) >> 1)));
+    co->obj = obj;
+    return obj;
+}
+
+double steadyNow()
+{
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() / 1e9;
+}
+
+void saveState(Interp &I, Co *c)
+{
+    c->sp = I.sp;
+    c->stackEnd = I.stackEnd;
+    c->frame = I.frame;
+    c->depth = I.depth;
+    c->lastMatch = I.lastMatch;
+    c->bang = I.globals[I.s.bang];
+    c->inspecting = I.inspecting;
+    c->eh = __eh_top();
+}
+
+void loadState(Interp &I, Co *c)
+{
+    I.sp = c->sp;
+    I.stackEnd = c->stackEnd;
+    I.frame = c->frame;
+    I.depth = c->depth;
+    I.lastMatch = c->lastMatch;
+    I.globals[I.s.bang] = c->bang;
+    I.inspecting = c->inspecting;
+    __eh_top_set(c->eh);
+}
+
+void coBody(Interp &I, Co *c);
+
+// hands the interpreter to `to`; returns when something hands it back
+void switchTo(Interp &I, Co *to, bool finishing)
+{
+    Co *me = g_cur;
+    if (to == me)
+        return;
+    if (!finishing)
+        saveState(I, me);
+    g_cur = to;
+    if (!to->started)
+    {
+        to->started = true;
+        to->event = __dll_kernel32::CreateEventA(nullptr, 0, 0, nullptr);
+        std::thread t([&I, to]() { coBody(I, to); });
+        t.detach();
+    }
+    else
+        __dll_kernel32::SetEvent(to->event);
+    if (finishing)
+        return;
+    __dll_kernel32::WaitForSingleObject(me->event, 0xFFFFFFFF);
+    loadState(I, me);
+}
+
+// the next thing that can run; nullptr when everything is blocked for good
+Co *pick(Interp &I)
+{
+    for (;;)
+    {
+        size_t n = g_all.size();
+        double now = steadyNow() + g_skew;
+        double soonest = -1;
+        for (size_t k = 1; k <= n; ++k)
+        {
+            Co *c = g_all[(g_next + k) % n];
+            if (c->state == S_RUNNABLE)
+            {
+                g_next = (g_next + k) % n;
+                return c;
+            }
+            if (c->state != S_WAITING)
+                continue;
+            if (c->woken)
+            {
+                c->timedOut = false;
+                g_next = (g_next + k) % n;
+                return c;
+            }
+            if (c->waitProc != Qnil && truthy(I.callProc(c->waitProc, 0, nullptr)))
+            {
+                c->timedOut = false;
+                g_next = (g_next + k) % n;
+                return c;
+            }
+            if (c->wakeAt >= 0)
+            {
+                if (c->wakeAt <= now)
+                {
+                    c->timedOut = true;
+                    g_next = (g_next + k) % n;
+                    return c;
+                }
+                if (soonest < 0 || c->wakeAt < soonest)
+                    soonest = c->wakeAt;
+            }
+        }
+        if (soonest < 0)
+            return nullptr;
+        // nothing can run before the next sleeper wakes: move the clock there
+        g_skew += soonest - now;
+    }
+}
+
+void removeCo(Co *c)
+{
+    for (size_t i = 0; i < g_all.size(); ++i)
+        if (g_all[i] == c)
+        {
+            g_all.erase(g_all.begin() + (long)i);
+            if (g_next >= g_all.size())
+                g_next = 0;
+            return;
+        }
+}
+
+void checkPending(Interp &I, Co *me)
+{
+    if (me->killed)
+    {
+        me->killed = false;
+        throw KillEx{0};
+    }
+    if (me->pending != Qnil)
+    {
+        V e = me->pending;
+        me->pending = Qnil;
+        I.raiseExc(e);
+    }
+}
+
+// blocks the current thread until the condition holds, or the timeout passes.
+// False when it timed out.
+bool blockOn(Interp &I, V cond, double timeout, bool forever)
+{
+    Co *me = g_cur;
+    me->state = S_WAITING;
+    me->waitProc = cond;
+    me->wakeAt = timeout >= 0 ? steadyNow() + g_skew + timeout : -1;
+    me->timedOut = false;
+    me->woken = false;
+    me->sleepForever = forever;
+    Co *next = pick(I);
+    if (!next)
+    {
+        // a deadlock: the main thread hears about it
+        me->state = S_RUNNABLE;
+        me->waitProc = Qnil;
+        V exc = I.makeExc(I.cThreadError, "No live threads left. Deadlock");
+        if (me == g_main || me->owner == g_main)
+            I.raiseExc(exc);
+        g_main->pending = exc;
+        g_main->state = S_RUNNABLE;
+        g_main->woken = true;
+        me->state = S_WAITING;
+        next = g_main;
+    }
+    switchTo(I, next, false);
+    me->state = S_RUNNABLE;
+    me->waitProc = Qnil;
+    me->wakeAt = -1;
+    me->woken = false;
+    checkPending(I, me);
+    return !me->timedOut;
+}
+
+void reportDeath(Interp &I, Co *c, V exc)
+{
+    if (!c->reportOnException || !I.kindOf(exc, I.cException))
+        return;
+    I.flush();
+    std::string text = "#<Thread:0x0000000000000001 run> terminated with exception (report_on_exception is true):\n" + I.uncaughtMessage(exc);
+    fwrite(text.data(), 1, text.size(), stderr);
+}
+
+void coBody(Interp &I, Co *c)
+{
+    __eh_top_set(0);
+    c->stackBase = new V[kCoStack];
+    I.sp = c->stackBase;
+    I.stackEnd = c->stackBase + kCoStack - 64;
+    I.frame = nullptr;
+    I.depth = 0;
+    I.lastMatch = Qnil;
+    I.globals[I.s.bang] = Qnil;
+    I.inspecting.clear();
+    V r = Qnil;
+    try
+    {
+        checkPending(I, c);
+        r = I.callProc(c->proc, (int)c->args.size(), c->args.data());
+    }
+    catch (RubyError &e)
+    {
+        c->exc = e.exc;
+    }
+    catch (BreakEx &e)
+    {
+        r = e.val;
+    }
+    catch (ReturnEx &e)
+    {
+        r = e.val;
+    }
+    catch (ThrowEx &e)
+    {
+        c->exc = I.makeExc(I.cUncaughtThrowError, "uncaught throw " + I.inspect(e.tag));
+    }
+    catch (StopEx &)
+    {
+    }
+    catch (KillEx &)
+    {
+    }
+    c->result = r;
+    c->state = S_DONE;
+    removeCo(c);
+    if (c->isFiber)
+    {
+        Co *back = c->resumer;
+        back->transfer = r;
+        back->state = S_RUNNABLE;
+        switchTo(I, back, true);
+        return;
+    }
+    if (c->exc != Qnil)
+    {
+        if (g_abortOnException)
+        {
+            g_main->pending = c->exc;
+            g_main->woken = true;
+        }
+        else if (!I.kindOf(c->exc, I.cSystemExit))
+            reportDeath(I, c, c->exc);
+    }
+    Co *next = pick(I);
+    if (!next)
+    {
+        g_main->pending = I.makeExc(I.cThreadError, "No live threads left. Deadlock");
+        g_main->woken = true;
+        next = g_main;
+    }
+    switchTo(I, next, true);
+}
+
+// ── Thread ────────────────────────────────────────────────────────────────
+
+V th_s_new(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        I.raise(I.cThreadError, "must be called with a block");
+    V obj = I.allocate(static_cast<RClass *>(op(self)));
+    auto *c = new Co();
+    coWrap(I, obj, c);
+    c->proc = I.procFromBlk(a.blk);
+    c->args.assign(a.argv, a.argv + a.argc);
+    c->reportOnException = g_reportDefault;
+    c->owner = c;
+    g_all.push_back(c);
+    I.preemptOn = true;
+    return obj;
+}
+
+Co *currentThread()
+{
+    Co *c = g_cur;
+    return c->isFiber ? c->owner : c;
+}
+
+V th_s_current(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return currentThread()->obj;
+}
+
+V th_s_main(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return g_main->obj;
+}
+
+V th_s_pass(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    Co *next = pick(I);
+    if (next && next != g_cur)
+    {
+        Co *me = g_cur;
+        switchTo(I, next, false);
+        checkPending(I, me);
+    }
+    return Qnil;
+}
+
+V th_s_list(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    V out = I.ary();
+    for (Co *c : g_all)
+        if (!c->isFiber)
+            I.aref(out).push_back(c->obj);
+    return out;
+}
+
+V th_s_stop(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    blockOn(I, Qnil, -1, true);
+    return Qnil;
+}
+
+// Thread.__wait(timeout = nil) { condition }: true once the condition holds
+V th_s_wait(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V cond = I.procFromBlk(a.blk);
+    if (truthy(I.callProc(cond, 0, nullptr)))
+        return Qtrue;
+    double timeout = a.argc > 0 && a.argv[0] != Qnil ? I.numToF(a.argv[0]) : -1;
+    return boolv(blockOn(I, cond, timeout, false));
+}
+
+V th_s_set_report(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    g_reportDefault = truthy(a.argv[0]);
+    return a.argv[0];
+}
+
+V th_s_get_report(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return boolv(g_reportDefault);
+}
+
+V th_s_set_abort(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    g_abortOnException = truthy(a.argv[0]);
+    return a.argv[0];
+}
+
+V th_s_get_abort(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return boolv(g_abortOnException);
+}
+
+V th_join(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    if (c == currentThread())
+        I.raise(I.cThreadError, "Target thread must not be current thread");
+    if (c->state != S_DONE)
+    {
+        double timeout = a.argc > 0 && a.argv[0] != Qnil ? I.numToF(a.argv[0]) : -1;
+        auto *fn = new NativeBlockFn();
+        *fn = [c](Interp &, Args &) -> V { return boolv(c->state == S_DONE); };
+        Blk b = I.nativeBlk(fn);
+        if (!blockOn(I, I.procFromBlk(&b), timeout, false))
+            return Qnil;
+    }
+    if (c->exc != Qnil)
+    {
+        V e = c->exc;
+        throw RubyError{e};
+    }
+    return self;
+}
+
+V th_value(Interp &I, V self, Args &a)
+{
+    Args none;
+    (void)a;
+    th_join(I, self, none);
+    return coOf(I, self)->result;
+}
+
+V th_alive(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(coOf(I, self)->state != S_DONE);
+}
+
+V th_stop_p(Interp &I, V self, Args &a)
+{
+    (void)a;
+    Co *c = coOf(I, self);
+    return boolv(c->state == S_DONE || c->state == S_WAITING);
+}
+
+V th_status(Interp &I, V self, Args &a)
+{
+    (void)a;
+    Co *c = coOf(I, self);
+    if (c->state == S_DONE)
+        return c->exc != Qnil ? Qnil : Qfalse;
+    if (c->state == S_WAITING)
+        return I.str("sleep");
+    return I.str("run");
+}
+
+V th_aref(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    if (c->locals == Qnil)
+        return Qnil;
+    V k = I.isStr(a.argv[0]) ? I.sym(I.sref(a.argv[0])) : a.argv[0];
+    return I.hget(I.href(c->locals), k);
+}
+
+V th_aset(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    if (c->locals == Qnil)
+        c->locals = I.newHash();
+    V k = I.isStr(a.argv[0]) ? I.sym(I.sref(a.argv[0])) : a.argv[0];
+    I.hset(I.href(c->locals), k, a.argv[1]);
+    return a.argv[1];
+}
+
+V th_key_p(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    if (c->locals == Qnil)
+        return Qfalse;
+    bool found = false;
+    V k = I.isStr(a.argv[0]) ? I.sym(I.sref(a.argv[0])) : a.argv[0];
+    I.hget(I.href(c->locals), k, &found);
+    return boolv(found);
+}
+
+V th_keys(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    (void)a;
+    return c->locals == Qnil ? I.ary() : I.call0(c->locals, I.s.keys);
+}
+
+V th_tv_get(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    if (c->threadVars == Qnil)
+        return Qnil;
+    V k = I.isStr(a.argv[0]) ? I.sym(I.sref(a.argv[0])) : a.argv[0];
+    return I.hget(I.href(c->threadVars), k);
+}
+
+V th_tv_set(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    if (c->threadVars == Qnil)
+        c->threadVars = I.newHash();
+    V k = I.isStr(a.argv[0]) ? I.sym(I.sref(a.argv[0])) : a.argv[0];
+    I.hset(I.href(c->threadVars), k, a.argv[1]);
+    return a.argv[1];
+}
+
+V th_name(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return coOf(I, self)->name;
+}
+
+V th_set_name(Interp &I, V self, Args &a)
+{
+    coOf(I, self)->name = a.argv[0];
+    return a.argv[0];
+}
+
+V th_kill(Interp &I, V self, Args &a)
+{
+    (void)a;
+    Co *c = coOf(I, self);
+    if (c->state == S_DONE)
+        return self;
+    if (c == currentThread())
+        throw KillEx{0};
+    if (!c->started)
+    {
+        c->state = S_DONE;
+        removeCo(c);
+        return self;
+    }
+    c->killed = true;
+    c->woken = true;
+    return self;
+}
+
+V th_wakeup(Interp &I, V self, Args &a)
+{
+    (void)a;
+    Co *c = coOf(I, self);
+    if (c->state == S_DONE)
+        I.raise(I.cThreadError, "killed thread");
+    c->woken = true;
+    return self;
+}
+
+V th_run(Interp &I, V self, Args &a)
+{
+    th_wakeup(I, self, a);
+    Args none;
+    return th_s_pass(I, Qnil, none);
+}
+
+V th_raise(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    V exc;
+    if (a.argc == 0)
+        exc = I.makeExc(I.cRuntimeError, "unhandled exception");
+    else if (I.isStr(a.argv[0]))
+        exc = I.makeExc(I.cRuntimeError, I.sref(a.argv[0]));
+    else if (a.argc > 1)
+        exc = I.call(a.argv[0], I.s.exception, 1, &a.argv[1]);
+    else
+        exc = I.call0(a.argv[0], I.s.exception);
+    if (c == currentThread())
+        I.raiseExc(exc);
+    if (c->state == S_DONE)
+        return Qnil;
+    c->pending = exc;
+    c->woken = true;
+    return Qnil;
+}
+
+V th_get_report(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(coOf(I, self)->reportOnException);
+}
+
+V th_set_report(Interp &I, V self, Args &a)
+{
+    coOf(I, self)->reportOnException = truthy(a.argv[0]);
+    return a.argv[0];
+}
+
+V th_priority(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    return a.argc > 0 ? a.argv[0] : fix(0);
+}
+
+V th_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    Co *c = coOf(I, self);
+    const char *st = c->state == S_DONE ? "dead" : c->state == S_WAITING ? "sleep" : "run";
+    return I.str("#<Thread:" + addrText(op(self)) + " " + st + ">");
+}
+
+V k_sleep(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (a.argc == 0 || a.argv[0] == Qnil)
+    {
+        double t0 = steadyNow() + g_skew;
+        blockOn(I, Qnil, -1, true);
+        return fix((int64_t)(steadyNow() + g_skew - t0 + 0.5));
+    }
+    if (!I.isNum(a.argv[0]))
+        I.raise(I.cTypeError, "can't convert " + I.className(I.realClassOf(a.argv[0])) + " into time interval");
+    double secs = I.numToF(a.argv[0]);
+    if (secs < 0)
+        I.raise(I.cArgumentError, "time interval must not be negative");
+    blockOn(I, Qnil, secs, false);
+    return fix((int64_t)(secs + 0.5));
+}
+
+// ── Fiber ─────────────────────────────────────────────────────────────────
+
+V fb_s_new(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        I.raise(I.cArgumentError, "tried to create Proc object without a block");
+    V obj = I.allocate(static_cast<RClass *>(op(self)));
+    auto *c = new Co();
+    coWrap(I, obj, c);
+    c->isFiber = true;
+    c->proc = I.procFromBlk(a.blk);
+    c->state = S_IDLE;
+    c->owner = currentThread();
+    g_all.push_back(c);
+    return obj;
+}
+
+V packTransfer(Interp &I, int argc, V *argv)
+{
+    if (argc == 0)
+        return Qnil;
+    if (argc == 1)
+        return argv[0];
+    return I.ary(std::vector<V>(argv, argv + argc));
+}
+
+V fb_resume(Interp &I, V self, Args &a)
+{
+    Co *c = coOf(I, self);
+    Co *me = g_cur;
+    if (c->state == S_DONE)
+        I.raise(I.cFiberError, "attempt to resume a terminated fiber");
+    if (c == me)
+        I.raise(I.cFiberError, "attempt to resume the current fiber");
+    if (c->state != S_IDLE)
+        I.raise(I.cFiberError, "attempt to resume a resuming fiber");
+    c->resumer = me;
+    if (!c->started)
+        c->args.assign(a.argv, a.argv + a.argc);
+    else
+        c->transfer = packTransfer(I, a.argc, a.argv);
+    me->state = S_IDLE;
+    c->state = S_RUNNABLE;
+    switchTo(I, c, false);
+    me->state = S_RUNNABLE;
+    checkPending(I, me);
+    if (c->state == S_DONE && c->exc != Qnil)
+    {
+        V e = c->exc;
+        c->exc = Qnil;
+        throw RubyError{e};
+    }
+    V r = me->transfer;
+    me->transfer = Qnil;
+    return r;
+}
+
+V fb_s_yield(Interp &I, V self, Args &a)
+{
+    (void)self;
+    Co *me = g_cur;
+    if (!me->isFiber || !me->resumer)
+        I.raise(I.cFiberError, "can't yield from root fiber");
+    Co *back = me->resumer;
+    back->transfer = packTransfer(I, a.argc, a.argv);
+    back->state = S_RUNNABLE;
+    me->state = S_IDLE;
+    me->resumer = nullptr;
+    switchTo(I, back, false);
+    checkPending(I, me);
+    V r = me->transfer;
+    me->transfer = Qnil;
+    return r;
+}
+
+V fb_alive(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(coOf(I, self)->state != S_DONE);
+}
+
+V fb_s_current(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (g_cur->isFiber)
+        return g_cur->obj;
+    V obj = I.ivarGet(g_cur->obj, intern("__fiber"));
+    if (obj == Qnil)
+    {
+        obj = I.allocate(static_cast<RClass *>(op(self)));
+        auto *c = new Co(*g_cur);
+        c->state = S_RUNNABLE;
+        I.ivarSet(obj, symCo(), fix((int64_t)(reinterpret_cast<uint64_t>(c) >> 1)));
+        I.ivarSet(g_cur->obj, intern("__fiber"), obj);
+    }
+    return obj;
+}
+
+V k_thread_class(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return ov(cThread);
+}
+
+} // namespace
+
+void Interp::preempt()
+{
+    quantum = 200000;
+    Co *me = g_cur;
+    Co *next = pick(*this);
+    if (next && next != me)
+    {
+        switchTo(*this, next, false);
+        checkPending(*this, me);
+    }
+}
+
+double rubyClockSkew() { return g_skew; }
+
+void Interp::initThread()
+{
+    cThread = newClass(cObject, false);
+    nameClass(cThread, intern("Thread"), cObject);
+    cFiber = defineClass("Fiber", cObject);
+    g_main = new Co();
+    g_main->started = true;
+    g_main->event = __dll_kernel32::CreateEventA(nullptr, 0, 0, nullptr);
+    g_main->owner = g_main;
+    g_cur = g_main;
+    g_all.push_back(g_main);
+    coWrap(*this, allocate(cThread), g_main);
+    defnPriv(mKernel, "__thread_class", k_thread_class, 0, 0);
+    defs(mKernel, "sleep", k_sleep, 0, 1);
+    defnPriv(mKernel, "sleep", k_sleep, 0, 1);
+    RClass *t = cThread;
+    defs(t, "new", th_s_new, 0, -1);
+    defs(t, "start", th_s_new, 0, -1);
+    defs(t, "fork", th_s_new, 0, -1);
+    defs(t, "current", th_s_current, 0, 0);
+    defs(t, "main", th_s_main, 0, 0);
+    defs(t, "pass", th_s_pass, 0, 0);
+    defs(t, "list", th_s_list, 0, 0);
+    defs(t, "stop", th_s_stop, 0, 0);
+    defs(t, "__wait", th_s_wait, 0, 1);
+    defs(t, "report_on_exception=", th_s_set_report, 1, 1);
+    defs(t, "report_on_exception", th_s_get_report, 0, 0);
+    defs(t, "abort_on_exception=", th_s_set_abort, 1, 1);
+    defs(t, "abort_on_exception", th_s_get_abort, 0, 0);
+    defn(t, "join", th_join, 0, 1);
+    defn(t, "value", th_value, 0, 0);
+    defn(t, "alive?", th_alive, 0, 0);
+    defn(t, "stop?", th_stop_p, 0, 0);
+    defn(t, "status", th_status, 0, 0);
+    defn(t, "[]", th_aref, 1, 1);
+    defn(t, "[]=", th_aset, 2, 2);
+    defn(t, "key?", th_key_p, 1, 1);
+    defn(t, "keys", th_keys, 0, 0);
+    defn(t, "thread_variable_get", th_tv_get, 1, 1);
+    defn(t, "thread_variable_set", th_tv_set, 2, 2);
+    defn(t, "name", th_name, 0, 0);
+    defn(t, "name=", th_set_name, 1, 1);
+    defn(t, "kill", th_kill, 0, 0);
+    defn(t, "exit", th_kill, 0, 0);
+    defn(t, "terminate", th_kill, 0, 0);
+    defn(t, "wakeup", th_wakeup, 0, 0);
+    defn(t, "run", th_run, 0, 0);
+    defn(t, "raise", th_raise, 0, 2);
+    defn(t, "report_on_exception", th_get_report, 0, 0);
+    defn(t, "report_on_exception=", th_set_report, 1, 1);
+    defn(t, "priority", th_priority, 0, 0);
+    defn(t, "priority=", th_priority, 1, 1);
+    defn(t, "inspect", th_inspect, 0, 0);
+    defn(t, "to_s", th_inspect, 0, 0);
+    RClass *f = cFiber;
+    defs(f, "new", fb_s_new, 0, -1);
+    defs(f, "yield", fb_s_yield, 0, -1);
+    defs(f, "current", fb_s_current, 0, 0);
+    defn(f, "resume", fb_resume, 0, -1);
+    defn(f, "alive?", fb_alive, 0, 0);
+}
+
+} // namespace ruby

@@ -1,0 +1,405 @@
+// quantum: cpp
+#pragma once
+// Ruby front-end: the syntax tree the parser (RubyParse.sa) builds and the
+// interpreter (RubyInterp.sa) walks. Local variables are resolved while
+// parsing: a variable is a (depth, slot) pair, where depth counts the block
+// scopes between the use and the scope that owns the variable.
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace ruby
+{
+
+using Sym = int;
+
+enum class N : uint8_t
+{
+    // literals
+    Nil, True, False, Self, Int, BigInt, Float, Rational, Imaginary, Str, DStr, XStr, Sym, DSym, Regex,
+    Array, Hash, Range,
+    // variables
+    LVar, LAsgn, IVar, IAsgn, GVar, GAsgn, CVar, CAsgn, Const, ConstAsgn, NthRef, BackRef,
+    // calls
+    Call, Super, ZSuper, Yield, BlockPass, Splat, DSplat,
+    // operators
+    And, Or, Not, Defined, OpAsgn, MAsgn, Mlhs,
+    // control flow
+    If, While, For, Case, CaseIn, Break, Next, Redo, Retry, Return, Begin, Seq,
+    // definitions
+    Def, Class, Module, SClass, Alias, Undef, Lambda, Block,
+    // pattern matching
+    PValue, PPin, PBind, PAlt, PCapture, PArray, PFind, PHash, PNil, MatchP, MatchPBool,
+    // misc
+    File, Line, Method, Dir, Postexe
+};
+
+struct Node
+{
+    N kind;
+    int line = 0;
+    explicit Node(N k, int ln = 0) : kind(k), line(ln) {}
+    virtual ~Node() {}
+};
+
+struct Scope;
+struct ProgramNode;
+
+// Integer / big integer literal (text kept for big ones), float, string ...
+struct LitNode : Node
+{
+    int64_t i = 0;
+    double f = 0;
+    std::string s; // string / symbol / big integer digits
+    uint64_t cache = 0; // the runtime value, once made (immutable literals)
+    LitNode(N k, int ln) : Node(k, ln) {}
+};
+
+// "a#{b}c": parts are Str nodes and expressions; regex flags in `flags`
+struct DStrNode : Node
+{
+    std::vector<Node *> parts;
+    std::string flags; // regex: i m x o
+    bool once = false;
+    uint64_t cache = 0; // a regex without interpolation, once compiled
+    DStrNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct ListNode : Node // Array, Seq, Splat target lists
+{
+    std::vector<Node *> items;
+    Node **raw = nullptr; // items.data() once running (the native backend's vector access is a call)
+    int count = 0;
+    ListNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct HashNode : Node
+{
+    std::vector<Node *> keys; // nullptr key: the value is a **splat
+    std::vector<Node *> values;
+    bool braces = true;       // false: keyword arguments of a call
+    HashNode(int ln) : Node(N::Hash, ln) {}
+};
+
+struct RangeNode : Node
+{
+    Node *lo = nullptr, *hi = nullptr;
+    bool exclusive = false;
+    uint64_t cache = 0; // a range of literals, once made
+    RangeNode(int ln) : Node(N::Range, ln) {}
+};
+
+struct VarNode : Node // LVar / LAsgn / IVar / GVar / CVar (+ assignments)
+{
+    Sym name = 0;
+    int depth = 0, slot = 0; // locals; instance variables: slot caches the index last found
+    Node *value = nullptr;   // assignments
+    VarNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct ConstNode : Node // Const / ConstAsgn: Foo, A::B, ::Top
+{
+    Node *scope = nullptr; // A in A::B
+    bool top = false;      // ::Top
+    Sym name = 0;
+    Node *value = nullptr;
+    int cacheVersion = -1; // the constant's value, valid while no constant changes
+    void *cacheLex = nullptr;
+    uint64_t cacheValue = 0;
+    ConstNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct BlockNode;
+
+struct CallNode : Node
+{
+    Node *recv = nullptr; // nullptr: a call on self (fcall)
+    Sym name = 0;
+    std::vector<Node *> args; // may hold Splat, BlockPass, keyword HashNode (braces=false)
+    BlockNode *block = nullptr;
+    bool safeNav = false; // &.
+    bool vcall = false;   // a bare identifier: no receiver, no arguments, no parens
+    bool hasParens = false;
+    bool attrAssign = false; // foo.bar = v / foo[i] = v
+    int cacheVersion = -1;   // inline method cache (RubyEval.sa)
+    void *cacheClass = nullptr;
+    void *cacheMethod = nullptr;
+    uint8_t fast = 0;        // integer fast path: 0 not yet known, 1 none, else the operator
+    int8_t plainArgs = -1;   // 1: every argument is one value (no splat, keywords, block pass)
+    Node **rawArgs = nullptr;
+    int argCount = 0;
+    CallNode(int ln) : Node(N::Call, ln) {}
+};
+
+struct SuperNode : Node // Super (explicit args) / ZSuper
+{
+    std::vector<Node *> args;
+    BlockNode *block = nullptr;
+    bool hasParens = false;
+    SuperNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct YieldNode : Node
+{
+    std::vector<Node *> args;
+    YieldNode(int ln) : Node(N::Yield, ln) {}
+};
+
+struct UnaryNode : Node // BlockPass, Splat, DSplat, Not, Defined, Return/Break/Next value, Alias...
+{
+    Node *expr = nullptr;
+    bool inBlock = false; // Break / Next / Redo: in a block (not directly in a loop)
+    UnaryNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct BinNode : Node // And, Or
+{
+    Node *left = nullptr, *right = nullptr;
+    BinNode(N k, int ln) : Node(k, ln) {}
+};
+
+// a += 1, a ||= b, obj.x += 1, h[k] ||= [] ...
+struct OpAsgnNode : Node
+{
+    Node *target = nullptr; // LVar/IVar/GVar/CVar/Const node, or Call (attr / index read)
+    Sym op = 0;             // the binary operator; 0 for ||=, -1 for &&=
+    Node *value = nullptr;
+    uint8_t fast = 0;       // the operator's fast path, as in CallNode
+    OpAsgnNode(int ln) : Node(N::OpAsgn, ln) {}
+};
+
+// a, (b, c), *d = ... and block / method destructuring
+struct MlhsNode;
+struct MAsgnNode : Node
+{
+    MlhsNode *lhs = nullptr;
+    Node *value = nullptr;
+    MAsgnNode(int ln) : Node(N::MAsgn, ln) {}
+};
+
+struct MlhsNode : Node // targets: assignable nodes (value == nullptr), nested MlhsNode, Splat(target or null)
+{
+    std::vector<Node *> pre;
+    Node *splat = nullptr;  // UnaryNode Splat with expr = target (or nullptr for bare *)
+    bool hasSplat = false;
+    std::vector<Node *> post;
+    MlhsNode(int ln) : Node(N::Mlhs, ln) {}
+};
+
+// Symbols: one id per name, shared by the parser and the runtime (RubySym.sa)
+Sym intern(const std::string &name);
+const std::string &symName(Sym s);
+
+// A syntax error: line and message
+struct SyntaxError
+{
+    int line;
+    std::string message;
+};
+
+// Parses a program (RubyParse.sa); throws SyntaxError
+ProgramNode *parseProgram(const std::string &source, const std::string &file);
+// Parses code for eval: `scope` (a block scope, made here when null, inside
+// `outer`) sees the enclosing locals and keeps the ones it declares
+ProgramNode *parseEval(const std::string &source, const std::string &file, Scope *outer, Scope *scope);
+
+struct IfNode : Node
+{
+    Node *cond = nullptr, *then = nullptr, *els = nullptr;
+    IfNode(int ln) : Node(N::If, ln) {}
+};
+
+struct WhileNode : Node
+{
+    Node *cond = nullptr, *body = nullptr;
+    bool until = false;
+    bool doWhile = false; // begin ... end while cond
+    WhileNode(int ln) : Node(N::While, ln) {}
+};
+
+struct ForNode : Node
+{
+    Node *var = nullptr; // assignable or MlhsNode
+    Node *iter = nullptr, *body = nullptr;
+    ForNode(int ln) : Node(N::For, ln) {}
+};
+
+struct WhenClause
+{
+    std::vector<Node *> values; // may hold Splat
+    Node *body = nullptr;
+    int line = 0;
+};
+
+struct CaseNode : Node
+{
+    Node *subject = nullptr; // nullptr: case without subject
+    std::vector<WhenClause> whens;
+    Node *els = nullptr;
+    bool hasElse = false;
+    CaseNode(int ln) : Node(N::Case, ln) {}
+};
+
+struct InClause
+{
+    Node *pattern = nullptr;
+    Node *guard = nullptr;
+    bool guardUnless = false;
+    Node *body = nullptr;
+    int line = 0;
+};
+
+struct CaseInNode : Node
+{
+    Node *subject = nullptr;
+    std::vector<InClause> ins;
+    Node *els = nullptr;
+    bool hasElse = false;
+    CaseInNode(int ln) : Node(N::CaseIn, ln) {}
+};
+
+// pattern nodes
+struct PatNode : Node
+{
+    Node *value = nullptr;      // PValue: expression (=== match); PPin: expression; PCapture: inner
+    VarNode *var = nullptr;     // PBind / PCapture target
+    std::vector<Node *> alts;   // PAlt
+    Node *constant = nullptr;   // PArray / PFind / PHash: Const[...] / Const(...)
+    std::vector<Node *> pre, post; // PArray / PFind (post)
+    bool hasRest = false;
+    VarNode *rest = nullptr;    // *rest (nullptr: anonymous)
+    VarNode *rest2 = nullptr;   // PFind: the trailing *post
+    std::vector<Sym> keys;      // PHash
+    std::vector<Node *> keyPats; // nullptr: bind to the key's name
+    std::vector<VarNode *> keyVars;
+    bool nilRest = false;       // **nil
+    bool hashRest = false;      // **rest / **
+    VarNode *hashRestVar = nullptr;
+    PatNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct MatchNode : Node // MatchP (expr => pat), MatchPBool (expr in pat)
+{
+    Node *value = nullptr;
+    Node *pattern = nullptr;
+    MatchNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct RescueClause
+{
+    std::vector<Node *> classes; // empty: StandardError
+    Node *var = nullptr;         // assignable target
+    Node *body = nullptr;
+    int line = 0;
+};
+
+struct BeginNode : Node
+{
+    Node *body = nullptr;
+    std::vector<RescueClause> rescues;
+    Node *els = nullptr;
+    Node *ensure = nullptr;
+    bool keyword = false; // written as begin ... end (a loop modifier makes it a do-while)
+    BeginNode(int ln) : Node(N::Begin, ln) {}
+};
+
+// method / block parameters
+struct Param
+{
+    enum Kind : uint8_t
+    {
+        Req,     // a
+        Opt,     // a = 1
+        Rest,    // *a  (name 0: anonymous)
+        Post,    // a after the rest
+        Key,     // a: 1
+        KeyReq,  // a:
+        KeyRest, // **a (name 0: anonymous)
+        NoKey,   // **nil
+        Block,   // &a
+        Destructure // (a, b) in a block or method
+    };
+    Kind kind = Req;
+    Sym name = 0;
+    int slot = -1;
+    Node *defaultValue = nullptr;
+    MlhsNode *destructure = nullptr;
+};
+
+struct ParamList
+{
+    std::vector<Param> params;
+    int required = 0, optional = 0, post = 0;
+    bool hasRest = false, hasKw = false, hasKwRest = false, hasBlock = false;
+    bool trailingComma = false; // |a,| in a block
+    bool forwarding = false;    // (...)
+    int restIndex = -1;
+    int8_t simple = -1;         // runtime: 1 when only required parameters, in slots 0..n-1
+};
+
+// A local variable scope: the def / class body / program, or a block
+struct Scope
+{
+    std::vector<Sym> names;
+    bool isBlock = false;
+    bool captured = false; // a block inside may outlive a call: locals live on the heap
+    Scope *parent = nullptr;
+    int find(Sym s) const
+    {
+        for (int i = (int)names.size() - 1; i >= 0; --i)
+            if (names[i] == s)
+                return i;
+        return -1;
+    }
+};
+
+struct BlockNode : Node // a do/end or {} block, or a lambda literal body
+{
+    ParamList params;
+    Node *body = nullptr;
+    Scope *scope = nullptr;
+    bool numbered = false; // _1 / it
+    int numberedCount = 0;
+    int nslots = -1;       // runtime: the scope's size, cached
+    int soleSlot = -2;     // runtime: the slot of a lone required parameter (-1: other shapes)
+    BlockNode(int ln) : Node(N::Block, ln) {}
+};
+
+struct DefNode : Node
+{
+    Node *singleton = nullptr; // def self.x / def obj.x
+    Sym name = 0;
+    ParamList params;
+    Node *body = nullptr;
+    Scope *scope = nullptr;
+    bool endless = false;
+    int nslots = -1; // runtime: the scope's size, cached
+    DefNode(int ln) : Node(N::Def, ln) {}
+};
+
+struct ClassNode : Node // Class / Module / SClass
+{
+    ConstNode *path = nullptr; // Class / Module
+    Node *superclass = nullptr;
+    Node *target = nullptr; // SClass: class << target
+    Node *body = nullptr;
+    Scope *scope = nullptr;
+    ClassNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct AliasNode : Node // Alias (method names) / Undef
+{
+    Sym to = 0, from = 0;
+    bool globals = false;
+    std::vector<Sym> names; // Undef
+    AliasNode(N k, int ln) : Node(k, ln) {}
+};
+
+struct ProgramNode
+{
+    Node *body = nullptr;
+    Scope *scope = nullptr;
+    std::vector<std::string> requires; // literal require / require_relative names
+};
+
+} // namespace ruby
