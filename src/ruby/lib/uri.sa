@@ -1,0 +1,243 @@
+module URI
+  class Error < StandardError; end
+  class InvalidURIError < Error; end
+  class BadURIError < Error; end
+
+  PORTS = { "http" => 80, "https" => 443, "ftp" => 21, "ws" => 80, "wss" => 443, "ldap" => 389, "ldaps" => 636 }.freeze
+
+  class Generic
+    include URI
+    attr_accessor :scheme, :userinfo, :host, :port, :path, :query, :fragment, :opaque
+
+    def self.default_port = nil
+
+    def initialize(scheme, userinfo, host, port, path, query, fragment, opaque = nil)
+      @scheme = scheme
+      @userinfo = userinfo
+      @host = host
+      @port = port
+      @path = path || ""
+      @query = query
+      @fragment = fragment
+      @opaque = opaque
+    end
+
+    def default_port = URI::PORTS[@scheme&.downcase]
+    def user = @userinfo&.split(":", 2)&.first
+    def password = @userinfo&.split(":", 2)&.[](1)
+    def hostname = @host&.delete_prefix("[")&.delete_suffix("]")
+    def absolute? = !@scheme.nil?
+    alias absolute absolute?
+    def relative? = @scheme.nil?
+    def hierarchical? = @opaque.nil?
+
+    def request_uri
+      p = @path.empty? ? "/" : @path
+      @query ? "#{p}?#{@query}" : p
+    end
+
+    def authority
+      return nil unless @host
+      s = +""
+      s << @userinfo << "@" if @userinfo
+      s << @host
+      s << ":#{@port}" if @port && @port != default_port
+      s
+    end
+
+    def to_s
+      s = +""
+      s << @scheme << ":" if @scheme
+      if @opaque
+        s << @opaque
+      else
+        s << "//" << authority if @host
+        s << @path
+        s << "?" << @query if @query
+      end
+      s << "#" << @fragment if @fragment
+      s
+    end
+    alias to_str to_s
+
+    def ==(o) = o.is_a?(Generic) && to_s == o.to_s
+    alias eql? ==
+    def hash = to_s.hash
+    def inspect = "#<#{self.class} #{self}>"
+
+    def merge(rel)
+      r = rel.is_a?(Generic) ? rel : URI.parse(rel.to_s)
+      return r if r.absolute?
+      raise BadURIError, "both URI are relative" unless absolute?
+      return self.class.new(@scheme, r.userinfo, r.host, r.port || default_port, r.path, r.query, r.fragment) if r.host
+      path = r.path
+      query = r.query
+      if path.empty?
+        path = @path
+        query ||= @query
+      elsif !path.start_with?("/")
+        base = @path.sub(%r{[^/]*\z}, "")
+        base = "/" if base.empty?
+        path = base + path
+      end
+      self.class.new(@scheme, @userinfo, @host, @port, URI.__normalize(path), query, r.fragment)
+    end
+    alias + merge
+
+    def normalize
+      self.class.new(@scheme&.downcase, @userinfo, @host&.downcase, @port, @path.empty? ? "/" : @path, @query, @fragment)
+    end
+  end
+
+  class HTTP < Generic; end
+  class HTTPS < HTTP; end
+  class WS < Generic; end
+  class WSS < WS; end
+  class File < Generic; end
+
+  # an FTP path is relative to the login directory: no leading slash
+  class FTP < Generic
+    def initialize(scheme, userinfo, host, port, path, query, fragment, opaque = nil)
+      super
+      @path = @path.delete_prefix("/")
+    end
+
+    def to_s
+      s = +"#{@scheme}://#{authority}/#{@path}"
+      s << "?" << @query if @query
+      s << "#" << @fragment if @fragment
+      s
+    end
+  end
+
+  class MailTo < Generic
+    def to = @opaque&.split("?")&.first
+  end
+
+  def self.__normalize(path)
+    out = []
+    parts = path.split("/", -1)
+    parts.each_with_index do |seg, i|
+      if seg == "."
+        out << "" if i == parts.size - 1
+      elsif seg == ".."
+        out.pop if out.size > 1
+        out << "" if i == parts.size - 1
+      else
+        out << seg
+      end
+    end
+    out.join("/")
+  end
+
+  def self.parse(str)
+    s = str.to_s
+    if s =~ /[\s<>"\\^`{|}]/ || s.count("#") > 1
+      raise InvalidURIError, "bad URI (is not URI?): #{s.inspect}"
+    end
+    m = s.match(%r{\A(?:([A-Za-z][A-Za-z0-9+.\-]*):)?(?://([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?\z})
+    raise InvalidURIError, "bad URI (is not URI?): #{s.inspect}" unless m
+    scheme, auth, path, query, frag = m[1], m[2], m[3], m[4], m[5]
+    k = case scheme&.downcase
+        when "http" then HTTP
+        when "https" then HTTPS
+        when "ftp" then FTP
+        when "ws" then WS
+        when "wss" then WSS
+        when "file" then File
+        when "mailto" then MailTo
+        else Generic
+        end
+    if scheme && auth.nil? && !path.start_with?("/") && !path.empty?
+      return k.new(scheme, nil, nil, nil, nil, nil, frag, query ? "#{path}?#{query}" : path)
+    end
+    userinfo = host = port = nil
+    if auth
+      userinfo, auth = auth.split("@", 2) if auth.include?("@")
+      if auth =~ /\A(\[[^\]]*\]|[^:]*)(?::(\d*))?\z/
+        host = $1
+        port = $2 && !$2.empty? ? $2.to_i : nil
+      else
+        raise InvalidURIError, "bad URI (is not URI?): #{s.inspect}"
+      end
+    end
+    port ||= PORTS[scheme&.downcase] if host
+    k.new(scheme, userinfo, host, port, path, query, frag)
+  end
+
+  def self.join(*parts)
+    u = parse(parts[0].to_s)
+    parts[1..].each { |p| u = u.merge(p) }
+    u
+  end
+
+  def self.encode_www_form_component(str, *)
+    out = +""
+    str.to_s.each_byte do |b|
+      if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 42 || b == 45 || b == 46 || b == 95
+        out << b
+      elsif b == 32
+        out << "+"
+      else
+        out << format("%%%02X", b)
+      end
+    end
+    out
+  end
+
+  def self.decode_www_form_component(str, *)
+    s = str.to_s
+    out = +""
+    i = 0
+    n = s.bytesize
+    while i < n
+      b = s.getbyte(i)
+      if b == 43
+        out.__append_byte(32)
+        i += 1
+      elsif b == 37
+        h = s.byteslice(i + 1, 2)
+        raise ArgumentError, "invalid %-encoding (#{s})" unless h =~ /\A\h\h\z/
+        out.__append_byte(h.to_i(16))
+        i += 3
+      else
+        out.__append_byte(b)
+        i += 1
+      end
+    end
+    out
+  end
+
+  def self.encode_uri_component(str, *) = encode_www_form_component(str).gsub("+", "%20")
+  def self.decode_uri_component(str, *) = decode_www_form_component(str.gsub("+", "%2B"))
+
+  def self.encode_www_form(enum, *)
+    pairs = []
+    enum.each do |k, v|
+      if v.nil?
+        pairs << encode_www_form_component(k)
+      elsif v.respond_to?(:to_ary)
+        v.to_ary.each do |w|
+          pairs << (w.nil? ? encode_www_form_component(k) : "#{encode_www_form_component(k)}=#{encode_www_form_component(w)}")
+        end
+      else
+        pairs << "#{encode_www_form_component(k)}=#{encode_www_form_component(v)}"
+      end
+    end
+    pairs.join("&")
+  end
+
+  def self.decode_www_form(str, *)
+    return [] if str.empty?
+    str.split(/[&;]/).map do |pair|
+      k, v = pair.split("=", 2)
+      [decode_www_form_component(k), decode_www_form_component(v || "")]
+    end
+  end
+
+  def self.extract(str) = str.scan(%r{[a-z][a-z0-9+.\-]*://[^\s<>"]+}i)
+end
+
+module Kernel
+  def URI(s) = s.is_a?(URI::Generic) ? s : URI.parse(s)
+end

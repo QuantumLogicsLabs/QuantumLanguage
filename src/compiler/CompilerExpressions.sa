@@ -834,6 +834,8 @@ void Compiler::compileListComp(ListComp &e, int line)
     CompilerState fnState("<listcomp>", current_);
     fnState.isFunction = true;
     CompilerState *prev = current_;
+    fnState.chunk->javaStyle = javaDepth_ > 0 || (prev && prev->chunk->javaStyle);
+    fnState.chunk->rubyStyle = !fnState.chunk->javaStyle && prev && prev->chunk->rubyStyle;
     current_ = &fnState;
 
     beginScope();

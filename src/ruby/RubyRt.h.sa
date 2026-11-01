@@ -1,0 +1,690 @@
+// quantum: cpp
+#pragma once
+// Ruby front-end: the runtime. Values are 64-bit words: small integers,
+// floats (CRuby's "flonum" encoding), symbols, nil/true/false are immediate;
+// everything else points at a heap object. Objects are never freed: the
+// programs this runs are short.
+#include "RubyAst.h.sa"
+
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace ruby
+{
+
+typedef uint64_t V;
+
+// Macros, not functions: the native backend does not inline, and these are
+// the interpreter's hottest operations. Arguments must have no side effects.
+#define Qfalse ((V)0)
+#define Qnil ((V)4)
+#define Qtrue ((V)0x14)
+#define Qundef ((V)0x34)
+#define truthy(v) (((V)(v) & ~(V)4) != 0)
+#define boolv(b) ((b) ? Qtrue : Qfalse)
+#define isFix(v) (((V)(v) & 1) != 0)
+#define fixv(v) ((int64_t)(V)(v) >> 1)
+#define fix(i) ((((V)(int64_t)(i)) << 1) | 1)
+#define FIXMAX 4611686018427387903LL
+#define FIXMIN (-4611686018427387903LL - 1)
+#define fixable(i) ((i) >= FIXMIN && (i) <= FIXMAX)
+#define isFlonum(v) (((V)(v) & 3) == 2)
+#define isSymV(v) (((V)(v) & 0xff) == 0x0c)
+#define symv(s) (((V)(uint32_t)(s) << 8) | 0x0c)
+#define vsym(v) ((Sym)((V)(v) >> 8))
+#define isObj(v) (((V)(v) & 7) == 0 && (V)(v) != 0)
+
+enum class T : uint8_t
+{
+    Object,
+    Class,
+    Module,
+    Float,
+    String,
+    Array,
+    Hash,
+    Range,
+    Proc,
+    Method,
+    UMethod,
+    Bignum,
+    Rational,
+    Complex,
+    Regexp,
+    Match,
+    Enumerator,
+    Data // native payload (StringScanner, Marshal dump, ...)
+};
+
+struct RClass;
+struct Interp;
+
+struct Obj
+{
+    RClass *klass = nullptr;
+    T type = T::Object;
+    bool frozen = false;
+    int32_t niv = 0, civ = 0;
+    Sym *ivn = nullptr; // instance variable names, in assignment order
+    V *ivv = nullptr;
+};
+
+#define op(v) (reinterpret_cast<Obj *>(v))
+#define ov(o) (reinterpret_cast<V>(o))
+#define isType(v, t) (isObj(v) && op(v)->type == (t))
+
+struct RFloat : Obj
+{
+    double d = 0;
+};
+struct RString : Obj
+{
+    std::string s;
+    bool binary = false; // ASCII-8BIT: characters are bytes
+    int64_t charLen = -1; // characters, once counted; for `byteLen` bytes (mutators reset it)
+    size_t byteLen = 0;
+};
+// `skip` leading elements have been shifted off and not yet erased: a queue
+// stays O(1). Interp::aref erases them; the queue operations work around them.
+struct RArray : Obj
+{
+    std::vector<V> a;
+    size_t skip = 0;
+};
+// insertion-ordered hash: parallel arrays, deleted keys are Qundef; `index`
+// maps hash -> entry (open addressing) once the table grows past a few keys
+struct RHash : Obj
+{
+    std::vector<V> keys, vals;
+    std::vector<uint64_t> hashes;
+    std::vector<int32_t> index;
+    int32_t live = 0;
+    V defVal = Qnil;
+    V defProc = Qnil;
+    bool byId = false;
+};
+struct RRange : Obj
+{
+    V lo = Qnil, hi = Qnil;
+    bool excl = false;
+};
+struct RBig : Obj
+{
+    bool neg = false;
+    std::vector<uint32_t> mag; // little-endian base 2^32, no leading zeros
+};
+struct RRational : Obj
+{
+    V num = 0, den = 0;
+};
+struct RComplex : Obj
+{
+    V re = 0, im = 0;
+};
+struct Regex;
+struct RRegexp : Obj
+{
+    Regex *re = nullptr;
+    std::string src;
+    int opts = 0; // 1 i, 2 x, 4 m
+};
+struct RMatch : Obj
+{
+    V str = Qnil;
+    RRegexp *re = nullptr;
+    std::vector<int> caps; // begin, end byte offsets per group (-1: unset)
+};
+
+struct Env
+{
+    V *slots = nullptr;
+    Env *parent = nullptr;
+    int n = 0;
+};
+
+struct LexScope // the lexical module nesting (cref) for constants and def
+{
+    RClass *klass = nullptr;
+    LexScope *parent = nullptr;
+};
+
+struct Method;
+struct Blk;
+
+struct Args
+{
+    V *argv = nullptr;
+    int argc = 0;
+    bool kw = false;   // argv[argc-1] is a keyword hash
+    Blk *blk = nullptr;
+};
+
+typedef V (*NativeFn)(Interp &I, V self, Args &a);
+typedef std::function<V(Interp &I, Args &a)> NativeBlockFn;
+
+enum BlkKind : uint8_t
+{
+    B_RUBY,
+    B_NATIVE,
+    B_SYM,
+    B_METHOD
+};
+
+// What a block shares with the scope it was written in
+struct Ctx
+{
+    V self = Qnil;
+    LexScope *lex = nullptr;
+    RClass *defTarget = nullptr; // where `def` puts methods
+    Method *method = nullptr;    // the method being run (super, __method__)
+    RClass *methodClass = nullptr; // where lookup found it (super starts after)
+    Blk *blk = nullptr;          // the method's block (yield)
+    Args *margs = nullptr;       // the method's arguments (zsuper)
+    uint64_t homeId = 0;         // the method invocation (`return` in a block)
+    Env *menv = nullptr;         // the method's own locals (zsuper)
+};
+
+struct Blk
+{
+    BlkKind kind = B_RUBY;
+    bool lambda = false;
+    BlockNode *node = nullptr;
+    Env *env = nullptr;
+    Ctx *ctx = nullptr; // the defining frame's (a heap copy once captured in a proc)
+    NativeBlockFn *native = nullptr;
+    Sym sym = 0;
+    V recv = Qnil;           // B_METHOD: the receiver
+    Method *meth = nullptr;  // B_METHOD
+    uint64_t tag = 0;        // the call this block was passed to (break)
+    int arity = -1;          // native blocks: Proc#arity
+};
+
+struct RProc : Obj
+{
+    Blk blk;
+    bool lambda = false;
+    bool fromMethod = false;
+    V methodObj = Qnil;
+};
+
+enum MKind : uint8_t
+{
+    M_NATIVE,
+    M_NATIVE_ENUM, // called with neither arguments nor a block: an Enumerator
+    M_RUBY,
+    M_READER,
+    M_WRITER,
+    M_PROC,
+    M_UNDEF
+};
+
+enum Vis : uint8_t
+{
+    V_PUBLIC,
+    V_PRIVATE,
+    V_PROTECTED
+};
+
+struct Method
+{
+    Sym name = 0;
+    Sym orig = 0; // alias: the original name (super looks it up)
+    RClass *owner = nullptr;
+    MKind kind = M_NATIVE;
+    Vis vis = V_PUBLIC;
+    int16_t minArgs = 0, maxArgs = -1;
+    NativeFn fn = nullptr;
+    DefNode *def = nullptr;
+    LexScope *lex = nullptr;
+    RProc *proc = nullptr;
+    Sym ivar = 0;
+};
+
+struct RMethod : Obj // Method / UnboundMethod objects
+{
+    V recv = Qnil;
+    Method *m = nullptr;
+    Sym name = 0;
+    RClass *lookupClass = nullptr;
+};
+
+struct REnum : Obj
+{
+    V recv = Qnil;
+    Sym meth = 0;
+    std::vector<V> args;
+    bool kw = false;
+    V gen = Qnil;   // Enumerator.new { |y| ... }: the block as a proc
+    V size = Qnil;
+    // external iteration: values buffered up to the cursor
+    std::vector<V> buf;
+    size_t pos = 0;
+    bool done = false;
+    V result = Qnil;
+};
+
+struct RData : Obj
+{
+    int kind = 0;
+    void *ptr = nullptr;
+    V a = Qnil, b = Qnil;
+    int64_t i = 0;
+};
+
+struct RClass : Obj
+{
+    std::string name; // "A::B"; empty while anonymous
+    Sym baseName = 0;
+    RClass *super = nullptr;
+    bool isModule = false;
+    bool isSingleton = false;
+    bool isRefinement = false;
+    RClass *refined = nullptr; // refinement: the class it refines
+    V attached = Qnil;         // singleton: its object
+    std::vector<RClass *> includes;
+    std::vector<RClass *> prepends;
+    std::unordered_map<Sym, Method *> mt;
+    std::vector<Sym> mtOrder; // method names, first definition first
+    std::unordered_map<Sym, V> consts;
+    std::vector<Sym> constOrder;
+    std::vector<Sym> privateConsts;
+    std::unordered_map<Sym, V> cvars;
+    RClass *lexParent = nullptr;
+    std::vector<RClass *> anc;
+    int ancVersion = -1;
+    T instType = T::Object;
+    Vis defaultVis = V_PUBLIC; // `private` with no arguments in the body
+    bool moduleFunction = false;
+    std::vector<RClass *> refinements; // a module's `refine` blocks
+    std::vector<RClass *> subclasses;
+};
+
+// A Ruby exception in flight
+struct RubyError
+{
+    V exc;
+};
+
+// Control flow that crosses method boundaries
+struct BreakEx
+{
+    uint64_t tag;
+    V val;
+};
+struct ReturnEx
+{
+    uint64_t home;
+    V val;
+};
+struct ThrowEx
+{
+    V tag;
+    V val;
+};
+struct StopEx // internal: ends a native iteration early
+{
+    uint64_t tag;
+};
+
+enum Unwind : uint8_t
+{
+    U_NONE,
+    U_RETURN,
+    U_BREAK,
+    U_NEXT,
+    U_REDO,
+    U_RETRY
+};
+
+struct Frame
+{
+    Ctx *c = nullptr;
+    Env *env = nullptr;
+    Frame *prev = nullptr;
+    int line = 0;
+    uint8_t kind = 0; // 0 top, 1 method, 2 block, 3 class body, 4 eval
+    BlockNode *block = nullptr;
+    Scope *scope = nullptr; // for eval and binding
+};
+
+// interned names the runtime uses
+struct Syms
+{
+    Sym initialize, inspect, to_s, to_str, to_a, to_ary, to_h, to_hash, to_proc, to_i, to_int, to_f, to_r, to_sym,
+        call, each, eq, eqq, eql, hash, cmp, lt, gt, le, ge, plus, minus, mul, div, mod, pow, aref, aset, not_,
+        neq, match, method_missing, respond_to_missing, respond_to, coerce, message, new_, included, extended,
+        inherited, prepended, method_added, initialize_copy, size, succ, deconstruct, deconstruct_keys,
+        exception, backtrace, key, receiver, name, result, mesg, bt, cause, keys, values, members, it, bang,
+        each_pair, to_enum, lambda_, begin, end;
+};
+
+struct Interp;
+extern Interp *g_interp;
+
+struct Interp
+{
+    Syms s;
+    // core classes
+    RClass *cBasicObject, *cObject, *cModule, *cClass, *mKernel, *mComparable, *mEnumerable, *cNil, *cTrue,
+        *cFalse, *cNumeric, *cInteger, *cFloat, *cString, *cSymbol, *cArray, *cHash, *cRange, *cProc,
+        *cMethod, *cUMethod, *cRational, *cComplex, *cRegexp, *cMatch, *cEnumerator, *cLazy, *cYielder,
+        *cGenerator, *cArith, *cException, *cStandardError, *cRuntimeError, *cArgumentError, *cTypeError,
+        *cNameError, *cNoMethodError, *cZeroDivisionError, *cIndexError, *cKeyError, *cRangeError,
+        *cStopIteration, *cFrozenError, *cLocalJumpError, *cFloatDomainError, *cIOError,
+        *cNotImplementedError, *cScriptError, *cNoMatchingPatternError, *cNoMatchingPatternKeyError,
+        *cSystemExit, *cSystemStackError, *cUncaughtThrowError, *cRegexpError, *cEncodingError,
+        *cSecurityError, *cClosedQueueError, *cFiberError, *cThreadError, *cEOFError, *cSignalException,
+        *cInterrupt, *cLoadError, *cSyntaxError, *cNoMemoryError, *cEncCompatError, *mMath, *cStruct,
+        *cData, *cSet, *mProcess, *cIO, *cTime, *cRandom, *cEncoding, *mMarshal, *mGC, *mObjectSpace,
+        *cStringScanner, *mJSON, *cJSONParserError, *cMathDomainError, *mWarning;
+    V mainObj = Qnil;
+    V vStdout = Qnil, vStderr = Qnil;
+    std::string out;   // buffered standard output
+    std::string file;  // the script's path
+    std::string scriptName;
+    std::unordered_map<Sym, V> globals;
+    V lastMatch = Qnil; // $~
+    int methodVersion = 0, constVersion = 0;
+    uint64_t frameCounter = 0, tagCounter = 0;
+    Unwind unwind = U_NONE;
+    V unwindVal = Qnil;
+    Frame *frame = nullptr; // the innermost frame (backtraces)
+    std::vector<V> stack;   // argument and local slots
+    V *sp = nullptr;
+    V *stackEnd = nullptr;
+    int depth = 0;
+    std::vector<V> atExit;
+    std::vector<RClass *> activeRefinements;
+    std::unordered_map<std::string, bool> loaded; // require'd libraries
+    std::vector<V> inspecting; // recursion guard for inspect / ==
+    Method *mHashDefault = nullptr, *mEqlDefault = nullptr, *mEqDefault = nullptr, *mEqqDefault = nullptr,
+           *mInspectDefault = nullptr, *mToSDefault = nullptr, *mModEqq = nullptr;
+    Frame *topFrame = nullptr;
+    LexScope *topLex = nullptr;
+    bool loadingCoreExt = false; // lib/core_ext.sa must not replace a program's methods
+    V evalString(const std::string &src, V self, Ctx *base, Scope *outer, Env *outerEnv, RClass *defTarget, LexScope *lex);
+    bool preemptOn = false; // threads exist: safepoints may switch
+    int quantum = 200000;
+    void preempt();
+    V vStdoutOrig = Qnil;
+    bool failed = false; // the program ended with an uncaught exception
+    std::string failKind, failMessage;
+    int failLine = 0;
+    uint64_t randState = 0;
+    bool randSeeded = false;
+
+    Interp();
+
+    // ── evaluation ──────────────────────────────────────────────────────
+    V eval(Node *n, Frame *f);
+    V evalCold(Node *n, Frame *f);
+    V evalSeq(Node *n, Frame *f);
+    V evalCall(CallNode *n, Frame *f);
+    V evalSuper(SuperNode *n, Frame *f);
+    V evalYield(YieldNode *n, Frame *f);
+    V evalOpAsgn(OpAsgnNode *n, Frame *f);
+    void assignTo(Node *target, V value, Frame *f);
+    void massign(MlhsNode *m, V value, Frame *f);
+    V evalBegin(BeginNode *n, Frame *f);
+    V evalRescue(BeginNode *n, Frame *f);
+    V evalCase(CaseNode *n, Frame *f);
+    V evalCaseIn(CaseInNode *n, Frame *f);
+    bool matchPattern(Node *p, V v, Frame *f);
+    V evalDef(DefNode *n, Frame *f);
+    V evalClass(ClassNode *n, Frame *f);
+    V evalWhile(WhileNode *n, Frame *f);
+    V evalFor(ForNode *n, Frame *f);
+    V evalDefined(Node *e, Frame *f);
+    V evalDStr(DStrNode *n, Frame *f);
+    V evalConst(ConstNode *n, Frame *f);
+    V lookupConst(LexScope *lex, Sym name, bool raise = true);
+    V constIn(RClass *k, Sym name, bool inherit, bool raise = true);
+    void setConst(RClass *k, Sym name, V value);
+    V *localRef(VarNode *v, Frame *f);
+    int pushArgs(std::vector<Node *> &args, Frame *f, bool &kw, Blk *&blk, Blk &store);
+    V regexLiteral(DStrNode *n, Frame *f);
+
+    // ── calls ───────────────────────────────────────────────────────────
+    V invoke(Method *m, V self, Args &a, RClass *found, Frame *caller);
+    V invokeRuby(Method *m, V self, Args &a, RClass *found, Frame *caller);
+    void bindParams(ParamList &pl, Env *env, Args &a, Frame *f, bool lambda, bool isProc, Sym name);
+    V callBlock(Blk *b, int argc, V *argv, bool kw = false, Blk *passBlk = nullptr, V selfOverride = Qundef,
+                RClass *defTarget = nullptr);
+    V yield(Blk *b, V arg) { return callBlock(b, 1, &arg); }
+    V yield2(Blk *b, V a1, V a2)
+    {
+        V av[2] = {a1, a2};
+        return callBlock(b, 2, av);
+    }
+    V yieldN(Blk *b, std::vector<V> &args) { return callBlock(b, (int)args.size(), args.data()); }
+    V call(V recv, Sym m, int argc = 0, V *argv = nullptr, Blk *blk = nullptr, bool fcall = true, bool kw = false);
+    V call0(V recv, Sym m) { return call(recv, m, 0, nullptr); }
+    V call1(V recv, Sym m, V a)
+    {
+        return call(recv, m, 1, &a);
+    }
+    V call2(V recv, Sym m, V a, V b)
+    {
+        V av[2] = {a, b};
+        return call(recv, m, 2, av);
+    }
+    V callArgs(V recv, Sym m, Args &a, bool fcall = true);
+    V callProc(V proc, int argc, V *argv, Blk *blk = nullptr);
+    V methodMissing(V recv, Sym name, Args &a, bool vcall, bool fcall);
+    Method *findMethod(RClass *k, Sym name);
+    Method *findMethodAfter(RClass *k, RClass *after, Sym name, RClass **foundIn);
+    Method *findMethodIn(RClass *k, Sym name, RClass **foundIn);
+    bool respondTo(V v, Sym name, bool priv = false);
+    std::vector<RClass *> &ancestors(RClass *k);
+    RClass *singletonOf(V v);
+    RClass *classOf(V v);
+    RClass *realClass(RClass *k);
+    RClass *realClassOf(V v) { return realClass(classOf(v)); }
+    bool kindOf(V v, RClass *k);
+    bool isSubclass(RClass *a, RClass *b); // a <= b
+    V procFromBlk(Blk *b, bool lambda = false);
+    Blk *blkFromProc(V proc);
+    Blk nativeBlk(NativeBlockFn *fn, int arity = -1);
+    V methodObj(V recv, Sym name, bool unbound = false);
+
+    // ── definitions ─────────────────────────────────────────────────────
+    RClass *defineClass(const std::string &name, RClass *super, RClass *under = nullptr);
+    RClass *defineModule(const std::string &name, RClass *under = nullptr);
+    RClass *newClass(RClass *super, bool module);
+    void nameClass(RClass *k, Sym name, RClass *under);
+    Method *addMethod(RClass *k, Sym name, Method *m);
+    Method *defn(RClass *k, const char *name, NativeFn fn, int minArgs = 0, int maxArgs = -1);
+    Method *defs(RClass *k, const char *name, NativeFn fn, int minArgs = 0, int maxArgs = -1);
+    Method *defnPriv(RClass *k, const char *name, NativeFn fn, int minArgs = 0, int maxArgs = -1);
+    void includeModule(RClass *k, RClass *mod);
+    void prependModule(RClass *k, RClass *mod);
+    void extendObject(V obj, RClass *mod);
+    void bumpMethods() { ++methodVersion; }
+
+    // ── objects ─────────────────────────────────────────────────────────
+    V ivarGet(V obj, Sym name);
+    void ivarSet(V obj, Sym name, V value);
+    bool ivarDefined(V obj, Sym name);
+    V newObject(RClass *k);
+    V allocate(RClass *k);
+    void checkFrozen(V v);
+    bool frozen(V v);
+    V freeze(V v);
+    V dup(V v, bool clone);
+
+    // ── values ──────────────────────────────────────────────────────────
+    V str(const std::string &s);
+    V strFrozen(const std::string &s);
+    std::string &sref(V v) { return static_cast<RString *>(op(v))->s; }
+    std::vector<V> &aref(V v)
+    {
+        auto *r = static_cast<RArray *>(op(v));
+        if (r->skip)
+            arrayCompact(r);
+        return r->a;
+    }
+    void arrayCompact(RArray *r);
+    RHash *href(V v) { return static_cast<RHash *>(op(v)); }
+    V ary();
+    V ary(const std::vector<V> &items);
+    V ary2(V a, V b);
+    V newHash();
+    V flo(double d);
+    double fltv(V v);
+    bool isFloat(V v) { return isFlonum(v) || isType(v, T::Float); }
+    bool isInt(V v) { return isFix(v) || isType(v, T::Bignum); }
+    bool isNum(V v) { return isFix(v) || isFloat(v) || isType(v, T::Bignum) || isType(v, T::Rational) || isType(v, T::Complex); }
+    bool isStr(V v) { return isType(v, T::String); }
+    bool isAry(V v) { return isType(v, T::Array); }
+    bool isHash(V v) { return isType(v, T::Hash); }
+    V range(V lo, V hi, bool excl);
+    V sym(const std::string &s) { return symv(intern(s)); }
+    V regexp(const std::string &src, int opts);
+
+    // ── conversions and protocols ───────────────────────────────────────
+    std::string inspect(V v);
+    std::string toS(V v);
+    V toSV(V v);
+    std::string strOf(V v, const char *what = "String"); // implicit conversion (to_str)
+    int64_t intOf(V v);                                  // implicit conversion (to_int)
+    double numToF(V v);
+    V toAry(V v); // implicit Array conversion or nil
+    V arrayOf(V v); // Array(v)
+    std::vector<V> toList(V v); // anything enumerable, via each
+    bool eq(V a, V b);
+    bool eql(V a, V b);
+    uint64_t hashOf(V v);
+    int cmp(V a, V b);              // <=>, raising if incomparable
+    V cmpV(V a, V b);               // <=> (nil when incomparable)
+    bool caseEq(V pat, V v);        // pat === v
+    std::string className(RClass *k);
+    std::string describe(V v); // for error messages: "an instance of Foo", "nil", "main" ...
+
+    // ── errors ──────────────────────────────────────────────────────────
+    [[noreturn]] void raise(RClass *k, const std::string &msg);
+    [[noreturn]] void raiseExc(V exc);
+    [[noreturn]] void argError(int given, int min, int max);
+    [[noreturn]] void typeError(V v, const char *to);
+    [[noreturn]] void frozenError(V v);
+    V makeExc(RClass *k, const std::string &msg);
+    V backtrace(Frame *f);
+    std::string excMessage(V exc);
+
+    // ── output ──────────────────────────────────────────────────────────
+    void write(const std::string &s) { out += s; if (out.size() > 65536) flush(); }
+    void flush();
+    void putsValue(V v);
+
+    // ── hash tables ─────────────────────────────────────────────────────
+    V hget(RHash *h, V key, bool *found = nullptr);
+    V hfetch(V hv, V key); // [] with default / default proc
+    void hset(RHash *h, V key, V val);
+    V hdel(RHash *h, V key, bool *found = nullptr);
+    void hrehash(RHash *h);
+    void hclear(RHash *h);
+    int hfind(RHash *h, V key, uint64_t hv);
+
+    // ── setup ───────────────────────────────────────────────────────────
+    void bootstrap();
+    void initKernel();
+    void initModule();
+    void initException();
+    void initNumeric();
+    void initString();
+    void initSymbol();
+    void initArray();
+    void initHash();
+    void initRange();
+    void initProc();
+    void initEnumerable();
+    void initEnumerator();
+    void initRegexp();
+    void initMath();
+    void initComparable();
+    void initLib();
+    void initThread();
+    void markEnumMethods();
+    void loadPrelude();
+    void loadLibrary(const std::string &name);
+    V runSource(const std::string &src, const std::string &file, V self, LexScope *lex);
+    int run(const std::string &src, const std::string &file);
+    std::string uncaughtMessage(V exc);
+};
+
+// helpers shared by the native libraries
+V intFromBig(Interp &I, RBig *b);
+V bigFromInt64(Interp &I, int64_t v);
+V bigFromString(Interp &I, const std::string &digits, int base = 10);
+std::string intToS(Interp &I, V v, int base = 10);
+V intAdd(Interp &I, V a, V b);
+V intSub(Interp &I, V a, V b);
+V intMul(Interp &I, V a, V b);
+V intDiv(Interp &I, V a, V b); // floor
+V intMod(Interp &I, V a, V b); // floor
+V intPow(Interp &I, V a, V b);
+int intCmp(Interp &I, V a, V b);
+V intNeg(Interp &I, V a);
+double intToDouble(Interp &I, V a);
+double rubyClockSkew();
+double rubyRandom(Interp &I);
+uint64_t rubyRandomLimited(Interp &I, uint64_t limit);
+V intFromDouble(Interp &I, double d);
+V intGcd(Interp &I, V a, V b);
+bool intIsZero(V a);
+bool intIsNeg(Interp &I, V a);
+V intShift(Interp &I, V a, int64_t n);
+V intBitop(Interp &I, V a, V b, char op);
+std::string floatToS(double d);
+std::string fmtDouble(double v, char conv, int prec, bool alt);
+void rubyFloatStep(Interp &I, double beg, double end, double unit, bool excl, Blk *blk, V *collect);
+int rbByteCompare(const std::string &a, const std::string &b);
+// the regex engine (RubyRegex.sa): caps holds begin/end byte offsets per group
+Regex *regexCompile(const std::string &src, int opts, std::string &error);
+bool regexSearch(Regex *re, const std::string &s, size_t start, std::vector<int> &caps);
+bool regexMatchAt(Regex *re, const std::string &s, size_t at, std::vector<int> &caps);
+int regexGroups(Regex *re);
+const std::vector<std::string> &regexNames(Regex *re); // group names by number ("" when unnamed)
+V matchData(Interp &I, V str, RRegexp *re, const std::vector<int> &caps);
+RRegexp *toRegexp(Interp &I, V pattern); // a Regexp, or a String made literal
+std::string regexEscape(const std::string &s);
+// sorting exactly as MRI on this platform orders ties (RubyArr.sa)
+void rbSort(Interp &I, std::vector<V> &v, Blk *blk);
+void rbSortBy(Interp &I, std::vector<V> &v, Blk *blk);
+V enumFor(Interp &I, V recv, const char *meth, Args &a);
+std::string addrText(const void *p); // "0x" and sixteen hex digits, as in #<Foo:0x...>
+V aryInspect(Interp &I, V ary);
+V arySum(Interp &I, std::vector<V> &v, V init, bool hasInit, Blk *blk);
+std::string formatStr(Interp &I, const std::string &fmt, int argc, V *argv);
+V numAdd(Interp &I, V a, V b);
+V numSub(Interp &I, V a, V b);
+V numMul(Interp &I, V a, V b);
+V numDiv(Interp &I, V a, V b);
+V numCmpV(Interp &I, V a, V b);
+bool numEq(Interp &I, V a, V b);
+V makeRational(Interp &I, V num, V den);
+V makeComplex(Interp &I, V re, V im);
+size_t utf8Len(const std::string &s);
+bool asciiOnly(const std::string &s);
+std::vector<std::string> utf8Chars(const std::string &s);
+std::string strInspect(const std::string &s, bool binary = false);
+void regexSetBinary(bool on); // match bytes, not code points
+inline bool strBinary(V v) { return static_cast<RString *>(op(v))->binary; }
+int64_t strChars(V v);                        // its length in characters (cached)
+inline bool strBytewise(V v) { return strChars(v) == (int64_t)static_cast<RString *>(op(v))->s.size(); }
+std::string symInspect(const std::string &s);
+V strNew(Interp &I, const std::string &s);
+
+// argument helpers for natives
+inline V argOr(Args &a, int i, V dflt) { return i < a.argc ? a.argv[i] : dflt; }
+// the keyword hash passed to a native, or nullptr
+inline RHash *kwArg(Args &a)
+{
+    if (a.kw && a.argc > 0)
+        return static_cast<RHash *>(op(a.argv[a.argc - 1]));
+    return nullptr;
+}
+
+} // namespace ruby

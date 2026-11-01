@@ -649,6 +649,11 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
         }
         return QuantumValue((double)cnt);
     }
+    // a java.lang.String name in a program with Java-style code (s.charAt(i), ...)
+    bool handled = false;
+    QuantumValue r = javaStyleFallback(QuantumValue(str), m, args, handled);
+    if (handled)
+        return r;
     throw TypeError("String has no method '" + m + "'");
 }
 

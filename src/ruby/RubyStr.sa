@@ -1,0 +1,2592 @@
+// quantum: cpp
+// Ruby front-end: String, Symbol and format. Strings are UTF-8 bytes;
+// character positions count code points.
+#include "RubyRt.h.sa"
+
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+namespace ruby
+{
+
+// ── UTF-8 ─────────────────────────────────────────────────────────────────
+
+static size_t u8len(unsigned char c) { return c < 0xC0 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4; }
+
+bool asciiOnly(const std::string &s)
+{
+    for (size_t i = 0; i < s.size(); ++i)
+        if ((unsigned char)s[i] >= 0x80)
+            return false;
+    return true;
+}
+
+size_t utf8Len(const std::string &s)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < s.size(); ++i)
+        if (((unsigned char)s[i] & 0xC0) != 0x80)
+            ++n;
+    return n;
+}
+
+std::vector<std::string> utf8Chars(const std::string &s)
+{
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        size_t n = u8len((unsigned char)s[i]);
+        if (i + n > s.size())
+            n = s.size() - i;
+        out.push_back(s.substr(i, n));
+        i += n;
+    }
+    return out;
+}
+
+int64_t strChars(V v)
+{
+    auto *r = static_cast<RString *>(op(v));
+    size_t n = r->s.size();
+    if (r->charLen >= 0 && r->byteLen == n)
+        return r->charLen;
+    r->byteLen = n;
+    r->charLen = r->binary ? (int64_t)n : (int64_t)utf8Len(r->s);
+    return r->charLen;
+}
+
+static uint32_t decodeAt(const std::string &s, size_t i, size_t *len)
+{
+    unsigned char c = (unsigned char)s[i];
+    size_t n = u8len(c);
+    if (i + n > s.size())
+        n = 1;
+    if (len)
+        *len = n;
+    if (n == 1)
+        return c;
+    uint32_t cp = c & (n == 2 ? 0x1F : n == 3 ? 0x0F : 0x07);
+    for (size_t k = 1; k < n; ++k)
+        cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+    return cp;
+}
+
+static bool validUtf8(const std::string &s)
+{
+    size_t i = 0;
+    while (i < s.size())
+    {
+        unsigned char c = (unsigned char)s[i];
+        size_t n = c < 0x80 ? 1 : (c >= 0xC2 && c < 0xE0) ? 2 : (c >= 0xE0 && c < 0xF0) ? 3 : (c >= 0xF0 && c < 0xF5) ? 4 : 0;
+        if (n == 0 || i + n > s.size())
+            return false;
+        for (size_t k = 1; k < n; ++k)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80)
+                return false;
+        i += n;
+    }
+    return true;
+}
+
+// byte offset of character `ci` (0 <= ci <= length)
+static size_t byteOf(const std::string &s, size_t ci, bool ascii)
+{
+    if (ascii)
+        return ci < s.size() ? ci : s.size();
+    size_t i = 0, c = 0;
+    while (i < s.size() && c < ci)
+    {
+        i += u8len((unsigned char)s[i]);
+        ++c;
+    }
+    return i < s.size() ? i : s.size();
+}
+
+std::string strInspect(const std::string &s, bool binary)
+{
+    std::string out = "\"";
+    size_t i = 0;
+    bool valid = !binary && validUtf8(s);
+    while (i < s.size())
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 0x80)
+        {
+            size_t n = u8len(c);
+            if (valid && i + n <= s.size())
+            {
+                out += s.substr(i, n);
+                i += n;
+                continue;
+            }
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "\\x%02X", c);
+            out += buf;
+            ++i;
+            continue;
+        }
+        switch (c)
+        {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\t': out += "\\t"; break;
+        case '\r': out += "\\r"; break;
+        case 27: out += "\\e"; break;
+        case 7: out += "\\a"; break;
+        case 8: out += "\\b"; break;
+        case 11: out += "\\v"; break;
+        case 12: out += "\\f"; break;
+        case '#':
+            if (i + 1 < s.size() && (s[i + 1] == '{' || s[i + 1] == '$' || s[i + 1] == '@'))
+                out += "\\#";
+            else
+                out += '#';
+            break;
+        default:
+            if (c < 0x20 || c == 0x7f)
+            {
+                char buf[10];
+                if (c == 0x7f)
+                    std::snprintf(buf, sizeof buf, "\\x7F");
+                else
+                    std::snprintf(buf, sizeof buf, "\\u%04X", c);
+                out += buf;
+            }
+            else
+                out += (char)c;
+        }
+        ++i;
+    }
+    return out + "\"";
+}
+
+static bool identStartC(unsigned char c) { return c == '_' || std::isalpha(c) || c >= 0x80; }
+static bool identC(unsigned char c) { return c == '_' || std::isalnum(c) || c >= 0x80; }
+
+std::string symInspect(const std::string &s)
+{
+    static const char *ops[] = {"[]", "[]=", "<=>", "===", "==", "=~", "!=", "!~", "**", "+@", "-@", "<<", ">>",
+                                "<=", ">=", "+", "-", "*", "/", "%", "<", ">", "!", "&", "|", "^", "~", "call"};
+    for (const char *o : ops)
+        if (s == o)
+            return ":" + s;
+    if (s.empty())
+        return ":\"\"";
+    size_t i = 0;
+    if (s[0] == '@')
+    {
+        i = s.size() > 1 && s[1] == '@' ? 2 : 1;
+    }
+    else if (s[0] == '$')
+        i = 1;
+    bool ok = i < s.size() && identStartC((unsigned char)s[i]);
+    size_t j = i;
+    while (ok && j < s.size() && identC((unsigned char)s[j]))
+        ++j;
+    if (ok && j < s.size())
+    {
+        // a trailing ? ! or = on a method name
+        if (i == 0 && j + 1 == s.size() && (s[j] == '?' || s[j] == '!' || s[j] == '='))
+            j = s.size();
+    }
+    if (ok && j == s.size())
+        return ":" + s;
+    return ":" + strInspect(s);
+}
+
+namespace
+{
+
+std::string &S(Interp &I, V v) { return I.sref(v); }
+
+V newStr(Interp &I, V self, const std::string &s)
+{
+    (void)self;
+    return I.str(s);
+}
+
+void modify(Interp &I, V self)
+{
+    if (op(self)->frozen)
+        I.frozenError(self);
+    static_cast<RString *>(op(self))->charLen = -1;
+}
+
+std::string argStr(Interp &I, V v) { return I.strOf(v); }
+
+// ── character sets (tr, count, delete, squeeze) ───────────────────────────
+
+struct CharSet
+{
+    bool neg = false;
+    std::vector<uint32_t> lo, hi;
+    bool has(uint32_t c) const
+    {
+        bool in = false;
+        for (size_t i = 0; i < lo.size(); ++i)
+            if (c >= lo[i] && c <= hi[i])
+            {
+                in = true;
+                break;
+            }
+        return in != neg;
+    }
+};
+
+std::vector<uint32_t> codepoints(const std::string &s)
+{
+    std::vector<uint32_t> out;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        size_t n;
+        out.push_back(decodeAt(s, i, &n));
+        i += n;
+    }
+    return out;
+}
+
+// expands a tr-style spec into a list of code points (ranges a-z, escapes)
+std::vector<uint32_t> expandSpec(const std::string &spec, bool &neg)
+{
+    std::vector<uint32_t> cps = codepoints(spec);
+    neg = false;
+    size_t i = 0;
+    if (cps.size() > 1 && cps[0] == '^')
+    {
+        neg = true;
+        i = 1;
+    }
+    std::vector<uint32_t> out;
+    for (; i < cps.size(); ++i)
+    {
+        uint32_t c = cps[i];
+        if (c == '\\' && i + 1 < cps.size())
+        {
+            out.push_back(cps[++i]);
+            continue;
+        }
+        if (i + 2 < cps.size() && cps[i + 1] == '-')
+        {
+            uint32_t e = cps[i + 2];
+            if (e >= c)
+                for (uint32_t x = c; x <= e; ++x)
+                    out.push_back(x);
+            i += 2;
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+CharSet makeSet(const std::string &spec)
+{
+    CharSet cs;
+    bool neg;
+    std::vector<uint32_t> list = expandSpec(spec, neg);
+    cs.neg = neg;
+    for (uint32_t c : list)
+    {
+        cs.lo.push_back(c);
+        cs.hi.push_back(c);
+    }
+    return cs;
+}
+
+bool inAllSets(const std::vector<CharSet> &sets, uint32_t c)
+{
+    for (const CharSet &s : sets)
+        if (!s.has(c))
+            return false;
+    return true;
+}
+
+std::vector<CharSet> setsFrom(Interp &I, Args &a)
+{
+    if (a.argc == 0)
+        I.raise(I.cArgumentError, "wrong number of arguments (given 0, expected 1+)");
+    std::vector<CharSet> sets;
+    for (int i = 0; i < a.argc; ++i)
+        sets.push_back(makeSet(argStr(I, a.argv[i])));
+    return sets;
+}
+
+std::string trString(const std::string &src, const std::string &from, const std::string &to, bool squeeze)
+{
+    bool neg;
+    std::vector<uint32_t> f = expandSpec(from, neg);
+    bool dummy;
+    std::vector<uint32_t> t = expandSpec(to, dummy);
+    std::string out;
+    size_t i = 0;
+    bool lastWasTr = false;
+    uint32_t lastOut = 0;
+    while (i < src.size())
+    {
+        size_t n;
+        uint32_t c = decodeAt(src, i, &n);
+        i += n;
+        int idx = -1;
+        for (size_t k = 0; k < f.size(); ++k)
+            if (f[k] == c)
+            {
+                idx = (int)k;
+                break;
+            }
+        bool match = neg ? idx < 0 : idx >= 0;
+        if (!match)
+        {
+            appendUtf8(out, c);
+            lastWasTr = false;
+            continue;
+        }
+        if (t.empty())
+            continue; // tr with empty replacement deletes
+        uint32_t r = neg ? t.back() : (idx < (int)t.size() ? t[idx] : t.back());
+        if (squeeze && lastWasTr && lastOut == r)
+            continue;
+        appendUtf8(out, r);
+        lastWasTr = true;
+        lastOut = r;
+    }
+    return out;
+}
+
+// ── String methods ────────────────────────────────────────────────────────
+
+V str_new(Interp &I, V self, Args &a)
+{
+    V s = I.allocate(static_cast<RClass *>(op(self)));
+    int argc = a.kw ? a.argc - 1 : a.argc;
+    if (argc > 0)
+        S(I, s) = argStr(I, a.argv[0]);
+    if (static_cast<RClass *>(op(self)) != I.cString)
+    {
+        Method *init = I.findMethod(op(s)->klass, I.s.initialize);
+        if (init && init->kind != M_NATIVE)
+            I.invoke(init, s, a, nullptr, I.frame);
+    }
+    return s;
+}
+
+V str_initialize(Interp &I, V self, Args &a)
+{
+    int argc = a.kw ? a.argc - 1 : a.argc;
+    if (argc > 0)
+        S(I, self) = argStr(I, a.argv[0]);
+    return Qnil;
+}
+
+V str_length(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return fix(strChars(self));
+}
+
+V str_bytesize(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix((int64_t)S(I, self).size());
+}
+
+// a binary string with bytes above ASCII makes what it joins binary
+bool binaryJoin(Interp &I, V x)
+{
+    return strBinary(x) && !asciiOnly(I.sref(x));
+}
+
+V str_plus(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (!I.isStr(o))
+        I.typeError(o, "String");
+    V r = I.str(S(I, self) + S(I, o));
+    static_cast<RString *>(op(r))->binary = binaryJoin(I, self) || binaryJoin(I, o);
+    return r;
+}
+
+V str_mul(Interp &I, V self, Args &a)
+{
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "negative argument");
+    const std::string &s = S(I, self);
+    std::string out;
+    out.reserve(s.size() * (size_t)n);
+    for (int64_t i = 0; i < n; ++i)
+        out += s;
+    return I.str(out);
+}
+
+V str_format(Interp &I, V self, Args &a)
+{
+    V arg = a.argv[0];
+    if (I.isAry(arg))
+    {
+        std::vector<V> &v = I.aref(arg);
+        return I.str(formatStr(I, S(I, self), (int)v.size(), v.data()));
+    }
+    return I.str(formatStr(I, S(I, self), 1, &arg));
+}
+
+V str_eq(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (I.isStr(o))
+        return boolv(S(I, self) == S(I, o));
+    if (isObj(o) && op(o)->type == T::Object && I.respondTo(o, I.s.to_str))
+        return boolv(truthy(I.call1(o, I.s.eq, self)));
+    return Qfalse;
+}
+
+V str_eql(Interp &I, V self, Args &a) { return boolv(I.isStr(a.argv[0]) && S(I, self) == S(I, a.argv[0])); }
+
+V str_cmp(Interp &I, V self, Args &a)
+{
+    V o = a.argv[0];
+    if (!I.isStr(o))
+        return Qnil;
+    return fix(rbByteCompare(S(I, self), S(I, o)));
+}
+
+V str_hash(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix((int64_t)(I.hashOf(self) >> 2));
+}
+
+V str_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (I.realClassOf(self) != I.cString)
+        return I.str(S(I, self));
+    return self;
+}
+
+V str_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(strInspect(S(I, self), strBinary(self)));
+}
+
+V str_dump(Interp &I, V self, Args &a)
+{
+    (void)a;
+    const std::string &s = S(I, self);
+    std::string out = "\"";
+    size_t i = 0;
+    while (i < s.size())
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 0x80)
+        {
+            size_t n;
+            uint32_t cp = decodeAt(s, i, &n);
+            char buf[16];
+            if (cp > 0xFFFF)
+                std::snprintf(buf, sizeof buf, "\\u{%X}", cp);
+            else
+                std::snprintf(buf, sizeof buf, "\\u%04X", cp);
+            out += buf;
+            i += n;
+            continue;
+        }
+        std::string one = strInspect(std::string(1, (char)c));
+        out += one.substr(1, one.size() - 2);
+        ++i;
+    }
+    return I.str(out + "\"");
+}
+
+V str_to_sym(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return symv(intern(S(I, self)));
+}
+
+V str_to_i(Interp &I, V self, Args &a)
+{
+    int base = a.argc > 0 ? (int)I.intOf(a.argv[0]) : 10;
+    const std::string &s = S(I, self);
+    size_t i = 0;
+    while (i < s.size() && std::isspace((unsigned char)s[i]))
+        ++i;
+    bool neg = false;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+'))
+    {
+        neg = s[i] == '-';
+        ++i;
+    }
+    if (i + 1 < s.size() && s[i] == '0')
+    {
+        char p = (char)(s[i + 1] | 32);
+        if ((p == 'x' && base == 16) || (p == 'b' && base == 2) || (p == 'o' && base == 8))
+            i += 2;
+    }
+    std::string digits;
+    for (; i < s.size(); ++i)
+    {
+        char c = s[i];
+        if (c == '_' && !digits.empty() && i + 1 < s.size() && s[i + 1] != '_')
+            continue;
+        int d = c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'z' ? (c | 32) - 'a' + 10 : 99;
+        if (d >= base)
+            break;
+        digits += c;
+    }
+    if (digits.empty())
+        return fix(0);
+    V r = bigFromString(I, digits, base);
+    return neg ? intNeg(I, r) : r;
+}
+
+double parseLeadingFloat(const std::string &s, bool *any)
+{
+    size_t i = 0;
+    while (i < s.size() && std::isspace((unsigned char)s[i]))
+        ++i;
+    std::string t;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+'))
+        t += s[i++];
+    bool digits = false;
+    while (i < s.size() && (std::isdigit((unsigned char)s[i]) || (s[i] == '_' && digits && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1]))))
+    {
+        if (s[i] != '_')
+            t += s[i];
+        digits = true;
+        ++i;
+    }
+    if (i + 1 < s.size() && s[i] == '.' && std::isdigit((unsigned char)s[i + 1]) && digits)
+    {
+        t += '.';
+        ++i;
+        while (i < s.size() && (std::isdigit((unsigned char)s[i]) || (s[i] == '_' && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1]))))
+        {
+            if (s[i] != '_')
+                t += s[i];
+            ++i;
+        }
+    }
+    if (digits && i < s.size() && (s[i] == 'e' || s[i] == 'E'))
+    {
+        size_t j = i + 1;
+        std::string e = "e";
+        if (j < s.size() && (s[j] == '-' || s[j] == '+'))
+            e += s[j++];
+        if (j < s.size() && std::isdigit((unsigned char)s[j]))
+        {
+            while (j < s.size() && std::isdigit((unsigned char)s[j]))
+                e += s[j++];
+            t += e;
+        }
+    }
+    if (any)
+        *any = digits;
+    if (!digits)
+        return 0.0;
+    return std::strtod(t.c_str(), nullptr);
+}
+
+V str_to_f(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.flo(parseLeadingFloat(S(I, self), nullptr));
+}
+
+V str_to_r(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V av = self;
+    Args b;
+    b.argv = &av;
+    b.argc = 1;
+    return I.call(ov(I.mKernel), intern("Rational"), 1, &av);
+}
+
+V str_to_c(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return makeComplex(I, I.flo(parseLeadingFloat(S(I, self), nullptr)), fix(0));
+}
+
+V str_hex(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V av = fix(16);
+    Args b;
+    b.argv = &av;
+    b.argc = 1;
+    return str_to_i(I, self, b);
+}
+
+V str_oct(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V av = fix(8);
+    Args b;
+    b.argv = &av;
+    b.argc = 1;
+    return str_to_i(I, self, b);
+}
+
+// str[...] indexing: returns Qundef for an unsupported key
+V substrChars(Interp &I, V self, int64_t start, int64_t len)
+{
+    const std::string &s = I.sref(self);
+    bool ascii = strBytewise(self);
+    int64_t n = strChars(self);
+    if (start < 0)
+        start += n;
+    if (start < 0 || start > n || len < 0)
+        return Qnil;
+    if (start + len > n)
+        len = n - start;
+    size_t b = byteOf(s, (size_t)start, ascii), e = byteOf(s, (size_t)(start + len), ascii);
+    return I.str(s.substr(b, e - b));
+}
+
+bool rangeBounds(Interp &I, V range, int64_t n, int64_t &start, int64_t &len)
+{
+    auto *r = static_cast<RRange *>(op(range));
+    int64_t b = r->lo == Qnil ? 0 : I.intOf(r->lo);
+    int64_t e = r->hi == Qnil ? n : I.intOf(r->hi);
+    if (b < 0)
+        b += n;
+    if (e < 0)
+        e += n;
+    if (b < 0 || b > n)
+        return false;
+    if (!r->excl && r->hi != Qnil)
+        ++e;
+    if (e > n)
+        e = n;
+    start = b;
+    len = e - b < 0 ? 0 : e - b;
+    return true;
+}
+
+V str_aref(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    V k = a.argv[0];
+    if (a.argc == 2)
+    {
+        if (isType(k, T::Regexp))
+        {
+            std::vector<int> caps;
+            RRegexp *re = static_cast<RRegexp *>(op(k));
+            if (!regexSearch(re->re, s, 0, caps))
+            {
+                I.lastMatch = Qnil;
+                return Qnil;
+            }
+            I.lastMatch = matchData(I, self, re, caps);
+            int g;
+            if (isSymV(a.argv[1]) || I.isStr(a.argv[1]))
+            {
+                std::string nm = isSymV(a.argv[1]) ? symName(vsym(a.argv[1])) : S(I, a.argv[1]);
+                g = -1;
+                const std::vector<std::string> &names = regexNames(re->re);
+                for (size_t i = 0; i < names.size(); ++i)
+                    if (names[i] == nm)
+                        g = (int)i;
+                if (g < 0)
+                    I.raise(I.cIndexError, "undefined group name reference: " + nm);
+            }
+            else
+                g = (int)I.intOf(a.argv[1]);
+            if (g < 0 || g * 2 + 1 >= (int)caps.size() || caps[g * 2] < 0)
+                return Qnil;
+            return I.str(s.substr(caps[g * 2], caps[g * 2 + 1] - caps[g * 2]));
+        }
+        return substrChars(I, self, I.intOf(k), I.intOf(a.argv[1]));
+    }
+    if (isFix(k))
+    {
+        int64_t i = fixv(k);
+        if (strBytewise(self))
+        {
+            int64_t n = (int64_t)s.size();
+            if (i < 0)
+                i += n;
+            if (i < 0 || i >= n)
+                return Qnil;
+            V one = I.str(std::string(1, s[i]));
+            static_cast<RString *>(op(one))->binary = strBinary(self);
+            return one;
+        }
+        int64_t n = strChars(self);
+        if (i < 0)
+            i += n;
+        if (i < 0 || i >= n)
+            return Qnil;
+        return substrChars(I, self, i, 1);
+    }
+    if (isType(k, T::Range))
+    {
+        int64_t n = strChars(self);
+        int64_t st, len;
+        if (!rangeBounds(I, k, n, st, len))
+            return Qnil;
+        return substrChars(I, self, st, len);
+    }
+    if (I.isStr(k))
+        return s.find(S(I, k)) == std::string::npos ? Qnil : I.str(S(I, k));
+    if (isType(k, T::Regexp))
+    {
+        std::vector<int> caps;
+        RRegexp *re = static_cast<RRegexp *>(op(k));
+        if (!regexSearch(re->re, s, 0, caps))
+        {
+            I.lastMatch = Qnil;
+            return Qnil;
+        }
+        I.lastMatch = matchData(I, self, re, caps);
+        return I.str(s.substr(caps[0], caps[1] - caps[0]));
+    }
+    if (I.isFloat(k))
+    {
+        V iv = fix(I.intOf(k));
+        Args b;
+        b.argv = &iv;
+        b.argc = 1;
+        return str_aref(I, self, b);
+    }
+    I.typeError(k, "Integer");
+}
+
+V str_aset(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::string &s = S(I, self);
+    V k = a.argv[0];
+    V val = a.argv[a.argc - 1];
+    std::string rep = argStr(I, val);
+    bool ascii = strBytewise(self);
+    int64_t n = strChars(self);
+    static_cast<RString *>(op(self))->charLen = -1;
+    int64_t st, len;
+    if (a.argc == 3)
+    {
+        st = I.intOf(k);
+        len = I.intOf(a.argv[1]);
+        if (st < 0)
+            st += n;
+        if (st < 0 || st > n)
+            I.raise(I.cIndexError, "index " + std::to_string(I.intOf(k)) + " out of string");
+        if (st + len > n)
+            len = n - st;
+    }
+    else if (isFix(k))
+    {
+        st = fixv(k);
+        if (st < 0)
+            st += n;
+        if (st < 0 || st >= n)
+            I.raise(I.cIndexError, "index " + std::to_string(fixv(k)) + " out of string");
+        len = 1;
+    }
+    else if (isType(k, T::Range))
+    {
+        if (!rangeBounds(I, k, n, st, len))
+            I.raise(I.cRangeError, I.inspect(k) + " out of range");
+    }
+    else if (I.isStr(k))
+    {
+        size_t pos = s.find(S(I, k));
+        if (pos == std::string::npos)
+            I.raise(I.cIndexError, "string not matched");
+        s = s.substr(0, pos) + rep + s.substr(pos + S(I, k).size());
+        return val;
+    }
+    else if (isType(k, T::Regexp))
+    {
+        std::vector<int> caps;
+        if (!regexSearch(static_cast<RRegexp *>(op(k))->re, s, 0, caps))
+            I.raise(I.cIndexError, "regexp not matched");
+        s = s.substr(0, caps[0]) + rep + s.substr(caps[1]);
+        return val;
+    }
+    else
+        I.typeError(k, "Integer");
+    size_t b = byteOf(s, (size_t)st, ascii), e = byteOf(s, (size_t)(st + len), ascii);
+    s = s.substr(0, b) + rep + s.substr(e);
+    return val;
+}
+
+V str_slice_bang(Interp &I, V self, Args &a)
+{
+    V r = str_aref(I, self, a);
+    if (r == Qnil)
+        return Qnil;
+    modify(I, self);
+    std::string &s = S(I, self);
+    V k = a.argv[0];
+    if (I.isStr(k) || isType(k, T::Regexp))
+    {
+        size_t pos = s.find(S(I, r));
+        if (pos != std::string::npos)
+            s.erase(pos, S(I, r).size());
+        return r;
+    }
+    bool ascii = asciiOnly(s);
+    int64_t n = ascii ? (int64_t)s.size() : (int64_t)utf8Len(s);
+    int64_t st, len;
+    if (a.argc == 2)
+    {
+        st = I.intOf(k);
+        len = I.intOf(a.argv[1]);
+        if (st < 0)
+            st += n;
+        if (st + len > n)
+            len = n - st;
+    }
+    else if (isType(k, T::Range))
+        rangeBounds(I, k, n, st, len);
+    else
+    {
+        st = I.intOf(k);
+        if (st < 0)
+            st += n;
+        len = 1;
+    }
+    size_t b = byteOf(s, (size_t)st, ascii), e = byteOf(s, (size_t)(st + len), ascii);
+    s.erase(b, e - b);
+    return r;
+}
+
+std::string upcaseStr(const std::string &s)
+{
+    std::string out = s;
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        unsigned char c = (unsigned char)out[i];
+        if (c >= 'a' && c <= 'z')
+            out[i] = (char)(c - 32);
+        else if (c == 0xC3 && i + 1 < out.size())
+        {
+            unsigned char d = (unsigned char)out[i + 1];
+            if (d >= 0xA0 && d <= 0xBE && d != 0xB7)
+                out[i + 1] = (char)(d - 0x20);
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::string downcaseStr(const std::string &s)
+{
+    std::string out = s;
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        unsigned char c = (unsigned char)out[i];
+        if (c >= 'A' && c <= 'Z')
+            out[i] = (char)(c + 32);
+        else if (c == 0xC3 && i + 1 < out.size())
+        {
+            unsigned char d = (unsigned char)out[i + 1];
+            if (d >= 0x80 && d <= 0x9E && d != 0x97)
+                out[i + 1] = (char)(d + 0x20);
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::string capitalizeStr(const std::string &s)
+{
+    if (s.empty())
+        return s;
+    size_t n = u8len((unsigned char)s[0]);
+    return upcaseStr(s.substr(0, n)) + downcaseStr(s.substr(n));
+}
+
+std::string swapcaseStr(const std::string &s)
+{
+    std::string out = s;
+    for (size_t i = 0; i < out.size(); ++i)
+    {
+        unsigned char c = (unsigned char)out[i];
+        if (c >= 'a' && c <= 'z')
+            out[i] = (char)(c - 32);
+        else if (c >= 'A' && c <= 'Z')
+            out[i] = (char)(c + 32);
+    }
+    return out;
+}
+
+V str_upcase(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(upcaseStr(S(I, self)));
+}
+V str_downcase(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(downcaseStr(S(I, self)));
+}
+V str_capitalize(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(capitalizeStr(S(I, self)));
+}
+V str_swapcase(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(swapcaseStr(S(I, self)));
+}
+
+V bangResult(Interp &I, V self, const std::string &next)
+{
+    modify(I, self);
+    if (S(I, self) == next)
+        return Qnil;
+    S(I, self) = next;
+    return self;
+}
+
+V str_upcase_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return bangResult(I, self, upcaseStr(S(I, self)));
+}
+V str_downcase_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return bangResult(I, self, downcaseStr(S(I, self)));
+}
+V str_capitalize_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return bangResult(I, self, capitalizeStr(S(I, self)));
+}
+V str_swapcase_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return bangResult(I, self, swapcaseStr(S(I, self)));
+}
+
+std::string reverseStr(const std::string &s)
+{
+    if (asciiOnly(s))
+        return std::string(s.rbegin(), s.rend());
+    std::vector<std::string> cs = utf8Chars(s);
+    std::string out;
+    for (size_t i = cs.size(); i-- > 0;)
+        out += cs[i];
+    return out;
+}
+
+V str_reverse(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(reverseStr(S(I, self)));
+}
+
+V str_reverse_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    modify(I, self);
+    S(I, self) = reverseStr(S(I, self));
+    return self;
+}
+
+V str_include(Interp &I, V self, Args &a) { return boolv(S(I, self).find(argStr(I, a.argv[0])) != std::string::npos); }
+
+V str_start_with(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    for (int i = 0; i < a.argc; ++i)
+    {
+        V p = a.argv[i];
+        if (isType(p, T::Regexp))
+        {
+            std::vector<int> caps;
+            if (regexMatchAt(static_cast<RRegexp *>(op(p))->re, s, 0, caps))
+            {
+                I.lastMatch = matchData(I, self, static_cast<RRegexp *>(op(p)), caps);
+                return Qtrue;
+            }
+            continue;
+        }
+        const std::string &t = argStr(I, p);
+        if (s.compare(0, t.size(), t) == 0 && s.size() >= t.size())
+            return Qtrue;
+    }
+    return Qfalse;
+}
+
+V str_end_with(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    for (int i = 0; i < a.argc; ++i)
+    {
+        std::string t = argStr(I, a.argv[i]);
+        if (s.size() >= t.size() && s.compare(s.size() - t.size(), t.size(), t) == 0)
+            return Qtrue;
+    }
+    return Qfalse;
+}
+
+V str_delete_prefix(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    std::string t = argStr(I, a.argv[0]);
+    if (s.size() >= t.size() && s.compare(0, t.size(), t) == 0)
+        return I.str(s.substr(t.size()));
+    return I.str(s);
+}
+
+V str_delete_suffix(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    std::string t = argStr(I, a.argv[0]);
+    if (s.size() >= t.size() && s.compare(s.size() - t.size(), t.size(), t) == 0)
+        return I.str(s.substr(0, s.size() - t.size()));
+    return I.str(s);
+}
+
+V str_delete_prefix_bang(Interp &I, V self, Args &a) { return bangResult(I, self, S(I, str_delete_prefix(I, self, a))); }
+V str_delete_suffix_bang(Interp &I, V self, Args &a) { return bangResult(I, self, S(I, str_delete_suffix(I, self, a))); }
+
+int64_t charIndexOf(const std::string &s, size_t byte)
+{
+    if (asciiOnly(s))
+        return (int64_t)byte;
+    return (int64_t)utf8Len(s.substr(0, byte));
+}
+
+V str_index(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    bool ascii = strBytewise(self);
+    int64_t n = strChars(self);
+    int64_t start = a.argc > 1 ? I.intOf(a.argv[1]) : 0;
+    if (start < 0)
+        start += n;
+    if (start < 0 || start > n)
+        return Qnil;
+    size_t from = byteOf(s, (size_t)start, ascii);
+    V p = a.argv[0];
+    if (isType(p, T::Regexp))
+    {
+        std::vector<int> caps;
+        if (!regexSearch(static_cast<RRegexp *>(op(p))->re, s, from, caps))
+        {
+            I.lastMatch = Qnil;
+            return Qnil;
+        }
+        I.lastMatch = matchData(I, self, static_cast<RRegexp *>(op(p)), caps);
+        return fix(ascii ? (int64_t)caps[0] : charIndexOf(s, caps[0]));
+    }
+    size_t pos = s.find(argStr(I, p), from);
+    if (pos == std::string::npos)
+        return Qnil;
+    return fix(ascii ? (int64_t)pos : charIndexOf(s, pos));
+}
+
+V str_rindex(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    bool ascii = strBytewise(self);
+    int64_t n = strChars(self);
+    int64_t start = a.argc > 1 ? I.intOf(a.argv[1]) : n;
+    if (start < 0)
+        start += n;
+    if (start < 0)
+        return Qnil;
+    if (start > n)
+        start = n;
+    size_t from = byteOf(s, (size_t)start, ascii);
+    V p = a.argv[0];
+    if (isType(p, T::Regexp))
+    {
+        Regex *re = static_cast<RRegexp *>(op(p))->re;
+        std::vector<int> caps;
+        for (size_t pos = from + 1; pos-- > 0;)
+        {
+            if (pos < s.size() && ((unsigned char)s[pos] & 0xC0) == 0x80)
+                continue;
+            if (regexMatchAt(re, s, pos, caps))
+            {
+                I.lastMatch = matchData(I, self, static_cast<RRegexp *>(op(p)), caps);
+                return fix(charIndexOf(s, pos));
+            }
+        }
+        return Qnil;
+    }
+    size_t pos = s.rfind(argStr(I, p), from);
+    if (pos == std::string::npos)
+        return Qnil;
+    return fix(ascii ? (int64_t)pos : charIndexOf(s, pos));
+}
+
+V str_count(Interp &I, V self, Args &a)
+{
+    std::vector<CharSet> sets = setsFrom(I, a);
+    const std::string &s = S(I, self);
+    int64_t n = 0;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        size_t len;
+        uint32_t c = decodeAt(s, i, &len);
+        if (inAllSets(sets, c))
+            ++n;
+        i += len;
+    }
+    return fix(n);
+}
+
+std::string deleteChars(const std::string &s, const std::vector<CharSet> &sets)
+{
+    std::string out;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        size_t len;
+        uint32_t c = decodeAt(s, i, &len);
+        if (!inAllSets(sets, c))
+            out += s.substr(i, len);
+        i += len;
+    }
+    return out;
+}
+
+V str_delete(Interp &I, V self, Args &a) { return I.str(deleteChars(S(I, self), setsFrom(I, a))); }
+V str_delete_bang(Interp &I, V self, Args &a) { return bangResult(I, self, deleteChars(S(I, self), setsFrom(I, a))); }
+
+std::string squeezeStr(Interp &I, const std::string &s, Args &a)
+{
+    std::vector<CharSet> sets;
+    if (a.argc > 0)
+        sets = setsFrom(I, a);
+    std::string out;
+    size_t i = 0;
+    uint32_t last = 0xFFFFFFFF;
+    while (i < s.size())
+    {
+        size_t len;
+        uint32_t c = decodeAt(s, i, &len);
+        if (!(c == last && (sets.empty() || inAllSets(sets, c))))
+            out += s.substr(i, len);
+        last = c;
+        i += len;
+    }
+    return out;
+}
+
+V str_squeeze(Interp &I, V self, Args &a) { return I.str(squeezeStr(I, S(I, self), a)); }
+V str_squeeze_bang(Interp &I, V self, Args &a) { return bangResult(I, self, squeezeStr(I, S(I, self), a)); }
+
+V str_tr(Interp &I, V self, Args &a) { return I.str(trString(S(I, self), argStr(I, a.argv[0]), argStr(I, a.argv[1]), false)); }
+V str_tr_s(Interp &I, V self, Args &a) { return I.str(trString(S(I, self), argStr(I, a.argv[0]), argStr(I, a.argv[1]), true)); }
+V str_tr_bang(Interp &I, V self, Args &a) { return bangResult(I, self, trString(S(I, self), argStr(I, a.argv[0]), argStr(I, a.argv[1]), false)); }
+
+bool isSpaceC(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' || c == 0; }
+
+std::string stripStr(const std::string &s, bool left, bool right)
+{
+    size_t b = 0, e = s.size();
+    if (left)
+        while (b < e && isSpaceC(s[b]))
+            ++b;
+    if (right)
+        while (e > b && isSpaceC(s[e - 1]))
+            --e;
+    return s.substr(b, e - b);
+}
+
+V str_strip(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(stripStr(S(I, self), true, true));
+}
+V str_lstrip(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(stripStr(S(I, self), true, false));
+}
+V str_rstrip(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(stripStr(S(I, self), false, true));
+}
+V str_strip_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return bangResult(I, self, stripStr(S(I, self), true, true));
+}
+V str_lstrip_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return bangResult(I, self, stripStr(S(I, self), true, false));
+}
+V str_rstrip_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return bangResult(I, self, stripStr(S(I, self), false, true));
+}
+
+std::string chompStr(Interp &I, const std::string &s, Args &a)
+{
+    if (a.argc > 0)
+    {
+        if (a.argv[0] == Qnil)
+            return s;
+        std::string t = argStr(I, a.argv[0]);
+        if (t.empty())
+        {
+            std::string r = s;
+            while (!r.empty() && r.back() == '\n')
+            {
+                r.pop_back();
+                if (!r.empty() && r.back() == '\r')
+                    r.pop_back();
+            }
+            return r;
+        }
+        if (s.size() >= t.size() && s.compare(s.size() - t.size(), t.size(), t) == 0)
+            return s.substr(0, s.size() - t.size());
+        return s;
+    }
+    if (!s.empty() && s.back() == '\n')
+    {
+        if (s.size() >= 2 && s[s.size() - 2] == '\r')
+            return s.substr(0, s.size() - 2);
+        return s.substr(0, s.size() - 1);
+    }
+    if (!s.empty() && s.back() == '\r')
+        return s.substr(0, s.size() - 1);
+    return s;
+}
+
+V str_chomp(Interp &I, V self, Args &a) { return I.str(chompStr(I, S(I, self), a)); }
+V str_chomp_bang(Interp &I, V self, Args &a) { return bangResult(I, self, chompStr(I, S(I, self), a)); }
+
+std::string chopStr(const std::string &s)
+{
+    if (s.empty())
+        return s;
+    if (s.size() >= 2 && s[s.size() - 2] == '\r' && s.back() == '\n')
+        return s.substr(0, s.size() - 2);
+    size_t i = s.size() - 1;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80)
+        --i;
+    return s.substr(0, i);
+}
+
+V str_chop(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(chopStr(S(I, self)));
+}
+V str_chop_bang(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return bangResult(I, self, chopStr(S(I, self)));
+}
+
+V str_chars(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    const std::string &s = S(I, self);
+    std::vector<V> &v = I.aref(out);
+    if (strBinary(self) || asciiOnly(s))
+    {
+        v.reserve(s.size());
+        for (char c : s)
+        {
+            V one = I.str(std::string(1, c));
+            static_cast<RString *>(op(one))->binary = strBinary(self);
+            v.push_back(one);
+        }
+    }
+    else
+        for (auto &c : utf8Chars(s))
+            v.push_back(I.str(c));
+    return out;
+}
+
+V str_each_char(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+    {
+        V av = I.sym("each_char");
+        return I.call(self, I.s.to_enum, 1, &av);
+    }
+    V chars = str_chars(I, self, a);
+    for (V c : I.aref(chars))
+        I.yield(a.blk, c);
+    return self;
+}
+
+V str_bytes(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    for (char c : S(I, self))
+        I.aref(out).push_back(fix((unsigned char)c));
+    return out;
+}
+
+V str_each_byte(Interp &I, V self, Args &a)
+{
+    V bytes = str_bytes(I, self, a);
+    if (!a.blk)
+        return I.call0(bytes, I.s.each);
+    for (V b : I.aref(bytes))
+        I.yield(a.blk, b);
+    return self;
+}
+
+V str_codepoints(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V out = I.ary();
+    for (uint32_t c : codepoints(S(I, self)))
+        I.aref(out).push_back(fix(c));
+    return out;
+}
+
+V str_getbyte(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    int64_t i = I.intOf(a.argv[0]);
+    if (i < 0)
+        i += (int64_t)s.size();
+    if (i < 0 || i >= (int64_t)s.size())
+        return Qnil;
+    return fix((unsigned char)s[i]);
+}
+
+std::vector<std::string> linesOf(const std::string &s, const std::string &sep, bool chomp)
+{
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        size_t p = s.find(sep, i);
+        if (p == std::string::npos)
+        {
+            out.push_back(s.substr(i));
+            break;
+        }
+        out.push_back(s.substr(i, chomp ? p - i : p + sep.size() - i));
+        i = p + sep.size();
+    }
+    return out;
+}
+
+V str_lines(Interp &I, V self, Args &a)
+{
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    bool chomp = false;
+    if (kw)
+    {
+        bool found = false;
+        V c = I.hget(kw, I.sym("chomp"), &found);
+        chomp = found && truthy(c);
+    }
+    std::string sep = argc > 0 ? argStr(I, a.argv[0]) : "\n";
+    V out = I.ary();
+    for (auto &l : linesOf(S(I, self), sep, chomp))
+        I.aref(out).push_back(I.str(l));
+    return out;
+}
+
+V str_each_line(Interp &I, V self, Args &a)
+{
+    V lines = str_lines(I, self, a);
+    if (!a.blk)
+        return I.call0(lines, I.s.each);
+    for (V l : I.aref(lines))
+        I.yield(a.blk, l);
+    return self;
+}
+
+V str_split(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    V pat = a.argc > 0 ? a.argv[0] : Qnil;
+    int64_t limit = a.argc > 1 ? I.intOf(a.argv[1]) : 0;
+    std::vector<std::string> parts;
+    bool awk = pat == Qnil || (I.isStr(pat) && S(I, pat) == " ");
+    if (awk)
+    {
+        size_t i = 0;
+        while (i < s.size() && isSpaceC(s[i]))
+            ++i;
+        while (i < s.size())
+        {
+            if (limit > 0 && (int64_t)parts.size() == limit - 1)
+            {
+                parts.push_back(s.substr(i));
+                i = s.size();
+                break;
+            }
+            size_t j = i;
+            while (j < s.size() && !isSpaceC(s[j]))
+                ++j;
+            parts.push_back(s.substr(i, j - i));
+            i = j;
+            while (i < s.size() && isSpaceC(s[i]))
+                ++i;
+            if (i == s.size() && j < s.size() && limit < 0)
+                parts.push_back("");
+        }
+    }
+    else if (I.isStr(pat))
+    {
+        const std::string &sep = S(I, pat);
+        if (sep.empty())
+        {
+            std::vector<std::string> cs = utf8Chars(s);
+            for (size_t k = 0; k < cs.size(); ++k)
+            {
+                if (limit > 0 && (int64_t)parts.size() == limit - 1)
+                {
+                    std::string rest;
+                    for (size_t m = k; m < cs.size(); ++m)
+                        rest += cs[m];
+                    parts.push_back(rest);
+                    break;
+                }
+                parts.push_back(cs[k]);
+            }
+        }
+        else
+        {
+            size_t i = 0;
+            for (;;)
+            {
+                if (limit > 0 && (int64_t)parts.size() == limit - 1)
+                {
+                    parts.push_back(s.substr(i));
+                    break;
+                }
+                size_t p = s.find(sep, i);
+                if (p == std::string::npos)
+                {
+                    parts.push_back(s.substr(i));
+                    break;
+                }
+                parts.push_back(s.substr(i, p - i));
+                i = p + sep.size();
+            }
+        }
+    }
+    else if (isType(pat, T::Regexp))
+    {
+        RRegexp *re = static_cast<RRegexp *>(op(pat));
+        std::vector<int> caps;
+        size_t start = 0, searchFrom = 0;
+        while (searchFrom <= s.size())
+        {
+            if (limit > 0 && (int64_t)parts.size() >= limit - 1)
+                break;
+            if (!regexSearch(re->re, s, searchFrom, caps))
+                break;
+            size_t mb = caps[0], me = caps[1];
+            if (me == mb)
+            {
+                // an empty match splits between characters
+                if (mb >= s.size())
+                    break;
+                if (mb == start)
+                {
+                    searchFrom = mb + u8len((unsigned char)s[mb]);
+                    if (mb == 0 && start == 0)
+                    {
+                        // nothing before the first character
+                    }
+                    parts.push_back(s.substr(start, searchFrom - start));
+                    start = searchFrom;
+                    continue;
+                }
+            }
+            parts.push_back(s.substr(start, mb - start));
+            for (size_t g = 1; g * 2 + 1 < caps.size(); ++g)
+                if (caps[g * 2] >= 0)
+                    parts.push_back(s.substr(caps[g * 2], caps[g * 2 + 1] - caps[g * 2]));
+            start = me;
+            searchFrom = me == mb ? me + u8len((unsigned char)s[me]) : me;
+        }
+        parts.push_back(s.substr(start < s.size() ? start : s.size()));
+    }
+    else
+        I.typeError(pat, "String");
+    if (limit == 0)
+        while (!parts.empty() && parts.back().empty())
+            parts.pop_back();
+    V out = I.ary();
+    for (auto &p : parts)
+        I.aref(out).push_back(I.str(p));
+    if (a.blk)
+    {
+        for (V x : I.aref(out))
+            I.yield(a.blk, x);
+        return self;
+    }
+    return out;
+}
+
+std::string padStr(Interp &I, const std::string &s, int64_t width, const std::string &pad, int where)
+{
+    if (pad.empty())
+        I.raise(I.cArgumentError, "zero width padding");
+    int64_t n = (int64_t)utf8Len(s);
+    if (width <= n)
+        return s;
+    int64_t total = width - n;
+    std::vector<std::string> pc = utf8Chars(pad);
+    auto make = [&](int64_t count) -> std::string
+    {
+        std::string out;
+        for (int64_t i = 0; i < count; ++i)
+            out += pc[i % pc.size()];
+        return out;
+    };
+    if (where < 0)
+        return s + make(total);
+    if (where > 0)
+        return make(total) + s;
+    int64_t left = total / 2, right = total - left;
+    return make(left) + s + make(right);
+}
+
+V str_ljust(Interp &I, V self, Args &a)
+{
+    return I.str(padStr(I, S(I, self), I.intOf(a.argv[0]), a.argc > 1 ? argStr(I, a.argv[1]) : " ", -1));
+}
+V str_rjust(Interp &I, V self, Args &a)
+{
+    return I.str(padStr(I, S(I, self), I.intOf(a.argv[0]), a.argc > 1 ? argStr(I, a.argv[1]) : " ", 1));
+}
+V str_center(Interp &I, V self, Args &a)
+{
+    return I.str(padStr(I, S(I, self), I.intOf(a.argv[0]), a.argc > 1 ? argStr(I, a.argv[1]) : " ", 0));
+}
+
+V str_ord(Interp &I, V self, Args &a)
+{
+    (void)a;
+    const std::string &s = S(I, self);
+    if (s.empty())
+        I.raise(I.cArgumentError, "empty string");
+    if (strBinary(self))
+        return fix((unsigned char)s[0]);
+    return fix(decodeAt(s, 0, nullptr));
+}
+
+V str_chr(Interp &I, V self, Args &a)
+{
+    (void)a;
+    const std::string &s = S(I, self);
+    if (s.empty())
+        return I.str("");
+    return I.str(s.substr(0, u8len((unsigned char)s[0])));
+}
+
+V str_empty(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(S(I, self).empty());
+}
+
+V str_freeze(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    op(self)->frozen = true;
+    return self;
+}
+
+V str_uminus(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (op(self)->frozen)
+        return self;
+    return I.strFrozen(S(I, self));
+}
+
+V str_uplus(Interp &I, V self, Args &a)
+{
+    (void)a;
+    if (op(self)->frozen)
+        return I.str(S(I, self));
+    return self;
+}
+
+V str_append(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    V o = a.argv[0];
+    if (isFix(o))
+    {
+        if (strBinary(self) && fixv(o) < 256)
+            S(I, self) += (char)fixv(o);
+        else
+            appendUtf8(S(I, self), (uint32_t)fixv(o));
+    }
+    else
+    {
+        S(I, self) += argStr(I, o);
+        if (I.isStr(o) && binaryJoin(I, o))
+            static_cast<RString *>(op(self))->binary = true;
+    }
+    return self;
+}
+
+V str_concat(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::string add;
+    for (int i = 0; i < a.argc; ++i)
+    {
+        if (isFix(a.argv[i]))
+            appendUtf8(add, (uint32_t)fixv(a.argv[i]));
+        else
+            add += argStr(I, a.argv[i]);
+    }
+    S(I, self) += add;
+    return self;
+}
+
+V str_prepend(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::string add;
+    for (int i = 0; i < a.argc; ++i)
+        add += argStr(I, a.argv[i]);
+    S(I, self) = add + S(I, self);
+    return self;
+}
+
+V str_insert(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    std::string &s = S(I, self);
+    int64_t idx = I.intOf(a.argv[0]);
+    std::string t = argStr(I, a.argv[1]);
+    bool ascii = asciiOnly(s);
+    int64_t n = ascii ? (int64_t)s.size() : (int64_t)utf8Len(s);
+    if (idx < 0)
+        idx += n + 1;
+    if (idx < 0 || idx > n)
+        I.raise(I.cIndexError, "index " + std::to_string(I.intOf(a.argv[0])) + " out of string");
+    size_t b = byteOf(s, (size_t)idx, ascii);
+    s.insert(b, t);
+    return self;
+}
+
+V str_replace(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    S(I, self) = argStr(I, a.argv[0]);
+    return self;
+}
+
+V str_clear(Interp &I, V self, Args &a)
+{
+    (void)a;
+    modify(I, self);
+    S(I, self).clear();
+    return self;
+}
+
+std::string succStr(const std::string &src)
+{
+    std::string s = src;
+    if (s.empty())
+        return s;
+    int i = (int)s.size() - 1;
+    bool anyAlnum = false;
+    for (char c : s)
+        if (std::isalnum((unsigned char)c))
+            anyAlnum = true;
+    if (!anyAlnum)
+    {
+        for (int k = (int)s.size() - 1; k >= 0; --k)
+        {
+            unsigned char c = (unsigned char)s[k];
+            if (c < 255)
+            {
+                s[k] = (char)(c + 1);
+                return s;
+            }
+            s[k] = 0;
+        }
+        return std::string(1, '\x01') + s;
+    }
+    while (i >= 0 && !std::isalnum((unsigned char)s[i]))
+        --i;
+    for (;;)
+    {
+        char c = s[i];
+        char carry = 0;
+        if (c >= '0' && c <= '9')
+        {
+            if (c < '9')
+            {
+                s[i] = (char)(c + 1);
+                return s;
+            }
+            s[i] = '0';
+            carry = '1';
+        }
+        else if (c >= 'a' && c <= 'z')
+        {
+            if (c < 'z')
+            {
+                s[i] = (char)(c + 1);
+                return s;
+            }
+            s[i] = 'a';
+            carry = 'a';
+        }
+        else if (c >= 'A' && c <= 'Z')
+        {
+            if (c < 'Z')
+            {
+                s[i] = (char)(c + 1);
+                return s;
+            }
+            s[i] = 'A';
+            carry = 'A';
+        }
+        int j = i - 1;
+        while (j >= 0 && !std::isalnum((unsigned char)s[j]))
+            --j;
+        if (j < 0)
+        {
+            s.insert(s.begin() + i, carry);
+            return s;
+        }
+        i = j;
+    }
+}
+
+V str_succ(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(succStr(S(I, self)));
+}
+
+V str_upto(Interp &I, V self, Args &a)
+{
+    std::string cur = S(I, self);
+    std::string last = argStr(I, a.argv[0]);
+    bool excl = a.argc > 1 && truthy(a.argv[1]);
+    if (!a.blk)
+    {
+        V av[3] = {I.sym("upto"), a.argv[0], boolv(excl)};
+        return I.call(self, I.s.to_enum, 3, av);
+    }
+    if (cur.size() > last.size())
+        return self;
+    for (;;)
+    {
+        if (cur == last)
+        {
+            if (!excl)
+                I.yield(a.blk, I.str(cur));
+            break;
+        }
+        I.yield(a.blk, I.str(cur));
+        cur = succStr(cur);
+        if (cur.size() > last.size())
+            break;
+    }
+    return self;
+}
+
+V str_casecmp(Interp &I, V self, Args &a)
+{
+    if (!I.isStr(a.argv[0]))
+        return Qnil;
+    return fix(rbByteCompare(downcaseStr(S(I, self)), downcaseStr(S(I, a.argv[0]))));
+}
+
+V str_casecmp_p(Interp &I, V self, Args &a)
+{
+    if (!I.isStr(a.argv[0]))
+        return Qnil;
+    return boolv(downcaseStr(S(I, self)) == downcaseStr(S(I, a.argv[0])));
+}
+
+V str_partition(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    V p = a.argv[0];
+    size_t pos, len;
+    if (isType(p, T::Regexp))
+    {
+        std::vector<int> caps;
+        if (!regexSearch(static_cast<RRegexp *>(op(p))->re, s, 0, caps))
+            return I.ary(std::vector<V>{I.str(s), I.str(""), I.str("")});
+        pos = caps[0];
+        len = caps[1] - caps[0];
+    }
+    else
+    {
+        std::string t = argStr(I, p);
+        pos = s.find(t);
+        len = t.size();
+        if (pos == std::string::npos)
+            return I.ary(std::vector<V>{I.str(s), I.str(""), I.str("")});
+    }
+    return I.ary(std::vector<V>{I.str(s.substr(0, pos)), I.str(s.substr(pos, len)), I.str(s.substr(pos + len))});
+}
+
+V str_rpartition(Interp &I, V self, Args &a)
+{
+    const std::string &s = S(I, self);
+    std::string t = argStr(I, a.argv[0]);
+    size_t pos = s.rfind(t);
+    if (pos == std::string::npos)
+        return I.ary(std::vector<V>{I.str(""), I.str(""), I.str(s)});
+    return I.ary(std::vector<V>{I.str(s.substr(0, pos)), I.str(t), I.str(s.substr(pos + t.size()))});
+}
+
+V str_encoding(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.constIn(I.cEncoding, intern(strBinary(self) ? "BINARY" : "UTF_8"), false);
+}
+
+V str_force_encoding(Interp &I, V self, Args &a)
+{
+    if (a.argc > 0)
+    {
+        std::string n = I.toS(a.argv[0]);
+        static_cast<RString *>(op(self))->binary = n == "BINARY" || n == "ASCII-8BIT" || n == "binary";
+    }
+    return self;
+}
+
+V str_encode(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(S(I, self));
+}
+
+V str_valid_encoding(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(validUtf8(S(I, self)));
+}
+
+V str_ascii_only(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(asciiOnly(S(I, self)));
+}
+
+V str_b(Interp &I, V self, Args &a)
+{
+    (void)a;
+    V r = I.str(S(I, self));
+    static_cast<RString *>(op(r))->binary = true;
+    return r;
+}
+
+V str_scrub(Interp &I, V self, Args &a)
+{
+    (void)a;
+    const std::string &s = S(I, self);
+    if (validUtf8(s))
+        return I.str(s);
+    std::string rep = a.argc > 0 ? argStr(I, a.argv[0]) : "\xEF\xBF\xBD";
+    std::string out;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        unsigned char c = (unsigned char)s[i];
+        size_t n = c < 0x80 ? 1 : (c >= 0xC2 && c < 0xE0) ? 2 : (c >= 0xE0 && c < 0xF0) ? 3 : (c >= 0xF0 && c < 0xF5) ? 4 : 0;
+        bool ok = n > 0 && i + n <= s.size();
+        for (size_t k = 1; ok && k < n; ++k)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80)
+                ok = false;
+        if (ok)
+        {
+            out += s.substr(i, n);
+            i += n;
+        }
+        else
+        {
+            out += rep;
+            ++i;
+        }
+    }
+    return I.str(out);
+}
+
+V str_unicode_normalize(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(S(I, self));
+}
+
+V str_sum(Interp &I, V self, Args &a)
+{
+    (void)a;
+    int64_t t = 0;
+    for (char c : S(I, self))
+        t += (unsigned char)c;
+    return fix(t & 0xFFFF);
+}
+
+V str_between(Interp &I, V self, Args &a)
+{
+    return boolv(rbByteCompare(S(I, self), argStr(I, a.argv[0])) >= 0 && rbByteCompare(S(I, self), argStr(I, a.argv[1])) <= 0);
+}
+
+V str_unpack1(Interp &I, V self, Args &a)
+{
+    std::string fmt = argStr(I, a.argv[0]);
+    const std::string &s = S(I, self);
+    if (fmt == "U*" || fmt == "U")
+    {
+        std::vector<uint32_t> cps = codepoints(s);
+        return cps.empty() ? Qnil : fix(cps[0]);
+    }
+    if (fmt == "C*" || fmt == "C" || fmt == "c")
+        return s.empty() ? Qnil : fix((unsigned char)s[0]);
+    if (fmt == "B*" || fmt == "b*")
+    {
+        std::string out;
+        for (char c : s)
+            for (int b = 7; b >= 0; --b)
+                out += fmt[0] == 'B' ? (((unsigned char)c >> b) & 1 ? '1' : '0') : (((unsigned char)c >> (7 - b)) & 1 ? '1' : '0');
+        return I.str(out);
+    }
+    if (fmt == "H*")
+    {
+        std::string out;
+        const char *hex = "0123456789abcdef";
+        for (char c : s)
+        {
+            out += hex[((unsigned char)c) >> 4];
+            out += hex[((unsigned char)c) & 15];
+        }
+        return I.str(out);
+    }
+    I.raise(I.cNotImplementedError, "unpack format " + fmt + " is not supported");
+}
+
+V str_unpack(Interp &I, V self, Args &a)
+{
+    std::string fmt = argStr(I, a.argv[0]);
+    const std::string &s = S(I, self);
+    V out = I.ary();
+    if (fmt == "U*")
+    {
+        for (uint32_t c : codepoints(s))
+            I.aref(out).push_back(fix(c));
+        return out;
+    }
+    if (fmt == "C*" || fmt == "c*")
+    {
+        for (char c : s)
+            I.aref(out).push_back(fix(fmt[0] == 'C' ? (unsigned char)c : (signed char)c));
+        return out;
+    }
+    I.aref(out).push_back(str_unpack1(I, self, a));
+    return out;
+}
+
+// ── Symbol ────────────────────────────────────────────────────────────────
+
+V sym_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(symName(vsym(self)));
+}
+
+V sym_name(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.strFrozen(symName(vsym(self)));
+}
+
+V sym_to_sym(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V sym_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str(symInspect(symName(vsym(self))));
+}
+
+V sym_to_proc(Interp &I, V self, Args &a)
+{
+    (void)a;
+    Blk b;
+    b.kind = B_SYM;
+    b.sym = vsym(self);
+    b.lambda = true;
+    return I.procFromBlk(&b, true);
+}
+
+V sym_length(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return fix((int64_t)utf8Len(symName(vsym(self))));
+}
+
+V sym_cmp(Interp &I, V self, Args &a)
+{
+    (void)I;
+    if (!isSymV(a.argv[0]))
+        return Qnil;
+    return fix(rbByteCompare(symName(vsym(self)), symName(vsym(a.argv[0]))));
+}
+
+V sym_upcase(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return symv(intern(upcaseStr(symName(vsym(self)))));
+}
+
+V sym_downcase(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return symv(intern(downcaseStr(symName(vsym(self)))));
+}
+
+V sym_capitalize(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return symv(intern(capitalizeStr(symName(vsym(self)))));
+}
+
+V sym_succ(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return symv(intern(succStr(symName(vsym(self)))));
+}
+
+V sym_aref(Interp &I, V self, Args &a)
+{
+    V s = I.str(symName(vsym(self)));
+    return str_aref(I, s, a);
+}
+
+V sym_start_with(Interp &I, V self, Args &a) { return str_start_with(I, I.str(symName(vsym(self))), a); }
+V sym_end_with(Interp &I, V self, Args &a) { return str_end_with(I, I.str(symName(vsym(self))), a); }
+
+V sym_empty(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return boolv(symName(vsym(self)).empty());
+}
+
+V sym_eq(Interp &I, V self, Args &a)
+{
+    (void)I;
+    return boolv(self == a.argv[0]);
+}
+
+V sym_all(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.ary();
+}
+
+} // namespace
+
+// ── format ────────────────────────────────────────────────────────────────
+
+std::string formatStr(Interp &I, const std::string &fmt, int argc, V *argv)
+{
+    std::string out;
+    int argi = 0;
+    V hash = argc > 0 && I.isHash(argv[argc - 1]) ? argv[argc - 1] : Qnil;
+    auto nextArg = [&]() -> V
+    {
+        if (argi >= argc)
+            I.raise(I.cArgumentError, "too few arguments");
+        return argv[argi++];
+    };
+    size_t i = 0;
+    while (i < fmt.size())
+    {
+        char c = fmt[i];
+        if (c != '%')
+        {
+            out += c;
+            ++i;
+            continue;
+        }
+        ++i;
+        if (i >= fmt.size())
+        {
+            out += '%';
+            break;
+        }
+        if (fmt[i] == '%')
+        {
+            out += '%';
+            ++i;
+            continue;
+        }
+        bool minus = false, plus = false, space = false, zero = false, alt = false;
+        int width = -1, prec = -1;
+        V named = Qundef;
+        for (;;)
+        {
+            char f = fmt[i];
+            if (f == '-')
+                minus = true;
+            else if (f == '+')
+                plus = true;
+            else if (f == ' ')
+                space = true;
+            else if (f == '0')
+                zero = true;
+            else if (f == '#')
+                alt = true;
+            else if (f == '<' || f == '{')
+            {
+                char close = f == '<' ? '>' : '}';
+                size_t e = fmt.find(close, i);
+                std::string name = fmt.substr(i + 1, e - i - 1);
+                if (hash == Qnil)
+                    I.raise(I.cArgumentError, "one hash required");
+                bool found = false;
+                V v = I.hget(I.href(hash), I.sym(name), &found);
+                if (!found)
+                {
+                    V exc = I.makeExc(I.cKeyError, "key<" + name + "> not found");
+                    I.raiseExc(exc);
+                }
+                i = e + 1;
+                if (f == '{')
+                {
+                    std::string t = I.toS(v);
+                    out += t;
+                    named = Qnil;
+                    break;
+                }
+                named = v;
+                continue;
+            }
+            else
+                break;
+            ++i;
+        }
+        if (named == Qnil)
+            continue;
+        if (fmt[i] == '*')
+        {
+            width = (int)I.intOf(nextArg());
+            if (width < 0)
+            {
+                minus = true;
+                width = -width;
+            }
+            ++i;
+        }
+        else
+            while (i < fmt.size() && std::isdigit((unsigned char)fmt[i]))
+            {
+                width = (width < 0 ? 0 : width) * 10 + (fmt[i] - '0');
+                ++i;
+            }
+        if (i < fmt.size() && fmt[i] == '.')
+        {
+            ++i;
+            prec = 0;
+            if (fmt[i] == '*')
+            {
+                prec = (int)I.intOf(nextArg());
+                ++i;
+            }
+            else
+                while (i < fmt.size() && std::isdigit((unsigned char)fmt[i]))
+                {
+                    prec = prec * 10 + (fmt[i] - '0');
+                    ++i;
+                }
+        }
+        if (i < fmt.size() && (fmt[i] == '<' || fmt[i] == '{') && named == Qundef)
+        {
+            char close = fmt[i] == '<' ? '>' : '}';
+            size_t e = fmt.find(close, i);
+            std::string name = fmt.substr(i + 1, e - i - 1);
+            bool found = false;
+            named = hash == Qnil ? Qnil : I.hget(I.href(hash), I.sym(name), &found);
+            i = e + 1;
+        }
+        if (i >= fmt.size())
+            I.raise(I.cArgumentError, "malformed format string - %" + fmt.substr(i - 1));
+        char conv = fmt[i++];
+        V arg = Qnil;
+        if (conv != '%')
+            arg = named != Qundef ? named : nextArg();
+        std::string body, sign;
+        bool numeric = false;
+        switch (conv)
+        {
+        case 'd':
+        case 'i':
+        case 'u':
+        {
+            numeric = true;
+            V iv = arg;
+            if (I.isFloat(iv))
+                iv = intFromDouble(I, std::floor(I.fltv(iv)) == I.fltv(iv) ? I.fltv(iv) : (I.fltv(iv) < 0 ? std::ceil(I.fltv(iv)) : std::floor(I.fltv(iv))));
+            else if (!I.isInt(iv))
+            {
+                V av = iv;
+                iv = I.call(ov(I.mKernel), intern("Integer"), 1, &av);
+            }
+            std::string digits = intToS(I, iv);
+            if (digits[0] == '-')
+            {
+                sign = "-";
+                digits = digits.substr(1);
+            }
+            else if (plus)
+                sign = "+";
+            else if (space)
+                sign = " ";
+            if (prec >= 0 && (int)digits.size() < prec)
+                digits = std::string(prec - digits.size(), '0') + digits;
+            body = digits;
+            if (prec >= 0)
+                zero = false;
+            break;
+        }
+        case 'x':
+        case 'X':
+        case 'o':
+        case 'b':
+        case 'B':
+        {
+            numeric = true;
+            V iv = arg;
+            if (I.isFloat(iv))
+                iv = intFromDouble(I, I.fltv(iv));
+            else if (!I.isInt(iv))
+            {
+                V av = iv;
+                iv = I.call(ov(I.mKernel), intern("Integer"), 1, &av);
+            }
+            int base = conv == 'o' ? 8 : (conv == 'b' || conv == 'B') ? 2 : 16;
+            std::string digits = intToS(I, iv, base);
+            if (digits[0] == '-')
+            {
+                sign = "-";
+                digits = digits.substr(1);
+            }
+            else if (plus)
+                sign = "+";
+            else if (space)
+                sign = " ";
+            if (conv == 'X')
+                for (auto &ch : digits)
+                    ch = (char)std::toupper((unsigned char)ch);
+            if (prec >= 0 && (int)digits.size() < prec)
+                digits = std::string(prec - digits.size(), '0') + digits;
+            if (alt)
+            {
+                if (conv == 'o')
+                    digits = "0" + digits;
+                else if (conv == 'x')
+                    sign += "0x";
+                else if (conv == 'X')
+                    sign += "0X";
+                else if (conv == 'b')
+                    sign += "0b";
+                else
+                    sign += "0B";
+            }
+            body = digits;
+            break;
+        }
+        case 'f':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G':
+        case 'a':
+        case 'A':
+        {
+            numeric = true;
+            double d;
+            if (I.isFloat(arg))
+                d = I.fltv(arg);
+            else if (I.isNum(arg))
+                d = I.numToF(arg);
+            else
+            {
+                V av = arg;
+                d = I.fltv(I.call(ov(I.mKernel), intern("Float"), 1, &av));
+            }
+            if (std::signbit(d) && !(d != d))
+            {
+                sign = "-";
+                d = -d;
+            }
+            else if (plus)
+                sign = "+";
+            else if (space)
+                sign = " ";
+            if (d != d)
+            {
+                body = "NaN";
+                zero = false;
+            }
+            else if (d == 1.0 / 0.0)
+            {
+                body = "Inf";
+                zero = false;
+            }
+            else
+                body = fmtDouble(d, conv, prec, alt);
+            break;
+        }
+        case 's':
+        case 'p':
+        {
+            body = conv == 's' ? I.toS(arg) : I.inspect(arg);
+            if (prec >= 0)
+            {
+                std::vector<std::string> cs = utf8Chars(body);
+                if ((int)cs.size() > prec)
+                {
+                    std::string t;
+                    for (int k = 0; k < prec; ++k)
+                        t += cs[k];
+                    body = t;
+                }
+            }
+            zero = false;
+            break;
+        }
+        case 'c':
+        {
+            if (isFix(arg))
+            {
+                body.clear();
+                appendUtf8(body, (uint32_t)fixv(arg));
+            }
+            else
+            {
+                std::string t = I.toS(arg);
+                body = t.empty() ? "" : t.substr(0, u8len((unsigned char)t[0]));
+            }
+            zero = false;
+            break;
+        }
+        default: I.raise(I.cArgumentError, std::string("malformed format string - %") + conv);
+        }
+        int len = (int)(utf8Len(body) + sign.size());
+        if (width > len)
+        {
+            int padn = width - len;
+            if (minus)
+                out += sign + body + std::string(padn, ' ');
+            else if (zero && numeric)
+                out += sign + std::string(padn, '0') + body;
+            else
+                out += std::string(padn, ' ') + sign + body;
+        }
+        else
+            out += sign + body;
+    }
+    return out;
+}
+
+void Interp::initString()
+{
+    RClass *c = cString;
+    defs(c, "new", str_new, 0, -1);
+    defnPriv(c, "initialize", str_initialize, 0, -1);
+    defn(c, "length", str_length, 0, 0);
+    defn(c, "size", str_length, 0, 0);
+    defn(c, "bytesize", str_bytesize, 0, 0);
+    defn(c, "+", str_plus, 1, 1);
+    defn(c, "*", str_mul, 1, 1);
+    defn(c, "%", str_format, 1, 1);
+    defn(c, "==", str_eq, 1, 1);
+    defn(c, "===", str_eq, 1, 1);
+    defn(c, "eql?", str_eql, 1, 1);
+    defn(c, "<=>", str_cmp, 1, 1);
+    defn(c, "hash", str_hash, 0, 0);
+    defn(c, "to_s", str_to_s, 0, 0);
+    defn(c, "to_str", str_to_s, 0, 0);
+    defn(c, "inspect", str_inspect, 0, 0);
+    defn(c, "dump", str_dump, 0, 0);
+    defn(c, "to_sym", str_to_sym, 0, 0);
+    defn(c, "intern", str_to_sym, 0, 0);
+    defn(c, "to_i", str_to_i, 0, 1);
+    defn(c, "to_f", str_to_f, 0, 0);
+    defn(c, "to_r", str_to_r, 0, 0);
+    defn(c, "to_c", str_to_c, 0, 0);
+    defn(c, "hex", str_hex, 0, 0);
+    defn(c, "oct", str_oct, 0, 0);
+    defn(c, "[]", str_aref, 1, 2);
+    defn(c, "slice", str_aref, 1, 2);
+    defn(c, "[]=", str_aset, 2, 3);
+    defn(c, "slice!", str_slice_bang, 1, 2);
+    defn(c, "upcase", str_upcase, 0, -1);
+    defn(c, "downcase", str_downcase, 0, -1);
+    defn(c, "capitalize", str_capitalize, 0, -1);
+    defn(c, "swapcase", str_swapcase, 0, -1);
+    defn(c, "upcase!", str_upcase_bang, 0, -1);
+    defn(c, "downcase!", str_downcase_bang, 0, -1);
+    defn(c, "capitalize!", str_capitalize_bang, 0, -1);
+    defn(c, "swapcase!", str_swapcase_bang, 0, -1);
+    defn(c, "reverse", str_reverse, 0, 0);
+    defn(c, "reverse!", str_reverse_bang, 0, 0);
+    defn(c, "include?", str_include, 1, 1);
+    defn(c, "start_with?", str_start_with, 0, -1);
+    defn(c, "end_with?", str_end_with, 0, -1);
+    defn(c, "delete_prefix", str_delete_prefix, 1, 1);
+    defn(c, "delete_suffix", str_delete_suffix, 1, 1);
+    defn(c, "delete_prefix!", str_delete_prefix_bang, 1, 1);
+    defn(c, "delete_suffix!", str_delete_suffix_bang, 1, 1);
+    defn(c, "index", str_index, 1, 2);
+    defn(c, "rindex", str_rindex, 1, 2);
+    defn(c, "count", str_count, 0, -1);
+    defn(c, "delete", str_delete, 0, -1);
+    defn(c, "delete!", str_delete_bang, 0, -1);
+    defn(c, "squeeze", str_squeeze, 0, -1);
+    defn(c, "squeeze!", str_squeeze_bang, 0, -1);
+    defn(c, "tr", str_tr, 2, 2);
+    defn(c, "tr_s", str_tr_s, 2, 2);
+    defn(c, "tr!", str_tr_bang, 2, 2);
+    defn(c, "strip", str_strip, 0, 0);
+    defn(c, "lstrip", str_lstrip, 0, 0);
+    defn(c, "rstrip", str_rstrip, 0, 0);
+    defn(c, "strip!", str_strip_bang, 0, 0);
+    defn(c, "lstrip!", str_lstrip_bang, 0, 0);
+    defn(c, "rstrip!", str_rstrip_bang, 0, 0);
+    defn(c, "chomp", str_chomp, 0, 1);
+    defn(c, "chomp!", str_chomp_bang, 0, 1);
+    defn(c, "chop", str_chop, 0, 0);
+    defn(c, "chop!", str_chop_bang, 0, 0);
+    defn(c, "chars", str_chars, 0, 0);
+    defn(c, "each_char", str_each_char, 0, 0);
+    defn(c, "bytes", str_bytes, 0, 0);
+    defn(c, "each_byte", str_each_byte, 0, 0);
+    defn(c, "codepoints", str_codepoints, 0, 0);
+    defn(c, "getbyte", str_getbyte, 1, 1);
+    defn(c, "lines", str_lines, 0, 2);
+    defn(c, "each_line", str_each_line, 0, 2);
+    defn(c, "split", str_split, 0, 2);
+    defn(c, "ljust", str_ljust, 1, 2);
+    defn(c, "rjust", str_rjust, 1, 2);
+    defn(c, "center", str_center, 1, 2);
+    defn(c, "ord", str_ord, 0, 0);
+    defn(c, "chr", str_chr, 0, 0);
+    defn(c, "empty?", str_empty, 0, 0);
+    defn(c, "freeze", str_freeze, 0, 0);
+    defn(c, "-@", str_uminus, 0, 0);
+    defn(c, "dedup", str_uminus, 0, 0);
+    defn(c, "+@", str_uplus, 0, 0);
+    defn(c, "<<", str_append, 1, 1);
+    defn(c, "concat", str_concat, 0, -1);
+    defn(c, "prepend", str_prepend, 0, -1);
+    defn(c, "insert", str_insert, 2, 2);
+    defn(c, "replace", str_replace, 1, 1);
+    defn(c, "clear", str_clear, 0, 0);
+    defn(c, "succ", str_succ, 0, 0);
+    defn(c, "next", str_succ, 0, 0);
+    defn(c, "upto", str_upto, 1, 2);
+    defn(c, "casecmp", str_casecmp, 1, 1);
+    defn(c, "casecmp?", str_casecmp_p, 1, 1);
+    defn(c, "partition", str_partition, 1, 1);
+    defn(c, "rpartition", str_rpartition, 1, 1);
+    defn(c, "encoding", str_encoding, 0, 0);
+    defn(c, "force_encoding", str_force_encoding, 1, 1);
+    defn(c, "encode", str_encode, 0, -1);
+    defn(c, "encode!", str_force_encoding, 0, -1);
+    defn(c, "valid_encoding?", str_valid_encoding, 0, 0);
+    defn(c, "ascii_only?", str_ascii_only, 0, 0);
+    defn(c, "b", str_b, 0, 0);
+    defn(c, "scrub", str_scrub, 0, 1);
+    defn(c, "unicode_normalize", str_unicode_normalize, 0, 1);
+    defn(c, "sum", str_sum, 0, 1);
+    defn(c, "between?", str_between, 2, 2);
+    defn(c, "unpack1", str_unpack1, 1, 1);
+    defn(c, "unpack", str_unpack, 1, 1);
+    RClass *enc = cEncoding;
+    auto encoding = [&](const char *name, const char *display)
+    {
+        V e = newObject(enc);
+        ivarSet(e, intern("__name"), strFrozen(name));
+        ivarSet(e, intern("__display"), strFrozen(display));
+        return e;
+    };
+    V bin = encoding("ASCII-8BIT", "BINARY (ASCII-8BIT)");
+    setConst(enc, intern("UTF_8"), encoding("UTF-8", "UTF-8"));
+    setConst(enc, intern("ASCII_8BIT"), bin);
+    setConst(enc, intern("BINARY"), bin);
+    setConst(enc, intern("US_ASCII"), encoding("US-ASCII", "US-ASCII"));
+}
+
+static V enc_to_s(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.ivarGet(self, intern("__name"));
+}
+
+static V enc_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.str("#<Encoding:" + I.sref(I.ivarGet(self, intern("__display"))) + ">");
+}
+
+void Interp::initSymbol()
+{
+    RClass *c = cSymbol;
+    defn(c, "to_s", sym_to_s, 0, 0);
+    defn(c, "id2name", sym_to_s, 0, 0);
+    defn(c, "name", sym_name, 0, 0);
+    defn(c, "to_sym", sym_to_sym, 0, 0);
+    defn(c, "inspect", sym_inspect, 0, 0);
+    defn(c, "to_proc", sym_to_proc, 0, 0);
+    defn(c, "length", sym_length, 0, 0);
+    defn(c, "size", sym_length, 0, 0);
+    defn(c, "<=>", sym_cmp, 1, 1);
+    defn(c, "==", sym_eq, 1, 1);
+    defn(c, "===", sym_eq, 1, 1);
+    defn(c, "upcase", sym_upcase, 0, 0);
+    defn(c, "downcase", sym_downcase, 0, 0);
+    defn(c, "capitalize", sym_capitalize, 0, 0);
+    defn(c, "succ", sym_succ, 0, 0);
+    defn(c, "next", sym_succ, 0, 0);
+    defn(c, "[]", sym_aref, 1, 2);
+    defn(c, "start_with?", sym_start_with, 0, -1);
+    defn(c, "end_with?", sym_end_with, 0, -1);
+    defn(c, "empty?", sym_empty, 0, 0);
+    defs(c, "all_symbols", sym_all, 0, 0);
+    defn(cEncoding, "to_s", enc_to_s, 0, 0);
+    defn(cEncoding, "name", enc_to_s, 0, 0);
+    defn(cEncoding, "inspect", enc_inspect, 0, 0);
+}
+
+} // namespace ruby

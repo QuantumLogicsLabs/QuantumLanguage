@@ -147,6 +147,11 @@ std::shared_ptr<Chunk> Compiler::compileFunction(
   CompilerState fnState(name, current_);
   fnState.isFunction = true;
   CompilerState *prev = current_;
+  // a method of a Java class, a library function, or a lambda inside one;
+  // else a Ruby def / block (or a function inside one)
+  fnState.chunk->javaStyle = javaDepth_ > 0 || (prev && prev->chunk->javaStyle);
+  fnState.chunk->rubyStyle = !fnState.chunk->javaStyle && !rubyLines_.empty() &&
+                             (rubyLines_.count(line) || (prev && prev->chunk->rubyStyle));
   current_ = &fnState;
 
   beginScope();

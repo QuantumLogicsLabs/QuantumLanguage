@@ -1,0 +1,91 @@
+# Data, in Ruby: immutable value objects.
+class Data
+  class << self
+    undef_method :new
+  end
+
+  def self.define(*syms, &blk)
+    syms.each do |m|
+      raise TypeError, "#{m.inspect} is not a symbol nor a string" unless m.is_a?(Symbol) || m.is_a?(String)
+    end
+    members = syms.map(&:to_sym)
+    raise ArgumentError, "duplicate member #{members.detect { |m| members.count(m) > 1 }}" if members.uniq.size != members.size
+    k = Class.new(self)
+    hidden = members.map { |m| :"__s_#{m}" }
+    k.define_singleton_method(:members) { members.dup }
+    k.define_singleton_method(:__hidden) { hidden }
+    make = lambda do |klass, args, kw|
+      if args.size > members.size
+        raise ArgumentError, "wrong number of arguments (given #{args.size}, expected #{members.empty? ? 0 : "0..#{members.size}"})"
+      end
+      h = kw
+      unless args.empty?
+        h = {}
+        args.each_with_index { |a, i| h[members[i]] = a }
+        h = h.merge(kw)
+      end
+      obj = klass.allocate
+      obj.__send__(:initialize, **h)
+      obj.freeze
+    end
+    k.define_singleton_method(:new) { |*args, **kw| make.call(self, args, kw) }
+    k.define_singleton_method(:[]) { |*args, **kw| make.call(self, args, kw) }
+    members.each_with_index { |m, i| k.__hidden_attr(m, hidden[i], false) }
+    k.class_eval(&blk) if blk
+    k
+  end
+
+  def initialize(**kw)
+    ms = self.class.members
+    hidden = self.class.__hidden
+    missing = ms - kw.keys
+    unless missing.empty?
+      raise ArgumentError, "missing keyword#{missing.size > 1 ? 's' : ''}: #{missing.map(&:inspect).join(', ')}"
+    end
+    unknown = kw.keys - ms
+    unless unknown.empty?
+      raise ArgumentError, "unknown keyword#{unknown.size > 1 ? 's' : ''}: #{unknown.map(&:inspect).join(', ')}"
+    end
+    ms.each_with_index { |m, i| instance_variable_set(hidden[i], kw[m]) }
+  end
+
+  def members = self.class.members
+
+  def to_h(&blk)
+    h = {}
+    hidden = self.class.__hidden
+    members.each_with_index { |m, i| h[m] = instance_variable_get(hidden[i]) }
+    blk ? h.to_h(&blk) : h
+  end
+
+  def deconstruct_keys(keys)
+    h = to_h
+    return h if keys.nil?
+    out = {}
+    keys.each do |key|
+      break unless h.key?(key)
+      out[key] = h[key]
+    end
+    out
+  end
+
+  def deconstruct = to_h.values
+
+  def with(*args, **kw)
+    raise ArgumentError, "wrong number of arguments (given #{args.size}, expected 0)" unless args.empty?
+    return self if kw.empty?
+    self.class.new(**to_h.merge(kw))
+  end
+
+  def ==(o) = o.class == self.class && to_h == o.to_h
+  def eql?(o) = o.class == self.class && to_h.values.eql?(o.to_h.values)
+  def hash = [self.class.__id__, to_h.values].hash
+
+  def inspect
+    name = self.class.name
+    body = to_h.map { |m, v| "#{m}=#{v.inspect}" }.join(", ")
+    return name ? "#<data #{name}>" : "#<data >" if body.empty?
+    name ? "#<data #{name} #{body}>" : "#<data #{body}>"
+  end
+  alias to_s inspect
+end

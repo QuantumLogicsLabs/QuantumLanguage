@@ -1,0 +1,510 @@
+# File, Dir and Errno, in Ruby, over native file helpers. A File object holds
+# the contents in memory and writes them back when flushed or closed.
+class SystemCallError < StandardError
+  attr_reader :errno
+end
+
+module Errno
+  { ENOENT: [2, "No such file or directory"], EACCES: [13, "Permission denied"], EEXIST: [17, "File exists"],
+    ENOTDIR: [20, "Not a directory"], EISDIR: [21, "Is a directory"], EINVAL: [22, "Invalid argument"],
+    ENOTEMPTY: [41, "Directory not empty"], EPIPE: [32, "Broken pipe"], ECONNREFUSED: [10061, "Connection refused"],
+    ECONNRESET: [10054, "Connection reset by peer"], EADDRINUSE: [10048, "Address already in use"],
+    ETIMEDOUT: [10060, "Connection timed out"], EDOM: [33, "Numerical argument out of domain"], EAGAIN: [11, "Resource temporarily unavailable"] }.each do |name, (num, text)|
+    k = Class.new(SystemCallError)
+    k.const_set(:Errno, num)
+    k.define_method(:initialize) do |msg = nil|
+      # the runtime's own messages name the failing call: "... @ rb_sysopen - path"
+      super(msg ? "#{text}#{msg.to_s.start_with?('@ ') ? ' ' : ' - '}#{msg}" : text)
+      @errno = num
+    end
+    const_set(name, k)
+  end
+end
+
+class IO
+  SEEK_SET = 0
+  SEEK_CUR = 1
+  SEEK_END = 2
+end
+
+class File < IO
+  SEPARATOR = "/"
+  Separator = "/"
+  ALT_SEPARATOR = "\\"
+  PATH_SEPARATOR = ";"
+
+  module Constants
+    RDONLY = 0
+    WRONLY = 1
+    RDWR = 2
+    APPEND = 8
+    CREAT = 256
+    TRUNC = 512
+    EXCL = 1024
+  end
+  include Constants
+
+  def self.__path(p) = p.respond_to?(:path) ? p.path : p.respond_to?(:to_path) ? p.to_path : p.to_str
+  def self.path(p) = __path(p).dup
+
+  def self.exist?(p) = __file_kind(__path(p)) != 0
+  def self.file?(p) = __file_kind(__path(p)) == 1
+  def self.directory?(p) = __file_kind(__path(p)) == 2
+  def self.readable?(p) = exist?(p)
+  def self.writable?(p) = exist?(p)
+  def self.executable?(p) = exist?(p)
+  def self.symlink?(p) = false
+  def self.zero?(p) = file?(p) && size(p) == 0
+  singleton_class.alias_method(:empty?, :zero?)
+
+  def self.__missing(p, what = "rb_sysopen") = raise(Errno::ENOENT, "@ #{what} - #{p}")
+
+  def self.size(p)
+    q = __path(p)
+    __missing(q, "rb_file_s_size") unless exist?(q)
+    __file_read(q).bytesize
+  end
+
+  def self.size?(p)
+    return nil unless exist?(p)
+    s = size(p)
+    s == 0 ? nil : s
+  end
+
+  # Text mode on Windows: a file's CRLF is LF to the program
+  CRLF_TEXT = RUBY_PLATFORM.include?("mingw")
+
+  def self.__text_in(s) = CRLF_TEXT ? s.gsub("\r\n", "\n") : s
+  def self.__text_out(s) = CRLF_TEXT ? s.gsub("\n", "\r\n") : s
+
+  def self.__raw(p)
+    q = __path(p)
+    k = __file_kind(q)
+    __missing(q) if k == 0
+    raise Errno::EISDIR, "@ io_fread - #{q}" if k == 2
+    __file_read(q)
+  end
+
+  def self.binread(p, len = nil, off = 0)
+    s = __raw(p)
+    s = s.byteslice(off, len || s.bytesize) if len || off != 0
+    s.force_encoding("BINARY")
+  end
+
+  # asking for a length reads bytes, untranslated
+  def self.read(p, len = nil, off = nil, mode: "r", binmode: false, **)
+    return binread(p, len, off || 0) if len || off || binmode || mode.to_s.include?("b")
+    __text_in(__raw(p))
+  end
+
+  def self.binwrite(p, data, *, mode: "wb", **)
+    s = data.to_s
+    __file_write(__path(p), s, mode.to_s.start_with?("a"))
+    s.bytesize
+  end
+
+  def self.write(p, data, *, mode: "w", binmode: false, **)
+    s = data.to_s
+    __file_write(__path(p), binmode || mode.to_s.include?("b") ? s : __text_out(s), mode.to_s.start_with?("a"))
+    s.bytesize
+  end
+
+  def self.readlines(p, *a, chomp: false, **) = read(p).lines(*a, chomp: chomp)
+
+  def self.foreach(p, *a, chomp: false, **, &blk)
+    return readlines(p, *a, chomp: chomp).each unless blk
+    readlines(p, *a, chomp: chomp).each(&blk)
+    nil
+  end
+
+  def self.delete(*paths)
+    paths.each do |p|
+      q = __path(p)
+      __missing(q, "apply2files") unless exist?(q)
+      __file_delete(q)
+    end
+    paths.size
+  end
+  singleton_class.alias_method(:unlink, :delete)
+
+  def self.rename(a, b)
+    __missing("(#{a}, #{b})", "rb_file_s_rename") unless exist?(a)
+    __file_rename(__path(a), __path(b))
+    0
+  end
+
+  def self.basename(p, ext = nil)
+    s = __path(p).tr("\\", "/")
+    return "/" if s =~ %r{\A/+\z}
+    s = s.sub(%r{/+\z}, "")
+    b = s[(s.rindex("/") || -1) + 1..]
+    if ext == ".*"
+      i = b.rindex(".")
+      b = b[0...i] if i && i > 0
+    elsif ext && b.end_with?(ext) && b != ext
+      b = b[0...-ext.size]
+    end
+    b
+  end
+
+  def self.dirname(p, *)
+    s = __path(p).tr("\\", "/").sub(%r{/+\z}, "")
+    i = s.rindex("/")
+    return s.empty? ? "/" : "." unless i
+    i == 0 ? "/" : s[0...i].sub(%r{/+\z}, "")
+  end
+
+  def self.extname(p)
+    b = basename(p)
+    i = b.rindex(".")
+    i && i > 0 && i < b.size - 1 ? b[i..] : ""
+  end
+
+  def self.split(p) = [dirname(p), basename(p)]
+
+  def self.join(*parts)
+    list = parts.flatten.map { |x| __path(x) }
+    out = +""
+    list.each_with_index do |x, i|
+      if i == 0
+        out << x
+      else
+        out = out.sub(%r{/+\z}, "") << "/" << x.sub(%r{\A/+}, "")
+      end
+    end
+    out
+  end
+
+  def self.absolute_path?(p) = __path(p) =~ %r{\A([A-Za-z]:)?[/\\]} ? true : false
+
+  def self.expand_path(p, dir = nil)
+    s = __path(p).tr("\\", "/")
+    s = s.sub(/\A~/, ENV["HOME"] || ENV["USERPROFILE"] || "~")
+    unless absolute_path?(s)
+      s = "#{dir ? expand_path(dir) : Dir.pwd.tr("\\", "/")}/#{s}"
+    end
+    drive = s[%r{\A[A-Za-z]:}] || ""
+    out = []
+    s.delete_prefix(drive).split("/").each do |seg|
+      next if seg.empty? || seg == "."
+      seg == ".." ? out.pop : out << seg
+    end
+    "#{drive}/#{out.join("/")}"
+  end
+  singleton_class.alias_method(:absolute_path, :expand_path)
+  singleton_class.alias_method(:realpath, :expand_path)
+
+  def self.open(path, mode = nil, *rest, **kw)
+    f = new(path, mode, *rest, **kw)
+    return f unless block_given?
+    begin
+      yield f
+    ensure
+      f.close unless f.closed?
+    end
+  end
+
+  attr_reader :path
+  alias to_path path
+
+  def initialize(path, pos_mode = nil, *, mode: nil, binmode: false, **)
+    mode = pos_mode || mode || "r"
+    @path = File.__path(path)
+    @bin = binmode || (!mode.is_a?(Integer) && mode.to_s.sub(/:.*/, "").include?("b"))
+    @mode = mode.is_a?(Integer) ? "r" : mode.to_s.delete("bt").sub(/:.*/, "")
+    @closed = false
+    @dirty = false
+    @pos = 0
+    @lineno = 0
+    kind = __file_kind(@path)
+    raise Errno::EISDIR, "@ io_fread - #{@path}" if kind == 2
+    case @mode
+    when "r", "r+"
+      File.__missing(@path) if kind == 0
+      @data = __load
+      @data = @data.dup.force_encoding("BINARY") if @bin
+      # overwriting in place must leave a file's LF-only lines alone
+      @bin = true if @mode == "r+" && !__file_read(@path).include?("\r\n")
+    when "w", "w+"
+      @data = +""
+      @dirty = true
+      __file_write(@path, "", false)
+    when "a", "a+"
+      @data = kind == 1 ? __load : +""
+      @pos = @data.bytesize
+      # what is already there stays byte for byte
+      @kept = kind == 1 ? __file_read(@path) : ""
+      @kept_size = @pos
+      __file_write(@path, "", true)
+    else
+      raise ArgumentError, "invalid access mode #{mode}"
+    end
+    @data = @data.dup
+  end
+
+  def __load
+    raw = __file_read(@path)
+    @bin ? raw : File.__text_in(raw)
+  end
+
+  def binmode
+    unless @bin
+      @bin = true
+      @data = __file_read(@path).dup if @mode.start_with?("r") && @pos == 0 && !@dirty
+    end
+    self
+  end
+
+  def binmode? = @bin
+
+  def __writable
+    raise IOError, "closed stream" if @closed
+    raise IOError, "not opened for writing" if @mode == "r"
+  end
+
+  def __readable
+    raise IOError, "closed stream" if @closed
+    raise IOError, "not opened for reading" if @mode == "w" || @mode == "a"
+  end
+
+  def write(*items)
+    __writable
+    n = 0
+    items.each do |x|
+      s = x.to_s
+      if @mode.start_with?("a")
+        @pos = @data.bytesize
+      end
+      if @pos >= @data.bytesize
+        @data << s
+      else
+        @data = @data.byteslice(0, @pos) + s + (@data.byteslice(@pos + s.bytesize, @data.bytesize) || "")
+      end
+      @pos += s.bytesize
+      n += s.bytesize
+    end
+    @dirty = true
+    n
+  end
+
+  def <<(x)
+    write(x)
+    self
+  end
+
+  def print(*items)
+    write(*items)
+    nil
+  end
+
+  def puts(*items)
+    if items.empty?
+      write("\n")
+      return nil
+    end
+    items.flatten.each do |x|
+      s = x.to_s
+      write(s.end_with?("\n") ? s : s + "\n")
+    end
+    nil
+  end
+
+  def printf(fmt, *a)
+    write(format(fmt, *a))
+    nil
+  end
+
+  def flush
+    if @dirty
+      if @kept
+        added = @data.byteslice(@kept_size, @data.bytesize) || ""
+        __file_write(@path, @kept + (@bin ? added : File.__text_out(added)), false)
+      else
+        __file_write(@path, @bin ? @data : File.__text_out(@data), false)
+      end
+    end
+    @dirty = false
+    self
+  end
+  alias fsync flush
+  def sync = true
+  def sync=(v)
+    v
+  end
+
+  def close
+    return nil if @closed
+    flush
+    @closed = true
+    nil
+  end
+
+  def closed? = @closed
+  def eof? = (__readable; @pos >= @data.bytesize)
+  alias eof eof?
+  def size
+    flush
+    File.size(@path)
+  end
+  def pos = @pos
+  alias tell pos
+  def pos=(n)
+    @pos = n
+  end
+  attr_accessor :lineno
+
+  def rewind
+    @pos = 0
+    @lineno = 0
+    0
+  end
+
+  def seek(n, whence = 0)
+    @pos = case whence
+           when 0, :SET then n
+           when 1, :CUR then @pos + n
+           else @data.bytesize + n
+           end
+    0
+  end
+
+  def read(n = nil, *)
+    __readable
+    if n.nil?
+      s = @data.byteslice(@pos, @data.bytesize) || ""
+      @pos = @data.bytesize
+      return s
+    end
+    return nil if @pos >= @data.bytesize && n > 0
+    s = @data.byteslice(@pos, n) || ""
+    @pos += s.bytesize
+    s
+  end
+
+  def gets(sep = "\n", chomp: false)
+    __readable
+    return nil if @pos >= @data.bytesize
+    rest = @data.byteslice(@pos, @data.bytesize)
+    i = sep ? rest.index(sep) : nil
+    line = i ? rest[0, i + sep.size] : rest
+    @pos += line.bytesize
+    @lineno += 1
+    $_ = line
+    chomp ? line.chomp : line
+  end
+
+  def readline(*a, **k) = gets(*a, **k) || raise(EOFError, "end of file reached")
+  def getc = read(1)
+  def readchar = getc || raise(EOFError, "end of file reached")
+
+  def each_line(*a, chomp: false)
+    return to_enum(:each_line, *a, chomp: chomp) unless block_given?
+    while (l = gets(*a, chomp: chomp))
+      yield l
+    end
+    self
+  end
+  alias each each_line
+
+  def readlines(*a, chomp: false)
+    out = []
+    while (l = gets(*a, chomp: chomp))
+      out << l
+    end
+    out
+  end
+
+  def tty? = false
+  alias isatty tty?
+  def inspect = "#<File:#{@path}#{@closed ? " (closed)" : ""}>"
+end
+
+FileTest = File
+
+class Dir
+  def self.pwd = __dir_pwd
+  singleton_class.alias_method(:getwd, :pwd)
+  def self.exist?(p) = __file_kind(File.__path(p)) == 2
+  def self.empty?(p) = entries(p).size <= 2
+
+  def self.mkdir(p, *)
+    raise Errno::EEXIST, "@ dir_s_mkdir - #{p}" if File.exist?(p)
+    __dir_make(File.__path(p))
+    0
+  end
+
+  def self.rmdir(p)
+    raise Errno::ENOENT, "@ dir_s_rmdir - #{p}" unless exist?(p)
+    raise Errno::ENOTEMPTY, "@ dir_s_rmdir - #{p}" unless empty?(p)
+    __file_delete(File.__path(p))
+    0
+  end
+  singleton_class.alias_method(:delete, :rmdir)
+  singleton_class.alias_method(:unlink, :rmdir)
+
+  def self.children(p)
+    raise Errno::ENOENT, "@ dir_initialize - #{p}" unless exist?(p)
+    __dir_list(File.__path(p)).sort
+  end
+
+  def self.entries(p) = [".", ".."] + children(p)
+  def self.each_child(p, &b) = children(p).each(&b)
+  def self.foreach(p, &b) = entries(p).each(&b)
+
+  def self.__glob_rx(pat)
+    rx = +""
+    i = 0
+    while i < pat.size
+      c = pat[i]
+      if pat[i, 3] == "**/"
+        rx << "(?:[^/]+/)*"
+        i += 3
+        next
+      end
+      case c
+      when "*" then rx << "[^/]*"
+      when "?" then rx << "[^/]"
+      when "[" then
+        e = pat.index("]", i)
+        rx << pat[i..e]
+        i = e
+      when "{"
+        e = pat.index("}", i)
+        rx << "(?:" << pat[(i + 1)...e].split(",", -1).map { |a| Regexp.escape(a) }.join("|") << ")"
+        i = e
+      else rx << Regexp.escape(c)
+      end
+      i += 1
+    end
+    Regexp.new("\\A#{rx}\\z")
+  end
+
+  def self.__walk(dir, prefix, out)
+    children(dir).each do |n|
+      next if n.start_with?(".")
+      full = prefix + n
+      out << full
+      __walk(File.join(dir, n), full + "/", out) if __file_kind(File.join(dir, n)) == 2
+    end
+  end
+
+  def self.glob(pats, *, base: nil, **)
+    out = []
+    Array(pats).each do |pat|
+      s = pat.tr("\\", "/")
+      root_len = s[/\A[^*?\[{]*\//]&.size || 0
+      root = s[0, root_len]
+      start = root.empty? ? (base || ".") : (base ? File.join(base, root) : root)
+      next unless __file_kind(start) == 2
+      found = []
+      __walk(start, root, found)
+      rx = __glob_rx(s)
+      out.concat(found.select { |f| rx.match?(f) }.sort)
+    end
+    return out unless block_given?
+    out.each { |f| yield f }
+    nil
+  end
+
+  def self.[](*pats) = glob(pats)
+end

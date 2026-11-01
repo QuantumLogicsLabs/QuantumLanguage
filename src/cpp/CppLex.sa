@@ -379,6 +379,7 @@ public:
             macros_[name] = m;
         };
         def("__QUANTUM__", "1");
+        def("__QUANTUM_EH_TOP__", "1"); // __eh_top() / __eh_top_set() exist
         def("__cplusplus", "201703L");
         def("_WIN32", "1");
         def("_WIN64", "1");

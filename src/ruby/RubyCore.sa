@@ -1,0 +1,1156 @@
+// quantum: cpp
+// Ruby front-end: the core protocols (==, eql?, hash, <=>, ===, inspect,
+// to_s, implicit conversions), the hash table, the class hierarchy and the
+// program runner.
+#include "RubyRt.h.sa"
+
+#include <cstdio>
+#include <cstdlib>
+
+namespace ruby
+{
+
+namespace
+{
+
+uint64_t mix(uint64_t x)
+{
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+const int32_t kEmpty = -1;
+const int32_t kDeleted = -2;
+
+int byteCompare(const std::string &a, const std::string &b)
+{
+    size_t n = a.size() < b.size() ? a.size() : b.size();
+    for (size_t i = 0; i < n; ++i)
+    {
+        unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+        if (x != y)
+            return x < y ? -1 : 1;
+    }
+    if (a.size() == b.size())
+        return 0;
+    return a.size() < b.size() ? -1 : 1;
+}
+
+} // namespace
+
+int rbByteCompare(const std::string &a, const std::string &b) { return byteCompare(a, b); }
+
+// ── equality, hashing, ordering ───────────────────────────────────────────
+
+bool Interp::eq(V a, V b)
+{
+    if (a == b)
+    {
+        if (isFloat(a))
+        {
+            double d = fltv(a);
+            return d == d;
+        }
+        return true;
+    }
+    if (isFix(a) && isFix(b))
+        return false;
+    if (isNum(a) && isNum(b))
+        return numEq(*this, a, b);
+    if (!isObj(a))
+    {
+        if (isFix(a) || isFloat(a))
+            return isObj(b) && op(b)->type == T::Object ? truthy(call1(b, s.eq, a)) : false;
+        return false;
+    }
+    Obj *x = op(a);
+    switch (x->type)
+    {
+    case T::String:
+        if (isStr(b))
+        {
+            if (sref(a) != sref(b))
+                return false;
+            return strBinary(a) == strBinary(b) || asciiOnly(sref(a));
+        }
+        return false;
+    case T::Array:
+    {
+        if (!isAry(b))
+            return false;
+        std::vector<V> &p = aref(a), &q = aref(b);
+        if (p.size() != q.size())
+            return false;
+        for (V seen : inspecting)
+            if (seen == a)
+                return true;
+        inspecting.push_back(a);
+        bool same = true;
+        for (size_t i = 0; i < p.size() && i < q.size(); ++i)
+            if (!eq(p[i], q[i]))
+            {
+                same = false;
+                break;
+            }
+        inspecting.pop_back();
+        return same;
+    }
+    case T::Hash:
+    {
+        if (!isHash(b))
+            return false;
+        RHash *p = href(a), *q = href(b);
+        if (p->live != q->live)
+            return false;
+        for (size_t i = 0; i < p->keys.size(); ++i)
+        {
+            if (p->keys[i] == Qundef)
+                continue;
+            bool found = false;
+            V v = hget(q, p->keys[i], &found);
+            if (!found || !eq(p->vals[i], v))
+                return false;
+        }
+        return true;
+    }
+    case T::Range:
+    {
+        if (!isType(b, T::Range))
+            return false;
+        auto *p = static_cast<RRange *>(x), *q = static_cast<RRange *>(op(b));
+        return p->excl == q->excl && eq(p->lo, q->lo) && eq(p->hi, q->hi);
+    }
+    default: break;
+    }
+    Method *m = findMethod(x->klass, s.eq);
+    if (m == mEqDefault)
+        return false;
+    return truthy(call1(a, s.eq, b));
+}
+
+bool Interp::eql(V a, V b)
+{
+    if (a == b)
+        return true;
+    if (!isObj(a) || !isObj(b))
+    {
+        if (isFloat(a) && isFloat(b))
+            return fltv(a) == fltv(b);
+        return false;
+    }
+    Obj *x = op(a), *y = op(b);
+    switch (x->type)
+    {
+    case T::String: return y->type == T::String && sref(a) == sref(b);
+    case T::Float: return y->type == T::Float && fltv(a) == fltv(b);
+    case T::Bignum: return y->type == T::Bignum && intCmp(*this, a, b) == 0;
+    case T::Array:
+    {
+        if (y->type != T::Array)
+            return false;
+        std::vector<V> &p = aref(a), &q = aref(b);
+        if (p.size() != q.size())
+            return false;
+        for (size_t i = 0; i < p.size(); ++i)
+            if (!eql(p[i], q[i]))
+                return false;
+        return true;
+    }
+    case T::Hash: return y->type == T::Hash && eq(a, b);
+    case T::Rational:
+    {
+        if (y->type != T::Rational)
+            return false;
+        auto *p = static_cast<RRational *>(x), *q = static_cast<RRational *>(y);
+        return eql(p->num, q->num) && eql(p->den, q->den);
+    }
+    case T::Range:
+    {
+        if (y->type != T::Range)
+            return false;
+        auto *p = static_cast<RRange *>(x), *q = static_cast<RRange *>(y);
+        return p->excl == q->excl && eql(p->lo, q->lo) && eql(p->hi, q->hi);
+    }
+    default: break;
+    }
+    Method *m = findMethod(x->klass, s.eql);
+    if (m == mEqlDefault)
+        return false;
+    return truthy(call1(a, s.eql, b));
+}
+
+uint64_t Interp::hashOf(V v)
+{
+    if (isFix(v) || isSymV(v))
+    {
+        // a cheap mix: these are the commonest keys
+        uint64_t x = v * 0x9E3779B97F4A7C15ULL;
+        return x ^ (x >> 29);
+    }
+    if (!isObj(v))
+    {
+        if (isFlonum(v))
+        {
+            double d = fltv(v);
+            if (d == 0)
+                d = 0;
+            return mix(*reinterpret_cast<uint64_t *>(&d) ^ 0x9e3779b97f4a7c15ULL);
+        }
+        return mix(v);
+    }
+    Obj *o = op(v);
+    switch (o->type)
+    {
+    case T::String:
+    {
+        const std::string &str = static_cast<RString *>(o)->s;
+        const char *bytes = str.data();
+        size_t len = str.size();
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t i = 0; i < len; ++i)
+        {
+            h ^= (unsigned char)bytes[i];
+            h *= 1099511628211ULL;
+        }
+        return h ^ (h >> 29);
+    }
+    case T::Float:
+    {
+        double d = static_cast<RFloat *>(o)->d;
+        return mix(*reinterpret_cast<uint64_t *>(&d) ^ 0x9e3779b97f4a7c15ULL);
+    }
+    case T::Array:
+    {
+        for (V seen : inspecting)
+            if (seen == v)
+                return 7;
+        inspecting.push_back(v);
+        uint64_t h = 0x12345;
+        for (V x : static_cast<RArray *>(o)->a)
+            h = mix(h * 31 + hashOf(x));
+        inspecting.pop_back();
+        return h;
+    }
+    case T::Hash:
+    {
+        RHash *hp = static_cast<RHash *>(o);
+        uint64_t h = 0x6789;
+        for (size_t i = 0; i < hp->keys.size(); ++i)
+            if (hp->keys[i] != Qundef)
+                h += mix(hashOf(hp->keys[i]) ^ (hashOf(hp->vals[i]) * 3));
+        return h;
+    }
+    case T::Bignum:
+    {
+        auto *b = static_cast<RBig *>(o);
+        uint64_t h = b->neg ? 0xabc : 0xdef;
+        for (uint32_t limb : b->mag)
+            h = mix(h * 31 + limb);
+        return h;
+    }
+    case T::Rational:
+    {
+        auto *r = static_cast<RRational *>(o);
+        return mix(hashOf(r->num) * 31 + hashOf(r->den));
+    }
+    case T::Range:
+    {
+        auto *r = static_cast<RRange *>(o);
+        return mix(hashOf(r->lo) * 31 + hashOf(r->hi) + (r->excl ? 1 : 0));
+    }
+    default: break;
+    }
+    Method *m = findMethod(o->klass, s.hash);
+    if (m == mHashDefault)
+        return mix(v);
+    V h = call0(v, s.hash);
+    if (isFix(h))
+        return mix(h);
+    return hashOf(h);
+}
+
+V Interp::cmpV(V a, V b)
+{
+    if (isFix(a) && isFix(b))
+        return fix(fixv(a) < fixv(b) ? -1 : fixv(a) > fixv(b) ? 1 : 0);
+    if (isStr(a) && isStr(b))
+        return fix(byteCompare(sref(a), sref(b)));
+    if (isNum(a) && isNum(b))
+        return numCmpV(*this, a, b);
+    return call1(a, s.cmp, b);
+}
+
+int Interp::cmp(V a, V b)
+{
+    if (isFix(a) && isFix(b))
+        return fixv(a) < fixv(b) ? -1 : fixv(a) > fixv(b) ? 1 : 0;
+    if (isStr(a) && isStr(b))
+        return byteCompare(sref(a), sref(b));
+    V r = cmpV(a, b);
+    if (r == Qnil)
+    {
+        std::string other = !isObj(b) || isFloat(b) ? inspect(b) : className(realClassOf(b));
+        raise(cArgumentError, "comparison of " + className(realClassOf(a)) + " with " + other + " failed");
+    }
+    if (isFix(r))
+        return fixv(r) < 0 ? -1 : fixv(r) > 0 ? 1 : 0;
+    if (isFloat(r))
+        return fltv(r) < 0 ? -1 : fltv(r) > 0 ? 1 : 0;
+    return intIsNeg(*this, r) ? -1 : intIsZero(r) ? 0 : 1;
+}
+
+bool Interp::caseEq(V pat, V v)
+{
+    if (isObj(pat))
+    {
+        Obj *o = op(pat);
+        switch (o->type)
+        {
+        case T::Class:
+        case T::Module:
+        {
+            Method *m = findMethod(o->klass, s.eqq);
+            if (m != mModEqq)
+                return truthy(call1(pat, s.eqq, v));
+            return kindOf(v, static_cast<RClass *>(o));
+        }
+        case T::String: return isStr(v) && sref(pat) == sref(v);
+        case T::Proc: return truthy(callProc(pat, 1, &v));
+        default: break;
+        }
+        return truthy(call1(pat, s.eqq, v));
+    }
+    if (pat == v)
+        return !isFloat(pat) || fltv(pat) == fltv(pat);
+    if ((isFix(pat) || isFloat(pat)) && isNum(v))
+        return numEq(*this, pat, v);
+    if ((isFix(pat) || isFloat(pat)) && isObj(v) && op(v)->type == T::Object)
+        return truthy(call1(v, s.eq, pat));
+    return false;
+}
+
+// ── conversions ───────────────────────────────────────────────────────────
+
+std::string Interp::inspect(V v)
+{
+    if (isFix(v))
+        return std::to_string(fixv(v));
+    if (v == Qnil)
+        return "nil";
+    if (v == Qtrue)
+        return "true";
+    if (v == Qfalse)
+        return "false";
+    if (isSymV(v))
+        return symInspect(symName(vsym(v)));
+    if (isFlonum(v))
+        return floatToS(fltv(v));
+    V r = call0(v, s.inspect);
+    if (isStr(r))
+        return sref(r);
+    return toS(r);
+}
+
+std::string Interp::toS(V v)
+{
+    if (isFix(v))
+        return std::to_string(fixv(v));
+    if (v == Qnil)
+        return "";
+    if (v == Qtrue)
+        return "true";
+    if (v == Qfalse)
+        return "false";
+    if (isSymV(v))
+        return symName(vsym(v));
+    if (isFlonum(v))
+        return floatToS(fltv(v));
+    if (isObj(v) && op(v)->type == T::String)
+        return sref(v);
+    V r = call0(v, s.to_s);
+    if (isStr(r))
+        return sref(r);
+    return "#<" + className(realClassOf(v)) + ":" + addrText(isObj(v) ? op(v) : nullptr) + ">";
+}
+
+V Interp::toSV(V v)
+{
+    if (isStr(v))
+        return v;
+    return str(toS(v));
+}
+
+std::string Interp::strOf(V v, const char *what)
+{
+    if (isStr(v))
+        return sref(v);
+    if (isObj(v) && respondTo(v, s.to_str, true))
+    {
+        V r = call0(v, s.to_str);
+        if (isStr(r))
+            return sref(r);
+    }
+    typeError(v, what);
+}
+
+int64_t Interp::intOf(V v)
+{
+    if (isFix(v))
+        return fixv(v);
+    if (isFloat(v))
+    {
+        double d = fltv(v);
+        if (d != d || d > 9.2e18 || d < -9.2e18)
+            raise(cFloatDomainError, floatToS(d));
+        return (int64_t)d;
+    }
+    if (isType(v, T::Bignum))
+        raise(cRangeError, "bignum too big to convert into 'long'");
+    if (v == Qnil)
+        raise(cTypeError, "no implicit conversion from nil to integer");
+    if (isObj(v) && respondTo(v, s.to_int, true))
+        return intOf(call0(v, s.to_int));
+    typeError(v, "Integer");
+}
+
+double Interp::numToF(V v)
+{
+    if (isFix(v))
+        return (double)fixv(v);
+    if (isFloat(v))
+        return fltv(v);
+    if (isType(v, T::Bignum))
+        return intToDouble(*this, v);
+    if (isType(v, T::Rational))
+    {
+        auto *r = static_cast<RRational *>(op(v));
+        return intToDouble(*this, r->num) / intToDouble(*this, r->den);
+    }
+    if (v == Qnil)
+        raise(cTypeError, "can't convert nil into Float");
+    if (isStr(v))
+        raise(cTypeError, "no implicit conversion to float from string");
+    if (isObj(v) && respondTo(v, s.to_f, true))
+        return numToF(call0(v, s.to_f));
+    raise(cTypeError, "can't convert " + className(realClassOf(v)) + " into Float");
+}
+
+V Interp::toAry(V v)
+{
+    if (isAry(v))
+        return v;
+    if (isObj(v) && op(v)->type == T::Object && respondTo(v, s.to_ary, true))
+    {
+        V r = call0(v, s.to_ary);
+        if (isAry(r))
+            return r;
+    }
+    return Qnil;
+}
+
+V Interp::arrayOf(V v)
+{
+    if (isAry(v))
+        return v;
+    if (v == Qnil)
+        return ary();
+    if (isHash(v))
+    {
+        V out = ary();
+        RHash *h = href(v);
+        for (size_t i = 0; i < h->keys.size(); ++i)
+            if (h->keys[i] != Qundef)
+                aref(out).push_back(ary2(h->keys[i], h->vals[i]));
+        return out;
+    }
+    if (isObj(v) && op(v)->type != T::String)
+    {
+        if (respondTo(v, s.to_ary, true))
+        {
+            V r = call0(v, s.to_ary);
+            if (isAry(r))
+                return r;
+        }
+        if (respondTo(v, s.to_a, true))
+        {
+            V r = call0(v, s.to_a);
+            if (isAry(r))
+                return r;
+        }
+    }
+    V out = ary();
+    aref(out).push_back(v);
+    return out;
+}
+
+std::vector<V> Interp::toList(V v)
+{
+    if (isAry(v))
+        return aref(v);
+    if (isHash(v))
+        return aref(arrayOf(v));
+    std::vector<V> out;
+    NativeBlockFn fn = [&out](Interp &I, Args &a) -> V
+    {
+        if (a.argc == 1)
+            out.push_back(a.argv[0]);
+        else
+            out.push_back(I.ary(std::vector<V>(a.argv, a.argv + a.argc)));
+        return Qnil;
+    };
+    Blk b = nativeBlk(&fn);
+    call(v, s.each, 0, nullptr, &b);
+    return out;
+}
+
+void Interp::putsValue(V v)
+{
+    if (isStr(v))
+    {
+        const std::string &t = sref(v);
+        write(t);
+        if (t.empty() || t.back() != '\n')
+            write("\n");
+        return;
+    }
+    V a = isAry(v) ? v : (isObj(v) && op(v)->type == T::Object ? toAry(v) : Qnil);
+    if (a != Qnil)
+    {
+        for (V seen : inspecting)
+            if (seen == a)
+            {
+                write("[...]\n");
+                return;
+            }
+        if (aref(a).empty())
+        {
+            write("\n");
+            return;
+        }
+        inspecting.push_back(a);
+        std::vector<V> items = aref(a);
+        for (V x : items)
+            putsValue(x);
+        inspecting.pop_back();
+        return;
+    }
+    std::string t = toS(v);
+    write(t);
+    if (t.empty() || t.back() != '\n')
+        write("\n");
+}
+
+// ── the hash table ────────────────────────────────────────────────────────
+
+static uint64_t keyHash(Interp &I, RHash *h, V key) { return h->byId ? mix(key) : I.hashOf(key); }
+
+int Interp::hfind(RHash *h, V key, uint64_t hv)
+{
+    const V *keys = h->keys.data();
+    const uint64_t *hashes = h->hashes.data();
+    if (h->index.empty())
+    {
+        size_t n = h->keys.size();
+        for (size_t i = 0; i < n; ++i)
+        {
+            V k = keys[i];
+            if (k == key)
+                return (int)i;
+            if (hashes[i] == hv && k != Qundef && !h->byId && eql(k, key))
+                return (int)i;
+        }
+        return -1;
+    }
+    const int32_t *index = h->index.data();
+    size_t mask = h->index.size() - 1;
+    size_t i = hv & mask;
+    for (;;)
+    {
+        int32_t e = index[i];
+        if (e == kEmpty)
+            return -1;
+        if (e >= 0)
+        {
+            V k = keys[e];
+            if (k == key || (hashes[e] == hv && !h->byId && eql(k, key)))
+                return e;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static void indexInsert(RHash *h, size_t entry)
+{
+    size_t mask = h->index.size() - 1;
+    size_t i = h->hashes[entry] & mask;
+    while (h->index[i] >= 0)
+        i = (i + 1) & mask;
+    h->index[i] = (int32_t)entry;
+}
+
+void Interp::hrehash(RHash *h)
+{
+    if (h->live != (int)h->keys.size())
+    {
+        size_t w = 0;
+        for (size_t i = 0; i < h->keys.size(); ++i)
+            if (h->keys[i] != Qundef)
+            {
+                h->keys[w] = h->keys[i];
+                h->vals[w] = h->vals[i];
+                h->hashes[w] = h->hashes[i];
+                ++w;
+            }
+        h->keys.resize(w);
+        h->vals.resize(w);
+        h->hashes.resize(w);
+    }
+    if (h->keys.size() <= 8)
+    {
+        h->index.clear();
+        return;
+    }
+    size_t cap = 16;
+    while (cap < h->keys.size() * 2 + 2)
+        cap *= 2;
+    h->index.assign(cap, kEmpty);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        indexInsert(h, i);
+}
+
+V Interp::hget(RHash *h, V key, bool *found)
+{
+    if (h->live == 0)
+    {
+        if (found)
+            *found = false;
+        return Qnil;
+    }
+    int i = hfind(h, key, keyHash(*this, h, key));
+    if (i < 0)
+    {
+        if (found)
+            *found = false;
+        return Qnil;
+    }
+    if (found)
+        *found = true;
+    return h->vals[i];
+}
+
+V Interp::hfetch(V hv, V key)
+{
+    RHash *h = href(hv);
+    bool found = false;
+    V v = hget(h, key, &found);
+    if (found)
+        return v;
+    if (h->defProc != Qnil)
+    {
+        V av[2] = {hv, key};
+        return callProc(h->defProc, 2, av);
+    }
+    return h->defVal;
+}
+
+void Interp::hset(RHash *h, V key, V val)
+{
+    uint64_t hv = keyHash(*this, h, key);
+    int i = hfind(h, key, hv);
+    if (i >= 0)
+    {
+        h->vals[i] = val;
+        return;
+    }
+    if (isStr(key) && !op(key)->frozen && !h->byId)
+        key = strFrozen(sref(key));
+    // deleted entries are dropped before the table grows
+    if (h->keys.size() >= 16 && h->live * 2 < (int)h->keys.size())
+        hrehash(h);
+    h->keys.push_back(key);
+    h->vals.push_back(val);
+    h->hashes.push_back(hv);
+    ++h->live;
+    size_t n = h->keys.size();
+    if (!h->index.empty())
+    {
+        if (n * 2 > h->index.size())
+            hrehash(h);
+        else
+            indexInsert(h, n - 1);
+    }
+    else if (n > 8)
+        hrehash(h);
+}
+
+V Interp::hdel(RHash *h, V key, bool *found)
+{
+    uint64_t hv = keyHash(*this, h, key);
+    int i = hfind(h, key, hv);
+    if (i < 0)
+    {
+        if (found)
+            *found = false;
+        return Qnil;
+    }
+    if (found)
+        *found = true;
+    V v = h->vals[i];
+    h->keys[i] = Qundef;
+    h->vals[i] = Qnil;
+    --h->live;
+    if (!h->index.empty())
+    {
+        size_t mask = h->index.size() - 1;
+        size_t j = hv & mask;
+        while (h->index[j] != i)
+            j = (j + 1) & mask;
+        h->index[j] = kDeleted;
+    }
+    // trailing deleted entries can go at once (shift / pop patterns)
+    while (!h->keys.empty() && h->keys.back() == Qundef && h->index.empty())
+    {
+        h->keys.pop_back();
+        h->vals.pop_back();
+        h->hashes.pop_back();
+    }
+    return v;
+}
+
+void Interp::hclear(RHash *h)
+{
+    h->keys.clear();
+    h->vals.clear();
+    h->hashes.clear();
+    h->index.clear();
+    h->live = 0;
+}
+
+// ── the class hierarchy ───────────────────────────────────────────────────
+
+void Interp::bootstrap()
+{
+    cBasicObject = nullptr;
+    cObject = nullptr;
+    cModule = nullptr;
+    cClass = nullptr;
+    auto root = [&](const char *name, RClass *super)
+    {
+        auto *k = new RClass();
+        k->type = T::Class;
+        k->super = super;
+        k->name = name;
+        k->baseName = intern(name);
+        return k;
+    };
+    cBasicObject = root("BasicObject", nullptr);
+    cObject = root("Object", cBasicObject);
+    cModule = root("Module", cObject);
+    cClass = root("Class", cModule);
+    RClass *roots[4] = {cBasicObject, cObject, cModule, cClass};
+    for (RClass *k : roots)
+        k->klass = cClass;
+    for (RClass *k : roots)
+        singletonOf(ov(k));
+    for (RClass *k : roots)
+        setConst(cObject, k->baseName, ov(k));
+    mKernel = defineModule("Kernel");
+    includeModule(cObject, mKernel);
+    mComparable = defineModule("Comparable");
+    mEnumerable = defineModule("Enumerable");
+    cNil = defineClass("NilClass", cObject);
+    cTrue = defineClass("TrueClass", cObject);
+    cFalse = defineClass("FalseClass", cObject);
+    cNumeric = defineClass("Numeric", cObject);
+    includeModule(cNumeric, mComparable);
+    cInteger = defineClass("Integer", cNumeric);
+    cFloat = defineClass("Float", cNumeric);
+    cRational = defineClass("Rational", cNumeric);
+    cComplex = defineClass("Complex", cNumeric);
+    cString = defineClass("String", cObject);
+    cString->instType = T::String;
+    includeModule(cString, mComparable);
+    cSymbol = defineClass("Symbol", cObject);
+    includeModule(cSymbol, mComparable);
+    cArray = defineClass("Array", cObject);
+    cArray->instType = T::Array;
+    includeModule(cArray, mEnumerable);
+    cHash = defineClass("Hash", cObject);
+    cHash->instType = T::Hash;
+    includeModule(cHash, mEnumerable);
+    cRange = defineClass("Range", cObject);
+    cRange->instType = T::Range;
+    includeModule(cRange, mEnumerable);
+    cProc = defineClass("Proc", cObject);
+    cMethod = defineClass("Method", cObject);
+    cUMethod = defineClass("UnboundMethod", cObject);
+    cRegexp = defineClass("Regexp", cObject);
+    cMatch = defineClass("MatchData", cObject);
+    cEnumerator = defineClass("Enumerator", cObject);
+    includeModule(cEnumerator, mEnumerable);
+    cLazy = defineClass("Lazy", cEnumerator, cEnumerator);
+    cYielder = defineClass("Yielder", cObject, cEnumerator);
+    cGenerator = defineClass("Generator", cObject, cEnumerator);
+    cArith = defineClass("ArithmeticSequence", cEnumerator, cEnumerator);
+    cException = defineClass("Exception", cObject);
+    cNoMemoryError = defineClass("NoMemoryError", cException);
+    cScriptError = defineClass("ScriptError", cException);
+    cLoadError = defineClass("LoadError", cScriptError);
+    cNotImplementedError = defineClass("NotImplementedError", cScriptError);
+    cSyntaxError = defineClass("SyntaxError", cScriptError);
+    cSecurityError = defineClass("SecurityError", cException);
+    cSignalException = defineClass("SignalException", cException);
+    cInterrupt = defineClass("Interrupt", cSignalException);
+    cSystemExit = defineClass("SystemExit", cException);
+    cSystemStackError = defineClass("SystemStackError", cException);
+    cStandardError = defineClass("StandardError", cException);
+    cArgumentError = defineClass("ArgumentError", cStandardError);
+    cUncaughtThrowError = defineClass("UncaughtThrowError", cArgumentError);
+    cEncodingError = defineClass("EncodingError", cStandardError);
+    cEncCompatError = defineClass("CompatibilityError", cEncodingError);
+    cFiberError = defineClass("FiberError", cStandardError);
+    defineClass("SystemCallError", cStandardError);
+    cIOError = defineClass("IOError", cStandardError);
+    cEOFError = defineClass("EOFError", cIOError);
+    cIndexError = defineClass("IndexError", cStandardError);
+    cKeyError = defineClass("KeyError", cIndexError);
+    cStopIteration = defineClass("StopIteration", cIndexError);
+    cClosedQueueError = defineClass("ClosedQueueError", cStopIteration);
+    cLocalJumpError = defineClass("LocalJumpError", cStandardError);
+    cNameError = defineClass("NameError", cStandardError);
+    cNoMethodError = defineClass("NoMethodError", cNameError);
+    cRangeError = defineClass("RangeError", cStandardError);
+    cFloatDomainError = defineClass("FloatDomainError", cRangeError);
+    cRegexpError = defineClass("RegexpError", cStandardError);
+    cRuntimeError = defineClass("RuntimeError", cStandardError);
+    cFrozenError = defineClass("FrozenError", cRuntimeError);
+    cThreadError = defineClass("ThreadError", cStandardError);
+    cTypeError = defineClass("TypeError", cStandardError);
+    cZeroDivisionError = defineClass("ZeroDivisionError", cStandardError);
+    cNoMatchingPatternError = defineClass("NoMatchingPatternError", cStandardError);
+    cNoMatchingPatternKeyError = defineClass("NoMatchingPatternKeyError", cNoMatchingPatternError);
+    mMath = defineModule("Math");
+    cMathDomainError = defineClass("DomainError", cArgumentError, mMath);
+    mProcess = defineModule("Process");
+    mGC = defineModule("GC");
+    mObjectSpace = defineModule("ObjectSpace");
+    mMarshal = defineModule("Marshal");
+    mWarning = defineModule("Warning");
+    cIO = defineClass("IO", cObject);
+    cRandom = defineClass("Random", cObject);
+    cEncoding = defineClass("Encoding", cObject);
+    cStruct = nullptr;
+    cData = nullptr;
+    cSet = nullptr;
+    cStringScanner = nullptr;
+    mJSON = nullptr;
+    cJSONParserError = nullptr;
+
+    mainObj = newObject(cObject);
+    vStdout = newObject(cIO);
+    vStderr = newObject(cIO);
+    vStdoutOrig = vStdout;
+    setConst(cObject, intern("STDOUT"), vStdout);
+    setConst(cObject, intern("STDERR"), vStderr);
+    topLex = new LexScope();
+    topLex->klass = cObject;
+    globals[intern("$!")] = Qnil;
+
+    initKernel();
+    initModule();
+    initException();
+    initComparable();
+    initNumeric();
+    initString();
+    initSymbol();
+    initArray();
+    initHash();
+    initRange();
+    initProc();
+    initEnumerable();
+    initEnumerator();
+    initRegexp();
+    initMath();
+    initLib();
+    initThread();
+    markEnumMethods();
+    mHashDefault = findMethod(cObject, s.hash);
+    mEqlDefault = findMethod(cObject, s.eql);
+    mEqDefault = findMethod(cObject, s.eq);
+    mEqqDefault = findMethod(cObject, s.eqq);
+    mInspectDefault = findMethod(cObject, s.inspect);
+    mToSDefault = findMethod(cObject, s.to_s);
+    mModEqq = findMethod(cClass, s.eqq);
+    loadPrelude();
+}
+
+// Iterators give back an Enumerator when they get no block
+void Interp::markEnumMethods()
+{
+    auto mark = [&](RClass *k, const char *names)
+    {
+        std::string word;
+        for (const char *p = names;; ++p)
+        {
+            if (*p == ' ' || !*p)
+            {
+                auto it = k->mt.find(intern(word));
+                if (it != k->mt.end() && it->second->kind == M_NATIVE)
+                    it->second->kind = M_NATIVE_ENUM;
+                word.clear();
+                if (!*p)
+                    break;
+            }
+            else
+                word += *p;
+        }
+    };
+    const char *iter = "chunk collect collect_concat cycle detect drop_while each_entry each_with_index filter filter_map find "
+                       "find_all find_index flat_map group_by map max_by min_by minmax_by partition reject reverse_each select "
+                       "sort_by take_while";
+    for (RClass *k : {cArray, cHash, cRange, mEnumerable, cEnumerator})
+        mark(k, iter);
+    for (RClass *k : {cArray, cHash, cRange})
+        mark(k, "each");
+    mark(cArray, "bsearch bsearch_index collect! delete_if each_index filter! index keep_if map! permutation reject! rindex select! "
+                 "sort_by!");
+    mark(cHash, "delete_if each_key each_pair each_value filter! keep_if reject! select! transform_keys transform_keys! "
+                "transform_values transform_values!");
+    mark(cRange, "bsearch");
+    mark(cEnumerator, "with_index");
+    mark(cString, "each_byte each_char each_line");
+    mark(cInteger, "times");
+}
+
+// ── running programs ──────────────────────────────────────────────────────
+
+V Interp::runSource(const std::string &src, const std::string &path, V self, LexScope *lex)
+{
+    ProgramNode *prog;
+    try
+    {
+        prog = parseProgram(src, path);
+    }
+    catch (SyntaxError &e)
+    {
+        raise(cSyntaxError, path + ":" + std::to_string(e.line) + ": " + e.message);
+    }
+    std::string savedFile = file;
+    file = path;
+    Ctx c;
+    c.self = self;
+    c.lex = lex;
+    c.defTarget = cObject;
+    c.homeId = ++frameCounter;
+    Frame fr;
+    fr.c = &c;
+    fr.prev = frame;
+    fr.kind = 0;
+    fr.scope = prog->scope;
+    fr.env = new Env();
+    fr.env->n = (int)prog->scope->names.size();
+    fr.env->slots = new V[fr.env->n + 1];
+    for (int i = 0; i < fr.env->n; ++i)
+        fr.env->slots[i] = Qnil;
+    Frame *saved = frame;
+    frame = &fr;
+    topFrame = &fr;
+    V r = Qnil;
+    try
+    {
+        if (prog->body)
+            r = eval(prog->body, &fr);
+        unwind = U_NONE;
+    }
+    catch (ReturnEx &e)
+    {
+        if (e.home != c.homeId)
+        {
+            frame = saved;
+            file = savedFile;
+            throw;
+        }
+    }
+    catch (...)
+    {
+        frame = saved;
+        file = savedFile;
+        throw;
+    }
+    frame = saved;
+    file = savedFile;
+    return r;
+}
+
+// Code from a string: it runs in a block-like scope inside `outer`
+V Interp::evalString(const std::string &src, V self, Ctx *base, Scope *outer, Env *outerEnv, RClass *defTarget, LexScope *lex)
+{
+    ProgramNode *prog;
+    try
+    {
+        prog = parseEval(src, "(eval)", outer, nullptr);
+    }
+    catch (SyntaxError &e)
+    {
+        raise(cSyntaxError, "(eval):" + std::to_string(e.line) + ": " + e.message);
+    }
+    auto *c = new Ctx(*base);
+    c->self = self;
+    if (defTarget)
+        c->defTarget = defTarget;
+    if (lex)
+        c->lex = lex;
+    Frame fr;
+    fr.c = c;
+    fr.prev = frame;
+    fr.kind = 4;
+    fr.scope = prog->scope;
+    Env *e = new Env();
+    e->n = (int)prog->scope->names.size();
+    e->slots = new V[e->n + 1];
+    for (int i = 0; i < e->n; ++i)
+        e->slots[i] = Qnil;
+    e->parent = outerEnv;
+    fr.env = e;
+    Frame *saved = frame;
+    frame = &fr;
+    V r = Qnil;
+    try
+    {
+        if (prog->body)
+            r = eval(prog->body, &fr);
+    }
+    catch (...)
+    {
+        frame = saved;
+        throw;
+    }
+    frame = saved;
+    if (unwind == U_RETURN)
+    {
+        unwind = U_NONE;
+        throw ReturnEx{c->homeId, unwindVal};
+    }
+    if (unwind == U_NEXT || unwind == U_BREAK)
+    {
+        unwind = U_NONE;
+        r = unwindVal;
+    }
+    return r;
+}
+
+std::string Interp::uncaughtMessage(V exc)
+{
+    std::string msg;
+    try
+    {
+        msg = excMessage(exc);
+    }
+    catch (...)
+    {
+        msg = "";
+    }
+    std::string cls = className(realClassOf(exc));
+    V bt = ivarGet(exc, s.bt);
+    std::string where = file;
+    std::vector<V> lines;
+    if (isAry(bt))
+        lines = aref(bt);
+    std::string first = lines.empty() ? where : sref(lines[0]);
+    std::string out = first + ": ";
+    if (msg.empty())
+        out += cls + " (" + cls + ")";
+    else
+    {
+        size_t nl = msg.find('\n');
+        if (nl == std::string::npos)
+            out += msg + " (" + cls + ")";
+        else
+            out += msg.substr(0, nl) + " (" + cls + ")" + msg.substr(nl);
+    }
+    out += "\n";
+    for (size_t i = 1; i < lines.size(); ++i)
+        out += "\tfrom " + sref(lines[i]) + "\n";
+    return out;
+}
+
+int Interp::run(const std::string &src, const std::string &path)
+{
+    scriptName = path;
+    int status = 0;
+    auto report = [&](V exc)
+    {
+        if (kindOf(exc, cSystemExit))
+        {
+            V st = ivarGet(exc, intern("__status"));
+            status = isFix(st) ? (int)fixv(st) : 0;
+            return;
+        }
+        flush();
+        status = 1;
+        failed = true;
+        failKind = className(realClassOf(exc));
+        try
+        {
+            failMessage = excMessage(exc);
+        }
+        catch (...)
+        {
+            failMessage = "";
+        }
+        V bt = ivarGet(exc, s.bt);
+        failLine = 0;
+        if (isAry(bt) && !aref(bt).empty())
+        {
+            const std::string &top = sref(aref(bt)[0]);
+            size_t c2 = top.rfind(":in");
+            size_t c1 = c2 == std::string::npos || c2 == 0 ? std::string::npos : top.rfind(':', c2 - 1);
+            if (c1 != std::string::npos)
+                failLine = std::atoi(top.c_str() + c1 + 1);
+        }
+    };
+    try
+    {
+        runSource(src, path, mainObj, topLex);
+    }
+    catch (RubyError &e)
+    {
+        report(e.exc);
+    }
+    catch (ThrowEx &t)
+    {
+        report(makeExc(cUncaughtThrowError, "uncaught throw " + inspect(t.tag)));
+    }
+    catch (BreakEx &)
+    {
+        report(makeExc(cLocalJumpError, "break from proc-closure"));
+    }
+    catch (ReturnEx &)
+    {
+    }
+    catch (StopEx &)
+    {
+    }
+    // at_exit handlers, last registered first
+    while (!atExit.empty())
+    {
+        V p = atExit.back();
+        atExit.pop_back();
+        try
+        {
+            callProc(p, 0, nullptr);
+        }
+        catch (RubyError &e)
+        {
+            report(e.exc);
+        }
+    }
+    flush();
+    return status;
+}
+
+} // namespace ruby

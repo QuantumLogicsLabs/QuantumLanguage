@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <functional>
 
@@ -25,7 +26,24 @@ public:
     // Compile an entire program (BlockStmt) and return the top-level Chunk.
     std::shared_ptr<Chunk> compile(ASTNode &root);
 
+    // Java-style code in a .sa file (javaStyleClasses() in Dialect.h): the
+    // functions of these classes and of these top-level statements (the
+    // Java-style library) are compiled as Java code (Chunk::javaStyle).
+    // The functions and top-level statements on `rubyLines` are the file's
+    // Ruby code (Chunk::rubyStyle; rubyStyleLines() in Dialect.h).
+    void setJavaStyle(std::set<std::string> classes, std::set<const ASTNode *> library, std::set<int> rubyLines)
+    {
+        javaClasses_ = std::move(classes);
+        javaLibrary_ = std::move(library);
+        rubyLines_ = std::move(rubyLines);
+    }
+
 private:
+    std::set<std::string> javaClasses_;
+    std::set<const ASTNode *> javaLibrary_;
+    int javaDepth_ = 0; // > 0 inside one of them
+    std::set<int> rubyLines_;
+
     // ── Scope management ──────────────────────────────────────────────────────
     struct Local
     {

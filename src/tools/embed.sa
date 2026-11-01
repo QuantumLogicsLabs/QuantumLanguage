@@ -7,6 +7,8 @@
 //     (the Java library: the .sa files in src/java's folders, not the
 //     front-end's own files directly in src/java)
 //   src/dialect/javastyle/*.sa -> JavaStyleData.sa  javastyle::librarySources()
+//   src/ruby/lib/*.sa -> RubyLibData.sa  ruby::librarySources()
+//     (the Ruby library: these .sa files hold Ruby source)
 // Run from compiler/:  quantum src/tools/embed.sa   (or qrun)
 // A file is rewritten only when its text changes.
 #include <algorithm>
@@ -120,6 +122,12 @@ int main()
         items.push_back({f, readText("src/dialect/javastyle/" + f)});
     changed += writeIfChanged("src/generated/JavaStyleData.sa",
                               generate("src/dialect/javastyle", "javastyle", "librarySources", items, "QJAVASTYLE"));
+
+    items.clear();
+    for (const std::string &f : listFiles("src/ruby/lib", ".sa"))
+        items.push_back({f, readText("src/ruby/lib/" + f)});
+    changed += writeIfChanged("src/generated/RubyLibData.sa",
+                              generate("src/ruby/lib", "ruby", "librarySources", items, "QRUBYLIB"));
 
     std::cout << "embed: " << changed << " file(s) updated in src/generated\n";
     return 0;

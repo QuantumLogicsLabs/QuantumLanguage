@@ -18,5 +18,12 @@ How Java values are represented: lists, stacks and vectors are Quantum arrays (t
 `Set.of` and `Map.of` are rewritten to `__jList_of`, ... so JavaScript's `Set`/`Map`/`Object` in the
 same file keep working.
 
+Which code gets these meanings: everything in the file except its Ruby code. The Ruby pass lists the
+Ruby lines (`// quantum: ruby-lines ...`), and the compiler marks those functions and top-level
+statements (`Chunk::rubyStyle`). They keep Quantum's meanings of method names and `+`, and get a Java
+method only for a name Quantum's value lacks. Char arithmetic (`c - '0'`) applies only in the file's
+Java classes (`Chunk::javaStyle`, named on the `// quantum: java-style` marker), where a declared
+field also wins over a global of the same name.
+
 A library name must not be a Quantum keyword (`from`, `def`, `is`, `as`, `hash`, ...) — check a change with
 `quantum --check`, then run the embed tool from `compiler/` and rebuild.

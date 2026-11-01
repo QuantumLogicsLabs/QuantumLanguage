@@ -1,0 +1,258 @@
+class Date
+  include Comparable
+
+  class Error < ArgumentError; end
+
+  MONTHNAMES = [nil, "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"].freeze
+  ABBR_MONTHNAMES = [nil, "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].freeze
+  DAYNAMES = %w[Sunday Monday Tuesday Wednesday Thursday Friday Saturday].freeze
+  ABBR_DAYNAMES = %w[Sun Mon Tue Wed Thu Fri Sat].freeze
+  ITALY = 2299161
+  ENGLAND = 2361222
+
+  def self.__civil_to_jd(y, m, d)
+    a = (14 - m) / 12
+    yy = y + 4800 - a
+    mm = m + 12 * a - 3
+    d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045
+  end
+
+  def self.__jd_to_civil(jd)
+    a = jd + 32044
+    b = (4 * a + 3) / 146097
+    c = a - 146097 * b / 4
+    d = (4 * c + 3) / 1461
+    e = c - 1461 * d / 4
+    m = (5 * e + 2) / 153
+    [100 * b + d - 4800 + m / 10, m + 3 - 12 * (m / 10), e - (153 * m + 2) / 5 + 1]
+  end
+
+  def self.leap?(y) = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+  def self.gregorian_leap?(y) = leap?(y)
+
+  def self.__days_in(y, m)
+    return 29 if m == 2 && leap?(y)
+    [nil, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m]
+  end
+
+  def self.valid_date?(y, m, d, *)
+    return false unless y.is_a?(Integer) && m.is_a?(Integer) && d.is_a?(Integer)
+    m += 13 if m < 0
+    return false if m < 1 || m > 12
+    dim = __days_in(y, m)
+    d = dim + d + 1 if d < 0
+    d >= 1 && d <= dim
+  end
+
+  def self.valid_civil?(*a) = valid_date?(*a)
+  def self.civil(*a) = new(*a)
+  def self.jd(n) = allocate.__set_jd(n)
+  def self.ordinal(y, yd = 1) = jd(__civil_to_jd(y, 1, 1) + yd - 1)
+
+  def self.parse(str, *)
+    s = str.to_s
+    if s =~ /(-?\d{4})-(\d{1,2})-(\d{1,2})/
+      new($1.to_i, $2.to_i, $3.to_i)
+    elsif s =~ /\b(\d{4})(\d{2})(\d{2})\b/
+      new($1.to_i, $2.to_i, $3.to_i)
+    elsif s =~ %r{(\d{4})/(\d{1,2})/(\d{1,2})}
+      new($1.to_i, $2.to_i, $3.to_i)
+    elsif s =~ %r{(\d{1,2})/(\d{1,2})/(\d{4})}
+      new($3.to_i, $1.to_i, $2.to_i)
+    elsif s =~ /(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3})[a-z]*\.?,?\s+(-?\d+)/
+      d, name, y = $1, $2, $3
+      m = ABBR_MONTHNAMES.index(name.capitalize)
+      raise Error, "invalid date" unless m
+      new(y.to_i, m, d.to_i)
+    elsif s =~ /([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(-?\d+)/
+      name, d, y = $1, $2, $3
+      m = ABBR_MONTHNAMES.index(name.capitalize)
+      raise Error, "invalid date" unless m
+      new(y.to_i, m, d.to_i)
+    else
+      raise Error, "invalid date"
+    end
+  end
+
+  def self.iso8601(s, *) = parse(s)
+
+  def initialize(y = -4712, m = 1, d = 1, *)
+    raise TypeError, "invalid year (not numeric)" unless y.is_a?(Numeric)
+    raise TypeError, "invalid month (not numeric)" unless m.is_a?(Numeric)
+    raise TypeError, "invalid day (not numeric)" unless d.is_a?(Numeric)
+    raise Error, "invalid date" unless Date.valid_date?(y, m, d)
+    m += 13 if m < 0
+    d = Date.__days_in(y, m) + d + 1 if d < 0
+    @year = y
+    @month = m
+    @day = d
+    @jd = Date.__civil_to_jd(y, m, d)
+  end
+
+  def __set_jd(n)
+    @jd = n
+    @year, @month, @day = Date.__jd_to_civil(n)
+    self
+  end
+
+  attr_reader :year, :month, :day, :jd
+  alias mon month
+  alias mday day
+
+  def wday = (@jd + 1) % 7
+  def yday = @jd - Date.__civil_to_jd(@year, 1, 1) + 1
+  def cwday = wday == 0 ? 7 : wday
+  def leap? = Date.leap?(@year)
+  def ajd = Rational(@jd * 2 - 1, 2)
+  def mjd = @jd - 2400001
+  def cweek = __iso[1]
+  def cwyear = __iso[0]
+
+  def __iso
+    thursday = @jd - cwday + 4
+    y = Date.__jd_to_civil(thursday)[0]
+    [y, (thursday - Date.__civil_to_jd(y, 1, 1)) / 7 + 1]
+  end
+
+  def sunday? = wday == 0
+  def monday? = wday == 1
+  def tuesday? = wday == 2
+  def wednesday? = wday == 3
+  def thursday? = wday == 4
+  def friday? = wday == 5
+  def saturday? = wday == 6
+
+  def +(n)
+    raise TypeError, "expected numeric" unless n.is_a?(Numeric)
+    self.class.jd(@jd + n.floor)
+  end
+
+  def -(o)
+    case o
+    when Date then Rational(@jd - o.jd, 1)
+    when Numeric then self.class.jd(@jd - o.floor)
+    else raise TypeError, "expected numeric"
+    end
+  end
+
+  def >>(n)
+    t = @year * 12 + (@month - 1) + n
+    y = t.div(12)
+    m = t % 12 + 1
+    self.class.new(y, m, [@day, Date.__days_in(y, m)].min)
+  end
+
+  def <<(n) = self >> -n
+  def next_day(n = 1) = self + n
+  def prev_day(n = 1) = self - n
+  def next_month(n = 1) = self >> n
+  def prev_month(n = 1) = self << n
+  def next_year(n = 1) = self >> (n * 12)
+  def prev_year(n = 1) = self << (n * 12)
+  def next = self + 1
+  alias succ next
+
+  def <=>(o)
+    case o
+    when Date then @jd <=> o.jd
+    when Numeric then @jd <=> o
+    end
+  end
+
+  def ==(o) = o.is_a?(Date) && @jd == o.jd
+  def ===(o) = o.is_a?(Date) && @jd == o.jd
+  def eql?(o) = o.is_a?(Date) && @jd == o.jd
+  def hash = @jd.hash
+
+  def step(limit, by = 1)
+    return to_enum(:step, limit, by) unless block_given?
+    d = self
+    if by > 0
+      while d <= limit
+        yield d
+        d += by
+      end
+    else
+      while d >= limit
+        yield d
+        d += by
+      end
+    end
+    self
+  end
+
+  def upto(max, &b)
+    return to_enum(:upto, max) unless b
+    step(max, 1, &b)
+  end
+
+  def downto(min, &b)
+    return to_enum(:downto, min) unless b
+    step(min, -1, &b)
+  end
+
+  def to_date = self
+  def to_s = format("%.4d-%02d-%02d", @year, @month, @day)
+  alias iso8601 to_s
+  alias xmlschema to_s
+  def inspect = "#<Date: #{self} ((#{@jd}j,0s,0n),+0s,2299161j)>"
+
+  def __field(c)
+    case c
+    when "Y" then [@year, "0", 1]
+    when "C" then [@year / 100, "0", 2]
+    when "y" then [@year % 100, "0", 2]
+    when "m" then [@month, "0", 2]
+    when "d" then [@day, "0", 2]
+    when "e" then [@day, " ", 2]
+    when "j" then [yday, "0", 3]
+    when "H", "M", "S" then [0, "0", 2]
+    when "I" then [12, "0", 2]
+    when "l" then [12, " ", 2]
+    when "L" then [0, "0", 3]
+    when "N" then [0, "0", 9]
+    when "u" then [cwday, "0", 1]
+    when "w" then [wday, "0", 1]
+    when "G" then [cwyear, "0", 1]
+    when "V" then [cweek, "0", 2]
+    when "U" then [(yday + 6 - wday) / 7, "0", 2]
+    when "W" then [(yday + 6 - (wday - 1) % 7) / 7, "0", 2]
+    when "s" then [(@jd - 2440588) * 86400, "0", 1]
+    when "B" then [MONTHNAMES[@month], " ", 0]
+    when "b", "h" then [ABBR_MONTHNAMES[@month], " ", 0]
+    when "A" then [DAYNAMES[wday], " ", 0]
+    when "a" then [ABBR_DAYNAMES[wday], " ", 0]
+    when "p" then ["AM", " ", 0]
+    when "P" then ["am", " ", 0]
+    when "Z" then ["+00:00", " ", 0]
+    when "z" then ["+0000", " ", 0]
+    when "F" then [to_s, " ", 0]
+    when "D", "x" then [strftime("%m/%d/%y"), " ", 0]
+    when "T", "X" then ["00:00:00", " ", 0]
+    when "R" then ["00:00", " ", 0]
+    when "r" then ["12:00:00 AM", " ", 0]
+    when "c" then [strftime("%a %b %e %T %Y"), " ", 0]
+    when "n" then ["\n", " ", 0]
+    when "t" then ["\t", " ", 0]
+    when "%" then ["%", " ", 0]
+    end
+  end
+
+  def strftime(fmt = "%F")
+    fmt.gsub(/%([-0^#_]*)(\d*)([A-Za-z%])/) do
+      whole, flags, width, c = $&, $1, $2, $3
+      f = __field(c)
+      next whole unless f
+      v, pad, w = f
+      s = v.to_s
+      s = s.upcase if flags.include?("^")
+      s = s.swapcase if flags.include?("#")
+      pad = "0" if flags.include?("0")
+      pad = " " if flags.include?("_")
+      w = width.to_i unless width.empty?
+      flags.include?("-") ? s : s.rjust(w, pad)
+    end
+  end
+
+  def deconstruct_keys(keys) = { year: @year, month: @month, day: @day, wday: wday, yday: yday }
+end

@@ -1,0 +1,26 @@
+module Timeout
+  class ExitException < Exception; end
+  class Error < RuntimeError; end
+
+  # The block runs on the clock of the program's own (virtual) time: it is
+  # interrupted only where it would wait past the limit.
+  def self.timeout(sec, klass = nil, message = nil)
+    return yield(sec) if sec.nil? || sec == 0
+    caller_thread = Thread.current
+    done = false
+    watcher = Thread.new do
+      Thread.current.report_on_exception = false
+      unless Thread.__wait(sec) { done }
+        caller_thread.raise(klass || Error, message || "execution expired")
+      end
+    end
+    begin
+      yield(sec)
+    ensure
+      done = true
+      watcher.kill
+    end
+  end
+
+  def timeout(*a, &b) = Timeout.timeout(*a, &b)
+end

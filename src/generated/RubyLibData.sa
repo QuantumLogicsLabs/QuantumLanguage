@@ -1,0 +1,4504 @@
+// quantum: cpp
+// Generated from src/ruby/lib by src/tools/embed.sa. Do not edit.
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace ruby
+{
+const std::vector<std::pair<std::string, std::string>> &librarySources()
+{
+    static const std::vector<std::pair<std::string, std::string>> items = {
+        {"benchmark.sa", R"QRUBYLIB(module Benchmark
+  CAPTION = "      user     system      total        real\n"
+  FORMAT = "%10.6u %10.6y %10.6t %10.6r\n"
+
+  class Tms
+    attr_reader :utime, :stime, :cutime, :cstime, :real, :total, :label
+
+    def initialize(utime = 0.0, stime = 0.0, cutime = 0.0, cstime = 0.0, real = 0.0, label = nil)
+      @utime, @stime, @cutime, @cstime, @real, @label = utime, stime, cutime, cstime, real, label.to_s
+      @total = utime + stime + cutime + cstime
+    end
+
+    def format(*)
+      Kernel.format("%10.6f %10.6f %10.6f (%10.6f)\n", utime, stime, total, real)
+    end
+    alias to_s format
+    def to_a = [label, utime, stime, cutime, cstime, real]
+    def +(o) = Tms.new(utime + o.utime, stime + o.stime, cutime + o.cutime, cstime + o.cstime, real + o.real, label)
+    def /(n) = Tms.new(utime / n, stime / n, cutime / n, cstime / n, real / n, label)
+  end
+
+  class Report
+    attr_reader :list
+
+    def initialize(width)
+      @width = width
+      @list = []
+    end
+
+    def item(label = "", &blk)
+      print label.to_s.ljust(@width)
+      t = Benchmark.measure(label, &blk)
+      print t.format
+      @list << t
+      t
+    end
+    alias report item
+  end
+
+  def self.__clock = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  def self.measure(label = "")
+    t0 = __clock
+    yield
+    e = __clock - t0
+    Tms.new(e, 0.0, 0.0, 0.0, e, label)
+  end
+
+  def self.realtime
+    t0 = __clock
+    yield
+    __clock - t0
+  end
+
+  def self.benchmark(caption = "", width = nil, _format = nil, *labels)
+    print " " * (width.to_i + 1) + caption
+    r = Report.new(width.to_i + 1)
+    yield r
+    r.list
+  end
+
+  def self.bm(width = 0, *labels, &blk) = benchmark(CAPTION, width, FORMAT, *labels, &blk)
+
+  def self.bmbm(width = 0)
+    jobs = []
+    collector = Object.new
+    collector.define_singleton_method(:report) { |label = "", &b| jobs << [label.to_s, b] }
+    collector.define_singleton_method(:item) { |label = "", &b| jobs << [label.to_s, b] }
+    yield collector
+    w = [width, jobs.map { |l, _| l.size }.max.to_i].max
+    puts "Rehearsal " + "-" * (w + 35)
+    total = jobs.map { |l, b| print l.ljust(w); t = measure(l, &b); print t.format; t }.sum(0.0) { |t| t.total }
+    puts format("%s total: %fsec", "-" * (w + 21), total)
+    puts
+    print " " * w + CAPTION
+    jobs.map { |l, b| print l.ljust(w); t = measure(l, &b); print t.format; t }
+  end
+end
+)QRUBYLIB"},
+        {"core_ext.sa", R"QRUBYLIB(# The rarely used corners of the core classes. This file loads the first time
+# a method is not found, so ordinary programs do not pay for parsing it.
+class String
+  def self.try_convert(x) = x.respond_to?(:to_str) ? x.to_str : nil
+  def each_codepoint(&b) = b ? (codepoints.each(&b); self) : codepoints.each
+  def grapheme_clusters = chars
+  def each_grapheme_cluster(&b) = b ? (chars.each(&b); self) : chars.each
+
+  def next!
+    replace(succ)
+  end
+  alias succ! next!
+
+  def scrub!(*a)
+    replace(scrub(*a))
+  end
+
+  def tr_s!(a, b)
+    r = tr_s(a, b)
+    return nil if r == self
+    replace(r)
+  end
+
+  def unicode_normalize!(*) = self
+  def unicode_normalized?(*) = true
+
+  def setbyte(i, v)
+    b = bytes
+    b[i] = v & 255
+    replace(b.pack("C*").force_encoding(encoding))
+    v
+  end
+
+  def byteindex(s, off = 0)
+    r = byteslice(off, bytesize)
+    return nil unless r
+    i = r.index(s)
+    i && off + r[0, i].bytesize
+  end
+
+  def byterindex(s, off = bytesize)
+    r = byteslice(0, off + s.bytesize)
+    i = r.rindex(s)
+    i && r[0, i].bytesize
+  end
+
+  def bytesplice(*args)
+    if args.size == 2
+      rng, str = args
+      st = rng.begin
+      len = rng.size
+    else
+      st, len, str = args
+    end
+    replace(byteslice(0, st) + str + (byteslice(st + len, bytesize) || ""))
+    self
+  end
+
+  def append_as_bytes(*items)
+    items.each { |x| x.is_a?(Integer) ? __append_byte(x & 255) : x.each_byte { |b| __append_byte(b) } }
+    self
+  end
+
+  def undump
+    s = self[1...-1]
+    s.gsub(/\\(u\{\h+\}|u\h{4}|x\h{1,2}|.)/) do
+      c = $1
+      case c[0]
+      when "u" then [c.delete("u{}").to_i(16)].pack("U")
+      when "x" then c[1..].to_i(16).chr
+      when "n" then "\n"
+      when "t" then "\t"
+      when "r" then "\r"
+      when "e" then "\e"
+      else c
+      end
+    end
+  end
+
+  def crypt(salt) = salt[0, 2] + to_s.sum.to_s(36)
+end
+
+class Symbol
+  def =~(o) = to_s =~ o
+  def match(*a, &b) = to_s.match(*a, &b)
+  def match?(*a) = to_s.match?(*a)
+  def casecmp(o) = o.is_a?(Symbol) ? to_s.casecmp(o.to_s) : nil
+  def casecmp?(o) = o.is_a?(Symbol) ? to_s.casecmp?(o.to_s) : nil
+  def encoding = to_s.ascii_only? ? Encoding::US_ASCII : Encoding::UTF_8
+  def intern = self
+  def slice(*a) = to_s[*a]
+  def swapcase = to_s.swapcase.to_sym
+end
+
+class Numeric
+  def +@ = self
+  def -@ = 0 - self
+  def <=>(o) = equal?(o) ? 0 : nil
+  def abs = self < 0 ? -self : self
+  alias magnitude abs
+  def abs2 = self * self
+  def arg = negative? ? Math::PI : 0
+  alias angle arg
+  alias phase arg
+  def conj = self
+  alias conjugate conj
+  def real = self
+  def imaginary = 0
+  alias imag imaginary
+  def rect = [self, 0]
+  alias rectangular rect
+  def polar = [abs, arg]
+  def i = Complex(0, self)
+  def to_c = Complex(self, 0)
+  def to_int = to_i
+  def div(o) = (self / o).floor
+  def modulo(o) = self - o * div(o)
+  alias % modulo
+  def divmod(o) = [div(o), modulo(o)]
+  def remainder(o) = self - o * (self / o).truncate
+  def fdiv(o) = to_f / o
+  def quo(o) = Rational(self, 1) / o
+  def ceil(*a) = to_f.ceil(*a)
+  def floor(*a) = to_f.floor(*a)
+  def round(*a) = to_f.round(*a)
+  def truncate(*a) = to_f.truncate(*a)
+  def finite? = true
+  def infinite? = nil
+  def eql?(o) = self.class == o.class && self == o
+  def numerator = to_r.numerator
+  def denominator = to_r.denominator
+  def dup = self
+  def clone(freeze: true) = self
+  def coerce(o) = o.class == self.class ? [o, self] : [Float(o), Float(self)]
+end
+
+class Integer
+  def self.try_convert(x) = x.respond_to?(:to_int) ? x.to_int : nil
+  def ceildiv(o) = -(-self).div(o)
+  def gcdlcm(o) = [gcd(o), lcm(o)]
+  def quo(o) = o.is_a?(Float) ? self / o : Rational(self, 1) / o
+end
+
+class Float
+  def arg = nan? ? self : (negative? ? Math::PI : 0)
+  alias angle arg
+  alias phase arg
+  def numerator = to_r.numerator
+  def denominator = to_r.denominator
+end
+
+class Rational
+  def fdiv(o) = to_f / o
+  def magnitude = abs
+  def positive? = numerator > 0
+  def negative? = numerator < 0
+end
+
+class Complex
+  def abs2 = real * real + imaginary * imaginary
+  def real? = false
+  def finite? = real.finite? && imaginary.finite?
+  def infinite? = real.infinite? || imaginary.infinite? ? 1 : nil
+  def to_c = self
+  def fdiv(o) = Complex(real.fdiv(o), imaginary.fdiv(o))
+  def eql?(o) = o.is_a?(Complex) && real.eql?(o.real) && imaginary.eql?(o.imaginary)
+  def hash = [real, imaginary].hash
+  def coerce(o) = [Complex(o, 0), self]
+  def <=>(o) = imaginary == 0 && (o.is_a?(Complex) ? o.imaginary == 0 : o.is_a?(Numeric)) ? real <=> (o.is_a?(Complex) ? o.real : o) : nil
+
+  def __real!(to)
+    raise RangeError, "can't convert #{self} into #{to}" unless imaginary == 0 && !imaginary.is_a?(Float)
+    real
+  end
+
+  def to_i = __real!("Integer").to_i
+  def to_f = __real!("Float").to_f
+  def to_r = __real!("Rational").to_r
+  def rationalize(*a) = __real!("Rational").rationalize(*a)
+  def denominator = real.denominator.lcm(imaginary.denominator)
+  def numerator = self * denominator
+end
+
+class NilClass
+  def to_r = Rational(0, 1)
+  def rationalize(*) = to_r
+  def to_c = Complex(0, 0)
+  def =~(_) = nil
+end
+
+class Array
+  def self.try_convert(x) = x.respond_to?(:to_ary) ? x.to_ary : nil
+  def deconstruct = self
+  def fetch_values(*idx, &b) = idx.map { |i| fetch(i, &b) }
+end
+
+class Hash
+  def self.try_convert(x) = x.respond_to?(:to_hash) ? x.to_hash : nil
+  def self.ruby2_keywords_hash?(_) = false
+  def self.ruby2_keywords_hash(h) = h.dup
+
+  def compact!
+    n = size
+    delete_if { |_, v| v.nil? }
+    n == size ? nil : self
+  end
+
+  def compare_by_identity? = false
+  def rehash = self
+  def to_proc = method(:[]).to_proc
+  def flatten(depth = 1) = to_a.flatten(depth)
+end
+
+class Proc
+  def eql?(o) = equal?(o)
+  def ==(o) = equal?(o)
+  def hash = __id__
+  def ruby2_keywords = self
+  def source_location = nil
+end
+
+class Method
+  def original_name = name
+  def eql?(o) = self == o
+  def hash = [receiver.__id__, name].hash
+end
+
+class UnboundMethod
+  def original_name = name
+  def eql?(o) = self == o
+  def hash = [owner.__id__, name].hash
+  def super_method = nil
+end
+
+class Regexp
+  def ~ = self =~ $_
+  def encoding = Encoding::UTF_8
+  def fixed_encoding? = false
+  def timeout = nil
+  def named_captures
+    h = {}
+    names.each { |n| h[n] = [] }
+    i = 0
+    source.scan(/\\.|\((\?<([A-Za-z_]\w*)>|(?!\?))/) do
+      if $1
+        i += 1
+        h[$2] << i if $2
+      end
+    end
+    h
+  end
+  def self.linear_time?(*) = true
+  def self.timeout = nil
+  def self.timeout=(v)
+    v
+  end
+  def self.try_convert(x) = x.respond_to?(:to_regexp) ? x.to_regexp : nil
+end
+
+class MatchData
+  def ==(o) = o.is_a?(MatchData) && string == o.string && regexp == o.regexp && to_a == o.to_a
+  alias eql? ==
+  def hash = [string, to_a].hash
+  def match(n) = self[n]
+  def match_length(n) = self[n]&.length
+  def bytebegin(n) = pre_match.bytesize + (n == 0 ? 0 : string[self.begin(0)...self.begin(n)].bytesize)
+  def byteend(n) = bytebegin(n) + self[n].bytesize
+  def byteoffset(n) = [bytebegin(n), byteend(n)]
+end
+
+class Enumerator
+  class Chain < Enumerator
+    def self.new(*enums)
+      obj = allocate
+      obj.__setup(enums)
+      obj
+    end
+
+    def __setup(enums)
+      @enums = enums
+      self
+    end
+
+    def each(&b)
+      return self unless b
+      @enums.each { |e| e.each(&b) }
+      self
+    end
+
+    def size = @enums.sum(&:size)
+    def +(o) = Chain.new(self, o)
+    def inspect = "#<Enumerator::Chain: [#{@enums.map(&:inspect).join(', ')}]>"
+    alias to_s inspect
+    def next = (@__e ||= to_a.each).next
+    def peek = (@__e ||= to_a.each).peek
+    def rewind = (@__e = nil; self)
+    def with_index(off = 0, &b) = to_a.each.with_index(off, &b)
+    def each_with_index(&b) = to_a.each_with_index(&b)
+  end
+
+  def +(o) = Chain.new(self, o)
+  def next_values = [self.next].flatten(1)
+  def peek_values = [peek].flatten(1)
+  def feed(_) = nil
+
+  def self.product(*enums)
+    return [[]].each if enums.empty?
+    first, *rest = enums.map(&:to_a)
+    first.product(*rest).each
+  end
+end
+
+module Enumerable
+  def chain(*o) = Enumerator::Chain.new(self, *o)
+  def compact = to_a.compact
+end
+
+module Kernel
+  def pretty_inspect = PP.__format(self) + "\n"
+
+  def private_methods(all = true)
+    out = []
+    singleton_class.ancestors.each do |k|
+      out.concat(k.private_instance_methods(false))
+      break unless all
+    end
+    out.uniq
+  end
+
+  def protected_methods(*) = self.class.protected_instance_methods
+
+  def singleton_method(name)
+    raise NameError, "undefined singleton method '#{name}' for #{inspect}" unless singleton_methods.include?(name.to_sym)
+    method(name)
+  end
+
+  private
+
+  def __callee__ = nil
+  def autoload(*) = nil
+  def autoload?(*) = nil
+  def set_trace_func(*) = nil
+  def trace_var(*) = nil
+  def untrace_var(*) = []
+  def iterator? = block_given?
+
+  def trap(*) = "DEFAULT"
+
+  def putc(c)
+    print(c.is_a?(Integer) ? (c & 255).chr : c.to_s[0])
+    c
+  end
+
+  def readline(*a) = $stdin.gets(*a) || raise(EOFError, "end of file reached")
+  def readlines(*a) = $stdin.readlines(*a)
+
+  def open(path, *a, **k, &b) = File.open(path, *a, **k, &b)
+
+  def fork = raise(NotImplementedError, "fork() function is unimplemented on this machine")
+  def exec(*) = raise(NotImplementedError, "exec is not supported")
+  def spawn(*) = raise(NotImplementedError, "spawn is not supported")
+  def syscall(*) = raise(NotImplementedError, "syscall() function is unimplemented on this machine")
+
+  def test(cmd, a, *)
+    case cmd
+    when "e", ?e then File.exist?(a)
+    when "f", ?f then File.file?(a)
+    when "d", ?d then File.directory?(a)
+    when "s", ?s then File.size?(a)
+    else raise ArgumentError, "unknown command '#{cmd}'"
+    end
+  end
+
+  def caller_locations(start = 1, length = nil)
+    list = caller(start + 1) || []
+    list = list.first(length) if length
+    list.map { |s| Thread::Backtrace::Location.new(s) }
+  end
+end
+
+class Thread
+  module Backtrace
+    class Location
+      attr_reader :path, :lineno, :label
+
+      def initialize(s)
+        @text = s
+        m = s.match(/\A(.*):(\d+):in '(.*)'\z/)
+        @path, @lineno, @label = m ? [m[1], m[2].to_i, m[3]] : [s, 0, ""]
+      end
+
+      def absolute_path = File.expand_path(@path)
+      def base_label = @label.sub(/\Ablock (\(\d+ levels\) )?in /, "").sub(/.*[#.]/, "")
+      def to_s = @text
+      def inspect = @text.inspect
+    end
+  end
+
+  def self.exit = current.exit
+  def self.kill(t) = t.kill
+  def self.handle_interrupt(*) = yield
+  def self.pending_interrupt? = false
+  def self.ignore_deadlock = false
+  def self.ignore_deadlock=(v)
+    v
+  end
+  def self.each_caller_location(&b) = caller_locations(2).each(&b)
+
+  def fetch(k, *d)
+    return self[k] if key?(k)
+    return yield(k) if block_given?
+    return d[0] unless d.empty?
+    raise KeyError.new("key not found: #{k.inspect}", key: k, receiver: self)
+  end
+
+  def thread_variable?(k) = !thread_variable_get(k).nil?
+  def thread_variables = []
+  def backtrace(*) = alive? ? [] : nil
+  def backtrace_locations(*) = alive? ? [] : nil
+  def group = nil
+  def native_thread_id = __id__
+  def pending_interrupt? = false
+  def abort_on_exception = Thread.abort_on_exception
+  def abort_on_exception=(v)
+    Thread.abort_on_exception = v
+  end
+  def add_trace_func(*) = nil
+  def set_trace_func(*) = nil
+end
+
+class Fiber
+  def inspect = "#{Kernel.instance_method(:to_s).bind_call(self).chomp('>')} (#{alive? ? 'suspended' : 'terminated'})>"
+  alias to_s inspect
+  def blocking? = false
+  def backtrace(*) = []
+  def backtrace_locations(*) = []
+  def storage = (@__storage ||= {})
+  def storage=(h)
+    @__storage = h
+  end
+  def self.[](k) = current.storage[k]
+  def self.[]=(k, v)
+    current.storage[k] = v
+  end
+  def self.blocking? = 1
+  def self.current_scheduler = nil
+  def self.scheduler = nil
+  def self.set_scheduler(_) = nil
+end
+
+class Random
+  def ==(o) = o.is_a?(Random) && seed == o.seed
+  DEFAULT = self
+  def self.new_seed = rand(2**62)
+  def self.seed = srand.tap { |s| srand(s) }
+  def self.bytes(n) = Random.new(new_seed).bytes(n)
+  def self.urandom(n) = bytes(n)
+end
+
+class Module
+  def const_source_location(*) = []
+  def deprecate_constant(*) = self
+  def refinements = []
+  def set_temporary_name(_) = self
+  def undefined_instance_methods = []
+  def autoload(*) = nil
+  def autoload?(*) = nil
+  def self.used_modules = []
+  def self.used_refinements = []
+
+  def remove_class_variable(name)
+    raise NameError, "class variable #{name} not defined for #{self}" unless class_variable_defined?(name)
+    __cvar_remove(name)
+  end
+end
+
+class Class
+  def json_creatable? = respond_to?(:json_create)
+end
+
+class Exception
+  def self.to_tty? = false
+end
+
+class IO
+  def self.read(*a, **k) = File.read(*a, **k)
+  def self.write(*a, **k) = File.write(*a, **k)
+  def self.binread(*a) = File.binread(*a)
+  def self.binwrite(*a) = File.binwrite(*a)
+  def self.readlines(*a, **k) = File.readlines(*a, **k)
+  def self.foreach(*a, **k, &b) = File.foreach(*a, **k, &b)
+  def self.select(r, w = nil, e = nil, *) = [r || [], w || [], e || []]
+  def self.copy_stream(from, to, *) = to.write(from.read)
+  def self.try_convert(x) = x.respond_to?(:to_io) ? x.to_io : nil
+
+  def readline(*a) = gets(*a) || raise(EOFError, "end of file reached")
+
+  def each_line(*a)
+    return to_enum(:each_line, *a) unless block_given?
+    while (l = gets(*a))
+      yield l
+    end
+    self
+  end
+  alias each each_line
+
+  def eof? = (@__peek ||= gets).nil?
+  alias eof eof?
+  def getc = read(1)
+  def getbyte = getc&.ord
+  def readchar = getc || raise(EOFError, "end of file reached")
+  def readbyte = getbyte || raise(EOFError, "end of file reached")
+  def putc(c)
+    write(c.is_a?(Integer) ? (c & 255).chr : c.to_s[0])
+    c
+  end
+  def close = nil
+  def closed? = false
+  def close_read = nil
+  def close_write = nil
+  def fsync = 0
+  def fdatasync = 0
+  def binmode = self
+  def binmode? = false
+  def set_encoding(*) = self
+  def external_encoding = Encoding::UTF_8
+  def internal_encoding = nil
+  def fileno = equal?($stdin) ? 0 : equal?($stderr) ? 2 : 1
+  alias to_i fileno
+  def to_io = self
+  def pid = nil
+  def inspect = equal?($stdin) ? "#<IO:<STDIN>>" : equal?($stderr) ? "#<IO:<STDERR>>" : "#<IO:<STDOUT>>"
+  def lineno = 0
+  def wait_readable(*) = self
+  def wait_writable(*) = self
+  def syswrite(*a) = write(*a)
+  def write_nonblock(*a, **) = write(*a)
+end
+
+class File
+  class Stat
+    attr_reader :size, :mtime
+
+    def initialize(path)
+      @path = path
+      raise Errno::ENOENT, "@ rb_file_s_stat - #{path}" unless File.exist?(path)
+      @size = File.directory?(path) ? 0 : File.size(path)
+      @mtime = File.mtime(path)
+    end
+
+    def file? = File.file?(@path)
+    def directory? = File.directory?(@path)
+    def symlink? = false
+    def atime = @mtime
+    def ctime = @mtime
+    def mode = directory? ? 0o40755 : 0o100644
+    def zero? = @size == 0
+  end
+
+  def self.mtime(p) = Time.at(__file_mtime(__path(p)))
+  def self.atime(p) = mtime(p)
+  def self.ctime(p) = mtime(p)
+  def self.birthtime(p) = mtime(p)
+  def self.stat(p) = Stat.new(__path(p))
+  def self.lstat(p) = stat(p)
+  def self.ftype(p) = directory?(p) ? "directory" : "file"
+  def self.chmod(_, *paths) = paths.size
+  def self.chown(_, _, *paths) = paths.size
+  def self.umask(*) = 0o022
+  def self.readlink(p) = raise(Errno::EINVAL, "@ rb_readlink - #{p}")
+  def self.identical?(a, b) = expand_path(a) == expand_path(b)
+  def self.utime(_, _, *paths) = paths.size
+  def self.truncate(p, n)
+    write(p, read(p).byteslice(0, n))
+    0
+  end
+
+  def self.fnmatch?(pat, path, *)
+    rx = Regexp.escape(pat).gsub("\\*\\*/", "(?:.*/)?").gsub("\\*", "[^/]*").gsub("\\?", "[^/]")
+    Regexp.new("\\A#{rx}\\z").match?(path)
+  end
+  singleton_class.alias_method(:fnmatch, :fnmatch?)
+
+  def mtime = File.mtime(@path)
+  def atime = mtime
+  def ctime = mtime
+  def stat = File.stat(@path)
+  def lstat = stat
+  def chmod(*) = 0
+  def flock(*) = 0
+  def truncate(n)
+    @data = @data.byteslice(0, n)
+    @dirty = true
+    0
+  end
+end
+
+class Dir
+  include Enumerable
+
+  attr_reader :path
+  alias to_path path
+
+  def self.open(p)
+    d = new(p)
+    return d unless block_given?
+    yield d
+  end
+
+  def self.home(*) = ENV["HOME"] || ENV["USERPROFILE"] || "/"
+  def self.tmpdir = ENV["TEMP"] || ENV["TMP"] || "/tmp"
+
+  def self.chdir(p = home)
+    old = pwd
+    __dir_change(File.__path(p))
+    return 0 unless block_given?
+    begin
+      yield p
+    ensure
+      __dir_change(old)
+    end
+  end
+
+  def initialize(p)
+    raise Errno::ENOENT, "@ dir_initialize - #{p}" unless Dir.exist?(p)
+    @path = p
+    @names = Dir.entries(p)
+    @pos = 0
+  end
+
+  def read
+    n = @names[@pos]
+    @pos += 1 if n
+    n
+  end
+
+  def each(&b)
+    return to_enum(:each) unless b
+    @names.each(&b)
+    self
+  end
+
+  def children = @names - [".", ".."]
+  def each_child(&b) = children.each(&b)
+  def rewind
+    @pos = 0
+    self
+  end
+  def pos = @pos
+  alias tell pos
+  def pos=(n)
+    @pos = n
+  end
+  def close = nil
+  def inspect = "#<Dir:#{@path}>"
+end
+
+class Time
+  def ctime = strftime("%a %b %e %T %Y")
+  alias asctime ctime
+  def floor(n = 0) = Time.allocate.__init(to_r.floor(n), @fixed)
+  def ceil(n = 0) = Time.allocate.__init(to_r.ceil(n), @fixed)
+  def deconstruct_keys(_) = { year: year, month: month, day: day, wday: wday, yday: yday, hour: hour, min: min, sec: sec, subsec: subsec, dst: dst?, zone: zone }
+end
+)QRUBYLIB"},
+        {"data.sa", R"QRUBYLIB(# Data, in Ruby: immutable value objects.
+class Data
+  class << self
+    undef_method :new
+  end
+
+  def self.define(*syms, &blk)
+    syms.each do |m|
+      raise TypeError, "#{m.inspect} is not a symbol nor a string" unless m.is_a?(Symbol) || m.is_a?(String)
+    end
+    members = syms.map(&:to_sym)
+    raise ArgumentError, "duplicate member #{members.detect { |m| members.count(m) > 1 }}" if members.uniq.size != members.size
+    k = Class.new(self)
+    hidden = members.map { |m| :"__s_#{m}" }
+    k.define_singleton_method(:members) { members.dup }
+    k.define_singleton_method(:__hidden) { hidden }
+    make = lambda do |klass, args, kw|
+      if args.size > members.size
+        raise ArgumentError, "wrong number of arguments (given #{args.size}, expected #{members.empty? ? 0 : "0..#{members.size}"})"
+      end
+      h = kw
+      unless args.empty?
+        h = {}
+        args.each_with_index { |a, i| h[members[i]] = a }
+        h = h.merge(kw)
+      end
+      obj = klass.allocate
+      obj.__send__(:initialize, **h)
+      obj.freeze
+    end
+    k.define_singleton_method(:new) { |*args, **kw| make.call(self, args, kw) }
+    k.define_singleton_method(:[]) { |*args, **kw| make.call(self, args, kw) }
+    members.each_with_index { |m, i| k.__hidden_attr(m, hidden[i], false) }
+    k.class_eval(&blk) if blk
+    k
+  end
+
+  def initialize(**kw)
+    ms = self.class.members
+    hidden = self.class.__hidden
+    missing = ms - kw.keys
+    unless missing.empty?
+      raise ArgumentError, "missing keyword#{missing.size > 1 ? 's' : ''}: #{missing.map(&:inspect).join(', ')}"
+    end
+    unknown = kw.keys - ms
+    unless unknown.empty?
+      raise ArgumentError, "unknown keyword#{unknown.size > 1 ? 's' : ''}: #{unknown.map(&:inspect).join(', ')}"
+    end
+    ms.each_with_index { |m, i| instance_variable_set(hidden[i], kw[m]) }
+  end
+
+  def members = self.class.members
+
+  def to_h(&blk)
+    h = {}
+    hidden = self.class.__hidden
+    members.each_with_index { |m, i| h[m] = instance_variable_get(hidden[i]) }
+    blk ? h.to_h(&blk) : h
+  end
+
+  def deconstruct_keys(keys)
+    h = to_h
+    return h if keys.nil?
+    out = {}
+    keys.each do |key|
+      break unless h.key?(key)
+      out[key] = h[key]
+    end
+    out
+  end
+
+  def deconstruct = to_h.values
+
+  def with(*args, **kw)
+    raise ArgumentError, "wrong number of arguments (given #{args.size}, expected 0)" unless args.empty?
+    return self if kw.empty?
+    self.class.new(**to_h.merge(kw))
+  end
+
+  def ==(o) = o.class == self.class && to_h == o.to_h
+  def eql?(o) = o.class == self.class && to_h.values.eql?(o.to_h.values)
+  def hash = [self.class.__id__, to_h.values].hash
+
+  def inspect
+    name = self.class.name
+    body = to_h.map { |m, v| "#{m}=#{v.inspect}" }.join(", ")
+    return name ? "#<data #{name}>" : "#<data >" if body.empty?
+    name ? "#<data #{name} #{body}>" : "#<data #{body}>"
+  end
+  alias to_s inspect
+end
+)QRUBYLIB"},
+        {"date.sa", R"QRUBYLIB(class Date
+  include Comparable
+
+  class Error < ArgumentError; end
+
+  MONTHNAMES = [nil, "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"].freeze
+  ABBR_MONTHNAMES = [nil, "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].freeze
+  DAYNAMES = %w[Sunday Monday Tuesday Wednesday Thursday Friday Saturday].freeze
+  ABBR_DAYNAMES = %w[Sun Mon Tue Wed Thu Fri Sat].freeze
+  ITALY = 2299161
+  ENGLAND = 2361222
+
+  def self.__civil_to_jd(y, m, d)
+    a = (14 - m) / 12
+    yy = y + 4800 - a
+    mm = m + 12 * a - 3
+    d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045
+  end
+
+  def self.__jd_to_civil(jd)
+    a = jd + 32044
+    b = (4 * a + 3) / 146097
+    c = a - 146097 * b / 4
+    d = (4 * c + 3) / 1461
+    e = c - 1461 * d / 4
+    m = (5 * e + 2) / 153
+    [100 * b + d - 4800 + m / 10, m + 3 - 12 * (m / 10), e - (153 * m + 2) / 5 + 1]
+  end
+
+  def self.leap?(y) = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+  def self.gregorian_leap?(y) = leap?(y)
+
+  def self.__days_in(y, m)
+    return 29 if m == 2 && leap?(y)
+    [nil, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m]
+  end
+
+  def self.valid_date?(y, m, d, *)
+    return false unless y.is_a?(Integer) && m.is_a?(Integer) && d.is_a?(Integer)
+    m += 13 if m < 0
+    return false if m < 1 || m > 12
+    dim = __days_in(y, m)
+    d = dim + d + 1 if d < 0
+    d >= 1 && d <= dim
+  end
+
+  def self.valid_civil?(*a) = valid_date?(*a)
+  def self.civil(*a) = new(*a)
+  def self.jd(n) = allocate.__set_jd(n)
+  def self.ordinal(y, yd = 1) = jd(__civil_to_jd(y, 1, 1) + yd - 1)
+
+  def self.parse(str, *)
+    s = str.to_s
+    if s =~ /(-?\d{4})-(\d{1,2})-(\d{1,2})/
+      new($1.to_i, $2.to_i, $3.to_i)
+    elsif s =~ /\b(\d{4})(\d{2})(\d{2})\b/
+      new($1.to_i, $2.to_i, $3.to_i)
+    elsif s =~ %r{(\d{4})/(\d{1,2})/(\d{1,2})}
+      new($1.to_i, $2.to_i, $3.to_i)
+    elsif s =~ %r{(\d{1,2})/(\d{1,2})/(\d{4})}
+      new($3.to_i, $1.to_i, $2.to_i)
+    elsif s =~ /(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3})[a-z]*\.?,?\s+(-?\d+)/
+      d, name, y = $1, $2, $3
+      m = ABBR_MONTHNAMES.index(name.capitalize)
+      raise Error, "invalid date" unless m
+      new(y.to_i, m, d.to_i)
+    elsif s =~ /([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(-?\d+)/
+      name, d, y = $1, $2, $3
+      m = ABBR_MONTHNAMES.index(name.capitalize)
+      raise Error, "invalid date" unless m
+      new(y.to_i, m, d.to_i)
+    else
+      raise Error, "invalid date"
+    end
+  end
+
+  def self.iso8601(s, *) = parse(s)
+
+  def initialize(y = -4712, m = 1, d = 1, *)
+    raise TypeError, "invalid year (not numeric)" unless y.is_a?(Numeric)
+    raise TypeError, "invalid month (not numeric)" unless m.is_a?(Numeric)
+    raise TypeError, "invalid day (not numeric)" unless d.is_a?(Numeric)
+    raise Error, "invalid date" unless Date.valid_date?(y, m, d)
+    m += 13 if m < 0
+    d = Date.__days_in(y, m) + d + 1 if d < 0
+    @year = y
+    @month = m
+    @day = d
+    @jd = Date.__civil_to_jd(y, m, d)
+  end
+
+  def __set_jd(n)
+    @jd = n
+    @year, @month, @day = Date.__jd_to_civil(n)
+    self
+  end
+
+  attr_reader :year, :month, :day, :jd
+  alias mon month
+  alias mday day
+
+  def wday = (@jd + 1) % 7
+  def yday = @jd - Date.__civil_to_jd(@year, 1, 1) + 1
+  def cwday = wday == 0 ? 7 : wday
+  def leap? = Date.leap?(@year)
+  def ajd = Rational(@jd * 2 - 1, 2)
+  def mjd = @jd - 2400001
+  def cweek = __iso[1]
+  def cwyear = __iso[0]
+
+  def __iso
+    thursday = @jd - cwday + 4
+    y = Date.__jd_to_civil(thursday)[0]
+    [y, (thursday - Date.__civil_to_jd(y, 1, 1)) / 7 + 1]
+  end
+
+  def sunday? = wday == 0
+  def monday? = wday == 1
+  def tuesday? = wday == 2
+  def wednesday? = wday == 3
+  def thursday? = wday == 4
+  def friday? = wday == 5
+  def saturday? = wday == 6
+
+  def +(n)
+    raise TypeError, "expected numeric" unless n.is_a?(Numeric)
+    self.class.jd(@jd + n.floor)
+  end
+
+  def -(o)
+    case o
+    when Date then Rational(@jd - o.jd, 1)
+    when Numeric then self.class.jd(@jd - o.floor)
+    else raise TypeError, "expected numeric"
+    end
+  end
+
+  def >>(n)
+    t = @year * 12 + (@month - 1) + n
+    y = t.div(12)
+    m = t % 12 + 1
+    self.class.new(y, m, [@day, Date.__days_in(y, m)].min)
+  end
+
+  def <<(n) = self >> -n
+  def next_day(n = 1) = self + n
+  def prev_day(n = 1) = self - n
+  def next_month(n = 1) = self >> n
+  def prev_month(n = 1) = self << n
+  def next_year(n = 1) = self >> (n * 12)
+  def prev_year(n = 1) = self << (n * 12)
+  def next = self + 1
+  alias succ next
+
+  def <=>(o)
+    case o
+    when Date then @jd <=> o.jd
+    when Numeric then @jd <=> o
+    end
+  end
+
+  def ==(o) = o.is_a?(Date) && @jd == o.jd
+  def ===(o) = o.is_a?(Date) && @jd == o.jd
+  def eql?(o) = o.is_a?(Date) && @jd == o.jd
+  def hash = @jd.hash
+
+  def step(limit, by = 1)
+    return to_enum(:step, limit, by) unless block_given?
+    d = self
+    if by > 0
+      while d <= limit
+        yield d
+        d += by
+      end
+    else
+      while d >= limit
+        yield d
+        d += by
+      end
+    end
+    self
+  end
+
+  def upto(max, &b)
+    return to_enum(:upto, max) unless b
+    step(max, 1, &b)
+  end
+
+  def downto(min, &b)
+    return to_enum(:downto, min) unless b
+    step(min, -1, &b)
+  end
+
+  def to_date = self
+  def to_s = format("%.4d-%02d-%02d", @year, @month, @day)
+  alias iso8601 to_s
+  alias xmlschema to_s
+  def inspect = "#<Date: #{self} ((#{@jd}j,0s,0n),+0s,2299161j)>"
+
+  def __field(c)
+    case c
+    when "Y" then [@year, "0", 1]
+    when "C" then [@year / 100, "0", 2]
+    when "y" then [@year % 100, "0", 2]
+    when "m" then [@month, "0", 2]
+    when "d" then [@day, "0", 2]
+    when "e" then [@day, " ", 2]
+    when "j" then [yday, "0", 3]
+    when "H", "M", "S" then [0, "0", 2]
+    when "I" then [12, "0", 2]
+    when "l" then [12, " ", 2]
+    when "L" then [0, "0", 3]
+    when "N" then [0, "0", 9]
+    when "u" then [cwday, "0", 1]
+    when "w" then [wday, "0", 1]
+    when "G" then [cwyear, "0", 1]
+    when "V" then [cweek, "0", 2]
+    when "U" then [(yday + 6 - wday) / 7, "0", 2]
+    when "W" then [(yday + 6 - (wday - 1) % 7) / 7, "0", 2]
+    when "s" then [(@jd - 2440588) * 86400, "0", 1]
+    when "B" then [MONTHNAMES[@month], " ", 0]
+    when "b", "h" then [ABBR_MONTHNAMES[@month], " ", 0]
+    when "A" then [DAYNAMES[wday], " ", 0]
+    when "a" then [ABBR_DAYNAMES[wday], " ", 0]
+    when "p" then ["AM", " ", 0]
+    when "P" then ["am", " ", 0]
+    when "Z" then ["+00:00", " ", 0]
+    when "z" then ["+0000", " ", 0]
+    when "F" then [to_s, " ", 0]
+    when "D", "x" then [strftime("%m/%d/%y"), " ", 0]
+    when "T", "X" then ["00:00:00", " ", 0]
+    when "R" then ["00:00", " ", 0]
+    when "r" then ["12:00:00 AM", " ", 0]
+    when "c" then [strftime("%a %b %e %T %Y"), " ", 0]
+    when "n" then ["\n", " ", 0]
+    when "t" then ["\t", " ", 0]
+    when "%" then ["%", " ", 0]
+    end
+  end
+
+  def strftime(fmt = "%F")
+    fmt.gsub(/%([-0^#_]*)(\d*)([A-Za-z%])/) do
+      whole, flags, width, c = $&, $1, $2, $3
+      f = __field(c)
+      next whole unless f
+      v, pad, w = f
+      s = v.to_s
+      s = s.upcase if flags.include?("^")
+      s = s.swapcase if flags.include?("#")
+      pad = "0" if flags.include?("0")
+      pad = " " if flags.include?("_")
+      w = width.to_i unless width.empty?
+      flags.include?("-") ? s : s.rjust(w, pad)
+    end
+  end
+
+  def deconstruct_keys(keys) = { year: @year, month: @month, day: @day, wday: wday, yday: yday }
+end
+)QRUBYLIB"},
+        {"delegate.sa", R"QRUBYLIB(class Delegator < BasicObject
+  def initialize(obj)
+    __setobj__(obj)
+  end
+
+  def method_missing(m, *args, **kw, &blk)
+    target = __getobj__
+    if target.respond_to?(m)
+      target.__send__(m, *args, **kw, &blk)
+    else
+      ::Kernel.raise ::NoMethodError, "undefined method '#{m}' for an instance of #{self.class}"
+    end
+  end
+
+  def respond_to_missing?(m, all = false) = __getobj__.respond_to?(m, all)
+  def respond_to?(m, all = false) = self.class.method_defined?(m) || __getobj__.respond_to?(m, all)
+  def class = (class << self; self; end).superclass
+  def is_a?(k) = self.class <= k || __getobj__.is_a?(k)
+  alias kind_of? is_a?
+  def nil? = false
+  def ==(o) = o.equal?(self) || __getobj__ == o
+  def !=(o) = !(self == o)
+  def to_s = __getobj__.to_s
+  def inspect = __getobj__.inspect
+  def hash = __getobj__.hash
+  def eql?(o) = o.equal?(self) || __getobj__.eql?(o)
+  def object_id = __id__
+  def freeze = self
+  def frozen? = false
+  def send(*a, &b) = __send__(*a, &b)
+  def public_send(*a, &b) = __send__(*a, &b)
+  def instance_of?(k) = self.class == k
+  def itself = self
+  def then = yield(self)
+  def tap
+    yield self
+    self
+  end
+end
+
+class SimpleDelegator < Delegator
+  def __getobj__ = @delegate_sd_obj
+
+  def __setobj__(obj)
+    @delegate_sd_obj = obj
+  end
+end
+
+def DelegateClass(superclass)
+  klass = Class.new(Delegator)
+  klass.class_eval do
+    def __getobj__ = @delegate_dc_obj
+
+    def __setobj__(obj)
+      @delegate_dc_obj = obj
+    end
+  end
+  klass
+end
+)QRUBYLIB"},
+        {"file.sa", R"QRUBYLIB(# File, Dir and Errno, in Ruby, over native file helpers. A File object holds
+# the contents in memory and writes them back when flushed or closed.
+class SystemCallError < StandardError
+  attr_reader :errno
+end
+
+module Errno
+  { ENOENT: [2, "No such file or directory"], EACCES: [13, "Permission denied"], EEXIST: [17, "File exists"],
+    ENOTDIR: [20, "Not a directory"], EISDIR: [21, "Is a directory"], EINVAL: [22, "Invalid argument"],
+    ENOTEMPTY: [41, "Directory not empty"], EPIPE: [32, "Broken pipe"], ECONNREFUSED: [10061, "Connection refused"],
+    ECONNRESET: [10054, "Connection reset by peer"], EADDRINUSE: [10048, "Address already in use"],
+    ETIMEDOUT: [10060, "Connection timed out"], EDOM: [33, "Numerical argument out of domain"], EAGAIN: [11, "Resource temporarily unavailable"] }.each do |name, (num, text)|
+    k = Class.new(SystemCallError)
+    k.const_set(:Errno, num)
+    k.define_method(:initialize) do |msg = nil|
+      # the runtime's own messages name the failing call: "... @ rb_sysopen - path"
+      super(msg ? "#{text}#{msg.to_s.start_with?('@ ') ? ' ' : ' - '}#{msg}" : text)
+      @errno = num
+    end
+    const_set(name, k)
+  end
+end
+
+class IO
+  SEEK_SET = 0
+  SEEK_CUR = 1
+  SEEK_END = 2
+end
+
+class File < IO
+  SEPARATOR = "/"
+  Separator = "/"
+  ALT_SEPARATOR = "\\"
+  PATH_SEPARATOR = ";"
+
+  module Constants
+    RDONLY = 0
+    WRONLY = 1
+    RDWR = 2
+    APPEND = 8
+    CREAT = 256
+    TRUNC = 512
+    EXCL = 1024
+  end
+  include Constants
+
+  def self.__path(p) = p.respond_to?(:path) ? p.path : p.respond_to?(:to_path) ? p.to_path : p.to_str
+  def self.path(p) = __path(p).dup
+
+  def self.exist?(p) = __file_kind(__path(p)) != 0
+  def self.file?(p) = __file_kind(__path(p)) == 1
+  def self.directory?(p) = __file_kind(__path(p)) == 2
+  def self.readable?(p) = exist?(p)
+  def self.writable?(p) = exist?(p)
+  def self.executable?(p) = exist?(p)
+  def self.symlink?(p) = false
+  def self.zero?(p) = file?(p) && size(p) == 0
+  singleton_class.alias_method(:empty?, :zero?)
+
+  def self.__missing(p, what = "rb_sysopen") = raise(Errno::ENOENT, "@ #{what} - #{p}")
+
+  def self.size(p)
+    q = __path(p)
+    __missing(q, "rb_file_s_size") unless exist?(q)
+    __file_read(q).bytesize
+  end
+
+  def self.size?(p)
+    return nil unless exist?(p)
+    s = size(p)
+    s == 0 ? nil : s
+  end
+
+  # Text mode on Windows: a file's CRLF is LF to the program
+  CRLF_TEXT = RUBY_PLATFORM.include?("mingw")
+
+  def self.__text_in(s) = CRLF_TEXT ? s.gsub("\r\n", "\n") : s
+  def self.__text_out(s) = CRLF_TEXT ? s.gsub("\n", "\r\n") : s
+
+  def self.__raw(p)
+    q = __path(p)
+    k = __file_kind(q)
+    __missing(q) if k == 0
+    raise Errno::EISDIR, "@ io_fread - #{q}" if k == 2
+    __file_read(q)
+  end
+
+  def self.binread(p, len = nil, off = 0)
+    s = __raw(p)
+    s = s.byteslice(off, len || s.bytesize) if len || off != 0
+    s.force_encoding("BINARY")
+  end
+
+  # asking for a length reads bytes, untranslated
+  def self.read(p, len = nil, off = nil, mode: "r", binmode: false, **)
+    return binread(p, len, off || 0) if len || off || binmode || mode.to_s.include?("b")
+    __text_in(__raw(p))
+  end
+
+  def self.binwrite(p, data, *, mode: "wb", **)
+    s = data.to_s
+    __file_write(__path(p), s, mode.to_s.start_with?("a"))
+    s.bytesize
+  end
+
+  def self.write(p, data, *, mode: "w", binmode: false, **)
+    s = data.to_s
+    __file_write(__path(p), binmode || mode.to_s.include?("b") ? s : __text_out(s), mode.to_s.start_with?("a"))
+    s.bytesize
+  end
+
+  def self.readlines(p, *a, chomp: false, **) = read(p).lines(*a, chomp: chomp)
+
+  def self.foreach(p, *a, chomp: false, **, &blk)
+    return readlines(p, *a, chomp: chomp).each unless blk
+    readlines(p, *a, chomp: chomp).each(&blk)
+    nil
+  end
+
+  def self.delete(*paths)
+    paths.each do |p|
+      q = __path(p)
+      __missing(q, "apply2files") unless exist?(q)
+      __file_delete(q)
+    end
+    paths.size
+  end
+  singleton_class.alias_method(:unlink, :delete)
+
+  def self.rename(a, b)
+    __missing("(#{a}, #{b})", "rb_file_s_rename") unless exist?(a)
+    __file_rename(__path(a), __path(b))
+    0
+  end
+
+  def self.basename(p, ext = nil)
+    s = __path(p).tr("\\", "/")
+    return "/" if s =~ %r{\A/+\z}
+    s = s.sub(%r{/+\z}, "")
+    b = s[(s.rindex("/") || -1) + 1..]
+    if ext == ".*"
+      i = b.rindex(".")
+      b = b[0...i] if i && i > 0
+    elsif ext && b.end_with?(ext) && b != ext
+      b = b[0...-ext.size]
+    end
+    b
+  end
+
+  def self.dirname(p, *)
+    s = __path(p).tr("\\", "/").sub(%r{/+\z}, "")
+    i = s.rindex("/")
+    return s.empty? ? "/" : "." unless i
+    i == 0 ? "/" : s[0...i].sub(%r{/+\z}, "")
+  end
+
+  def self.extname(p)
+    b = basename(p)
+    i = b.rindex(".")
+    i && i > 0 && i < b.size - 1 ? b[i..] : ""
+  end
+
+  def self.split(p) = [dirname(p), basename(p)]
+
+  def self.join(*parts)
+    list = parts.flatten.map { |x| __path(x) }
+    out = +""
+    list.each_with_index do |x, i|
+      if i == 0
+        out << x
+      else
+        out = out.sub(%r{/+\z}, "") << "/" << x.sub(%r{\A/+}, "")
+      end
+    end
+    out
+  end
+
+  def self.absolute_path?(p) = __path(p) =~ %r{\A([A-Za-z]:)?[/\\]} ? true : false
+
+  def self.expand_path(p, dir = nil)
+    s = __path(p).tr("\\", "/")
+    s = s.sub(/\A~/, ENV["HOME"] || ENV["USERPROFILE"] || "~")
+    unless absolute_path?(s)
+      s = "#{dir ? expand_path(dir) : Dir.pwd.tr("\\", "/")}/#{s}"
+    end
+    drive = s[%r{\A[A-Za-z]:}] || ""
+    out = []
+    s.delete_prefix(drive).split("/").each do |seg|
+      next if seg.empty? || seg == "."
+      seg == ".." ? out.pop : out << seg
+    end
+    "#{drive}/#{out.join("/")}"
+  end
+  singleton_class.alias_method(:absolute_path, :expand_path)
+  singleton_class.alias_method(:realpath, :expand_path)
+
+  def self.open(path, mode = nil, *rest, **kw)
+    f = new(path, mode, *rest, **kw)
+    return f unless block_given?
+    begin
+      yield f
+    ensure
+      f.close unless f.closed?
+    end
+  end
+
+  attr_reader :path
+  alias to_path path
+
+  def initialize(path, pos_mode = nil, *, mode: nil, binmode: false, **)
+    mode = pos_mode || mode || "r"
+    @path = File.__path(path)
+    @bin = binmode || (!mode.is_a?(Integer) && mode.to_s.sub(/:.*/, "").include?("b"))
+    @mode = mode.is_a?(Integer) ? "r" : mode.to_s.delete("bt").sub(/:.*/, "")
+    @closed = false
+    @dirty = false
+    @pos = 0
+    @lineno = 0
+    kind = __file_kind(@path)
+    raise Errno::EISDIR, "@ io_fread - #{@path}" if kind == 2
+    case @mode
+    when "r", "r+"
+      File.__missing(@path) if kind == 0
+      @data = __load
+      @data = @data.dup.force_encoding("BINARY") if @bin
+      # overwriting in place must leave a file's LF-only lines alone
+      @bin = true if @mode == "r+" && !__file_read(@path).include?("\r\n")
+    when "w", "w+"
+      @data = +""
+      @dirty = true
+      __file_write(@path, "", false)
+    when "a", "a+"
+      @data = kind == 1 ? __load : +""
+      @pos = @data.bytesize
+      # what is already there stays byte for byte
+      @kept = kind == 1 ? __file_read(@path) : ""
+      @kept_size = @pos
+      __file_write(@path, "", true)
+    else
+      raise ArgumentError, "invalid access mode #{mode}"
+    end
+    @data = @data.dup
+  end
+
+  def __load
+    raw = __file_read(@path)
+    @bin ? raw : File.__text_in(raw)
+  end
+
+  def binmode
+    unless @bin
+      @bin = true
+      @data = __file_read(@path).dup if @mode.start_with?("r") && @pos == 0 && !@dirty
+    end
+    self
+  end
+
+  def binmode? = @bin
+
+  def __writable
+    raise IOError, "closed stream" if @closed
+    raise IOError, "not opened for writing" if @mode == "r"
+  end
+
+  def __readable
+    raise IOError, "closed stream" if @closed
+    raise IOError, "not opened for reading" if @mode == "w" || @mode == "a"
+  end
+
+  def write(*items)
+    __writable
+    n = 0
+    items.each do |x|
+      s = x.to_s
+      if @mode.start_with?("a")
+        @pos = @data.bytesize
+      end
+      if @pos >= @data.bytesize
+        @data << s
+      else
+        @data = @data.byteslice(0, @pos) + s + (@data.byteslice(@pos + s.bytesize, @data.bytesize) || "")
+      end
+      @pos += s.bytesize
+      n += s.bytesize
+    end
+    @dirty = true
+    n
+  end
+
+  def <<(x)
+    write(x)
+    self
+  end
+
+  def print(*items)
+    write(*items)
+    nil
+  end
+
+  def puts(*items)
+    if items.empty?
+      write("\n")
+      return nil
+    end
+    items.flatten.each do |x|
+      s = x.to_s
+      write(s.end_with?("\n") ? s : s + "\n")
+    end
+    nil
+  end
+
+  def printf(fmt, *a)
+    write(format(fmt, *a))
+    nil
+  end
+
+  def flush
+    if @dirty
+      if @kept
+        added = @data.byteslice(@kept_size, @data.bytesize) || ""
+        __file_write(@path, @kept + (@bin ? added : File.__text_out(added)), false)
+      else
+        __file_write(@path, @bin ? @data : File.__text_out(@data), false)
+      end
+    end
+    @dirty = false
+    self
+  end
+  alias fsync flush
+  def sync = true
+  def sync=(v)
+    v
+  end
+
+  def close
+    return nil if @closed
+    flush
+    @closed = true
+    nil
+  end
+
+  def closed? = @closed
+  def eof? = (__readable; @pos >= @data.bytesize)
+  alias eof eof?
+  def size
+    flush
+    File.size(@path)
+  end
+  def pos = @pos
+  alias tell pos
+  def pos=(n)
+    @pos = n
+  end
+  attr_accessor :lineno
+
+  def rewind
+    @pos = 0
+    @lineno = 0
+    0
+  end
+
+  def seek(n, whence = 0)
+    @pos = case whence
+           when 0, :SET then n
+           when 1, :CUR then @pos + n
+           else @data.bytesize + n
+           end
+    0
+  end
+
+  def read(n = nil, *)
+    __readable
+    if n.nil?
+      s = @data.byteslice(@pos, @data.bytesize) || ""
+      @pos = @data.bytesize
+      return s
+    end
+    return nil if @pos >= @data.bytesize && n > 0
+    s = @data.byteslice(@pos, n) || ""
+    @pos += s.bytesize
+    s
+  end
+
+  def gets(sep = "\n", chomp: false)
+    __readable
+    return nil if @pos >= @data.bytesize
+    rest = @data.byteslice(@pos, @data.bytesize)
+    i = sep ? rest.index(sep) : nil
+    line = i ? rest[0, i + sep.size] : rest
+    @pos += line.bytesize
+    @lineno += 1
+    $_ = line
+    chomp ? line.chomp : line
+  end
+
+  def readline(*a, **k) = gets(*a, **k) || raise(EOFError, "end of file reached")
+  def getc = read(1)
+  def readchar = getc || raise(EOFError, "end of file reached")
+
+  def each_line(*a, chomp: false)
+    return to_enum(:each_line, *a, chomp: chomp) unless block_given?
+    while (l = gets(*a, chomp: chomp))
+      yield l
+    end
+    self
+  end
+  alias each each_line
+
+  def readlines(*a, chomp: false)
+    out = []
+    while (l = gets(*a, chomp: chomp))
+      out << l
+    end
+    out
+  end
+
+  def tty? = false
+  alias isatty tty?
+  def inspect = "#<File:#{@path}#{@closed ? " (closed)" : ""}>"
+end
+
+FileTest = File
+
+class Dir
+  def self.pwd = __dir_pwd
+  singleton_class.alias_method(:getwd, :pwd)
+  def self.exist?(p) = __file_kind(File.__path(p)) == 2
+  def self.empty?(p) = entries(p).size <= 2
+
+  def self.mkdir(p, *)
+    raise Errno::EEXIST, "@ dir_s_mkdir - #{p}" if File.exist?(p)
+    __dir_make(File.__path(p))
+    0
+  end
+
+  def self.rmdir(p)
+    raise Errno::ENOENT, "@ dir_s_rmdir - #{p}" unless exist?(p)
+    raise Errno::ENOTEMPTY, "@ dir_s_rmdir - #{p}" unless empty?(p)
+    __file_delete(File.__path(p))
+    0
+  end
+  singleton_class.alias_method(:delete, :rmdir)
+  singleton_class.alias_method(:unlink, :rmdir)
+
+  def self.children(p)
+    raise Errno::ENOENT, "@ dir_initialize - #{p}" unless exist?(p)
+    __dir_list(File.__path(p)).sort
+  end
+
+  def self.entries(p) = [".", ".."] + children(p)
+  def self.each_child(p, &b) = children(p).each(&b)
+  def self.foreach(p, &b) = entries(p).each(&b)
+
+  def self.__glob_rx(pat)
+    rx = +""
+    i = 0
+    while i < pat.size
+      c = pat[i]
+      if pat[i, 3] == "**/"
+        rx << "(?:[^/]+/)*"
+        i += 3
+        next
+      end
+      case c
+      when "*" then rx << "[^/]*"
+      when "?" then rx << "[^/]"
+      when "[" then
+        e = pat.index("]", i)
+        rx << pat[i..e]
+        i = e
+      when "{"
+        e = pat.index("}", i)
+        rx << "(?:" << pat[(i + 1)...e].split(",", -1).map { |a| Regexp.escape(a) }.join("|") << ")"
+        i = e
+      else rx << Regexp.escape(c)
+      end
+      i += 1
+    end
+    Regexp.new("\\A#{rx}\\z")
+  end
+
+  def self.__walk(dir, prefix, out)
+    children(dir).each do |n|
+      next if n.start_with?(".")
+      full = prefix + n
+      out << full
+      __walk(File.join(dir, n), full + "/", out) if __file_kind(File.join(dir, n)) == 2
+    end
+  end
+
+  def self.glob(pats, *, base: nil, **)
+    out = []
+    Array(pats).each do |pat|
+      s = pat.tr("\\", "/")
+      root_len = s[/\A[^*?\[{]*\//]&.size || 0
+      root = s[0, root_len]
+      start = root.empty? ? (base || ".") : (base ? File.join(base, root) : root)
+      next unless __file_kind(start) == 2
+      found = []
+      __walk(start, root, found)
+      rx = __glob_rx(s)
+      out.concat(found.select { |f| rx.match?(f) }.sort)
+    end
+    return out unless block_given?
+    out.each { |f| yield f }
+    nil
+  end
+
+  def self.[](*pats) = glob(pats)
+end
+)QRUBYLIB"},
+        {"forwardable.sa", R"QRUBYLIB(module Forwardable
+  def instance_delegate(hash)
+    hash.each do |methods, accessor|
+      Array(methods).each { |m| def_instance_delegator(accessor, m) }
+    end
+  end
+  alias delegate instance_delegate
+
+  def def_instance_delegators(accessor, *methods)
+    methods.each do |m|
+      next if m.to_s == "__send__" || m.to_s == "__id__"
+      def_instance_delegator(accessor, m)
+    end
+  end
+  alias def_delegators def_instance_delegators
+
+  def def_instance_delegator(accessor, method, ali = method)
+    acc = accessor.to_s
+    target = self.is_a?(Module) ? self : singleton_class
+    target.send(:define_method, ali) do |*args, **kw, &blk|
+      recv = if acc.start_with?("@@")
+               self.class.class_variable_get(acc)
+             elsif acc.start_with?("@")
+               instance_variable_get(acc)
+             elsif acc =~ /\A[A-Z]/
+               Object.const_get(acc)
+             else
+               __send__(acc)
+             end
+      recv.__send__(method, *args, **kw, &blk)
+    end
+    ali.to_sym
+  end
+  alias def_delegator def_instance_delegator
+end
+SingleForwardable = Forwardable
+)QRUBYLIB"},
+        {"json.sa", R"QRUBYLIB(module JSON
+  class JSONError < StandardError; end
+  class ParserError < JSONError; end
+  class GeneratorError < JSONError; end
+  class NestingError < ParserError; end
+
+  def self.__str(s)
+    out = +"\""
+    s.each_char do |c|
+      case c
+      when "\"" then out << "\\\""
+      when "\\" then out << "\\\\"
+      when "\n" then out << "\\n"
+      when "\t" then out << "\\t"
+      when "\r" then out << "\\r"
+      when "\f" then out << "\\f"
+      when "\b" then out << "\\b"
+      else
+        if c.ord < 0x20
+          out << format("\\u%04x", c.ord)
+        else
+          out << c
+        end
+      end
+    end
+    out << "\""
+  end
+
+  def self.__gen(v, indent, depth)
+    case v
+    when nil then "null"
+    when true then "true"
+    when false then "false"
+    when String then __str(v)
+    when Symbol then __str(v.to_s)
+    when Integer then v.to_s
+    when Float
+      raise GeneratorError, "#{v} not allowed in JSON" if v.nan? || v.infinite?
+      v.to_s
+    when Hash
+      return "{}" if v.empty?
+      if indent
+        pad = indent * (depth + 1)
+        "{\n" + v.map { |k, x| "#{pad}#{__str(k.to_s)}: #{__gen(x, indent, depth + 1)}" }.join(",\n") + "\n#{indent * depth}}"
+      else
+        "{" + v.map { |k, x| "#{__str(k.to_s)}:#{__gen(x, nil, 0)}" }.join(",") + "}"
+      end
+    when Array
+      return "[]" if v.empty?
+      if indent
+        pad = indent * (depth + 1)
+        "[\n" + v.map { |x| pad + __gen(x, indent, depth + 1) }.join(",\n") + "\n#{indent * depth}]"
+      else
+        "[" + v.map { |x| __gen(x, nil, 0) }.join(",") + "]"
+      end
+    else
+      if v.method(:to_json).owner != Object
+        v.to_json
+      else
+        __str(v.to_s)
+      end
+    end
+  end
+
+  def self.generate(v, opts = nil) = __gen(v, nil, 0)
+  def self.dump(v, *) = __gen(v, nil, 0)
+  def self.pretty_generate(v, opts = nil) = __gen(v, "  ", 0)
+
+  class Parser
+    def initialize(src, sym)
+      @s = src
+      @i = 0
+      @n = src.bytesize
+      @sym = sym
+    end
+
+    def fail_at
+      raise ParserError, "unexpected end of input" if @i >= @n
+      raise ParserError, "unexpected character: '#{@s.byteslice(@i, 20)}' at line 1 column #{@i + 1}"
+    end
+
+    def ws
+      while @i < @n
+        c = @s.getbyte(@i)
+        break unless c == 32 || c == 10 || c == 13 || c == 9
+        @i += 1
+      end
+    end
+
+    def parse
+      v = value
+      ws
+      fail_at if @i < @n
+      v
+    end
+
+    def value
+      ws
+      fail_at if @i >= @n
+      case @s.getbyte(@i)
+      when 123 then object
+      when 91 then array
+      when 34 then string
+      when 116 then lit("true", true)
+      when 102 then lit("false", false)
+      when 110 then lit("null", nil)
+      else number
+      end
+    end
+
+    def lit(word, v)
+      fail_at unless @s.byteslice(@i, word.size) == word
+      @i += word.size
+      v
+    end
+
+    def digits
+      while @i < @n
+        c = @s.getbyte(@i)
+        break unless c >= 48 && c <= 57
+        @i += 1
+      end
+    end
+
+    def number
+      st = @i
+      @i += 1 if @s.getbyte(@i) == 45
+      ds = @i
+      digits
+      if @i == ds
+        @i = st
+        fail_at
+      end
+      fl = false
+      if @s.getbyte(@i) == 46
+        fl = true
+        @i += 1
+        digits
+      end
+      c = @s.getbyte(@i)
+      if c == 101 || c == 69
+        fl = true
+        @i += 1
+        c = @s.getbyte(@i)
+        @i += 1 if c == 43 || c == 45
+        digits
+      end
+      t = @s.byteslice(st, @i - st)
+      fl ? t.to_f : t.to_i
+    end
+
+    def string
+      @i += 1
+      out = +""
+      loop do
+        fail_at if @i >= @n
+        c = @s.getbyte(@i)
+        if c == 34
+          @i += 1
+          return out
+        elsif c == 92
+          @i += 1
+          e = @s.getbyte(@i)
+          @i += 1
+          case e
+          when 110 then out << "\n"
+          when 116 then out << "\t"
+          when 114 then out << "\r"
+          when 98 then out << "\b"
+          when 102 then out << "\f"
+          when 117
+            cp = @s.byteslice(@i, 4).to_i(16)
+            @i += 4
+            if cp >= 0xD800 && cp < 0xDC00 && @s.byteslice(@i, 2) == "\\u"
+              low = @s.byteslice(@i + 2, 4).to_i(16)
+              @i += 6
+              cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+            end
+            out << cp
+          else out << e.chr
+          end
+        else
+          st = @i
+          while @i < @n
+            c = @s.getbyte(@i)
+            break if c == 34 || c == 92
+            @i += 1
+          end
+          out << @s.byteslice(st, @i - st)
+        end
+      end
+    end
+
+    def array
+      @i += 1
+      out = []
+      ws
+      if @s.getbyte(@i) == 93
+        @i += 1
+        return out
+      end
+      loop do
+        out << value
+        ws
+        c = @s.getbyte(@i)
+        fail_at unless c == 93 || c == 44
+        @i += 1
+        return out if c == 93
+      end
+    end
+
+    def object
+      @i += 1
+      out = {}
+      ws
+      if @s.getbyte(@i) == 125
+        @i += 1
+        return out
+      end
+      loop do
+        ws
+        fail_at unless @s.getbyte(@i) == 34
+        k = string
+        ws
+        fail_at unless @s.getbyte(@i) == 58
+        @i += 1
+        out[@sym ? k.to_sym : k] = value
+        ws
+        c = @s.getbyte(@i)
+        fail_at unless c == 125 || c == 44
+        @i += 1
+        return out if c == 125
+      end
+    end
+  end
+
+  def self.parse(src, opts = nil, symbolize_names: false)
+    raise TypeError, "no implicit conversion of nil into String" if src.nil?
+    sym = symbolize_names || (opts && opts[:symbolize_names])
+    Parser.new(src.to_str, sym).parse
+  end
+
+  def self.load(src, *) = src.nil? ? nil : parse(src)
+end
+
+class Object
+  def to_json(*) = JSON.generate(to_s)
+end
+
+class String
+  def to_json(*) = JSON.__str(self)
+end
+
+class Symbol
+  def to_json(*) = JSON.__str(to_s)
+end
+
+class Integer
+  def to_json(*) = to_s
+end
+
+class Float
+  def to_json(*) = JSON.generate(self)
+end
+
+class NilClass
+  def to_json(*) = "null"
+end
+
+class TrueClass
+  def to_json(*) = "true"
+end
+
+class FalseClass
+  def to_json(*) = "false"
+end
+
+class Hash
+  def to_json(*) = JSON.generate(self)
+end
+
+class Array
+  def to_json(*) = JSON.generate(self)
+end
+)QRUBYLIB"},
+        {"lazy.sa", R"QRUBYLIB(# Enumerator::Lazy, in Ruby: each stage is a proc that drives the next block.
+class Enumerator::Lazy
+  def self.new(src = nil, desc = nil, &runner)
+    obj = allocate
+    obj.__setup(src, desc, runner)
+    obj
+  end
+
+  def __setup(src, desc, runner)
+    @src = src
+    @desc = desc
+    @runner = runner
+    self
+  end
+
+  def each(&blk)
+    return self unless blk
+    if @runner
+      @runner.call(blk)
+    else
+      @src.each(&blk)
+    end
+    self
+  end
+
+  def __stage(name, &step)
+    src = self
+    Enumerator::Lazy.new(src, name) do |out|
+      src.each { |*v| step.call(out, v.size <= 1 ? v[0] : v) }
+    end
+  end
+
+  def map(&f) = __stage("map") { |out, x| out.call(f.call(x)) }
+  alias collect map
+  def select(&f) = __stage("select") { |out, x| out.call(x) if f.call(x) }
+  alias filter select
+  alias find_all select
+  def reject(&f) = __stage("reject") { |out, x| out.call(x) unless f.call(x) }
+
+  def filter_map(&f)
+    __stage("filter_map") do |out, x|
+      r = f.call(x)
+      out.call(r) if r
+    end
+  end
+
+  def flat_map(&f)
+    __stage("flat_map") do |out, x|
+      r = f.call(x)
+      if r.is_a?(Array) || r.is_a?(Enumerator::Lazy)
+        r.each { |y| out.call(y) }
+      else
+        out.call(r)
+      end
+    end
+  end
+  alias collect_concat flat_map
+
+  def compact = __stage("compact") { |out, x| out.call(x) unless x.nil? }
+
+  def with_index(offset = 0, &f)
+    src = self
+    Enumerator::Lazy.new(src, "with_index") do |out|
+      i = offset - 1
+      src.each do |x|
+        i += 1
+        if f
+          f.call(x, i)
+          out.call(x)
+        else
+          out.call([x, i])
+        end
+      end
+    end
+  end
+  alias each_with_index with_index
+
+  def take(n)
+    src = self
+    Enumerator::Lazy.new(src, "take(#{n})") do |out|
+      if n > 0
+        i = 0
+        src.each do |x|
+          out.call(x)
+          i += 1
+          break if i >= n
+        end
+      end
+    end
+  end
+
+  def take_while(&f)
+    src = self
+    Enumerator::Lazy.new(src, "take_while") do |out|
+      src.each do |x|
+        break unless f.call(x)
+        out.call(x)
+      end
+    end
+  end
+
+  def drop(n)
+    src = self
+    Enumerator::Lazy.new(src, "drop(#{n})") do |out|
+      i = 0
+      src.each do |x|
+        out.call(x) if i >= n
+        i += 1
+      end
+    end
+  end
+
+  def drop_while(&f)
+    src = self
+    Enumerator::Lazy.new(src, "drop_while") do |out|
+      dropping = true
+      src.each do |x|
+        dropping = false if dropping && !f.call(x)
+        out.call(x) unless dropping
+      end
+    end
+  end
+
+  def uniq(&f)
+    src = self
+    Enumerator::Lazy.new(src, "uniq") do |out|
+      seen = {}
+      src.each do |x|
+        k = f ? f.call(x) : x
+        unless seen.key?(k)
+          seen[k] = true
+          out.call(x)
+        end
+      end
+    end
+  end
+
+  def force(*a) = to_a(*a)
+  def to_a(*) = [].tap { |r| each { |x| r << x } }
+
+  def first(*n)
+    return take(1).to_a.first if n.empty?
+    take(n[0]).to_a
+  end
+
+  def lazy = self
+  def eager = to_a.each
+  def size = nil
+  def rewind = self
+
+  def inspect
+    return "#<Enumerator::Lazy: #{@src.inspect}>" unless @desc
+    "#<Enumerator::Lazy: #{@src.inspect}:#{@desc}>"
+  end
+  alias to_s inspect
+end
+)QRUBYLIB"},
+        {"observer.sa", R"QRUBYLIB(module Observable
+  def add_observer(observer, func = :update)
+    @observer_peers ||= {}
+    unless observer.respond_to?(func)
+      raise NoMethodError, "observer does not respond to `#{func}'"
+    end
+    @observer_peers[observer] = func
+  end
+
+  def delete_observer(o) = (@observer_peers.delete(o) if @observer_peers)
+  def delete_observers = (@observer_peers.clear if @observer_peers)
+  def count_observers = @observer_peers ? @observer_peers.size : 0
+  def changed(state = true) = @observer_state = state
+  def changed? = !!@observer_state
+
+  def notify_observers(*arg)
+    if @observer_state
+      @observer_peers&.each { |k, v| k.__send__(v, *arg) }
+      @observer_state = false
+    end
+  end
+end
+)QRUBYLIB"},
+        {"ostruct.sa", R"QRUBYLIB(class OpenStruct
+  def initialize(hash = nil)
+    @table = {}
+    hash&.each { |k, v| @table[k.to_sym] = v }
+  end
+
+  def [](k) = @table[k.to_sym]
+
+  def []=(k, v)
+    @table[k.to_sym] = v
+  end
+
+  def to_h = @table.dup
+  def each_pair(&b) = @table.each_pair(&b)
+  def respond_to_missing?(n, p = false) = @table.key?(n.to_s.chomp("=").to_sym) || super
+  def dig(k, *r) = r.empty? ? @table[k.to_sym] : @table[k.to_sym]&.dig(*r)
+  def delete_field(k) = @table.delete(k.to_sym)
+
+  def method_missing(n, *a)
+    s = n.to_s
+    return @table[s.chomp("=").to_sym] = a[0] if s.end_with?("=")
+    @table[n]
+  end
+
+  def ==(o) = o.is_a?(OpenStruct) && to_h == o.to_h
+  def inspect = @table.empty? ? "#<OpenStruct>" : "#<OpenStruct #{@table.map { |k, v| "#{k}=#{v.inspect}" }.join(', ')}>"
+  alias to_s inspect
+end
+)QRUBYLIB"},
+        {"pp.sa", R"QRUBYLIB(# Kernel#pp for values too wide for one line (narrower ones just inspect).
+module PP
+  @width = 79
+
+  def self.layout(v, col, tail)
+    flat = v.inspect
+    return flat if col + flat.size + tail <= @width
+    case v
+    when Array
+      return flat if v.empty?
+      "[" + __list(v, col + 1, tail) + "]"
+    when Hash
+      return flat if v.empty?
+      inner = col + 1
+      n = v.size
+      "{" + v.each_with_index.map do |(k, x), i|
+        key = __key(k)
+        t = i == n - 1 ? tail + 1 : 1
+        one = x.inspect
+        if inner + key.size + 1 + one.size + t <= @width
+          "#{key} #{one}"
+        else
+          "#{key}\n#{' ' * (inner + 1)}#{layout(x, inner + 1, t)}"
+        end
+      end.join(",\n" + " " * inner) + "}"
+    when Struct
+      __fields("#<struct #{v.class.name}", v.members.zip(v.to_a), col, tail)
+    else
+      if defined?(Set) && v.is_a?(Set)
+        return flat if v.empty?
+        body = "{" + v.to_a.map(&:inspect).join(", ") + "}"
+        return "#<Set:\n #{' ' * col}#{body}>" if col + 1 + body.size + tail + 1 <= @width
+        "#<Set:\n #{' ' * col}{" + __list(v.to_a, col + 2, tail + 1) + "}>"
+      elsif defined?(Data) && v.is_a?(Data)
+        name = v.class.name
+        __fields("#<data #{name}".rstrip, v.class.members.map { |m| [m, v.public_send(m)] }, col, tail)
+      else
+        ivs = v.instance_variables
+        return flat if ivs.empty? || v.method(:inspect).owner != Kernel
+        head = Kernel.instance_method(:to_s).bind_call(v).chomp(">")
+        __fields(head, ivs.sort.map { |iv| [iv, v.instance_variable_get(iv)] }, col, tail)
+      end
+    end
+  end
+
+  def self.__list(items, inner, tail)
+    last = items.size - 1
+    items.each_with_index.map { |x, i| layout(x, inner, i == last ? tail + 1 : 1) }.join(",\n" + " " * inner)
+  end
+
+  # name=value lines; a value that does not fit goes on its own line
+  def self.__fields(head, fields, col, tail)
+    inner = col + 1
+    n = fields.size
+    body = fields.each_with_index.map do |(name, x), i|
+      t = i == n - 1 ? tail + 1 : 1
+      one = x.inspect
+      if inner + name.to_s.size + 1 + one.size + t <= @width
+        "#{name}=#{one}"
+      else
+        "#{name}=\n#{' ' * (inner + 1)}#{layout(x, inner + 1, t)}"
+      end
+    end
+    "#{head}\n#{' ' * inner}" + body.join(",\n" + " " * inner) + ">"
+  end
+
+  def self.__key(k)
+    return "#{k.inspect} =>" unless k.is_a?(Symbol)
+    s = { k => 0 }.inspect
+    s[1...-3]
+  end
+
+  def self.__format(v) = layout(v, 0, 0)
+
+  def self.pp(obj, out = $stdout, width = 79)
+    saved = @width
+    @width = width
+    out << __format(obj) << "\n"
+    out
+  ensure
+    @width = saved
+  end
+
+  def self.singleline_pp(obj, out = $stdout)
+    out << obj.inspect
+    out
+  end
+end
+
+module Kernel
+  def pretty_inspect = PP.__format(self) + "\n"
+end
+)QRUBYLIB"},
+        {"prime.sa", R"QRUBYLIB(class Prime
+  include Enumerable
+
+  def self.instance = (@instance ||= new)
+  def self.each(limit = nil, &b) = instance.each(limit, &b)
+  def self.prime?(n) = instance.prime?(n)
+  def self.first(n) = instance.first(n)
+  def self.take(n) = instance.first(n)
+  def self.lazy = instance.lazy
+  def self.take_while(&b) = instance.take_while(&b)
+  def self.find(&b) = instance.find(&b)
+  def self.include?(n) = instance.prime?(n)
+  def self.prime_division(n) = instance.prime_division(n)
+  def self.int_from_prime_division(pd) = pd.inject(1) { |v, (p, e)| v * p**e }
+
+  def each(limit = nil)
+    return to_enum(:each, limit) unless block_given?
+    n = 2
+    loop do
+      break if limit && n > limit
+      yield n if prime?(n)
+      n += n == 2 ? 1 : 2
+    end
+    self
+  end
+
+  def prime?(n)
+    raise ArgumentError, "Expected an integer, got #{n}" unless n.is_a?(Integer)
+    return false if n < 2
+    return n == 2 || n == 3 if n < 4
+    return false if n.even? || n % 3 == 0
+    i = 5
+    while i * i <= n
+      return false if n % i == 0 || n % (i + 2) == 0
+      i += 6
+    end
+    true
+  end
+
+  def prime_division(n)
+    raise ZeroDivisionError if n == 0
+    out = []
+    if n < 0
+      out << [-1, 1]
+      n = -n
+    end
+    d = 2
+    while d * d <= n
+      if n % d == 0
+        e = 0
+        while n % d == 0
+          n /= d
+          e += 1
+        end
+        out << [d, e]
+      end
+      d += d == 2 ? 1 : 2
+    end
+    out << [n, 1] if n > 1
+    out
+  end
+end
+
+class Integer
+  def prime? = Prime.prime?(self)
+  def prime_division = Prime.prime_division(self)
+  def self.each_prime(limit, &b) = Prime.each(limit, &b)
+  def self.from_prime_division(pd) = Prime.int_from_prime_division(pd)
+end
+)QRUBYLIB"},
+        {"set.sa", R"QRUBYLIB(# Set, in Ruby, over a Hash.
+class Set
+  include Enumerable
+
+  def self.[](*items) = new(items)
+
+  def initialize(enum = nil, &blk)
+    @hash = {}
+    return if enum.nil?
+    if blk
+      enum.each { |x| @hash[blk.call(x)] = true }
+    else
+      enum.each { |x| @hash[x] = true }
+    end
+  end
+
+  def initialize_copy(o)
+    @hash = o.__hash.dup
+    self
+  end
+
+  def __hash = @hash
+
+  def compare_by_identity
+    @hash.compare_by_identity
+    self
+  end
+
+  def freeze
+    @hash.freeze
+    super
+  end
+
+  def __check
+    raise FrozenError.new("can't modify frozen Set: #{inspect}", receiver: self) if frozen?
+  end
+
+  def size = @hash.size
+  alias length size
+  def count(*a, &b) = a.empty? && !b ? @hash.size : to_a.count(*a, &b)
+  def empty? = @hash.empty?
+
+  def include?(x) = @hash.key?(x)
+  alias member? include?
+  alias === include?
+  alias contain? include?
+
+  def add(x)
+    __check
+    @hash[x] = true
+    self
+  end
+  alias << add
+
+  def add?(x)
+    return nil if @hash.key?(x)
+    add(x)
+  end
+
+  def delete(x)
+    __check
+    @hash.delete(x)
+    self
+  end
+
+  def delete?(x)
+    return nil unless @hash.key?(x)
+    delete(x)
+  end
+
+  def clear
+    __check
+    @hash.clear
+    self
+  end
+
+  def each(&blk)
+    return to_enum(:each) unless blk
+    @hash.each_key(&blk)
+    self
+  end
+
+  def to_a = @hash.keys
+  def to_set = self
+  def dup = self.class.new(to_a)
+  def first(*n) = n.empty? ? to_a.first : to_a.first(*n)
+  def min(*a, &b) = to_a.min(*a, &b)
+  def max(*a, &b) = to_a.max(*a, &b)
+
+  def merge(*enums)
+    __check
+    enums.each { |e| e.each { |x| @hash[x] = true } }
+    self
+  end
+
+  def subtract(enum)
+    __check
+    enum.each { |x| @hash.delete(x) }
+    self
+  end
+
+  def |(o) = dup.merge(o)
+  alias union |
+  alias + |
+
+  def -(o) = dup.subtract(o)
+  alias difference -
+
+  def &(o)
+    out = self.class.new
+    o.each { |x| out.add(x) if include?(x) }
+    out
+  end
+  alias intersection &
+
+  def ^(o)
+    out = self.class.new(o)
+    each { |x| out.include?(x) ? out.delete(x) : out.add(x) }
+    out
+  end
+
+  def subset?(o) = size <= o.size && all? { |x| o.include?(x) }
+  alias <= subset?
+  def superset?(o) = o.size <= size && o.all? { |x| include?(x) }
+  alias >= superset?
+  def proper_subset?(o) = size < o.size && all? { |x| o.include?(x) }
+  alias < proper_subset?
+  def proper_superset?(o) = o.size < size && o.all? { |x| include?(x) }
+  alias > proper_superset?
+
+  def <=>(o)
+    return nil unless o.is_a?(Set)
+    return 0 if self == o
+    return -1 if proper_subset?(o)
+    return 1 if proper_superset?(o)
+    nil
+  end
+
+  def disjoint?(o) = none? { |x| o.include?(x) }
+  def intersect?(o) = !disjoint?(o)
+
+  def ==(o)
+    return true if equal?(o)
+    o.is_a?(Set) && size == o.size && o.all? { |x| include?(x) }
+  end
+
+  def eql?(o) = o.is_a?(Set) && self == o
+  def hash = to_a.map(&:hash).sort.hash
+
+  def delete_if
+    __check
+    to_a.each { |x| @hash.delete(x) if yield(x) }
+    self
+  end
+
+  def reject!(&b)
+    n = size
+    delete_if(&b)
+    n == size ? nil : self
+  end
+
+  def keep_if
+    __check
+    to_a.each { |x| @hash.delete(x) unless yield(x) }
+    self
+  end
+
+  def select!(&b)
+    n = size
+    keep_if(&b)
+    n == size ? nil : self
+  end
+  alias filter! select!
+
+  def map!
+    __check
+    items = to_a.map { |x| yield(x) }
+    @hash.clear
+    items.each { |x| @hash[x] = true }
+    self
+  end
+  alias collect! map!
+
+  def flatten
+    out = self.class.new
+    each { |x| x.is_a?(Set) ? out.merge(x.flatten) : out.add(x) }
+    out
+  end
+
+  def join(sep = nil) = to_a.join(sep)
+
+  def replace(e)
+    clear
+    merge(e)
+  end
+
+  def reset = self
+  def compare_by_identity? = false
+
+  def flatten!
+    return nil if none? { |x| x.is_a?(Set) }
+    replace(flatten)
+  end
+
+  def divide(&b) = self.class.new(to_a.group_by(&b).values.map { |v| self.class.new(v) })
+
+  def classify
+    h = {}
+    each { |x| (h[yield(x)] ||= self.class.new).add(x) }
+    h
+  end
+
+  def inspect = "#<Set: {#{to_a.map(&:inspect).join(', ')}}>"
+  alias to_s inspect
+end
+)QRUBYLIB"},
+        {"singleton.sa", R"QRUBYLIB(module Singleton
+  module SingletonClassMethods
+    def instance = (@singleton__instance__ ||= new)
+
+    def inherited(sub)
+      super
+      sub.instance_variable_set(:@singleton__instance__, nil)
+    end
+  end
+
+  def self.included(base)
+    super
+    base.private_class_method :new, :allocate
+    base.extend(SingletonClassMethods)
+  end
+
+  def clone = raise(TypeError, "can't clone instance of singleton #{self.class}")
+  def dup = raise(TypeError, "can't dup instance of singleton #{self.class}")
+end
+)QRUBYLIB"},
+        {"socket.sa", R"QRUBYLIB(# Loopback sockets inside the process: a connection is a pair of queues, so
+# client and server threads talk without the operating system's network.
+class SocketError < StandardError; end
+class IOError; end
+
+class BasicSocket
+  def initialize
+    @in = Queue.new
+    @buf = +""
+    @closed = false
+  end
+
+  def __link(peer)
+    @peer = peer
+    self
+  end
+
+  def __feed(s) = @in.push(s)
+
+  def __fill
+    return false if @eof
+    s = @in.pop
+    if s.nil?
+      @eof = true
+      return false
+    end
+    @buf << s
+    true
+  end
+
+  def write(*items)
+    raise IOError, "closed stream" if @closed
+    n = 0
+    items.each do |x|
+      s = x.to_s
+      @peer&.__feed(s)
+      n += s.bytesize
+    end
+    n
+  end
+  alias syswrite write
+  def send(data, *) = write(data)
+
+  def <<(x)
+    write(x)
+    self
+  end
+
+  def print(*items)
+    write(*items)
+    nil
+  end
+
+  def puts(*items)
+    if items.empty?
+      write("\n")
+      return nil
+    end
+    items.flatten.each do |x|
+      s = x.to_s
+      write(s.end_with?("\n") ? s : s + "\n")
+    end
+    nil
+  end
+
+  def gets(sep = "\n", chomp: false)
+    raise IOError, "closed stream" if @closed
+    until (i = sep && @buf.index(sep))
+      break unless __fill
+    end
+    return nil if @buf.empty?
+    line = i ? @buf.slice!(0, i + sep.size) : @buf.slice!(0, @buf.size)
+    chomp ? line.chomp : line
+  end
+
+  def read(n = nil)
+    if n
+      nil while @buf.bytesize < n && __fill
+      return nil if @buf.empty? && n > 0
+      s = @buf.byteslice(0, n)
+      @buf = @buf.byteslice(s.bytesize, @buf.bytesize) || +""
+      return s
+    end
+    nil while __fill
+    s = @buf
+    @buf = +""
+    s
+  end
+
+  def recv(n, *)
+    __fill if @buf.empty?
+    read([n, @buf.bytesize].min)
+  end
+  alias readpartial recv
+  alias sysread recv
+
+  def readline(*a, **k) = gets(*a, **k) || raise(EOFError, "end of file reached")
+
+  def each_line
+    return to_enum(:each_line) unless block_given?
+    while (l = gets)
+      yield l
+    end
+    self
+  end
+  alias each each_line
+
+  def eof?
+    __fill if @buf.empty?
+    @buf.empty?
+  end
+
+  def close
+    return nil if @closed
+    @closed = true
+    @peer&.__feed(nil)
+    nil
+  end
+
+  def close_write
+    @peer&.__feed(nil)
+    nil
+  end
+
+  def close_read = nil
+  def closed? = @closed
+  def flush = self
+  def sync = true
+  def sync=(v)
+    v
+  end
+  def setsockopt(*) = 0
+  def addr(*) = ["AF_INET", @port || 0, "127.0.0.1", "127.0.0.1"]
+  def peeraddr(*) = ["AF_INET", @peer_port || 0, "127.0.0.1", "127.0.0.1"]
+  def __ports(mine, theirs)
+    @port = mine
+    @peer_port = theirs
+    self
+  end
+end
+
+class IPSocket < BasicSocket; end
+
+class TCPSocket < IPSocket
+  def self.open(*a)
+    s = new(*a)
+    return s unless block_given?
+    begin
+      yield s
+    ensure
+      s.close
+    end
+  end
+
+  def initialize(host = nil, port = nil, *)
+    super()
+    return if host.nil? && port.nil?
+    server = TCPServer.__listeners[port.to_i]
+    raise Errno::ECONNREFUSED, "connect(2) for \"#{host}\" port #{port}" unless server
+    server.__connect(self)
+  end
+end
+
+class TCPServer < IPSocket
+  @listeners = {}
+  @next_port = 49152
+
+  def self.__listeners = @listeners
+  def self.__auto_port = (@next_port += 1)
+
+  def self.open(*a)
+    s = new(*a)
+    return s unless block_given?
+    begin
+      yield s
+    ensure
+      s.close
+    end
+  end
+
+  def initialize(host = nil, port = nil)
+    super()
+    port, host = host, nil if port.nil?
+    @port = port.to_i
+    @port = TCPServer.__auto_port if @port == 0
+    raise Errno::EADDRINUSE, "bind(2) for \"#{host}\" port #{@port}" if TCPServer.__listeners[@port]
+    TCPServer.__listeners[@port] = self
+    @backlog = Queue.new
+  end
+
+  def __connect(client)
+    conn = TCPSocket.new
+    @last_port = (@last_port || 50000) + 1
+    client.__link(conn).__ports(@last_port, @port)
+    conn.__link(client).__ports(@port, @last_port)
+    @backlog.push(conn)
+  end
+
+  def accept
+    raise IOError, "closed stream" if @closed
+    c = @backlog.pop
+    raise IOError, "closed stream" if c.nil?
+    c
+  end
+
+  def accept_nonblock(*)
+    @backlog.pop(true)
+  end
+
+  def listen(*) = 0
+
+  def close
+    return nil if @closed
+    @closed = true
+    TCPServer.__listeners.delete(@port)
+    @backlog.close
+    nil
+  end
+end
+
+Socket = BasicSocket
+)QRUBYLIB"},
+        {"stringio.sa", R"QRUBYLIB(class StringIO
+  include Enumerable
+
+  attr_accessor :string, :lineno
+
+  def self.open(*a)
+    io = new(*a)
+    return io unless block_given?
+    yield io
+  end
+
+  def initialize(str = +"", mode = nil)
+    @string = str
+    @pos = mode.to_s.start_with?("a") ? str.bytesize : 0
+    @lineno = 0
+    @closed = false
+    @append = mode.to_s.start_with?("a")
+    @string.clear if mode.to_s.start_with?("w") && !str.frozen?
+  end
+
+  def write(*items)
+    raise IOError, "not opened for writing" if @closed || @string.frozen?
+    n = 0
+    items.each do |x|
+      s = x.to_s
+      @pos = @string.bytesize if @append
+      if @pos >= @string.bytesize
+        @string << s
+      else
+        @string.replace(@string.byteslice(0, @pos) + s + (@string.byteslice(@pos + s.bytesize, @string.bytesize) || ""))
+      end
+      @pos += s.bytesize
+      n += s.bytesize
+    end
+    n
+  end
+
+  def <<(x)
+    write(x)
+    self
+  end
+
+  def print(*items)
+    write(*items)
+    nil
+  end
+
+  def puts(*items)
+    if items.empty?
+      write("\n")
+      return nil
+    end
+    items.flatten.each do |x|
+      s = x.nil? ? "" : x.to_s
+      write(s.end_with?("\n") ? s : s + "\n")
+    end
+    nil
+  end
+
+  def printf(fmt, *a)
+    write(format(fmt, *a))
+    nil
+  end
+
+  def putc(c)
+    write(c.is_a?(Integer) ? c.chr : c.to_s[0])
+    c
+  end
+
+  def read(n = nil, *)
+    if n.nil?
+      s = @string.byteslice(@pos, @string.bytesize) || ""
+      @pos = @string.bytesize
+      return s
+    end
+    return nil if @pos >= @string.bytesize && n > 0
+    s = @string.byteslice(@pos, n) || ""
+    @pos += s.bytesize
+    s
+  end
+
+  def gets(sep = "\n", chomp: false)
+    return nil if @pos >= @string.bytesize
+    rest = @string.byteslice(@pos, @string.bytesize)
+    i = sep ? rest.index(sep) : nil
+    line = i ? rest[0, i + sep.size] : rest
+    @pos += line.bytesize
+    @lineno += 1
+    chomp ? line.chomp : line
+  end
+
+  def readline(*a, **k) = gets(*a, **k) || raise(EOFError, "end of file reached")
+
+  def getc
+    return nil if @pos >= @string.bytesize
+    c = @string.byteslice(@pos, @string.bytesize)[0]
+    @pos += c.bytesize
+    c
+  end
+
+  def ungetc(c)
+    @pos -= c.to_s.bytesize if @pos > 0
+    nil
+  end
+
+  def each_line(*a, chomp: false)
+    return to_enum(:each_line, *a, chomp: chomp) unless block_given?
+    while (l = gets(*a, chomp: chomp))
+      yield l
+    end
+    self
+  end
+  alias each each_line
+
+  def each_char
+    return to_enum(:each_char) unless block_given?
+    while (c = getc)
+      yield c
+    end
+    self
+  end
+
+  def readlines(*a, chomp: false) = each_line(*a, chomp: chomp).to_a
+
+  def rewind
+    @pos = 0
+    @lineno = 0
+    0
+  end
+
+  def seek(n, whence = 0)
+    @pos = whence == 0 ? n : whence == 1 ? @pos + n : @string.bytesize + n
+    0
+  end
+
+  def pos = @pos
+  alias tell pos
+  def pos=(n)
+    @pos = n
+  end
+  def eof? = @pos >= @string.bytesize
+  alias eof eof?
+  def size = @string.bytesize
+  alias length size
+  def truncate(n)
+    @string.replace(@string.byteslice(0, n))
+    n
+  end
+  def close
+    @closed = true
+    nil
+  end
+  def close_read = nil
+  def close_write = nil
+  def closed? = @closed
+  def flush = self
+  def sync = true
+  def sync=(v)
+    v
+  end
+  def fsync = 0
+  def tty? = false
+  alias isatty tty?
+  def fileno = nil
+  def binmode = self
+  def set_encoding(*) = self
+  def external_encoding = @string.encoding
+  def reopen(s = +"", *)
+    @string = s
+    @pos = 0
+    self
+  end
+end
+)QRUBYLIB"},
+        {"strscan.sa", R"QRUBYLIB(class StringScanner
+  class Error < StandardError; end
+
+  attr_reader :string
+
+  def initialize(str)
+    @string = str
+    @pos = 0
+    @match = nil
+    @last = 0
+  end
+
+  def string=(s)
+    @string = s
+    @pos = 0
+    @match = nil
+  end
+
+  def pos = @pos
+  alias pointer pos
+
+  def pos=(n)
+    @pos = n
+  end
+  alias pointer= pos=
+
+  def charpos = @string.byteslice(0, @pos).size
+  def eos? = @pos >= @string.bytesize
+  def rest = @string.byteslice(@pos, @string.bytesize - @pos) || ""
+  def rest_size = @string.bytesize - @pos
+  def rest? = !eos?
+  def beginning_of_line? = @pos == 0 || @string.getbyte(@pos - 1) == 10
+  alias bol? beginning_of_line?
+
+  def reset
+    @pos = 0
+    @match = nil
+    self
+  end
+
+  def terminate
+    @pos = @string.bytesize
+    @match = nil
+    self
+  end
+
+  def unscan
+    @pos = @last
+    @match = nil
+    self
+  end
+
+  def __pat(p) = p.is_a?(String) ? Regexp.new(Regexp.escape(p)) : p
+
+  def __finish(m, advance, ret_str)
+    @match = m
+    return nil unless m
+    @last = @pos
+    e = m.__byte_end
+    r = ret_str ? @string.byteslice(@pos, e - @pos) : e - @pos
+    @pos = e if advance
+    r
+  end
+
+  def __at(pat, advance, ret_str) = __finish(__pat(pat).__match_at(@string, @pos), advance, ret_str)
+  def __until(pat, advance, ret_str) = __finish(__pat(pat).__search_at(@string, @pos), advance, ret_str)
+
+  def scan(p) = __at(p, true, true)
+  def match?(p) = __at(p, false, false)
+  def skip(p) = __at(p, true, false)
+  def check(p) = __at(p, false, true)
+  def scan_until(p) = __until(p, true, true)
+  def skip_until(p) = __until(p, true, false)
+  def check_until(p) = __until(p, false, true)
+  def exist?(p) = __until(p, false, false)
+
+  def getch
+    return nil if eos?
+    scan(/./m)
+  end
+
+  def get_byte
+    return nil if eos?
+    @last = @pos
+    @pos += 1
+    @string.byteslice(@pos - 1, 1)
+  end
+
+  def peek(n) = @string.byteslice(@pos, n) || ""
+  def matched = @match && @match[0]
+  def matched? = !@match.nil?
+  def matched_size = @match && @match[0].bytesize
+  def [](i) = @match && @match[i]
+  def pre_match = @match && @string.byteslice(0, @match.__byte_begin)
+  def post_match = @match && @match.post_match
+  def captures = @match && @match.captures
+  def values_at(*i) = @match && @match.values_at(*i)
+  def named_captures = @match ? @match.named_captures : {}
+
+  def inspect
+    return "#<StringScanner fin>" if eos?
+    after = peek(5)
+    after_s = (rest_size > 5 ? after + "..." : after).inspect
+    return "#<StringScanner #{@pos}/#{@string.bytesize} @ #{after_s}>" if @pos == 0
+    before = @string.byteslice([@pos - 5, 0].max, [5, @pos].min)
+    before_s = (@pos > 5 ? "..." + before : before).inspect
+    "#<StringScanner #{@pos}/#{@string.bytesize} #{before_s} @ #{after_s}>"
+  end
+end
+)QRUBYLIB"},
+        {"struct.sa", R"QRUBYLIB(# Struct, in Ruby. Values live in hidden instance variables (names without @),
+# read and written by native attribute methods.
+class Struct
+  include Enumerable
+
+  def self.new(*args, keyword_init: nil, &blk)
+    class_name = nil
+    if args.first.is_a?(String)
+      class_name = args.shift
+    end
+    raise ArgumentError, "wrong number of arguments (given 0, expected 1+)" if args.empty? && class_name.nil?
+    args.each do |m|
+      raise TypeError, "#{m.inspect} is not a symbol nor a string" unless m.is_a?(Symbol) || m.is_a?(String)
+    end
+    members = args.map(&:to_sym)
+    raise ArgumentError, "duplicate member #{members.detect { |m| members.count(m) > 1 }}" if members.uniq.size != members.size
+    k = Class.new(self)
+    k.singleton_class.alias_method(:new, :__new)
+    k.singleton_class.alias_method(:[], :__new)
+    hidden = members.map { |m| :"__s_#{m}" }
+    k.instance_variable_set(:__members, members)
+    k.instance_variable_set(:__hidden, hidden)
+    k.instance_variable_set(:__kw, keyword_init)
+    members.each_with_index { |m, i| k.__hidden_attr(m, hidden[i]) }
+    Struct.const_set(class_name, k) if class_name
+    k.class_eval(&blk) if blk
+    k
+  end
+
+  def self.__inherit(name)
+    c = self
+    while c
+      return c.instance_variable_get(name) if c.instance_variable_defined?(name)
+      c = c.superclass
+    end
+    nil
+  end
+
+  def self.members = __inherit(:__members).dup
+  def self.keyword_init? = __inherit(:__kw)
+
+  def self.inspect
+    return superclass.inspect if singleton_class?
+    kw = __inherit(:__kw)
+    kw ? "#{super}(keyword_init: true)" : super
+  end
+
+  def initialize(*args, **kw)
+    k = self.class
+    members = k.__inherit(:__members)
+    hidden = k.__inherit(:__hidden)
+    kwi = k.__inherit(:__kw)
+    if kwi || (kwi.nil? && args.empty? && !kw.empty?)
+      raise ArgumentError, "wrong number of arguments (given #{args.size}, expected 0)" unless args.empty?
+      unknown = kw.keys - members
+      raise ArgumentError, "unknown keywords: #{unknown.join(', ')}" unless unknown.empty?
+      members.each_with_index { |m, i| instance_variable_set(hidden[i], kw[m]) }
+    else
+      args << kw unless kw.empty?
+      raise ArgumentError, "struct size differs" if args.size > members.size
+      members.each_with_index { |_, i| instance_variable_set(hidden[i], args[i]) }
+    end
+  end
+
+  def members = self.class.__inherit(:__members).dup
+  def to_a = self.class.__inherit(:__hidden).map { |h| instance_variable_get(h) }
+  alias deconstruct to_a
+  alias values to_a
+
+  def to_h(&blk)
+    h = {}
+    members.zip(to_a) { |m, v| h[m] = v }
+    blk ? h.to_h(&blk) : h
+  end
+
+  def deconstruct_keys(keys)
+    h = to_h
+    return h if keys.nil?
+    out = {}
+    keys.each do |key|
+      break unless h.key?(key)
+      out[key] = h[key]
+    end
+    out
+  end
+
+  def each(&blk)
+    return to_enum(:each) unless blk
+    to_a.each(&blk)
+    self
+  end
+
+  def each_pair(&blk)
+    return to_enum(:each_pair) unless blk
+    to_h.each_pair(&blk)
+    self
+  end
+
+  def __index(k)
+    ms = members
+    case k
+    when Symbol, String
+      i = ms.index(k.to_sym)
+      raise NameError, "no member '#{k}' in struct" unless i
+      i
+    else
+      n = k.to_int
+      n2 = n < 0 ? n + ms.size : n
+      raise IndexError, "offset #{n} too small for struct(size:#{ms.size})" if n2 < 0
+      raise IndexError, "offset #{n} too large for struct(size:#{ms.size})" if n2 >= ms.size
+      n2
+    end
+  end
+
+  def [](k) = instance_variable_get(self.class.__inherit(:__hidden)[__index(k)])
+
+  def []=(k, v)
+    raise FrozenError.new("can't modify frozen #{self.class}: #{inspect}", receiver: self) if frozen?
+    instance_variable_set(self.class.__inherit(:__hidden)[__index(k)], v)
+  end
+
+  def dig(k, *rest)
+    v = self[k]
+    rest.empty? || v.nil? ? v : v.dig(*rest)
+  end
+
+  def ==(o) = o.class == self.class && to_a == o.to_a
+  def eql?(o) = o.class == self.class && to_a.eql?(o.to_a)
+  def hash = [self.class.__id__, to_a].hash
+  def size = members.size
+  alias length size
+  def values_at(*i) = to_a.values_at(*i)
+
+  def inspect
+    name = self.class.name
+    head = name ? "#<struct #{name} " : "#<struct "
+    head + members.zip(to_a).map { |m, v| "#{m}=#{v.inspect}" }.join(", ") + ">"
+  end
+  alias to_s inspect
+end
+)QRUBYLIB"},
+        {"thread.sa", R"QRUBYLIB(# Thread's synchronisation classes, over Thread.__wait (RubyThread.sa).
+Thread = __thread_class
+
+class Thread
+  class Mutex
+    def initialize
+      @owner = nil
+    end
+
+    def locked? = !@owner.nil?
+    def owned? = @owner.equal?(Thread.current)
+
+    def try_lock
+      return false if @owner
+      @owner = Thread.current
+      true
+    end
+
+    def lock
+      raise ThreadError, "deadlock; recursive locking" if owned?
+      Thread.__wait { @owner.nil? } if @owner
+      @owner = Thread.current
+      self
+    end
+
+    def unlock
+      raise ThreadError, "Attempt to unlock a mutex which is not locked" unless @owner
+      raise ThreadError, "Attempt to unlock a mutex which is locked by another thread/fiber" unless owned?
+      @owner = nil
+      self
+    end
+
+    def synchronize
+      lock
+      begin
+        yield
+      ensure
+        unlock if owned?
+      end
+    end
+
+    def sleep(timeout = nil)
+      unlock
+      begin
+        Kernel.sleep(*[timeout].compact)
+      ensure
+        lock
+      end
+    end
+  end
+
+  class ConditionVariable
+    def initialize
+      @waiters = []
+    end
+
+    def wait(mutex, timeout = nil)
+      token = [false]
+      @waiters << token
+      mutex.unlock
+      begin
+        Thread.__wait(timeout) { token[0] }
+      ensure
+        @waiters.delete_if { |t| t.equal?(token) }
+        mutex.lock
+      end
+      self
+    end
+
+    def signal
+      t = @waiters.shift
+      t[0] = true if t
+      self
+    end
+
+    def broadcast
+      @waiters.each { |t| t[0] = true }
+      @waiters.clear
+      self
+    end
+  end
+
+  class Queue
+    def initialize(items = nil)
+      @items = items ? items.to_a.dup : []
+      @closed = false
+      @waiting = 0
+    end
+
+    def size = @items.size
+    alias length size
+    def empty? = @items.empty?
+    def num_waiting = @waiting
+    def closed? = @closed
+
+    def clear
+      @items.clear
+      self
+    end
+
+    def close
+      @closed = true
+      self
+    end
+
+    def push(x)
+      raise ClosedQueueError, "queue closed" if @closed
+      @items.push(x)
+      self
+    end
+    alias << push
+    alias enq push
+
+    def pop(non_block = false, timeout: nil)
+      if @items.empty?
+        raise ThreadError, "queue empty" if non_block
+        return nil if @closed
+        @waiting += 1
+        begin
+          Thread.__wait(timeout) { !@items.empty? || @closed }
+        ensure
+          @waiting -= 1
+        end
+      end
+      @items.shift
+    end
+    alias shift pop
+    alias deq pop
+
+    def freeze = raise(TypeError, "cannot freeze #<Thread::Queue>")
+  end
+
+  class SizedQueue < Queue
+    attr_reader :max
+
+    def initialize(max)
+      raise ArgumentError, "queue size must be positive" unless max > 0
+      super()
+      @max = max
+    end
+
+    def max=(n)
+      @max = n
+    end
+
+    def push(x, non_block = false, timeout: nil)
+      raise ClosedQueueError, "queue closed" if @closed
+      if @items.size >= @max
+        raise ThreadError, "queue full" if non_block
+        @waiting += 1
+        ok = begin
+          Thread.__wait(timeout) { @items.size < @max || @closed }
+        ensure
+          @waiting -= 1
+        end
+        return nil unless ok
+        raise ClosedQueueError, "queue closed" if @closed
+      end
+      @items.push(x)
+      self
+    end
+    alias << push
+    alias enq push
+  end
+end
+
+Mutex = Thread::Mutex
+Queue = Thread::Queue
+SizedQueue = Thread::SizedQueue
+ConditionVariable = Thread::ConditionVariable
+
+class Monitor
+  def initialize
+    @mon_owner = nil
+    @mon_count = 0
+  end
+
+  def enter
+    me = Thread.current
+    if @mon_owner.equal?(me)
+      @mon_count += 1
+    else
+      Thread.__wait { @mon_owner.nil? } if @mon_owner
+      @mon_owner = me
+      @mon_count = 1
+    end
+    nil
+  end
+  alias mon_enter enter
+
+  def try_enter
+    return false if @mon_owner && !@mon_owner.equal?(Thread.current)
+    enter
+    true
+  end
+  alias mon_try_enter try_enter
+  alias try_mon_enter try_enter
+
+  def exit
+    raise ThreadError, "current thread not owner" unless @mon_owner.equal?(Thread.current)
+    @mon_count -= 1
+    @mon_owner = nil if @mon_count == 0
+    nil
+  end
+  alias mon_exit exit
+
+  def mon_locked? = !@mon_owner.nil?
+  def mon_owned? = @mon_owner.equal?(Thread.current)
+
+  def synchronize
+    enter
+    begin
+      yield
+    ensure
+      self.exit
+    end
+  end
+  alias mon_synchronize synchronize
+
+  def new_cond = MonitorMixin::ConditionVariable.new(self)
+
+  def __release
+    c = @mon_count
+    @mon_owner = nil
+    @mon_count = 0
+    c
+  end
+
+  def __reacquire(count)
+    Thread.__wait { @mon_owner.nil? } if @mon_owner
+    @mon_owner = Thread.current
+    @mon_count = count
+  end
+end
+
+module MonitorMixin
+  class ConditionVariable
+    def initialize(monitor)
+      @monitor = monitor
+      @waiters = []
+    end
+
+    def wait(timeout = nil)
+      token = [false]
+      @waiters << token
+      count = @monitor.__release
+      begin
+        Thread.__wait(timeout) { token[0] }
+      ensure
+        @waiters.delete_if { |t| t.equal?(token) }
+        @monitor.__reacquire(count)
+      end
+      true
+    end
+
+    def wait_while
+      wait while yield
+    end
+
+    def wait_until
+      wait until yield
+    end
+
+    def signal
+      t = @waiters.shift
+      t[0] = true if t
+      self
+    end
+
+    def broadcast
+      @waiters.each { |t| t[0] = true }
+      @waiters.clear
+      self
+    end
+  end
+
+  def __monitor = (@__monitor ||= Monitor.new)
+  def mon_enter = __monitor.enter
+  def mon_exit = __monitor.exit
+  def mon_try_enter = __monitor.try_enter
+  def mon_synchronize(&b) = __monitor.synchronize(&b)
+  alias synchronize mon_synchronize
+  def new_cond = __monitor.new_cond
+  def mon_initialize = @__monitor = Monitor.new
+end
+
+# Ractors, as threads: one interpreter lock, the same message passing
+class Ractor
+  class Error < StandardError; end
+  class ClosedError < StopIteration; end
+  class RemoteError < Error
+    attr_reader :ractor
+    def initialize(msg = nil, ractor: nil)
+      super(msg)
+      @ractor = ractor
+    end
+  end
+  class IsolationError < Error; end
+  class MovedError < Error; end
+
+  attr_reader :name
+
+  def self.current = Thread.current[:__ractor] || (@main ||= allocate.__setup_main)
+  def self.main = @main ||= allocate.__setup_main
+  def self.count = (@live ||= 1)
+  def self.receive = current.__receive
+  def self.recv = receive
+  def self.yield(v)
+    current.__out.push(v)
+    nil
+  end
+
+  def self.make_shareable(x, copy: false)
+    case x
+    when Array then x.each { |e| make_shareable(e) }
+    when Hash then x.each { |k, v| make_shareable(k); make_shareable(v) }
+    when Struct then x.to_a.each { |e| make_shareable(e) }
+    end
+    x.instance_variables.each { |iv| make_shareable(x.instance_variable_get(iv)) }
+    x.freeze
+  end
+
+  def self.shareable?(x)
+    return false unless x.frozen?
+    case x
+    when Array then x.all? { |e| shareable?(e) }
+    when Hash then x.all? { |k, v| shareable?(k) && shareable?(v) }
+    else true
+    end
+  end
+
+  def __setup_main
+    @in = Queue.new
+    @out = Queue.new
+    self
+  end
+
+  def initialize(*args, name: nil, &blk)
+    raise ArgumentError, "must be called with a block" unless blk
+    @name = name
+    @in = Queue.new
+    @out = Queue.new
+    me = self
+    @thread = Thread.new do
+      Thread.current[:__ractor] = me
+      Thread.current.report_on_exception = false
+      me.instance_exec(*args, &blk)
+    end
+  end
+
+  def __receive = @in.pop
+  def __out = @out
+  def send(v, move: false)
+    @in.push(v)
+    self
+  end
+  alias << send
+
+  def take
+    return @out.pop unless @out.empty?
+    Thread.__wait { !@out.empty? || !@thread.alive? }
+    return @out.pop unless @out.empty?
+    if @taken
+      raise ClosedError, "The outgoing-port is already closed"
+    end
+    @taken = true
+    begin
+      @thread.value
+    rescue StandardError => e
+      err = RemoteError.new("thrown by remote Ractor.", ractor: self)
+      raise err, cause: e
+    end
+  end
+  alias value take
+
+  def join
+    @thread.join
+    self
+  end
+
+  def inspect = "#<Ractor:##{__id__}#{@name ? " #{@name}" : ""}>"
+  alias to_s inspect
+end
+)QRUBYLIB"},
+        {"time.sa", R"QRUBYLIB(# Time, in Ruby, over native clock and time-zone helpers.
+class Time
+  include Comparable
+
+  MONTHS = %w[January February March April May June July August September October November December].freeze
+  DAYS = %w[Sunday Monday Tuesday Wednesday Thursday Friday Saturday].freeze
+
+  def self.__days(y, m, d)
+    a = (14 - m) / 12
+    yy = y + 4800 - a
+    mm = m + 12 * a - 3
+    d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045 - 2440588
+  end
+
+  def self.__civil(days)
+    a = days + 2440588 + 32044
+    b = (4 * a + 3) / 146097
+    c = a - 146097 * b / 4
+    d = (4 * c + 3) / 1461
+    e = c - 1461 * d / 4
+    m = (5 * e + 2) / 153
+    [100 * b + d - 4800 + m / 10, m + 3 - 12 * (m / 10), e - (153 * m + 2) / 5 + 1]
+  end
+
+  def self.now(**) = allocate.__init(Kernel.__wall_clock, nil)
+  def self.at(t, *, **) = allocate.__init(t.is_a?(Time) ? t.to_r : t, nil)
+
+  def self.__build(utc, y, m, d, h, mi, s)
+    m = MONTHS.index { |n| n[0, 3].downcase == m.downcase } + 1 if m.is_a?(String) && m !~ /\A\d+\z/
+    raise ArgumentError, "mon out of range" unless m.to_i.between?(1, 12)
+    raise ArgumentError, "mday out of range" unless d.to_i.between?(1, 31)
+    raise ArgumentError, "hour out of range" unless h.to_i.between?(0, 24)
+    raise ArgumentError, "min out of range" unless mi.to_i.between?(0, 59)
+    raise ArgumentError, "sec out of range" unless s.to_f >= 0 && s.to_f < 61
+    secs = __days(y.to_i, m.to_i, d.to_i) * 86400 + h.to_i * 3600 + mi.to_i * 60 + s
+    return allocate.__init(secs, 0) if utc
+    # the offset in force at that wall-clock moment
+    off = Kernel.__utc_offset(secs)
+    allocate.__init(secs - off, nil)
+  end
+
+  def self.new(y = nil, m = 1, d = 1, h = 0, mi = 0, s = 0, zone = nil, **)
+    return now if y.nil?
+    __build(zone == "UTC" || zone == "Z", y, m, d, h, mi, s)
+  end
+  def self.local(y, m = 1, d = 1, h = 0, mi = 0, s = 0, *) = __build(false, y, m, d, h, mi, s)
+  def self.mktime(*a) = local(*a)
+  def self.utc(y, m = 1, d = 1, h = 0, mi = 0, s = 0, *) = __build(true, y, m, d, h, mi, s)
+  def self.gm(*a) = utc(*a)
+
+  # offset: nil for local time, else seconds east of UTC
+  def __init(secs, offset)
+    @t = secs
+    @fixed = offset
+    @off = offset || Kernel.__utc_offset(secs.floor)
+    wall = secs.floor + @off
+    days = wall.div(86400)
+    rem = wall % 86400
+    @year, @month, @day = Time.__civil(days)
+    @hour = rem / 3600
+    @min = rem % 3600 / 60
+    @sec = rem % 60
+    @wday = (days + 4) % 7
+    @yday = days - Time.__days(@year, 1, 1) + 1
+    self
+  end
+
+  attr_reader :year, :month, :day, :hour, :min, :sec, :wday, :yday
+  alias mon month
+  alias mday day
+
+  def to_i = @t.floor
+  alias tv_sec to_i
+  def to_f = @t.to_f
+  def to_r = @t.to_r
+  def subsec = @t.to_r - @t.floor
+  def usec = (subsec * 1_000_000).floor
+  alias tv_usec usec
+  def nsec = (subsec * 1_000_000_000).floor
+  alias tv_nsec nsec
+  def utc_offset = @off
+  alias gmt_offset utc_offset
+  alias gmtoff utc_offset
+  def utc? = @fixed == 0
+  alias gmt? utc?
+  def zone = utc? ? "UTC" : Kernel.__zone_name
+  def dst? = false
+  alias isdst dst?
+  def utc = __init(@t, 0)
+  alias gmtime utc
+  def getutc = Time.allocate.__init(@t, 0)
+  alias getgm getutc
+  def localtime(*) = __init(@t, nil)
+  def getlocal(*) = Time.allocate.__init(@t, nil)
+  def to_time = self
+  def to_a = [sec, min, hour, day, month, year, wday, yday, dst?, zone]
+
+  def sunday? = @wday == 0
+  def monday? = @wday == 1
+  def tuesday? = @wday == 2
+  def wednesday? = @wday == 3
+  def thursday? = @wday == 4
+  def friday? = @wday == 5
+  def saturday? = @wday == 6
+
+  def +(n)
+    raise TypeError, "time + time?" if n.is_a?(Time)
+    Time.allocate.__init(@t + n, @fixed)
+  end
+
+  def -(o)
+    return (to_r - o.to_r).to_f if o.is_a?(Time)
+    Time.allocate.__init(@t - o, @fixed)
+  end
+
+  def <=>(o) = o.is_a?(Time) ? to_r <=> o.to_r : nil
+  def ==(o) = o.is_a?(Time) && to_r == o.to_r
+  def eql?(o) = self == o
+  def hash = to_r.hash
+
+  def round(n = 0) = Time.allocate.__init(@t.to_r.round(n), @fixed)
+
+  def __zone_str(colon = false)
+    a = @off.abs
+    format("%s%02d%s%02d", @off < 0 ? "-" : "+", a / 3600, colon ? ":" : "", a % 3600 / 60)
+  end
+
+  def to_s = utc? ? strftime("%Y-%m-%d %H:%M:%S UTC") : strftime("%Y-%m-%d %H:%M:%S %z")
+
+  def inspect
+    s = strftime("%Y-%m-%d %H:%M:%S")
+    if subsec != 0
+      digits = format("%09d", nsec).sub(/0+\z/, "")
+      s += ".#{digits}"
+    end
+    s + (utc? ? " UTC" : " #{__zone_str}")
+  end
+
+  def iso8601(n = 0)
+    s = strftime("%Y-%m-%dT%H:%M:%S")
+    s += "." + format("%09d", nsec)[0, n] if n > 0
+    s + (utc? ? "Z" : __zone_str(true))
+  end
+  alias xmlschema iso8601
+
+  def __field(c, flags)
+    case c
+    when "Y" then [@year, "0", 1]
+    when "C" then [@year / 100, "0", 2]
+    when "y" then [@year % 100, "0", 2]
+    when "m" then [@month, "0", 2]
+    when "d" then [@day, "0", 2]
+    when "e" then [@day, " ", 2]
+    when "j" then [@yday, "0", 3]
+    when "H" then [@hour, "0", 2]
+    when "k" then [@hour, " ", 2]
+    when "I" then [(@hour + 11) % 12 + 1, "0", 2]
+    when "l" then [(@hour + 11) % 12 + 1, " ", 2]
+    when "M" then [@min, "0", 2]
+    when "S" then [@sec, "0", 2]
+    when "L" then [(subsec * 1000).floor, "0", 3]
+    when "N" then [nsec, "0", 9]
+    when "u" then [@wday == 0 ? 7 : @wday, "0", 1]
+    when "w" then [@wday, "0", 1]
+    when "s" then [to_i, "0", 1]
+    when "U" then [(@yday + 6 - @wday) / 7, "0", 2]
+    when "W" then [(@yday + 6 - (@wday - 1) % 7) / 7, "0", 2]
+    when "B" then [MONTHS[@month - 1], " ", 0]
+    when "b", "h" then [MONTHS[@month - 1][0, 3], " ", 0]
+    when "A" then [DAYS[@wday], " ", 0]
+    when "a" then [DAYS[@wday][0, 3], " ", 0]
+    when "p" then [@hour < 12 ? "AM" : "PM", " ", 0]
+    when "P" then [@hour < 12 ? "am" : "pm", " ", 0]
+    when "Z" then [zone.to_s, " ", 0]
+    when "z" then [__zone_str(flags.include?(":")), " ", 0]
+    when "F" then [strftime("%Y-%m-%d"), " ", 0]
+    when "D", "x" then [strftime("%m/%d/%y"), " ", 0]
+    when "T", "X" then [strftime("%H:%M:%S"), " ", 0]
+    when "R" then [strftime("%H:%M"), " ", 0]
+    when "r" then [strftime("%I:%M:%S %p"), " ", 0]
+    when "c" then [strftime("%a %b %e %T %Y"), " ", 0]
+    when "n" then ["\n", " ", 0]
+    when "t" then ["\t", " ", 0]
+    when "%" then ["%", " ", 0]
+    end
+  end
+
+  def strftime(fmt)
+    fmt.gsub(/%([-0^#_:]*)(\d*)([A-Za-z%])/) do
+      whole, flags, width, c = $&, $1, $2, $3
+      f = __field(c, flags)
+      next whole unless f
+      v, pad, w = f
+      s = v.to_s
+      s = s.upcase if flags.include?("^")
+      s = s.swapcase if flags.include?("#")
+      pad = "0" if flags.include?("0")
+      pad = " " if flags.include?("_")
+      w = width.to_i unless width.empty?
+      flags.include?("-") ? s : s.rjust(w, pad)
+    end
+  end
+end
+)QRUBYLIB"},
+        {"timeout.sa", R"QRUBYLIB(module Timeout
+  class ExitException < Exception; end
+  class Error < RuntimeError; end
+
+  # The block runs on the clock of the program's own (virtual) time: it is
+  # interrupted only where it would wait past the limit.
+  def self.timeout(sec, klass = nil, message = nil)
+    return yield(sec) if sec.nil? || sec == 0
+    caller_thread = Thread.current
+    done = false
+    watcher = Thread.new do
+      Thread.current.report_on_exception = false
+      unless Thread.__wait(sec) { done }
+        caller_thread.raise(klass || Error, message || "execution expired")
+      end
+    end
+    begin
+      yield(sec)
+    ensure
+      done = true
+      watcher.kill
+    end
+  end
+
+  def timeout(*a, &b) = Timeout.timeout(*a, &b)
+end
+)QRUBYLIB"},
+        {"uri.sa", R"QRUBYLIB(module URI
+  class Error < StandardError; end
+  class InvalidURIError < Error; end
+  class BadURIError < Error; end
+
+  PORTS = { "http" => 80, "https" => 443, "ftp" => 21, "ws" => 80, "wss" => 443, "ldap" => 389, "ldaps" => 636 }.freeze
+
+  class Generic
+    include URI
+    attr_accessor :scheme, :userinfo, :host, :port, :path, :query, :fragment, :opaque
+
+    def self.default_port = nil
+
+    def initialize(scheme, userinfo, host, port, path, query, fragment, opaque = nil)
+      @scheme = scheme
+      @userinfo = userinfo
+      @host = host
+      @port = port
+      @path = path || ""
+      @query = query
+      @fragment = fragment
+      @opaque = opaque
+    end
+
+    def default_port = URI::PORTS[@scheme&.downcase]
+    def user = @userinfo&.split(":", 2)&.first
+    def password = @userinfo&.split(":", 2)&.[](1)
+    def hostname = @host&.delete_prefix("[")&.delete_suffix("]")
+    def absolute? = !@scheme.nil?
+    alias absolute absolute?
+    def relative? = @scheme.nil?
+    def hierarchical? = @opaque.nil?
+
+    def request_uri
+      p = @path.empty? ? "/" : @path
+      @query ? "#{p}?#{@query}" : p
+    end
+
+    def authority
+      return nil unless @host
+      s = +""
+      s << @userinfo << "@" if @userinfo
+      s << @host
+      s << ":#{@port}" if @port && @port != default_port
+      s
+    end
+
+    def to_s
+      s = +""
+      s << @scheme << ":" if @scheme
+      if @opaque
+        s << @opaque
+      else
+        s << "//" << authority if @host
+        s << @path
+        s << "?" << @query if @query
+      end
+      s << "#" << @fragment if @fragment
+      s
+    end
+    alias to_str to_s
+
+    def ==(o) = o.is_a?(Generic) && to_s == o.to_s
+    alias eql? ==
+    def hash = to_s.hash
+    def inspect = "#<#{self.class} #{self}>"
+
+    def merge(rel)
+      r = rel.is_a?(Generic) ? rel : URI.parse(rel.to_s)
+      return r if r.absolute?
+      raise BadURIError, "both URI are relative" unless absolute?
+      return self.class.new(@scheme, r.userinfo, r.host, r.port || default_port, r.path, r.query, r.fragment) if r.host
+      path = r.path
+      query = r.query
+      if path.empty?
+        path = @path
+        query ||= @query
+      elsif !path.start_with?("/")
+        base = @path.sub(%r{[^/]*\z}, "")
+        base = "/" if base.empty?
+        path = base + path
+      end
+      self.class.new(@scheme, @userinfo, @host, @port, URI.__normalize(path), query, r.fragment)
+    end
+    alias + merge
+
+    def normalize
+      self.class.new(@scheme&.downcase, @userinfo, @host&.downcase, @port, @path.empty? ? "/" : @path, @query, @fragment)
+    end
+  end
+
+  class HTTP < Generic; end
+  class HTTPS < HTTP; end
+  class WS < Generic; end
+  class WSS < WS; end
+  class File < Generic; end
+
+  # an FTP path is relative to the login directory: no leading slash
+  class FTP < Generic
+    def initialize(scheme, userinfo, host, port, path, query, fragment, opaque = nil)
+      super
+      @path = @path.delete_prefix("/")
+    end
+
+    def to_s
+      s = +"#{@scheme}://#{authority}/#{@path}"
+      s << "?" << @query if @query
+      s << "#" << @fragment if @fragment
+      s
+    end
+  end
+
+  class MailTo < Generic
+    def to = @opaque&.split("?")&.first
+  end
+
+  def self.__normalize(path)
+    out = []
+    parts = path.split("/", -1)
+    parts.each_with_index do |seg, i|
+      if seg == "."
+        out << "" if i == parts.size - 1
+      elsif seg == ".."
+        out.pop if out.size > 1
+        out << "" if i == parts.size - 1
+      else
+        out << seg
+      end
+    end
+    out.join("/")
+  end
+
+  def self.parse(str)
+    s = str.to_s
+    if s =~ /[\s<>"\\^`{|}]/ || s.count("#") > 1
+      raise InvalidURIError, "bad URI (is not URI?): #{s.inspect}"
+    end
+    m = s.match(%r{\A(?:([A-Za-z][A-Za-z0-9+.\-]*):)?(?://([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?\z})
+    raise InvalidURIError, "bad URI (is not URI?): #{s.inspect}" unless m
+    scheme, auth, path, query, frag = m[1], m[2], m[3], m[4], m[5]
+    k = case scheme&.downcase
+        when "http" then HTTP
+        when "https" then HTTPS
+        when "ftp" then FTP
+        when "ws" then WS
+        when "wss" then WSS
+        when "file" then File
+        when "mailto" then MailTo
+        else Generic
+        end
+    if scheme && auth.nil? && !path.start_with?("/") && !path.empty?
+      return k.new(scheme, nil, nil, nil, nil, nil, frag, query ? "#{path}?#{query}" : path)
+    end
+    userinfo = host = port = nil
+    if auth
+      userinfo, auth = auth.split("@", 2) if auth.include?("@")
+      if auth =~ /\A(\[[^\]]*\]|[^:]*)(?::(\d*))?\z/
+        host = $1
+        port = $2 && !$2.empty? ? $2.to_i : nil
+      else
+        raise InvalidURIError, "bad URI (is not URI?): #{s.inspect}"
+      end
+    end
+    port ||= PORTS[scheme&.downcase] if host
+    k.new(scheme, userinfo, host, port, path, query, frag)
+  end
+
+  def self.join(*parts)
+    u = parse(parts[0].to_s)
+    parts[1..].each { |p| u = u.merge(p) }
+    u
+  end
+
+  def self.encode_www_form_component(str, *)
+    out = +""
+    str.to_s.each_byte do |b|
+      if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 42 || b == 45 || b == 46 || b == 95
+        out << b
+      elsif b == 32
+        out << "+"
+      else
+        out << format("%%%02X", b)
+      end
+    end
+    out
+  end
+
+  def self.decode_www_form_component(str, *)
+    s = str.to_s
+    out = +""
+    i = 0
+    n = s.bytesize
+    while i < n
+      b = s.getbyte(i)
+      if b == 43
+        out.__append_byte(32)
+        i += 1
+      elsif b == 37
+        h = s.byteslice(i + 1, 2)
+        raise ArgumentError, "invalid %-encoding (#{s})" unless h =~ /\A\h\h\z/
+        out.__append_byte(h.to_i(16))
+        i += 3
+      else
+        out.__append_byte(b)
+        i += 1
+      end
+    end
+    out
+  end
+
+  def self.encode_uri_component(str, *) = encode_www_form_component(str).gsub("+", "%20")
+  def self.decode_uri_component(str, *) = decode_www_form_component(str.gsub("+", "%2B"))
+
+  def self.encode_www_form(enum, *)
+    pairs = []
+    enum.each do |k, v|
+      if v.nil?
+        pairs << encode_www_form_component(k)
+      elsif v.respond_to?(:to_ary)
+        v.to_ary.each do |w|
+          pairs << (w.nil? ? encode_www_form_component(k) : "#{encode_www_form_component(k)}=#{encode_www_form_component(w)}")
+        end
+      else
+        pairs << "#{encode_www_form_component(k)}=#{encode_www_form_component(v)}"
+      end
+    end
+    pairs.join("&")
+  end
+
+  def self.decode_www_form(str, *)
+    return [] if str.empty?
+    str.split(/[&;]/).map do |pair|
+      k, v = pair.split("=", 2)
+      [decode_www_form_component(k), decode_www_form_component(v || "")]
+    end
+  end
+
+  def self.extract(str) = str.scan(%r{[a-z][a-z0-9+.\-]*://[^\s<>"]+}i)
+end
+
+module Kernel
+  def URI(s) = s.is_a?(URI::Generic) ? s : URI.parse(s)
+end
+)QRUBYLIB"},
+        {"yaml.sa", R"QRUBYLIB(# A YAML subset: block and flow collections, plain and quoted scalars.
+module Psych
+  class Exception < ::RuntimeError; end
+  class SyntaxError < Exception; end
+  class DisallowedClass < Exception; end
+  class BadAlias < Exception; end
+
+  class Loader
+    def initialize(src, sym)
+      @sym = sym
+      @lines = []
+      src.each_line do |raw|
+        l = raw.chomp
+        st = l.strip
+        next if st.empty? || st.start_with?("#") || st == "---" || st == "..."
+        @lines << l.sub(/\A---\s+/, "")
+      end
+      @i = 0
+    end
+
+    def indent_of(l) = l[/\A */].size
+
+    def load
+      return nil if @lines.empty?
+      block(indent_of(@lines[0]))
+    end
+
+    def strip_comment(s)
+      q = nil
+      s.each_char.with_index do |c, i|
+        if q
+          q = nil if c == q
+        elsif c == "'" || c == '"'
+          q = c if i == 0 || " :[,{".include?(s[i - 1])
+        elsif c == "#" && i > 0 && s[i - 1] == " "
+          return s[0...i].rstrip
+        end
+      end
+      s.rstrip
+    end
+
+    def block(ind)
+      body = @lines[@i].strip
+      if body.start_with?("- ") || body == "-"
+        sequence(ind)
+      elsif key_split(strip_comment(body))
+        mapping(ind)
+      else
+        @i += 1
+        flow_or_scalar(strip_comment(body))
+      end
+    end
+
+    def sequence(ind)
+      out = []
+      while @i < @lines.size
+        l = @lines[@i]
+        break if indent_of(l) != ind
+        body = l.strip
+        break unless body.start_with?("- ") || body == "-"
+        rest = body == "-" ? "" : strip_comment(body[2..].strip)
+        if rest.empty?
+          @i += 1
+          if @i < @lines.size && indent_of(@lines[@i]) > ind
+            out << block(indent_of(@lines[@i]))
+          else
+            out << nil
+          end
+        elsif (rest.start_with?("- ") || key_split(rest)) && !flow_start?(rest)
+          # an inline collection: its column is where the content starts
+          col = l.index(rest, ind + 1)
+          @lines[@i] = " " * col + rest
+          out << block(col)
+        else
+          @i += 1
+          out << value_text(rest, ind)
+        end
+      end
+      out
+    end
+
+    def flow_start?(s) = s.start_with?("[") || s.start_with?("{")
+
+    def key_split(s)
+      return nil if s.start_with?("[") || s.start_with?("{")
+      if s.start_with?('"') || s.start_with?("'")
+        e = s.index(s[0], 1)
+        return nil unless e
+        rest = s[(e + 1)..].lstrip
+        return nil unless rest.start_with?(":")
+        return [s[0..e], rest[1..].strip]
+      end
+      i = s.index(": ")
+      return [s[0...i], s[(i + 2)..].strip] if i
+      return [s[0...-1], ""] if s.end_with?(":")
+      nil
+    end
+
+    def mapping(ind)
+      out = {}
+      while @i < @lines.size
+        l = @lines[@i]
+        break if indent_of(l) != ind
+        body = strip_comment(l.strip)
+        break if body.start_with?("- ")
+        kv = key_split(body)
+        raise SyntaxError, "could not find expected ':' at line #{@i + 1}" unless kv
+        key = scalar(kv[0])
+        key = key.to_sym if @sym && key.is_a?(String)
+        rest = kv[1]
+        @i += 1
+        if !rest.empty?
+          out[key] = value_text(rest, ind)
+        elsif @i < @lines.size
+          nxt = @lines[@i]
+          ni = indent_of(nxt)
+          if ni > ind
+            out[key] = block(ni)
+          elsif ni == ind && (nxt.strip.start_with?("- ") || nxt.strip == "-")
+            out[key] = sequence(ind)
+          else
+            out[key] = nil
+          end
+        else
+          out[key] = nil
+        end
+      end
+      out
+    end
+
+    def value_text(rest, ind)
+      if %w[| |- |+ > >-].include?(rest)
+        block_scalar(rest, ind)
+      else
+        flow_or_scalar(rest)
+      end
+    end
+
+    def block_scalar(style, ind)
+      parts = []
+      bi = nil
+      while @i < @lines.size
+        l = @lines[@i]
+        cur = indent_of(l)
+        break if cur <= ind
+        bi ||= cur
+        parts << l[bi..]
+        @i += 1
+      end
+      text = style.start_with?("|") ? parts.join("\n") : parts.join(" ")
+      style.end_with?("-") ? text : text + "\n"
+    end
+
+    def flow_or_scalar(s)
+      return scalar(s) unless flow_start?(s)
+      @f = s
+      @p = 0
+      flow_value
+    end
+
+    def fws
+      @p += 1 while @p < @f.size && @f[@p] == " "
+    end
+
+    def flow_value
+      fws
+      c = @f[@p]
+      if c == "["
+        @p += 1
+        out = []
+        loop do
+          fws
+          if @f[@p] == "]"
+            @p += 1
+            return out
+          end
+          out << flow_value
+          fws
+          @p += 1 if @f[@p] == ","
+          raise SyntaxError, "did not find expected ',' or ']'" if @p >= @f.size
+        end
+      elsif c == "{"
+        @p += 1
+        out = {}
+        loop do
+          fws
+          if @f[@p] == "}"
+            @p += 1
+            return out
+          end
+          key = scalar(flow_token(":"))
+          key = key.to_sym if @sym && key.is_a?(String)
+          fws
+          @p += 1 if @f[@p] == ":"
+          out[key] = flow_value
+          fws
+          @p += 1 if @f[@p] == ","
+          raise SyntaxError, "did not find expected ',' or '}'" if @p >= @f.size
+        end
+      else
+        scalar(flow_token(nil))
+      end
+    end
+
+    def flow_token(stop)
+      fws
+      c = @f[@p]
+      if c == '"' || c == "'"
+        e = @p + 1
+        e += 1 while e < @f.size && @f[e] != c
+        t = @f[@p..e]
+        @p = e + 1
+        return t
+      end
+      st = @p
+      while @p < @f.size
+        ch = @f[@p]
+        break if ch == "," || ch == "]" || ch == "}"
+        break if ch == ":" && stop && (@f[@p + 1] == " " || @f[@p + 1].nil?)
+        @p += 1
+      end
+      @f[st...@p].strip
+    end
+
+    def scalar(s)
+      return unquote_d(s[1...-1]) if s.start_with?('"') && s.end_with?('"') && s.size >= 2
+      return s[1...-1].gsub("''", "'") if s.start_with?("'") && s.end_with?("'") && s.size >= 2
+      case s
+      when "", "~", "null", "Null", "NULL" then nil
+      when "true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON" then true
+      when "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF" then false
+      when /\A[-+]?(0|[1-9][0-9_,]*)\z/ then s.delete("_,").to_i
+      when /\A0[0-7_,]+\z/ then s.delete("_,").to_i(8)
+      when /\A0x[0-9a-fA-F_,]+\z/ then s.delete("_,").to_i(16)
+      when /\A[-+]?([0-9][0-9_,]*)?\.[0-9]*([eE][-+][0-9]+)?\z/
+        s == "." ? s : s.delete("_,").to_f
+      when /\A[-+]?[0-9][0-9_,]*(\.[0-9]*)?[eE][-+]?[0-9]+\z/ then s.delete("_,").to_f
+      when /\A\+?\.(inf|Inf|INF)\z/ then Float::INFINITY
+      when /\A-\.(inf|Inf|INF)\z/ then -Float::INFINITY
+      when /\A\.(nan|NaN|NAN)\z/ then Float::NAN
+      when /\A:"(.*)"\z/ then $1.to_sym
+      when /\A:([a-zA-Z_][a-zA-Z0-9_]*[?!]?)\z/ then $1.to_sym
+      else s
+      end
+    end
+
+    def unquote_d(s)
+      s.gsub(/\\(.)/) do
+        case $1
+        when "n" then "\n"
+        when "t" then "\t"
+        when "r" then "\r"
+        when "e" then "\e"
+        when "0" then "\0"
+        else $1
+        end
+      end
+    end
+  end
+
+  def self.safe_load(src, permitted_classes: [], permitted_symbols: [], aliases: false, symbolize_names: false, **)
+    Loader.new(src, symbolize_names).load
+  end
+
+  def self.load(src, symbolize_names: false, **) = Loader.new(src, symbolize_names).load
+  def self.unsafe_load(src, **o) = load(src, **o)
+  def self.parse(src) = load(src)
+
+  def self.__plain?(s)
+    return false if s.empty?
+    return false if s =~ /\A\s|\s\z/
+    return false if s =~ /\A[-?:](\s|\z)/
+    return false if s =~ /\A[!&*\[\]{}|>@`"'%#,]/
+    return false if s =~ /: |:\z| #/
+    return false if s =~ /\A(~|null|Null|NULL|true|True|TRUE|false|False|FALSE|yes|Yes|YES|no|No|NO|on|On|ON|off|Off|OFF|y|Y|n|N)\z/
+    return false if s =~ /\A[-+]?[0-9][0-9_,]*(\.[0-9_]*)?([eE][-+]?[0-9]+)?\z/
+    return false if s =~ /\A[-+]?\.[0-9]+/
+    return false if s =~ /\A0[xob]/
+    return false if s =~ /\A:/
+    true
+  end
+
+  def self.__scalar(v)
+    case v
+    when nil then ""
+    when true then "true"
+    when false then "false"
+    when Integer then v.to_s
+    when Float
+      return ".inf" if v == Float::INFINITY
+      return "-.inf" if v == -Float::INFINITY
+      return ".nan" if v.nan?
+      v.to_s
+    when Symbol
+      s = v.to_s
+      __plain?(s) ? ":#{s}" : ":#{s.inspect}"
+    when String
+      if v =~ /[\x00-\x08\x0b-\x1f]/
+        v.inspect
+      elsif __plain?(v)
+        v
+      elsif v.empty?
+        "''"
+      elsif v.include?("'") && !v.include?("\"") && !v.include?("\\")
+        "\"#{v}\""
+      else
+        "'#{v.gsub("'", "''")}'"
+      end
+    else
+      __scalar(v.to_s)
+    end
+  end
+
+  # the entries of a collection; `inline`: the first one continues the current line
+  def self.__emit(v, ind, out, inline)
+    pad = "  " * ind
+    first = true
+    if v.is_a?(Hash)
+      v.each do |k, x|
+        out << pad unless first && inline
+        first = false
+        out << __scalar(k) << ":"
+        __value(x, ind, out)
+      end
+    else
+      v.each do |x|
+        out << pad unless first && inline
+        first = false
+        out << "-"
+        if (x.is_a?(Hash) || x.is_a?(Array)) && !x.empty?
+          out << " "
+          __emit(x, ind + 1, out, true)
+        else
+          __value(x, ind, out)
+        end
+      end
+    end
+  end
+
+  # a value after `key:` or `-`
+  def self.__value(x, ind, out)
+    case x
+    when Hash
+      if x.empty?
+        out << " {}\n"
+      else
+        out << "\n"
+        __emit(x, ind + 1, out, false)
+      end
+    when Array
+      if x.empty?
+        out << " []\n"
+      else
+        out << "\n"
+        __emit(x, ind, out, false)
+      end
+    when String
+      if x.include?("\n") && x !~ /[\x00-\x08\x0b-\x1f]/
+        out << (x.end_with?("\n") ? " |\n" : " |-\n")
+        x.each_line { |l| out << "  " * (ind + 1) << l.chomp << "\n" }
+      else
+        out << " " << __scalar(x) << "\n"
+      end
+    when nil
+      out << "\n"
+    else
+      out << " " << __scalar(x) << "\n"
+    end
+  end
+
+  def self.dump(v, *)
+    out = +"---"
+    if (v.is_a?(Hash) || v.is_a?(Array)) && !v.empty?
+      out << "\n"
+      __emit(v, 0, out, false)
+    else
+      __value(v, 0, out)
+    end
+    out
+  end
+end
+YAML = Psych
+
+class Object
+  def to_yaml(*) = Psych.dump(self)
+end
+)QRUBYLIB"},
+    };
+    return items;
+}
+} // namespace ruby

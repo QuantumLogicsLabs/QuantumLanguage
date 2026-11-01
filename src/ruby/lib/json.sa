@@ -1,0 +1,284 @@
+module JSON
+  class JSONError < StandardError; end
+  class ParserError < JSONError; end
+  class GeneratorError < JSONError; end
+  class NestingError < ParserError; end
+
+  def self.__str(s)
+    out = +"\""
+    s.each_char do |c|
+      case c
+      when "\"" then out << "\\\""
+      when "\\" then out << "\\\\"
+      when "\n" then out << "\\n"
+      when "\t" then out << "\\t"
+      when "\r" then out << "\\r"
+      when "\f" then out << "\\f"
+      when "\b" then out << "\\b"
+      else
+        if c.ord < 0x20
+          out << format("\\u%04x", c.ord)
+        else
+          out << c
+        end
+      end
+    end
+    out << "\""
+  end
+
+  def self.__gen(v, indent, depth)
+    case v
+    when nil then "null"
+    when true then "true"
+    when false then "false"
+    when String then __str(v)
+    when Symbol then __str(v.to_s)
+    when Integer then v.to_s
+    when Float
+      raise GeneratorError, "#{v} not allowed in JSON" if v.nan? || v.infinite?
+      v.to_s
+    when Hash
+      return "{}" if v.empty?
+      if indent
+        pad = indent * (depth + 1)
+        "{\n" + v.map { |k, x| "#{pad}#{__str(k.to_s)}: #{__gen(x, indent, depth + 1)}" }.join(",\n") + "\n#{indent * depth}}"
+      else
+        "{" + v.map { |k, x| "#{__str(k.to_s)}:#{__gen(x, nil, 0)}" }.join(",") + "}"
+      end
+    when Array
+      return "[]" if v.empty?
+      if indent
+        pad = indent * (depth + 1)
+        "[\n" + v.map { |x| pad + __gen(x, indent, depth + 1) }.join(",\n") + "\n#{indent * depth}]"
+      else
+        "[" + v.map { |x| __gen(x, nil, 0) }.join(",") + "]"
+      end
+    else
+      if v.method(:to_json).owner != Object
+        v.to_json
+      else
+        __str(v.to_s)
+      end
+    end
+  end
+
+  def self.generate(v, opts = nil) = __gen(v, nil, 0)
+  def self.dump(v, *) = __gen(v, nil, 0)
+  def self.pretty_generate(v, opts = nil) = __gen(v, "  ", 0)
+
+  class Parser
+    def initialize(src, sym)
+      @s = src
+      @i = 0
+      @n = src.bytesize
+      @sym = sym
+    end
+
+    def fail_at
+      raise ParserError, "unexpected end of input" if @i >= @n
+      raise ParserError, "unexpected character: '#{@s.byteslice(@i, 20)}' at line 1 column #{@i + 1}"
+    end
+
+    def ws
+      while @i < @n
+        c = @s.getbyte(@i)
+        break unless c == 32 || c == 10 || c == 13 || c == 9
+        @i += 1
+      end
+    end
+
+    def parse
+      v = value
+      ws
+      fail_at if @i < @n
+      v
+    end
+
+    def value
+      ws
+      fail_at if @i >= @n
+      case @s.getbyte(@i)
+      when 123 then object
+      when 91 then array
+      when 34 then string
+      when 116 then lit("true", true)
+      when 102 then lit("false", false)
+      when 110 then lit("null", nil)
+      else number
+      end
+    end
+
+    def lit(word, v)
+      fail_at unless @s.byteslice(@i, word.size) == word
+      @i += word.size
+      v
+    end
+
+    def digits
+      while @i < @n
+        c = @s.getbyte(@i)
+        break unless c >= 48 && c <= 57
+        @i += 1
+      end
+    end
+
+    def number
+      st = @i
+      @i += 1 if @s.getbyte(@i) == 45
+      ds = @i
+      digits
+      if @i == ds
+        @i = st
+        fail_at
+      end
+      fl = false
+      if @s.getbyte(@i) == 46
+        fl = true
+        @i += 1
+        digits
+      end
+      c = @s.getbyte(@i)
+      if c == 101 || c == 69
+        fl = true
+        @i += 1
+        c = @s.getbyte(@i)
+        @i += 1 if c == 43 || c == 45
+        digits
+      end
+      t = @s.byteslice(st, @i - st)
+      fl ? t.to_f : t.to_i
+    end
+
+    def string
+      @i += 1
+      out = +""
+      loop do
+        fail_at if @i >= @n
+        c = @s.getbyte(@i)
+        if c == 34
+          @i += 1
+          return out
+        elsif c == 92
+          @i += 1
+          e = @s.getbyte(@i)
+          @i += 1
+          case e
+          when 110 then out << "\n"
+          when 116 then out << "\t"
+          when 114 then out << "\r"
+          when 98 then out << "\b"
+          when 102 then out << "\f"
+          when 117
+            cp = @s.byteslice(@i, 4).to_i(16)
+            @i += 4
+            if cp >= 0xD800 && cp < 0xDC00 && @s.byteslice(@i, 2) == "\\u"
+              low = @s.byteslice(@i + 2, 4).to_i(16)
+              @i += 6
+              cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+            end
+            out << cp
+          else out << e.chr
+          end
+        else
+          st = @i
+          while @i < @n
+            c = @s.getbyte(@i)
+            break if c == 34 || c == 92
+            @i += 1
+          end
+          out << @s.byteslice(st, @i - st)
+        end
+      end
+    end
+
+    def array
+      @i += 1
+      out = []
+      ws
+      if @s.getbyte(@i) == 93
+        @i += 1
+        return out
+      end
+      loop do
+        out << value
+        ws
+        c = @s.getbyte(@i)
+        fail_at unless c == 93 || c == 44
+        @i += 1
+        return out if c == 93
+      end
+    end
+
+    def object
+      @i += 1
+      out = {}
+      ws
+      if @s.getbyte(@i) == 125
+        @i += 1
+        return out
+      end
+      loop do
+        ws
+        fail_at unless @s.getbyte(@i) == 34
+        k = string
+        ws
+        fail_at unless @s.getbyte(@i) == 58
+        @i += 1
+        out[@sym ? k.to_sym : k] = value
+        ws
+        c = @s.getbyte(@i)
+        fail_at unless c == 125 || c == 44
+        @i += 1
+        return out if c == 125
+      end
+    end
+  end
+
+  def self.parse(src, opts = nil, symbolize_names: false)
+    raise TypeError, "no implicit conversion of nil into String" if src.nil?
+    sym = symbolize_names || (opts && opts[:symbolize_names])
+    Parser.new(src.to_str, sym).parse
+  end
+
+  def self.load(src, *) = src.nil? ? nil : parse(src)
+end
+
+class Object
+  def to_json(*) = JSON.generate(to_s)
+end
+
+class String
+  def to_json(*) = JSON.__str(self)
+end
+
+class Symbol
+  def to_json(*) = JSON.__str(to_s)
+end
+
+class Integer
+  def to_json(*) = to_s
+end
+
+class Float
+  def to_json(*) = JSON.generate(self)
+end
+
+class NilClass
+  def to_json(*) = "null"
+end
+
+class TrueClass
+  def to_json(*) = "true"
+end
+
+class FalseClass
+  def to_json(*) = "false"
+end
+
+class Hash
+  def to_json(*) = JSON.generate(self)
+end
+
+class Array
+  def to_json(*) = JSON.generate(self)
+end

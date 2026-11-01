@@ -1,0 +1,664 @@
+# The rarely used corners of the core classes. This file loads the first time
+# a method is not found, so ordinary programs do not pay for parsing it.
+class String
+  def self.try_convert(x) = x.respond_to?(:to_str) ? x.to_str : nil
+  def each_codepoint(&b) = b ? (codepoints.each(&b); self) : codepoints.each
+  def grapheme_clusters = chars
+  def each_grapheme_cluster(&b) = b ? (chars.each(&b); self) : chars.each
+
+  def next!
+    replace(succ)
+  end
+  alias succ! next!
+
+  def scrub!(*a)
+    replace(scrub(*a))
+  end
+
+  def tr_s!(a, b)
+    r = tr_s(a, b)
+    return nil if r == self
+    replace(r)
+  end
+
+  def unicode_normalize!(*) = self
+  def unicode_normalized?(*) = true
+
+  def setbyte(i, v)
+    b = bytes
+    b[i] = v & 255
+    replace(b.pack("C*").force_encoding(encoding))
+    v
+  end
+
+  def byteindex(s, off = 0)
+    r = byteslice(off, bytesize)
+    return nil unless r
+    i = r.index(s)
+    i && off + r[0, i].bytesize
+  end
+
+  def byterindex(s, off = bytesize)
+    r = byteslice(0, off + s.bytesize)
+    i = r.rindex(s)
+    i && r[0, i].bytesize
+  end
+
+  def bytesplice(*args)
+    if args.size == 2
+      rng, str = args
+      st = rng.begin
+      len = rng.size
+    else
+      st, len, str = args
+    end
+    replace(byteslice(0, st) + str + (byteslice(st + len, bytesize) || ""))
+    self
+  end
+
+  def append_as_bytes(*items)
+    items.each { |x| x.is_a?(Integer) ? __append_byte(x & 255) : x.each_byte { |b| __append_byte(b) } }
+    self
+  end
+
+  def undump
+    s = self[1...-1]
+    s.gsub(/\\(u\{\h+\}|u\h{4}|x\h{1,2}|.)/) do
+      c = $1
+      case c[0]
+      when "u" then [c.delete("u{}").to_i(16)].pack("U")
+      when "x" then c[1..].to_i(16).chr
+      when "n" then "\n"
+      when "t" then "\t"
+      when "r" then "\r"
+      when "e" then "\e"
+      else c
+      end
+    end
+  end
+
+  def crypt(salt) = salt[0, 2] + to_s.sum.to_s(36)
+end
+
+class Symbol
+  def =~(o) = to_s =~ o
+  def match(*a, &b) = to_s.match(*a, &b)
+  def match?(*a) = to_s.match?(*a)
+  def casecmp(o) = o.is_a?(Symbol) ? to_s.casecmp(o.to_s) : nil
+  def casecmp?(o) = o.is_a?(Symbol) ? to_s.casecmp?(o.to_s) : nil
+  def encoding = to_s.ascii_only? ? Encoding::US_ASCII : Encoding::UTF_8
+  def intern = self
+  def slice(*a) = to_s[*a]
+  def swapcase = to_s.swapcase.to_sym
+end
+
+class Numeric
+  def +@ = self
+  def -@ = 0 - self
+  def <=>(o) = equal?(o) ? 0 : nil
+  def abs = self < 0 ? -self : self
+  alias magnitude abs
+  def abs2 = self * self
+  def arg = negative? ? Math::PI : 0
+  alias angle arg
+  alias phase arg
+  def conj = self
+  alias conjugate conj
+  def real = self
+  def imaginary = 0
+  alias imag imaginary
+  def rect = [self, 0]
+  alias rectangular rect
+  def polar = [abs, arg]
+  def i = Complex(0, self)
+  def to_c = Complex(self, 0)
+  def to_int = to_i
+  def div(o) = (self / o).floor
+  def modulo(o) = self - o * div(o)
+  alias % modulo
+  def divmod(o) = [div(o), modulo(o)]
+  def remainder(o) = self - o * (self / o).truncate
+  def fdiv(o) = to_f / o
+  def quo(o) = Rational(self, 1) / o
+  def ceil(*a) = to_f.ceil(*a)
+  def floor(*a) = to_f.floor(*a)
+  def round(*a) = to_f.round(*a)
+  def truncate(*a) = to_f.truncate(*a)
+  def finite? = true
+  def infinite? = nil
+  def eql?(o) = self.class == o.class && self == o
+  def numerator = to_r.numerator
+  def denominator = to_r.denominator
+  def dup = self
+  def clone(freeze: true) = self
+  def coerce(o) = o.class == self.class ? [o, self] : [Float(o), Float(self)]
+end
+
+class Integer
+  def self.try_convert(x) = x.respond_to?(:to_int) ? x.to_int : nil
+  def ceildiv(o) = -(-self).div(o)
+  def gcdlcm(o) = [gcd(o), lcm(o)]
+  def quo(o) = o.is_a?(Float) ? self / o : Rational(self, 1) / o
+end
+
+class Float
+  def arg = nan? ? self : (negative? ? Math::PI : 0)
+  alias angle arg
+  alias phase arg
+  def numerator = to_r.numerator
+  def denominator = to_r.denominator
+end
+
+class Rational
+  def fdiv(o) = to_f / o
+  def magnitude = abs
+  def positive? = numerator > 0
+  def negative? = numerator < 0
+end
+
+class Complex
+  def abs2 = real * real + imaginary * imaginary
+  def real? = false
+  def finite? = real.finite? && imaginary.finite?
+  def infinite? = real.infinite? || imaginary.infinite? ? 1 : nil
+  def to_c = self
+  def fdiv(o) = Complex(real.fdiv(o), imaginary.fdiv(o))
+  def eql?(o) = o.is_a?(Complex) && real.eql?(o.real) && imaginary.eql?(o.imaginary)
+  def hash = [real, imaginary].hash
+  def coerce(o) = [Complex(o, 0), self]
+  def <=>(o) = imaginary == 0 && (o.is_a?(Complex) ? o.imaginary == 0 : o.is_a?(Numeric)) ? real <=> (o.is_a?(Complex) ? o.real : o) : nil
+
+  def __real!(to)
+    raise RangeError, "can't convert #{self} into #{to}" unless imaginary == 0 && !imaginary.is_a?(Float)
+    real
+  end
+
+  def to_i = __real!("Integer").to_i
+  def to_f = __real!("Float").to_f
+  def to_r = __real!("Rational").to_r
+  def rationalize(*a) = __real!("Rational").rationalize(*a)
+  def denominator = real.denominator.lcm(imaginary.denominator)
+  def numerator = self * denominator
+end
+
+class NilClass
+  def to_r = Rational(0, 1)
+  def rationalize(*) = to_r
+  def to_c = Complex(0, 0)
+  def =~(_) = nil
+end
+
+class Array
+  def self.try_convert(x) = x.respond_to?(:to_ary) ? x.to_ary : nil
+  def deconstruct = self
+  def fetch_values(*idx, &b) = idx.map { |i| fetch(i, &b) }
+end
+
+class Hash
+  def self.try_convert(x) = x.respond_to?(:to_hash) ? x.to_hash : nil
+  def self.ruby2_keywords_hash?(_) = false
+  def self.ruby2_keywords_hash(h) = h.dup
+
+  def compact!
+    n = size
+    delete_if { |_, v| v.nil? }
+    n == size ? nil : self
+  end
+
+  def compare_by_identity? = false
+  def rehash = self
+  def to_proc = method(:[]).to_proc
+  def flatten(depth = 1) = to_a.flatten(depth)
+end
+
+class Proc
+  def eql?(o) = equal?(o)
+  def ==(o) = equal?(o)
+  def hash = __id__
+  def ruby2_keywords = self
+  def source_location = nil
+end
+
+class Method
+  def original_name = name
+  def eql?(o) = self == o
+  def hash = [receiver.__id__, name].hash
+end
+
+class UnboundMethod
+  def original_name = name
+  def eql?(o) = self == o
+  def hash = [owner.__id__, name].hash
+  def super_method = nil
+end
+
+class Regexp
+  def ~ = self =~ $_
+  def encoding = Encoding::UTF_8
+  def fixed_encoding? = false
+  def timeout = nil
+  def named_captures
+    h = {}
+    names.each { |n| h[n] = [] }
+    i = 0
+    source.scan(/\\.|\((\?<([A-Za-z_]\w*)>|(?!\?))/) do
+      if $1
+        i += 1
+        h[$2] << i if $2
+      end
+    end
+    h
+  end
+  def self.linear_time?(*) = true
+  def self.timeout = nil
+  def self.timeout=(v)
+    v
+  end
+  def self.try_convert(x) = x.respond_to?(:to_regexp) ? x.to_regexp : nil
+end
+
+class MatchData
+  def ==(o) = o.is_a?(MatchData) && string == o.string && regexp == o.regexp && to_a == o.to_a
+  alias eql? ==
+  def hash = [string, to_a].hash
+  def match(n) = self[n]
+  def match_length(n) = self[n]&.length
+  def bytebegin(n) = pre_match.bytesize + (n == 0 ? 0 : string[self.begin(0)...self.begin(n)].bytesize)
+  def byteend(n) = bytebegin(n) + self[n].bytesize
+  def byteoffset(n) = [bytebegin(n), byteend(n)]
+end
+
+class Enumerator
+  class Chain < Enumerator
+    def self.new(*enums)
+      obj = allocate
+      obj.__setup(enums)
+      obj
+    end
+
+    def __setup(enums)
+      @enums = enums
+      self
+    end
+
+    def each(&b)
+      return self unless b
+      @enums.each { |e| e.each(&b) }
+      self
+    end
+
+    def size = @enums.sum(&:size)
+    def +(o) = Chain.new(self, o)
+    def inspect = "#<Enumerator::Chain: [#{@enums.map(&:inspect).join(', ')}]>"
+    alias to_s inspect
+    def next = (@__e ||= to_a.each).next
+    def peek = (@__e ||= to_a.each).peek
+    def rewind = (@__e = nil; self)
+    def with_index(off = 0, &b) = to_a.each.with_index(off, &b)
+    def each_with_index(&b) = to_a.each_with_index(&b)
+  end
+
+  def +(o) = Chain.new(self, o)
+  def next_values = [self.next].flatten(1)
+  def peek_values = [peek].flatten(1)
+  def feed(_) = nil
+
+  def self.product(*enums)
+    return [[]].each if enums.empty?
+    first, *rest = enums.map(&:to_a)
+    first.product(*rest).each
+  end
+end
+
+module Enumerable
+  def chain(*o) = Enumerator::Chain.new(self, *o)
+  def compact = to_a.compact
+end
+
+module Kernel
+  def pretty_inspect = PP.__format(self) + "\n"
+
+  def private_methods(all = true)
+    out = []
+    singleton_class.ancestors.each do |k|
+      out.concat(k.private_instance_methods(false))
+      break unless all
+    end
+    out.uniq
+  end
+
+  def protected_methods(*) = self.class.protected_instance_methods
+
+  def singleton_method(name)
+    raise NameError, "undefined singleton method '#{name}' for #{inspect}" unless singleton_methods.include?(name.to_sym)
+    method(name)
+  end
+
+  private
+
+  def __callee__ = nil
+  def autoload(*) = nil
+  def autoload?(*) = nil
+  def set_trace_func(*) = nil
+  def trace_var(*) = nil
+  def untrace_var(*) = []
+  def iterator? = block_given?
+
+  def trap(*) = "DEFAULT"
+
+  def putc(c)
+    print(c.is_a?(Integer) ? (c & 255).chr : c.to_s[0])
+    c
+  end
+
+  def readline(*a) = $stdin.gets(*a) || raise(EOFError, "end of file reached")
+  def readlines(*a) = $stdin.readlines(*a)
+
+  def open(path, *a, **k, &b) = File.open(path, *a, **k, &b)
+
+  def fork = raise(NotImplementedError, "fork() function is unimplemented on this machine")
+  def exec(*) = raise(NotImplementedError, "exec is not supported")
+  def spawn(*) = raise(NotImplementedError, "spawn is not supported")
+  def syscall(*) = raise(NotImplementedError, "syscall() function is unimplemented on this machine")
+
+  def test(cmd, a, *)
+    case cmd
+    when "e", ?e then File.exist?(a)
+    when "f", ?f then File.file?(a)
+    when "d", ?d then File.directory?(a)
+    when "s", ?s then File.size?(a)
+    else raise ArgumentError, "unknown command '#{cmd}'"
+    end
+  end
+
+  def caller_locations(start = 1, length = nil)
+    list = caller(start + 1) || []
+    list = list.first(length) if length
+    list.map { |s| Thread::Backtrace::Location.new(s) }
+  end
+end
+
+class Thread
+  module Backtrace
+    class Location
+      attr_reader :path, :lineno, :label
+
+      def initialize(s)
+        @text = s
+        m = s.match(/\A(.*):(\d+):in '(.*)'\z/)
+        @path, @lineno, @label = m ? [m[1], m[2].to_i, m[3]] : [s, 0, ""]
+      end
+
+      def absolute_path = File.expand_path(@path)
+      def base_label = @label.sub(/\Ablock (\(\d+ levels\) )?in /, "").sub(/.*[#.]/, "")
+      def to_s = @text
+      def inspect = @text.inspect
+    end
+  end
+
+  def self.exit = current.exit
+  def self.kill(t) = t.kill
+  def self.handle_interrupt(*) = yield
+  def self.pending_interrupt? = false
+  def self.ignore_deadlock = false
+  def self.ignore_deadlock=(v)
+    v
+  end
+  def self.each_caller_location(&b) = caller_locations(2).each(&b)
+
+  def fetch(k, *d)
+    return self[k] if key?(k)
+    return yield(k) if block_given?
+    return d[0] unless d.empty?
+    raise KeyError.new("key not found: #{k.inspect}", key: k, receiver: self)
+  end
+
+  def thread_variable?(k) = !thread_variable_get(k).nil?
+  def thread_variables = []
+  def backtrace(*) = alive? ? [] : nil
+  def backtrace_locations(*) = alive? ? [] : nil
+  def group = nil
+  def native_thread_id = __id__
+  def pending_interrupt? = false
+  def abort_on_exception = Thread.abort_on_exception
+  def abort_on_exception=(v)
+    Thread.abort_on_exception = v
+  end
+  def add_trace_func(*) = nil
+  def set_trace_func(*) = nil
+end
+
+class Fiber
+  def inspect = "#{Kernel.instance_method(:to_s).bind_call(self).chomp('>')} (#{alive? ? 'suspended' : 'terminated'})>"
+  alias to_s inspect
+  def blocking? = false
+  def backtrace(*) = []
+  def backtrace_locations(*) = []
+  def storage = (@__storage ||= {})
+  def storage=(h)
+    @__storage = h
+  end
+  def self.[](k) = current.storage[k]
+  def self.[]=(k, v)
+    current.storage[k] = v
+  end
+  def self.blocking? = 1
+  def self.current_scheduler = nil
+  def self.scheduler = nil
+  def self.set_scheduler(_) = nil
+end
+
+class Random
+  def ==(o) = o.is_a?(Random) && seed == o.seed
+  DEFAULT = self
+  def self.new_seed = rand(2**62)
+  def self.seed = srand.tap { |s| srand(s) }
+  def self.bytes(n) = Random.new(new_seed).bytes(n)
+  def self.urandom(n) = bytes(n)
+end
+
+class Module
+  def const_source_location(*) = []
+  def deprecate_constant(*) = self
+  def refinements = []
+  def set_temporary_name(_) = self
+  def undefined_instance_methods = []
+  def autoload(*) = nil
+  def autoload?(*) = nil
+  def self.used_modules = []
+  def self.used_refinements = []
+
+  def remove_class_variable(name)
+    raise NameError, "class variable #{name} not defined for #{self}" unless class_variable_defined?(name)
+    __cvar_remove(name)
+  end
+end
+
+class Class
+  def json_creatable? = respond_to?(:json_create)
+end
+
+class Exception
+  def self.to_tty? = false
+end
+
+class IO
+  def self.read(*a, **k) = File.read(*a, **k)
+  def self.write(*a, **k) = File.write(*a, **k)
+  def self.binread(*a) = File.binread(*a)
+  def self.binwrite(*a) = File.binwrite(*a)
+  def self.readlines(*a, **k) = File.readlines(*a, **k)
+  def self.foreach(*a, **k, &b) = File.foreach(*a, **k, &b)
+  def self.select(r, w = nil, e = nil, *) = [r || [], w || [], e || []]
+  def self.copy_stream(from, to, *) = to.write(from.read)
+  def self.try_convert(x) = x.respond_to?(:to_io) ? x.to_io : nil
+
+  def readline(*a) = gets(*a) || raise(EOFError, "end of file reached")
+
+  def each_line(*a)
+    return to_enum(:each_line, *a) unless block_given?
+    while (l = gets(*a))
+      yield l
+    end
+    self
+  end
+  alias each each_line
+
+  def eof? = (@__peek ||= gets).nil?
+  alias eof eof?
+  def getc = read(1)
+  def getbyte = getc&.ord
+  def readchar = getc || raise(EOFError, "end of file reached")
+  def readbyte = getbyte || raise(EOFError, "end of file reached")
+  def putc(c)
+    write(c.is_a?(Integer) ? (c & 255).chr : c.to_s[0])
+    c
+  end
+  def close = nil
+  def closed? = false
+  def close_read = nil
+  def close_write = nil
+  def fsync = 0
+  def fdatasync = 0
+  def binmode = self
+  def binmode? = false
+  def set_encoding(*) = self
+  def external_encoding = Encoding::UTF_8
+  def internal_encoding = nil
+  def fileno = equal?($stdin) ? 0 : equal?($stderr) ? 2 : 1
+  alias to_i fileno
+  def to_io = self
+  def pid = nil
+  def inspect = equal?($stdin) ? "#<IO:<STDIN>>" : equal?($stderr) ? "#<IO:<STDERR>>" : "#<IO:<STDOUT>>"
+  def lineno = 0
+  def wait_readable(*) = self
+  def wait_writable(*) = self
+  def syswrite(*a) = write(*a)
+  def write_nonblock(*a, **) = write(*a)
+end
+
+class File
+  class Stat
+    attr_reader :size, :mtime
+
+    def initialize(path)
+      @path = path
+      raise Errno::ENOENT, "@ rb_file_s_stat - #{path}" unless File.exist?(path)
+      @size = File.directory?(path) ? 0 : File.size(path)
+      @mtime = File.mtime(path)
+    end
+
+    def file? = File.file?(@path)
+    def directory? = File.directory?(@path)
+    def symlink? = false
+    def atime = @mtime
+    def ctime = @mtime
+    def mode = directory? ? 0o40755 : 0o100644
+    def zero? = @size == 0
+  end
+
+  def self.mtime(p) = Time.at(__file_mtime(__path(p)))
+  def self.atime(p) = mtime(p)
+  def self.ctime(p) = mtime(p)
+  def self.birthtime(p) = mtime(p)
+  def self.stat(p) = Stat.new(__path(p))
+  def self.lstat(p) = stat(p)
+  def self.ftype(p) = directory?(p) ? "directory" : "file"
+  def self.chmod(_, *paths) = paths.size
+  def self.chown(_, _, *paths) = paths.size
+  def self.umask(*) = 0o022
+  def self.readlink(p) = raise(Errno::EINVAL, "@ rb_readlink - #{p}")
+  def self.identical?(a, b) = expand_path(a) == expand_path(b)
+  def self.utime(_, _, *paths) = paths.size
+  def self.truncate(p, n)
+    write(p, read(p).byteslice(0, n))
+    0
+  end
+
+  def self.fnmatch?(pat, path, *)
+    rx = Regexp.escape(pat).gsub("\\*\\*/", "(?:.*/)?").gsub("\\*", "[^/]*").gsub("\\?", "[^/]")
+    Regexp.new("\\A#{rx}\\z").match?(path)
+  end
+  singleton_class.alias_method(:fnmatch, :fnmatch?)
+
+  def mtime = File.mtime(@path)
+  def atime = mtime
+  def ctime = mtime
+  def stat = File.stat(@path)
+  def lstat = stat
+  def chmod(*) = 0
+  def flock(*) = 0
+  def truncate(n)
+    @data = @data.byteslice(0, n)
+    @dirty = true
+    0
+  end
+end
+
+class Dir
+  include Enumerable
+
+  attr_reader :path
+  alias to_path path
+
+  def self.open(p)
+    d = new(p)
+    return d unless block_given?
+    yield d
+  end
+
+  def self.home(*) = ENV["HOME"] || ENV["USERPROFILE"] || "/"
+  def self.tmpdir = ENV["TEMP"] || ENV["TMP"] || "/tmp"
+
+  def self.chdir(p = home)
+    old = pwd
+    __dir_change(File.__path(p))
+    return 0 unless block_given?
+    begin
+      yield p
+    ensure
+      __dir_change(old)
+    end
+  end
+
+  def initialize(p)
+    raise Errno::ENOENT, "@ dir_initialize - #{p}" unless Dir.exist?(p)
+    @path = p
+    @names = Dir.entries(p)
+    @pos = 0
+  end
+
+  def read
+    n = @names[@pos]
+    @pos += 1 if n
+    n
+  end
+
+  def each(&b)
+    return to_enum(:each) unless b
+    @names.each(&b)
+    self
+  end
+
+  def children = @names - [".", ".."]
+  def each_child(&b) = children.each(&b)
+  def rewind
+    @pos = 0
+    self
+  end
+  def pos = @pos
+  alias tell pos
+  def pos=(n)
+    @pos = n
+  end
+  def close = nil
+  def inspect = "#<Dir:#{@path}>"
+end
+
+class Time
+  def ctime = strftime("%a %b %e %T %Y")
+  alias asctime ctime
+  def floor(n = 0) = Time.allocate.__init(to_r.floor(n), @fixed)
+  def ceil(n = 0) = Time.allocate.__init(to_r.ceil(n), @fixed)
+  def deconstruct_keys(_) = { year: year, month: month, day: day, wday: wday, yday: yday, hour: hour, min: min, sec: sec, subsec: subsec, dst: dst?, zone: zone }
+end

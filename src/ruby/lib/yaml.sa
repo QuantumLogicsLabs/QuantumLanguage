@@ -1,0 +1,386 @@
+# A YAML subset: block and flow collections, plain and quoted scalars.
+module Psych
+  class Exception < ::RuntimeError; end
+  class SyntaxError < Exception; end
+  class DisallowedClass < Exception; end
+  class BadAlias < Exception; end
+
+  class Loader
+    def initialize(src, sym)
+      @sym = sym
+      @lines = []
+      src.each_line do |raw|
+        l = raw.chomp
+        st = l.strip
+        next if st.empty? || st.start_with?("#") || st == "---" || st == "..."
+        @lines << l.sub(/\A---\s+/, "")
+      end
+      @i = 0
+    end
+
+    def indent_of(l) = l[/\A */].size
+
+    def load
+      return nil if @lines.empty?
+      block(indent_of(@lines[0]))
+    end
+
+    def strip_comment(s)
+      q = nil
+      s.each_char.with_index do |c, i|
+        if q
+          q = nil if c == q
+        elsif c == "'" || c == '"'
+          q = c if i == 0 || " :[,{".include?(s[i - 1])
+        elsif c == "#" && i > 0 && s[i - 1] == " "
+          return s[0...i].rstrip
+        end
+      end
+      s.rstrip
+    end
+
+    def block(ind)
+      body = @lines[@i].strip
+      if body.start_with?("- ") || body == "-"
+        sequence(ind)
+      elsif key_split(strip_comment(body))
+        mapping(ind)
+      else
+        @i += 1
+        flow_or_scalar(strip_comment(body))
+      end
+    end
+
+    def sequence(ind)
+      out = []
+      while @i < @lines.size
+        l = @lines[@i]
+        break if indent_of(l) != ind
+        body = l.strip
+        break unless body.start_with?("- ") || body == "-"
+        rest = body == "-" ? "" : strip_comment(body[2..].strip)
+        if rest.empty?
+          @i += 1
+          if @i < @lines.size && indent_of(@lines[@i]) > ind
+            out << block(indent_of(@lines[@i]))
+          else
+            out << nil
+          end
+        elsif (rest.start_with?("- ") || key_split(rest)) && !flow_start?(rest)
+          # an inline collection: its column is where the content starts
+          col = l.index(rest, ind + 1)
+          @lines[@i] = " " * col + rest
+          out << block(col)
+        else
+          @i += 1
+          out << value_text(rest, ind)
+        end
+      end
+      out
+    end
+
+    def flow_start?(s) = s.start_with?("[") || s.start_with?("{")
+
+    def key_split(s)
+      return nil if s.start_with?("[") || s.start_with?("{")
+      if s.start_with?('"') || s.start_with?("'")
+        e = s.index(s[0], 1)
+        return nil unless e
+        rest = s[(e + 1)..].lstrip
+        return nil unless rest.start_with?(":")
+        return [s[0..e], rest[1..].strip]
+      end
+      i = s.index(": ")
+      return [s[0...i], s[(i + 2)..].strip] if i
+      return [s[0...-1], ""] if s.end_with?(":")
+      nil
+    end
+
+    def mapping(ind)
+      out = {}
+      while @i < @lines.size
+        l = @lines[@i]
+        break if indent_of(l) != ind
+        body = strip_comment(l.strip)
+        break if body.start_with?("- ")
+        kv = key_split(body)
+        raise SyntaxError, "could not find expected ':' at line #{@i + 1}" unless kv
+        key = scalar(kv[0])
+        key = key.to_sym if @sym && key.is_a?(String)
+        rest = kv[1]
+        @i += 1
+        if !rest.empty?
+          out[key] = value_text(rest, ind)
+        elsif @i < @lines.size
+          nxt = @lines[@i]
+          ni = indent_of(nxt)
+          if ni > ind
+            out[key] = block(ni)
+          elsif ni == ind && (nxt.strip.start_with?("- ") || nxt.strip == "-")
+            out[key] = sequence(ind)
+          else
+            out[key] = nil
+          end
+        else
+          out[key] = nil
+        end
+      end
+      out
+    end
+
+    def value_text(rest, ind)
+      if %w[| |- |+ > >-].include?(rest)
+        block_scalar(rest, ind)
+      else
+        flow_or_scalar(rest)
+      end
+    end
+
+    def block_scalar(style, ind)
+      parts = []
+      bi = nil
+      while @i < @lines.size
+        l = @lines[@i]
+        cur = indent_of(l)
+        break if cur <= ind
+        bi ||= cur
+        parts << l[bi..]
+        @i += 1
+      end
+      text = style.start_with?("|") ? parts.join("\n") : parts.join(" ")
+      style.end_with?("-") ? text : text + "\n"
+    end
+
+    def flow_or_scalar(s)
+      return scalar(s) unless flow_start?(s)
+      @f = s
+      @p = 0
+      flow_value
+    end
+
+    def fws
+      @p += 1 while @p < @f.size && @f[@p] == " "
+    end
+
+    def flow_value
+      fws
+      c = @f[@p]
+      if c == "["
+        @p += 1
+        out = []
+        loop do
+          fws
+          if @f[@p] == "]"
+            @p += 1
+            return out
+          end
+          out << flow_value
+          fws
+          @p += 1 if @f[@p] == ","
+          raise SyntaxError, "did not find expected ',' or ']'" if @p >= @f.size
+        end
+      elsif c == "{"
+        @p += 1
+        out = {}
+        loop do
+          fws
+          if @f[@p] == "}"
+            @p += 1
+            return out
+          end
+          key = scalar(flow_token(":"))
+          key = key.to_sym if @sym && key.is_a?(String)
+          fws
+          @p += 1 if @f[@p] == ":"
+          out[key] = flow_value
+          fws
+          @p += 1 if @f[@p] == ","
+          raise SyntaxError, "did not find expected ',' or '}'" if @p >= @f.size
+        end
+      else
+        scalar(flow_token(nil))
+      end
+    end
+
+    def flow_token(stop)
+      fws
+      c = @f[@p]
+      if c == '"' || c == "'"
+        e = @p + 1
+        e += 1 while e < @f.size && @f[e] != c
+        t = @f[@p..e]
+        @p = e + 1
+        return t
+      end
+      st = @p
+      while @p < @f.size
+        ch = @f[@p]
+        break if ch == "," || ch == "]" || ch == "}"
+        break if ch == ":" && stop && (@f[@p + 1] == " " || @f[@p + 1].nil?)
+        @p += 1
+      end
+      @f[st...@p].strip
+    end
+
+    def scalar(s)
+      return unquote_d(s[1...-1]) if s.start_with?('"') && s.end_with?('"') && s.size >= 2
+      return s[1...-1].gsub("''", "'") if s.start_with?("'") && s.end_with?("'") && s.size >= 2
+      case s
+      when "", "~", "null", "Null", "NULL" then nil
+      when "true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON" then true
+      when "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF" then false
+      when /\A[-+]?(0|[1-9][0-9_,]*)\z/ then s.delete("_,").to_i
+      when /\A0[0-7_,]+\z/ then s.delete("_,").to_i(8)
+      when /\A0x[0-9a-fA-F_,]+\z/ then s.delete("_,").to_i(16)
+      when /\A[-+]?([0-9][0-9_,]*)?\.[0-9]*([eE][-+][0-9]+)?\z/
+        s == "." ? s : s.delete("_,").to_f
+      when /\A[-+]?[0-9][0-9_,]*(\.[0-9]*)?[eE][-+]?[0-9]+\z/ then s.delete("_,").to_f
+      when /\A\+?\.(inf|Inf|INF)\z/ then Float::INFINITY
+      when /\A-\.(inf|Inf|INF)\z/ then -Float::INFINITY
+      when /\A\.(nan|NaN|NAN)\z/ then Float::NAN
+      when /\A:"(.*)"\z/ then $1.to_sym
+      when /\A:([a-zA-Z_][a-zA-Z0-9_]*[?!]?)\z/ then $1.to_sym
+      else s
+      end
+    end
+
+    def unquote_d(s)
+      s.gsub(/\\(.)/) do
+        case $1
+        when "n" then "\n"
+        when "t" then "\t"
+        when "r" then "\r"
+        when "e" then "\e"
+        when "0" then "\0"
+        else $1
+        end
+      end
+    end
+  end
+
+  def self.safe_load(src, permitted_classes: [], permitted_symbols: [], aliases: false, symbolize_names: false, **)
+    Loader.new(src, symbolize_names).load
+  end
+
+  def self.load(src, symbolize_names: false, **) = Loader.new(src, symbolize_names).load
+  def self.unsafe_load(src, **o) = load(src, **o)
+  def self.parse(src) = load(src)
+
+  def self.__plain?(s)
+    return false if s.empty?
+    return false if s =~ /\A\s|\s\z/
+    return false if s =~ /\A[-?:](\s|\z)/
+    return false if s =~ /\A[!&*\[\]{}|>@`"'%#,]/
+    return false if s =~ /: |:\z| #/
+    return false if s =~ /\A(~|null|Null|NULL|true|True|TRUE|false|False|FALSE|yes|Yes|YES|no|No|NO|on|On|ON|off|Off|OFF|y|Y|n|N)\z/
+    return false if s =~ /\A[-+]?[0-9][0-9_,]*(\.[0-9_]*)?([eE][-+]?[0-9]+)?\z/
+    return false if s =~ /\A[-+]?\.[0-9]+/
+    return false if s =~ /\A0[xob]/
+    return false if s =~ /\A:/
+    true
+  end
+
+  def self.__scalar(v)
+    case v
+    when nil then ""
+    when true then "true"
+    when false then "false"
+    when Integer then v.to_s
+    when Float
+      return ".inf" if v == Float::INFINITY
+      return "-.inf" if v == -Float::INFINITY
+      return ".nan" if v.nan?
+      v.to_s
+    when Symbol
+      s = v.to_s
+      __plain?(s) ? ":#{s}" : ":#{s.inspect}"
+    when String
+      if v =~ /[\x00-\x08\x0b-\x1f]/
+        v.inspect
+      elsif __plain?(v)
+        v
+      elsif v.empty?
+        "''"
+      elsif v.include?("'") && !v.include?("\"") && !v.include?("\\")
+        "\"#{v}\""
+      else
+        "'#{v.gsub("'", "''")}'"
+      end
+    else
+      __scalar(v.to_s)
+    end
+  end
+
+  # the entries of a collection; `inline`: the first one continues the current line
+  def self.__emit(v, ind, out, inline)
+    pad = "  " * ind
+    first = true
+    if v.is_a?(Hash)
+      v.each do |k, x|
+        out << pad unless first && inline
+        first = false
+        out << __scalar(k) << ":"
+        __value(x, ind, out)
+      end
+    else
+      v.each do |x|
+        out << pad unless first && inline
+        first = false
+        out << "-"
+        if (x.is_a?(Hash) || x.is_a?(Array)) && !x.empty?
+          out << " "
+          __emit(x, ind + 1, out, true)
+        else
+          __value(x, ind, out)
+        end
+      end
+    end
+  end
+
+  # a value after `key:` or `-`
+  def self.__value(x, ind, out)
+    case x
+    when Hash
+      if x.empty?
+        out << " {}\n"
+      else
+        out << "\n"
+        __emit(x, ind + 1, out, false)
+      end
+    when Array
+      if x.empty?
+        out << " []\n"
+      else
+        out << "\n"
+        __emit(x, ind, out, false)
+      end
+    when String
+      if x.include?("\n") && x !~ /[\x00-\x08\x0b-\x1f]/
+        out << (x.end_with?("\n") ? " |\n" : " |-\n")
+        x.each_line { |l| out << "  " * (ind + 1) << l.chomp << "\n" }
+      else
+        out << " " << __scalar(x) << "\n"
+      end
+    when nil
+      out << "\n"
+    else
+      out << " " << __scalar(x) << "\n"
+    end
+  end
+
+  def self.dump(v, *)
+    out = +"---"
+    if (v.is_a?(Hash) || v.is_a?(Array)) && !v.empty?
+      out << "\n"
+      __emit(v, 0, out, false)
+    else
+      __value(v, 0, out)
+    end
+    out
+  end
+end
+YAML = Psych
+
+class Object
+  def to_yaml(*) = Psych.dump(self)
+end

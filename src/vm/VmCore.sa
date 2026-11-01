@@ -338,7 +338,7 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
     // a value the Java way in Java-style code)
     if (op == Op::ADD && (L.isString() || R.isString()))
     {
-        if (javaStyle_)
+        if (javaStyleCode())
             return QuantumValue(javaString(L) + javaString(R));
         if (L.isInstance() || R.isInstance())
             return QuantumValue(displayString(L) + displayString(R));
@@ -383,8 +383,10 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
     }
 
     // Java-style code: a char (one-character string) in arithmetic is its
-    // code: c - '0', 'z' - c
-    if (javaStyle_ && (op == Op::SUB || op == Op::MUL || op == Op::DIV || op == Op::MOD) &&
+    // code: c - '0', 'z' - c. Only in the Java classes: elsewhere in the file
+    // "-" * 10 repeats the string, as in Ruby and Python.
+    if (javaStyle_ && (op == Op::SUB || op == Op::MUL || op == Op::DIV || op == Op::MOD) && !frames_.empty() &&
+        frames_.back().closure->chunk->javaStyle &&
         ((L.isString() && L.asString().size() == 1) || (R.isString() && R.asString().size() == 1)) &&
         (L.isNumber() || L.isString()) && (R.isNumber() || R.isString()))
     {
@@ -1230,7 +1232,7 @@ void VM::callClass(std::shared_ptr<QuantumClass> klass, int argCount, int line)
 QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
                                    std::vector<QuantumValue> args, int line)
 {
-    if (javaStyle_)
+    if (javaStyleCode())
     {
         bool handled = false;
         QuantumValue r = javaStyleMethod(obj, method, args, handled);
@@ -1452,6 +1454,10 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
         runFrame(depth);
         return pop();
     }
+    bool handled = false;
+    QuantumValue r = javaStyleFallback(obj, method, args, handled); // f.apply(x), n.intValue()
+    if (handled)
+        return r;
     throw TypeError("No method '" + method + "' on " + obj.typeName(), line);
 }
 

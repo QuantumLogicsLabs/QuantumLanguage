@@ -1,0 +1,140 @@
+# Struct, in Ruby. Values live in hidden instance variables (names without @),
+# read and written by native attribute methods.
+class Struct
+  include Enumerable
+
+  def self.new(*args, keyword_init: nil, &blk)
+    class_name = nil
+    if args.first.is_a?(String)
+      class_name = args.shift
+    end
+    raise ArgumentError, "wrong number of arguments (given 0, expected 1+)" if args.empty? && class_name.nil?
+    args.each do |m|
+      raise TypeError, "#{m.inspect} is not a symbol nor a string" unless m.is_a?(Symbol) || m.is_a?(String)
+    end
+    members = args.map(&:to_sym)
+    raise ArgumentError, "duplicate member #{members.detect { |m| members.count(m) > 1 }}" if members.uniq.size != members.size
+    k = Class.new(self)
+    k.singleton_class.alias_method(:new, :__new)
+    k.singleton_class.alias_method(:[], :__new)
+    hidden = members.map { |m| :"__s_#{m}" }
+    k.instance_variable_set(:__members, members)
+    k.instance_variable_set(:__hidden, hidden)
+    k.instance_variable_set(:__kw, keyword_init)
+    members.each_with_index { |m, i| k.__hidden_attr(m, hidden[i]) }
+    Struct.const_set(class_name, k) if class_name
+    k.class_eval(&blk) if blk
+    k
+  end
+
+  def self.__inherit(name)
+    c = self
+    while c
+      return c.instance_variable_get(name) if c.instance_variable_defined?(name)
+      c = c.superclass
+    end
+    nil
+  end
+
+  def self.members = __inherit(:__members).dup
+  def self.keyword_init? = __inherit(:__kw)
+
+  def self.inspect
+    return superclass.inspect if singleton_class?
+    kw = __inherit(:__kw)
+    kw ? "#{super}(keyword_init: true)" : super
+  end
+
+  def initialize(*args, **kw)
+    k = self.class
+    members = k.__inherit(:__members)
+    hidden = k.__inherit(:__hidden)
+    kwi = k.__inherit(:__kw)
+    if kwi || (kwi.nil? && args.empty? && !kw.empty?)
+      raise ArgumentError, "wrong number of arguments (given #{args.size}, expected 0)" unless args.empty?
+      unknown = kw.keys - members
+      raise ArgumentError, "unknown keywords: #{unknown.join(', ')}" unless unknown.empty?
+      members.each_with_index { |m, i| instance_variable_set(hidden[i], kw[m]) }
+    else
+      args << kw unless kw.empty?
+      raise ArgumentError, "struct size differs" if args.size > members.size
+      members.each_with_index { |_, i| instance_variable_set(hidden[i], args[i]) }
+    end
+  end
+
+  def members = self.class.__inherit(:__members).dup
+  def to_a = self.class.__inherit(:__hidden).map { |h| instance_variable_get(h) }
+  alias deconstruct to_a
+  alias values to_a
+
+  def to_h(&blk)
+    h = {}
+    members.zip(to_a) { |m, v| h[m] = v }
+    blk ? h.to_h(&blk) : h
+  end
+
+  def deconstruct_keys(keys)
+    h = to_h
+    return h if keys.nil?
+    out = {}
+    keys.each do |key|
+      break unless h.key?(key)
+      out[key] = h[key]
+    end
+    out
+  end
+
+  def each(&blk)
+    return to_enum(:each) unless blk
+    to_a.each(&blk)
+    self
+  end
+
+  def each_pair(&blk)
+    return to_enum(:each_pair) unless blk
+    to_h.each_pair(&blk)
+    self
+  end
+
+  def __index(k)
+    ms = members
+    case k
+    when Symbol, String
+      i = ms.index(k.to_sym)
+      raise NameError, "no member '#{k}' in struct" unless i
+      i
+    else
+      n = k.to_int
+      n2 = n < 0 ? n + ms.size : n
+      raise IndexError, "offset #{n} too small for struct(size:#{ms.size})" if n2 < 0
+      raise IndexError, "offset #{n} too large for struct(size:#{ms.size})" if n2 >= ms.size
+      n2
+    end
+  end
+
+  def [](k) = instance_variable_get(self.class.__inherit(:__hidden)[__index(k)])
+
+  def []=(k, v)
+    raise FrozenError.new("can't modify frozen #{self.class}: #{inspect}", receiver: self) if frozen?
+    instance_variable_set(self.class.__inherit(:__hidden)[__index(k)], v)
+  end
+
+  def dig(k, *rest)
+    v = self[k]
+    rest.empty? || v.nil? ? v : v.dig(*rest)
+  end
+
+  def ==(o) = o.class == self.class && to_a == o.to_a
+  def eql?(o) = o.class == self.class && to_a.eql?(o.to_a)
+  def hash = [self.class.__id__, to_a].hash
+  def size = members.size
+  alias length size
+  def values_at(*i) = to_a.values_at(*i)
+
+  def inspect
+    name = self.class.name
+    head = name ? "#<struct #{name} " : "#<struct "
+    head + members.zip(to_a).map { |m, v| "#{m}=#{v.inspect}" }.join(", ") + ">"
+  end
+  alias to_s inspect
+end

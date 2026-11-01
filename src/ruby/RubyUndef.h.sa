@@ -1,0 +1,22 @@
+// quantum: cpp
+// After the last Ruby source of a unity build: RubyRt.h.sa's macros end here.
+#undef Qfalse
+#undef Qnil
+#undef Qtrue
+#undef Qundef
+#undef truthy
+#undef boolv
+#undef isFix
+#undef fixv
+#undef fix
+#undef FIXMAX
+#undef FIXMIN
+#undef fixable
+#undef isFlonum
+#undef isSymV
+#undef symv
+#undef vsym
+#undef isObj
+#undef op
+#undef ov
+#undef isType

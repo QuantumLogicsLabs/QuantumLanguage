@@ -192,5 +192,10 @@ QuantumValue VM::callDictMethod(std::shared_ptr<Dict> dict,
     return QuantumValue(dict->empty());
   if (m == "key" || m == "has_key" || m == "include" || m == "member")
     return QuantumValue(!args.empty() && dict->count(args[0].toString()) > 0);
+  // a java.util.Map name in a program with Java-style code (m.put(k, v), ...)
+  bool handled = false;
+  QuantumValue r = javaStyleFallback(QuantumValue(dict), m, args, handled);
+  if (handled)
+    return r;
   throw TypeError("Dict has no method '" + m + "'");
 }

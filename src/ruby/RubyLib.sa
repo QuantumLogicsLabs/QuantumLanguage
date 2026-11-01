@@ -1,0 +1,1358 @@
+// quantum: cpp
+// Ruby front-end: what the libraries written in Ruby (src/ruby/lib, embedded
+// by src/tools/embed.sa) need from the runtime, their loader, Marshal's deep
+// copies and the entry point the VM calls.
+#include "RubyRt.h.sa"
+#include "RubyMain.h.sa"
+
+#include <cctype>
+
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <utility>
+
+extern std::vector<std::string> g_scriptArgv;
+
+namespace ruby
+{
+
+const std::vector<std::pair<std::string, std::string>> &librarySources();
+
+namespace
+{
+
+// Class#__new: an alias target for classes whose `new` is overridden above them
+V cls_plain_new(Interp &I, V self, Args &a)
+{
+    auto *k = static_cast<RClass *>(op(self));
+    V obj = I.allocate(k);
+    Method *init = I.findMethod(k, I.s.initialize);
+    if (init)
+        I.invoke(init, obj, a, nullptr, I.frame);
+    return obj;
+}
+
+// Module#__hidden_attr(name, ivar, writer = true): accessors over a hidden variable
+V mod_hidden_attr(Interp &I, V self, Args &a)
+{
+    auto *k = static_cast<RClass *>(op(self));
+    Sym name = vsym(a.argv[0]), iv = vsym(a.argv[1]);
+    auto *r = new Method();
+    r->kind = M_READER;
+    r->ivar = iv;
+    r->owner = k;
+    I.addMethod(k, name, r);
+    if (a.argc < 3 || truthy(a.argv[2]))
+    {
+        auto *w = new Method();
+        w->kind = M_WRITER;
+        w->ivar = iv;
+        w->owner = k;
+        I.addMethod(k, intern(symName(name) + "="), w);
+    }
+    return Qnil;
+}
+
+V rx_match_at(Interp &I, V self, Args &a)
+{
+    auto *re = static_cast<RRegexp *>(op(self));
+    std::vector<int> caps;
+    if (!regexMatchAt(re->re, I.sref(a.argv[0]), (size_t)I.intOf(a.argv[1]), caps))
+        return Qnil;
+    return matchData(I, a.argv[0], re, caps);
+}
+
+V rx_search_at(Interp &I, V self, Args &a)
+{
+    auto *re = static_cast<RRegexp *>(op(self));
+    std::vector<int> caps;
+    if (!regexSearch(re->re, I.sref(a.argv[0]), (size_t)I.intOf(a.argv[1]), caps))
+        return Qnil;
+    return matchData(I, a.argv[0], re, caps);
+}
+
+V md_byte_begin(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return fix(static_cast<RMatch *>(op(self))->caps[0]);
+}
+
+V md_byte_end(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return fix(static_cast<RMatch *>(op(self))->caps[1]);
+}
+
+V str_byteslice(Interp &I, V self, Args &a)
+{
+    const std::string &s = I.sref(self);
+    int64_t n = (int64_t)s.size();
+    int64_t st, len;
+    if (isType(a.argv[0], T::Range))
+    {
+        auto *r = static_cast<RRange *>(op(a.argv[0]));
+        st = r->lo == Qnil ? 0 : I.intOf(r->lo);
+        int64_t e = r->hi == Qnil ? n : I.intOf(r->hi);
+        if (st < 0)
+            st += n;
+        if (e < 0)
+            e += n;
+        if (!r->excl && r->hi != Qnil)
+            ++e;
+        len = e - st;
+    }
+    else
+    {
+        st = I.intOf(a.argv[0]);
+        len = a.argc > 1 ? I.intOf(a.argv[1]) : 1;
+        if (st < 0)
+            st += n;
+        if (a.argc == 1 && st >= n)
+            return Qnil;
+    }
+    if (st < 0 || st > n || len < 0)
+        return len < 0 && st >= 0 && st <= n ? I.str("") : Qnil;
+    return I.str(s.substr((size_t)st, (size_t)len));
+}
+
+V str_append_byte(Interp &I, V self, Args &a)
+{
+    I.sref(self) += (char)I.intOf(a.argv[0]);
+    static_cast<RString *>(op(self))->charLen = -1;
+    return self;
+}
+
+V en_to_set(Interp &I, V self, Args &a)
+{
+    (void)a;
+    I.loadLibrary("set");
+    return I.call1(I.constIn(I.cObject, intern("Set"), false), I.s.new_, self);
+}
+
+// ── Marshal: dump keeps a deep copy, load copies it again ─────────────────
+
+V deepCopy(Interp &I, V v, std::vector<std::pair<V, V>> &memo)
+{
+    if (!isObj(v))
+        return v;
+    for (auto &m : memo)
+        if (m.first == v)
+            return m.second;
+    Obj *o = op(v);
+    switch (o->type)
+    {
+    case T::Proc:
+    case T::Method:
+    case T::UMethod:
+        I.raise(I.cTypeError, "no _dump_data is defined for class " + I.className(I.realClassOf(v)));
+    case T::String:
+    case T::Array:
+    case T::Hash:
+    case T::Object:
+    case T::Range: break;
+    default: return v;
+    }
+    if (o->klass->isSingleton && !o->klass->mt.empty())
+        I.raise(I.cTypeError, "singleton can't be dumped");
+    V copy = I.allocate(I.realClass(o->klass));
+    memo.push_back(std::make_pair(v, copy));
+    switch (o->type)
+    {
+    case T::String: I.sref(copy) = I.sref(v); break;
+    case T::Array:
+        for (V x : I.aref(v))
+            I.aref(copy).push_back(deepCopy(I, x, memo));
+        break;
+    case T::Hash:
+    {
+        RHash *h = I.href(v);
+        I.href(copy)->defVal = deepCopy(I, h->defVal, memo);
+        if (h->defProc != Qnil)
+            I.raise(I.cTypeError, "can't dump hash with default proc");
+        for (size_t i = 0; i < h->keys.size(); ++i)
+            if (h->keys[i] != Qundef)
+                I.hset(I.href(copy), deepCopy(I, h->keys[i], memo), deepCopy(I, h->vals[i], memo));
+        break;
+    }
+    case T::Range:
+    {
+        auto *r = static_cast<RRange *>(o);
+        auto *c = static_cast<RRange *>(op(copy));
+        c->lo = deepCopy(I, r->lo, memo);
+        c->hi = deepCopy(I, r->hi, memo);
+        c->excl = r->excl;
+        break;
+    }
+    default: break;
+    }
+    for (int i = 0; i < o->niv; ++i)
+        I.ivarSet(copy, o->ivn[i], deepCopy(I, o->ivv[i], memo));
+    op(copy)->frozen = o->frozen && o->type != T::Object ? false : o->frozen;
+    return copy;
+}
+
+V marshal_dump(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::vector<std::pair<V, V>> memo;
+    V copy = deepCopy(I, a.argv[0], memo);
+    V s = I.str("\x04\x08");
+    I.ivarSet(s, intern("__marshal"), copy);
+    return s;
+}
+
+V marshal_load(Interp &I, V self, Args &a)
+{
+    (void)self;
+    if (!I.ivarDefined(a.argv[0], intern("__marshal")))
+        I.raise(I.cTypeError, "instance of IO needed");
+    std::vector<std::pair<V, V>> memo;
+    return deepCopy(I, I.ivarGet(a.argv[0], intern("__marshal")), memo);
+}
+
+// ── files ─────────────────────────────────────────────────────────────────
+
+namespace fs = std::filesystem;
+
+V f_kind(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::error_code ec;
+    fs::path p(I.strOf(a.argv[0]));
+    if (fs::is_directory(p, ec))
+        return fix(2);
+    return fix(fs::exists(p, ec) ? 1 : 0);
+}
+
+V f_read(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::ifstream in(I.strOf(a.argv[0]), std::ios::binary);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return I.str(ss.str());
+}
+
+V f_write(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::string path = I.strOf(a.argv[0]);
+    std::ofstream out(path, truthy(a.argv[2]) ? std::ios::binary | std::ios::app : std::ios::binary | std::ios::trunc);
+    if (!out)
+    {
+        V errno_ = I.lookupConst(nullptr, intern("Errno"));
+        V k = I.constIn(static_cast<RClass *>(op(errno_)), intern("ENOENT"), false);
+        V m = I.str("@ rb_sysopen - " + path);
+        I.raiseExc(I.call(k, I.s.new_, 1, &m));
+    }
+    out << I.sref(a.argv[1]);
+    return Qnil;
+}
+
+V f_delete(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::error_code ec;
+    fs::remove(fs::path(I.strOf(a.argv[0])), ec);
+    return Qnil;
+}
+
+V f_rename(Interp &I, V self, Args &a)
+{
+    (void)self;
+    fs::rename(fs::path(I.strOf(a.argv[0])), fs::path(I.strOf(a.argv[1])));
+    return Qnil;
+}
+
+V d_change(Interp &I, V self, Args &a)
+{
+    (void)self;
+    fs::current_path(fs::path(I.strOf(a.argv[0])));
+    return Qnil;
+}
+
+V f_mtime(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::error_code ec;
+    auto t = fs::last_write_time(fs::path(I.strOf(a.argv[0])), ec);
+    if (ec)
+        return fix(0);
+    // file times count 100ns units from 1601
+    return I.flo((double)(t.count() - 116444736000000000LL) / 1e7);
+}
+
+V d_pwd(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.str(fs::current_path().generic_string());
+}
+
+V d_make(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::error_code ec;
+    fs::create_directory(fs::path(I.strOf(a.argv[0])), ec);
+    return Qnil;
+}
+
+V d_list(Interp &I, V self, Args &a)
+{
+    (void)self;
+    V out = I.ary();
+    for (const auto &e : fs::directory_iterator(fs::path(I.strOf(a.argv[0]))))
+        I.aref(out).push_back(I.str(e.path().filename().string()));
+    return out;
+}
+
+V k_wall_clock(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    return I.flo((double)std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() / 1e9 + rubyClockSkew());
+}
+
+V k_utc_offset(Interp &I, V self, Args &a)
+{
+    (void)self;
+    std::time_t t = (std::time_t)I.intOf(a.argv[0]);
+    std::tm local, utc;
+    if (localtime_s(&local, &t) != 0 || gmtime_s(&utc, &t) != 0)
+        return fix(0);
+    int64_t days = local.tm_yday - utc.tm_yday;
+    if (local.tm_year != utc.tm_year)
+        days = local.tm_year > utc.tm_year ? 1 : -1;
+    return fix(days * 86400 + (local.tm_hour - utc.tm_hour) * 3600 + (local.tm_min - utc.tm_min) * 60);
+}
+
+V k_zone_name(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    return I.str("");
+}
+
+V env_aref(Interp &I, V self, Args &a)
+{
+    (void)self;
+    const char *v = std::getenv(I.strOf(a.argv[0]).c_str());
+    return v ? I.strFrozen(v) : Qnil;
+}
+
+V env_fetch(Interp &I, V self, Args &a)
+{
+    V v = env_aref(I, self, a);
+    if (v != Qnil)
+        return v;
+    if (a.blk)
+        return I.yield(a.blk, a.argv[0]);
+    if (a.argc > 1)
+        return a.argv[1];
+    V exc = I.makeExc(I.cKeyError, "key not found: " + I.inspect(a.argv[0]));
+    I.ivarSet(exc, I.s.key, a.argv[0]);
+    I.raiseExc(exc);
+}
+
+V env_key_p(Interp &I, V self, Args &a) { return boolv(env_aref(I, self, a) != Qnil); }
+
+// ── random numbers: MT19937, seeded and sampled the way MRI does ──────────
+
+struct MT
+{
+    std::vector<uint32_t> state;
+    int idx = 625;
+    void initGenrand(uint32_t s)
+    {
+        state.assign(624, 0);
+        state[0] = s;
+        for (int j = 1; j < 624; ++j)
+            state[j] = 1812433253U * (state[j - 1] ^ (state[j - 1] >> 30)) + (uint32_t)j;
+        idx = 624;
+    }
+    void initByArray(const std::vector<uint32_t> &key)
+    {
+        initGenrand(19650218U);
+        int i = 1, j = 0;
+        int len = (int)key.size();
+        int k = 624 > len ? 624 : len;
+        for (; k; --k)
+        {
+            state[i] = (state[i] ^ ((state[i - 1] ^ (state[i - 1] >> 30)) * 1664525U)) + key[j] + (uint32_t)j;
+            ++i;
+            ++j;
+            if (i >= 624)
+            {
+                state[0] = state[623];
+                i = 1;
+            }
+            if (j >= len)
+                j = 0;
+        }
+        for (k = 623; k; --k)
+        {
+            state[i] = (state[i] ^ ((state[i - 1] ^ (state[i - 1] >> 30)) * 1566083941U)) - (uint32_t)i;
+            ++i;
+            if (i >= 624)
+            {
+                state[0] = state[623];
+                i = 1;
+            }
+        }
+        state[0] = 0x80000000U;
+        idx = 624;
+    }
+    uint32_t next32()
+    {
+        if (idx >= 624)
+        {
+            uint32_t *s = state.data();
+            for (int kk = 0; kk < 624; ++kk)
+            {
+                uint32_t y = (s[kk] & 0x80000000U) | (s[(kk + 1) % 624] & 0x7fffffffU);
+                s[kk] = s[(kk + 397) % 624] ^ (y >> 1) ^ ((y & 1) ? 0x9908b0dfU : 0);
+            }
+            idx = 0;
+        }
+        uint32_t y = state.data()[idx++];
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c5680U;
+        y ^= (y << 15) & 0xefc60000U;
+        y ^= y >> 18;
+        return y;
+    }
+    double real()
+    {
+        uint32_t a = next32() >> 5, b = next32() >> 6;
+        return (a * 67108864.0 + b) * (1.0 / 9007199254740992.0);
+    }
+    // a..b includes b, so its reals reach 1.0
+    double realInclusive()
+    {
+        uint32_t a = next32(), b = next32();
+        uint64_t x = ((uint64_t)a << 32) | b;
+        uint64_t low = (x << 53) + x;
+        uint64_t r = (x >> 11) + (low < x ? 1 : 0);
+        return std::ldexp((double)r, -53);
+    }
+    uint64_t limited(uint64_t limit)
+    {
+        if (limit == 0)
+            return 0;
+        uint64_t mask = limit;
+        mask |= mask >> 1;
+        mask |= mask >> 2;
+        mask |= mask >> 4;
+        mask |= mask >> 8;
+        mask |= mask >> 16;
+        mask |= mask >> 32;
+        for (;;)
+        {
+            uint64_t val = 0;
+            bool again = false;
+            for (int i = 1; i >= 0; --i)
+                if ((mask >> (i * 32)) & 0xffffffffULL)
+                {
+                    val |= (uint64_t)next32() << (i * 32);
+                    val &= mask;
+                    if (limit < val)
+                    {
+                        again = true;
+                        break;
+                    }
+                }
+            if (!again)
+                return val;
+        }
+    }
+};
+
+MT g_defaultRng;
+V g_defaultSeed = Qnil;
+
+void seedMT(Interp &I, MT &m, V seed)
+{
+    V abs = intIsNeg(I, seed) ? intNeg(I, seed) : seed;
+    std::vector<uint32_t> key;
+    V mask = intSub(I, intShift(I, fix(1), 32), fix(1));
+    while (!intIsZero(abs))
+    {
+        V low = intBitop(I, abs, mask, '&');
+        key.push_back((uint32_t)fixv(low));
+        abs = intShift(I, abs, -32);
+    }
+    if (key.empty())
+        key.push_back(0);
+    if (key.size() == 1)
+    {
+        m.initGenrand(key[0]);
+        return;
+    }
+    // MRI drops a top word of 1, its leading-zero guard
+    if (key.back() == 1)
+        key.pop_back();
+    m.initByArray(key);
+}
+
+V timeSeed(Interp &I)
+{
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    return bigFromInt64(I, std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() & FIXMAX);
+}
+
+MT &defaultRng(Interp &I)
+{
+    if (g_defaultRng.state.empty())
+    {
+        g_defaultSeed = timeSeed(I);
+        seedMT(I, g_defaultRng, g_defaultSeed);
+    }
+    return g_defaultRng;
+}
+
+// 0..limit, as MRI's limited_big_rand: a word at a time from the top
+V limitedBig(Interp &I, MT &m, V limit)
+{
+    if (isFix(limit))
+        return bigFromInt64(I, (int64_t)m.limited((uint64_t)fixv(limit)));
+    std::vector<uint32_t> lim;
+    V wordMask = intSub(I, intShift(I, fix(1), 32), fix(1));
+    for (V rest = limit; !intIsZero(rest); rest = intShift(I, rest, -32))
+        lim.push_back((uint32_t)fixv(intBitop(I, rest, wordMask, '&')));
+    std::vector<uint32_t> rnd(lim.size());
+    for (;;)
+    {
+        uint32_t mask = 0;
+        bool boundary = true, again = false;
+        for (size_t i = lim.size(); i-- > 0;)
+        {
+            uint32_t word = 0;
+            if (mask)
+                mask = 0xffffffffU;
+            else
+            {
+                mask = lim[i];
+                mask |= mask >> 1;
+                mask |= mask >> 2;
+                mask |= mask >> 4;
+                mask |= mask >> 8;
+                mask |= mask >> 16;
+            }
+            if (mask)
+            {
+                word = m.next32() & mask;
+                if (boundary)
+                {
+                    if (word > lim[i])
+                    {
+                        again = true;
+                        break;
+                    }
+                    if (word < lim[i])
+                        boundary = false;
+                }
+            }
+            rnd[i] = word;
+        }
+        if (!again)
+            break;
+    }
+    V out = fix(0);
+    for (size_t i = rnd.size(); i-- > 0;)
+        out = intAdd(I, intShift(I, out, 32), fix((int64_t)rnd[i]));
+    return out;
+}
+
+V randRange(Interp &I, MT &m, RRange *r)
+{
+    if (r->lo == Qnil || r->hi == Qnil)
+    {
+        V errno = I.constIn(I.cObject, intern("Errno"), false);
+        V k = I.constIn(static_cast<RClass *>(op(errno)), intern("EDOM"), false);
+        I.raiseExc(I.call(k, intern("new"), 0, nullptr));
+    }
+    if (I.isInt(r->lo) && I.isInt(r->hi))
+    {
+        V span = intSub(I, r->hi, r->lo);
+        if (r->excl)
+            span = intSub(I, span, fix(1));
+        if (intIsNeg(I, span))
+            return Qnil;
+        return intAdd(I, r->lo, limitedBig(I, m, span));
+    }
+    double lo = I.numToF(r->lo), hi = I.numToF(r->hi);
+    double max = hi - lo;
+    if (std::isnan(max))
+    {
+        V errno = I.constIn(I.cObject, intern("Errno"), false);
+        V k = I.constIn(static_cast<RClass *>(op(errno)), intern("EDOM"), false);
+        I.raiseExc(I.call(k, intern("new"), 0, nullptr));
+    }
+    if (std::isinf(max))
+    {
+        double half = hi / 2.0, lowHalf = lo / 2.0;
+        double u = r->excl ? m.real() : m.realInclusive();
+        return I.flo((u - 0.5) * (half - lowHalf) * 2.0 + (half + lowHalf));
+    }
+    if (max > 0.0)
+        return I.flo((r->excl ? m.real() : m.realInclusive()) * max + lo);
+    if (max == 0.0 && !r->excl)
+        return I.flo(lo);
+    return Qnil;
+}
+
+V randWith(Interp &I, MT &m, Args &a, bool kernel)
+{
+    V arg = a.argc > 0 ? a.argv[0] : Qnil;
+    if (arg == Qnil || arg == Qfalse)
+        return I.flo(m.real());
+    if (isType(arg, T::Range))
+        return randRange(I, m, static_cast<RRange *>(op(arg)));
+    if (I.isFloat(arg))
+    {
+        double x = I.fltv(arg);
+        if (kernel)
+        {
+            int64_t n = (int64_t)(x < 0 ? -x : x);
+            if (n == 0)
+                return I.flo(m.real());
+            return fix((int64_t)m.limited((uint64_t)n - 1));
+        }
+        if (x <= 0)
+            I.raise(I.cArgumentError, "invalid argument - " + floatToS(x));
+        return I.flo(m.real() * x);
+    }
+    V n = I.isInt(arg) ? arg : fix(I.intOf(arg));
+    if (kernel)
+    {
+        if (intIsNeg(I, n))
+            n = intNeg(I, n);
+        if (intIsZero(n))
+            return I.flo(m.real());
+    }
+    else if (intIsNeg(I, n) || intIsZero(n))
+        I.raise(I.cArgumentError, "invalid argument - " + I.inspect(n));
+    return limitedBig(I, m, intSub(I, n, fix(1)));
+}
+
+V k_rand(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return randWith(I, defaultRng(I), a, true);
+}
+
+V k_srand(Interp &I, V self, Args &a)
+{
+    (void)self;
+    defaultRng(I);
+    V old = g_defaultSeed;
+    g_defaultSeed = a.argc > 0 ? a.argv[0] : timeSeed(I);
+    seedMT(I, g_defaultRng, g_defaultSeed);
+    return old;
+}
+
+V random_s_rand(Interp &I, V self, Args &a)
+{
+    (void)self;
+    return randWith(I, defaultRng(I), a, false);
+}
+
+MT *rngOf(Interp &I, V self) { return static_cast<MT *>(static_cast<RData *>(op(self))->ptr); (void)I; }
+
+V random_init(Interp &I, V self, Args &a)
+{
+    auto *d = static_cast<RData *>(op(self));
+    auto *m = new MT();
+    d->ptr = m;
+    d->a = a.argc > 0 ? a.argv[0] : timeSeed(I);
+    seedMT(I, *m, d->a);
+    return Qnil;
+}
+
+V random_rand(Interp &I, V self, Args &a) { return randWith(I, *rngOf(I, self), a, false); }
+
+V random_seed(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return static_cast<RData *>(op(self))->a;
+}
+
+V random_bytes(Interp &I, V self, Args &a)
+{
+    MT *m = rngOf(I, self);
+    std::string out;
+    // each generator word gives four bytes, low byte first
+    int64_t n = I.intOf(a.argv[0]);
+    for (int64_t i = 0; i < n; i += 4)
+    {
+        uint32_t word = m->next32();
+        for (int64_t b = 0; b < 4 && i + b < n; ++b)
+            out += (char)((word >> (8 * b)) & 0xff);
+    }
+    V r = I.str(out);
+    static_cast<RString *>(op(r))->binary = true;
+    return r;
+}
+
+MT &rngFrom(Interp &I, Args &a)
+{
+    RHash *kw = kwArg(a);
+    if (kw)
+    {
+        bool found = false;
+        V r = I.hget(kw, I.sym("random"), &found);
+        if (found && isType(r, T::Data))
+            return *rngOf(I, r);
+    }
+    return defaultRng(I);
+}
+
+V ary_shuffle_bang(Interp &I, V self, Args &a)
+{
+    if (op(self)->frozen)
+        I.frozenError(self);
+    MT &m = rngFrom(I, a);
+    std::vector<V> &v = I.aref(self);
+    size_t i = v.size();
+    while (i)
+    {
+        size_t j = (size_t)m.limited(i - 1);
+        --i;
+        V t = v[i];
+        v[i] = v[j];
+        v[j] = t;
+    }
+    return self;
+}
+
+V ary_shuffle(Interp &I, V self, Args &a)
+{
+    V copy = I.ary(I.aref(self));
+    return ary_shuffle_bang(I, copy, a);
+}
+
+V ary_sample(Interp &I, V self, Args &a)
+{
+    MT &m = rngFrom(I, a);
+    std::vector<V> &v = I.aref(self);
+    int argc = a.kw ? a.argc - 1 : a.argc;
+    size_t len = v.size();
+    if (argc == 0)
+        return len == 0 ? Qnil : v[(size_t)m.limited(len - 1)];
+    int64_t n = I.intOf(a.argv[0]);
+    if (n < 0)
+        I.raise(I.cArgumentError, "negative sample number");
+    size_t k = (size_t)n < len ? (size_t)n : len;
+    V out = I.ary();
+    // up to ten draws: each counts over the elements not yet taken
+    if (k <= 10)
+    {
+        size_t sorted[10];
+        for (size_t i = 0; i < k; ++i)
+        {
+            size_t idx = (size_t)m.limited(len - i - 1);
+            size_t j = 0;
+            for (; j < i; ++j)
+            {
+                if (idx < sorted[j])
+                    break;
+                ++idx;
+            }
+            for (size_t s = i; s > j; --s)
+                sorted[s] = sorted[s - 1];
+            sorted[j] = idx;
+            I.aref(out).push_back(v[idx]);
+        }
+        return out;
+    }
+    // the same draws as MRI's partial shuffle for the general case
+    std::vector<V> pool = v;
+    for (size_t i = 0; i < k; ++i)
+    {
+        size_t j = i + (size_t)m.limited(len - i - 1);
+        V t = pool[j];
+        pool[j] = pool[i];
+        pool[i] = t;
+        I.aref(out).push_back(t);
+    }
+    return out;
+}
+
+// ── pack and unpack ───────────────────────────────────────────────────────
+
+struct PackItem
+{
+    char code;
+    int count; // -1: *
+    bool hasCount;
+    bool big;
+    bool little;
+};
+
+std::vector<PackItem> parsePack(const std::string &fmt)
+{
+    std::vector<PackItem> out;
+    size_t i = 0;
+    while (i < fmt.size())
+    {
+        char c = fmt[i++];
+        if (c == ' ' || c == '\n' || c == '\t')
+            continue;
+        PackItem it;
+        it.code = c;
+        it.count = 1;
+        it.hasCount = false;
+        it.big = false;
+        it.little = false;
+        while (i < fmt.size() && (fmt[i] == '_' || fmt[i] == '!' || fmt[i] == '<' || fmt[i] == '>'))
+        {
+            if (fmt[i] == '>')
+                it.big = true;
+            if (fmt[i] == '<')
+                it.little = true;
+            ++i;
+        }
+        if (i < fmt.size() && fmt[i] == '*')
+        {
+            it.count = -1;
+            it.hasCount = true;
+            ++i;
+        }
+        else if (i < fmt.size() && std::isdigit((unsigned char)fmt[i]))
+        {
+            it.count = 0;
+            it.hasCount = true;
+            while (i < fmt.size() && std::isdigit((unsigned char)fmt[i]))
+                it.count = it.count * 10 + (fmt[i++] - '0');
+        }
+        out.push_back(it);
+    }
+    return out;
+}
+
+// the width and byte order of an integer directive; 0 when it is not one
+int intWidth(PackItem &it, bool &bigEndian)
+{
+    bigEndian = it.big;
+    switch (it.code)
+    {
+    case 'C':
+    case 'c': return 1;
+    case 'S':
+    case 's': return 2;
+    case 'L':
+    case 'l':
+    case 'I':
+    case 'i': return 4;
+    case 'Q':
+    case 'q':
+    case 'J':
+    case 'j': return 8;
+    case 'n':
+        bigEndian = true;
+        return 2;
+    case 'N':
+        bigEndian = true;
+        return 4;
+    case 'v': return 2;
+    case 'V': return 4;
+    default: return 0;
+    }
+}
+
+const char *kB64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+V ary_pack(Interp &I, V self, Args &a)
+{
+    std::string out;
+    std::vector<V> &v = I.aref(self);
+    size_t ai = 0;
+    std::vector<PackItem> items = parsePack(I.strOf(a.argv[0]));
+    bool binary = true;
+    for (size_t x = 0; x < items.size(); ++x)
+    {
+        PackItem it = items[x];
+        bool bigE;
+        int w = intWidth(it, bigE);
+        if (w)
+        {
+            int n = it.count < 0 ? (int)(v.size() - ai) : it.count;
+            for (int k = 0; k < n; ++k)
+            {
+                if (ai >= v.size())
+                    I.raise(I.cArgumentError, "too few arguments");
+                V val = v[ai++];
+                if (!I.isInt(val))
+                    val = fix(I.intOf(val));
+                V mask = intSub(I, intShift(I, fix(1), 8), fix(1));
+                std::string bytes;
+                for (int b = 0; b < w; ++b)
+                {
+                    V low = intBitop(I, intShift(I, val, -8 * b), mask, '&');
+                    bytes += (char)fixv(low);
+                }
+                if (bigE)
+                    bytes = std::string(bytes.rbegin(), bytes.rend());
+                out += bytes;
+            }
+            continue;
+        }
+        switch (it.code)
+        {
+        case 'U':
+        {
+            if (x == 0)
+                binary = false;
+            int n = it.count < 0 ? (int)(v.size() - ai) : it.count;
+            for (int k = 0; k < n; ++k)
+            {
+                if (ai >= v.size())
+                    I.raise(I.cArgumentError, "too few arguments");
+                int64_t cp = I.intOf(v[ai++]);
+                if (cp < 0 || cp > 0x10ffff)
+                    I.raise(I.cRangeError, "pack(U): value out of range");
+                appendUtf8(out, (uint32_t)cp);
+            }
+            break;
+        }
+        case 'a':
+        case 'A':
+        case 'Z':
+        {
+            if (ai >= v.size())
+                I.raise(I.cArgumentError, "too few arguments");
+            std::string s = v[ai] == Qnil ? "" : I.strOf(v[ai]);
+            ++ai;
+            int n = it.count < 0 ? (int)s.size() + (it.code == 'Z' ? 1 : 0) : it.hasCount ? it.count : 1;
+            for (int k = 0; k < n; ++k)
+                out += k < (int)s.size() ? s[k] : (it.code == 'A' ? ' ' : '\0');
+            break;
+        }
+        case 'B':
+        case 'b':
+        {
+            std::string s = I.strOf(v[ai++]);
+            int n = it.count < 0 ? (int)s.size() : it.hasCount ? it.count : 1;
+            if (n > (int)s.size())
+                n = (int)s.size();
+            int byte = 0, bits = 0;
+            for (int k = 0; k < n; ++k)
+            {
+                int bit = s[k] & 1;
+                byte |= it.code == 'B' ? bit << (7 - bits) : bit << bits;
+                if (++bits == 8)
+                {
+                    out += (char)byte;
+                    byte = 0;
+                    bits = 0;
+                }
+            }
+            if (bits)
+                out += (char)byte;
+            break;
+        }
+        case 'H':
+        case 'h':
+        {
+            std::string s = I.strOf(v[ai++]);
+            int n = it.count < 0 ? (int)s.size() : it.hasCount ? it.count : 1;
+            int byte = 0;
+            for (int k = 0; k < n && k < (int)s.size(); ++k)
+            {
+                char c = s[k];
+                int d = c >= '0' && c <= '9' ? c - '0' : ((c | 32) - 'a' + 10) & 15;
+                if ((k & 1) == 0)
+                    byte = it.code == 'H' ? d << 4 : d;
+                else
+                {
+                    byte |= it.code == 'H' ? d : d << 4;
+                    out += (char)byte;
+                    byte = 0;
+                }
+                if ((k & 1) == 0 && (k + 1 == n || k + 1 == (int)s.size()))
+                    out += (char)byte;
+            }
+            break;
+        }
+        case 'm':
+        {
+            std::string s = I.strOf(v[ai++]);
+            binary = false;
+            size_t i = 0;
+            int lineLen = it.hasCount && it.count == 0 ? -1 : 45;
+            std::string enc;
+            size_t lineChars = 0;
+            while (i < s.size())
+            {
+                uint32_t n = (unsigned char)s[i] << 16;
+                if (i + 1 < s.size())
+                    n |= (unsigned char)s[i + 1] << 8;
+                if (i + 2 < s.size())
+                    n |= (unsigned char)s[i + 2];
+                enc += kB64[(n >> 18) & 63];
+                enc += kB64[(n >> 12) & 63];
+                enc += i + 1 < s.size() ? kB64[(n >> 6) & 63] : '=';
+                enc += i + 2 < s.size() ? kB64[n & 63] : '=';
+                i += 3;
+                lineChars += 3;
+                if (lineLen > 0 && (int)lineChars >= lineLen)
+                {
+                    enc += '\n';
+                    lineChars = 0;
+                }
+            }
+            if (lineLen > 0 && lineChars > 0)
+                enc += '\n';
+            out += enc;
+            break;
+        }
+        case 'w':
+        {
+            int n = it.count < 0 ? (int)(v.size() - ai) : it.count;
+            for (int k = 0; k < n; ++k)
+            {
+                uint64_t x2 = (uint64_t)I.intOf(v[ai++]);
+                std::string b;
+                b += (char)(x2 & 0x7f);
+                x2 >>= 7;
+                while (x2)
+                {
+                    b += (char)((x2 & 0x7f) | 0x80);
+                    x2 >>= 7;
+                }
+                out += std::string(b.rbegin(), b.rend());
+            }
+            break;
+        }
+        case 'x':
+        {
+            int n = it.count < 0 ? 0 : it.count;
+            out += std::string((size_t)n, '\0');
+            break;
+        }
+        default: I.raise(I.cArgumentError, std::string("unknown pack directive '") + it.code + "'");
+        }
+    }
+    V r = I.str(out);
+    static_cast<RString *>(op(r))->binary = binary && !asciiOnly(out);
+    return r;
+}
+
+V str_unpack(Interp &I, V self, Args &a)
+{
+    const std::string &s = I.sref(self);
+    V out = I.ary();
+    size_t pos = 0;
+    std::vector<PackItem> items = parsePack(I.strOf(a.argv[0]));
+    for (size_t x = 0; x < items.size(); ++x)
+    {
+        PackItem it = items[x];
+        bool bigE;
+        int w = intWidth(it, bigE);
+        if (w)
+        {
+            bool isSigned = it.code == 'c' || it.code == 's' || it.code == 'l' || it.code == 'q' || it.code == 'i' || it.code == 'j';
+            int n = it.count < 0 ? (int)((s.size() - pos) / w) : it.count;
+            for (int k = 0; k < n; ++k)
+            {
+                if (pos + w > s.size())
+                {
+                    I.aref(out).push_back(Qnil);
+                    continue;
+                }
+                V val = fix(0);
+                for (int b = 0; b < w; ++b)
+                {
+                    int idx = bigE ? b : w - 1 - b;
+                    val = intAdd(I, intShift(I, val, 8), fix((unsigned char)s[pos + idx]));
+                }
+                pos += w;
+                if (isSigned && (unsigned char)s[pos - (bigE ? w : 1)] >= 0x80)
+                    val = intSub(I, val, intShift(I, fix(1), 8 * w));
+                I.aref(out).push_back(val);
+            }
+            continue;
+        }
+        switch (it.code)
+        {
+        case 'U':
+        {
+            int n = it.count < 0 ? 1 << 30 : it.count;
+            for (int k = 0; k < n && pos < s.size(); ++k)
+            {
+                unsigned char c = (unsigned char)s[pos];
+                size_t m = c < 0xC0 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+                uint32_t cp = m == 1 ? c : c & (m == 2 ? 0x1F : m == 3 ? 0x0F : 0x07);
+                for (size_t j = 1; j < m && pos + j < s.size(); ++j)
+                    cp = (cp << 6) | ((unsigned char)s[pos + j] & 0x3F);
+                I.aref(out).push_back(fix(cp));
+                pos += m;
+            }
+            break;
+        }
+        case 'a':
+        case 'A':
+        case 'Z':
+        {
+            size_t n = it.count < 0 ? s.size() - pos : (size_t)(it.hasCount ? it.count : 1);
+            if (pos + n > s.size())
+                n = s.size() - pos;
+            std::string t = s.substr(pos, n);
+            pos += n;
+            if (it.code == 'A')
+                while (!t.empty() && (t.back() == ' ' || t.back() == '\0'))
+                    t.pop_back();
+            else if (it.code == 'Z')
+            {
+                size_t z = t.find('\0');
+                if (z != std::string::npos)
+                    t = t.substr(0, z);
+            }
+            I.aref(out).push_back(I.str(t));
+            break;
+        }
+        case 'B':
+        case 'b':
+        {
+            size_t avail = (s.size() - pos) * 8;
+            size_t n = it.count < 0 ? avail : (size_t)(it.hasCount ? it.count : 1);
+            if (n > avail)
+                n = avail;
+            std::string t;
+            for (size_t k = 0; k < n; ++k)
+            {
+                unsigned char c = (unsigned char)s[pos + k / 8];
+                int bit = it.code == 'B' ? (c >> (7 - k % 8)) & 1 : (c >> (k % 8)) & 1;
+                t += (char)('0' + bit);
+            }
+            pos += (n + 7) / 8;
+            I.aref(out).push_back(I.str(t));
+            break;
+        }
+        case 'H':
+        case 'h':
+        {
+            size_t avail = (s.size() - pos) * 2;
+            size_t n = it.count < 0 ? avail : (size_t)(it.hasCount ? it.count : 1);
+            if (n > avail)
+                n = avail;
+            const char *hex = "0123456789abcdef";
+            std::string t;
+            for (size_t k = 0; k < n; ++k)
+            {
+                unsigned char c = (unsigned char)s[pos + k / 2];
+                bool high = (k % 2 == 0) == (it.code == 'H');
+                t += hex[high ? c >> 4 : c & 15];
+            }
+            pos += (n + 1) / 2;
+            I.aref(out).push_back(I.str(t));
+            break;
+        }
+        case 'm':
+        {
+            std::string dec;
+            uint32_t acc = 0;
+            int bits = 0;
+            for (; pos < s.size(); ++pos)
+            {
+                char c = s[pos];
+                int d = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52 : c == '+' || c == '-' ? 62 : c == '/' || c == '_' ? 63 : -1;
+                if (d < 0)
+                    continue;
+                acc = (acc << 6) | (uint32_t)d;
+                bits += 6;
+                if (bits >= 8)
+                {
+                    bits -= 8;
+                    dec += (char)((acc >> bits) & 0xff);
+                }
+            }
+            V r = I.str(dec);
+            static_cast<RString *>(op(r))->binary = !asciiOnly(dec);
+            I.aref(out).push_back(r);
+            break;
+        }
+        case 'x': pos += it.count < 0 ? 0 : (size_t)it.count; break;
+        default: I.raise(I.cArgumentError, std::string("unknown unpack directive '") + it.code + "'");
+        }
+    }
+    return out;
+}
+
+V str_unpack1(Interp &I, V self, Args &a)
+{
+    V all = str_unpack(I, self, a);
+    return I.aref(all).empty() ? Qnil : I.aref(all)[0];
+}
+
+V gc_nil(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)self;
+    (void)a;
+    return Qnil;
+}
+
+V process_clock(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return I.flo((double)std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() / 1e9 + rubyClockSkew());
+}
+
+V k_dir(Interp &I, V self, Args &a)
+{
+    (void)self;
+    (void)a;
+    size_t slash = I.scriptName.find_last_of("/\\");
+    return I.str(slash == std::string::npos ? "." : I.scriptName.substr(0, slash));
+}
+
+} // namespace
+
+void Interp::initLib()
+{
+    defn(cClass, "__new", cls_plain_new, 0, -1);
+    defn(cModule, "__hidden_attr", mod_hidden_attr, 2, 3);
+    defn(cRegexp, "__match_at", rx_match_at, 2, 2);
+    defn(cRegexp, "__search_at", rx_search_at, 2, 2);
+    defn(cMatch, "__byte_begin", md_byte_begin, 0, 0);
+    defn(cMatch, "__byte_end", md_byte_end, 0, 0);
+    defn(cString, "byteslice", str_byteslice, 1, 2);
+    defn(cString, "__append_byte", str_append_byte, 1, 1);
+    defn(mEnumerable, "to_set", en_to_set, 0, 0);
+    defs(mMarshal, "dump", marshal_dump, 1, 2);
+    defs(mMarshal, "load", marshal_load, 1, 2);
+    defs(mGC, "start", gc_nil, 0, -1);
+    defs(mGC, "stat", gc_nil, 0, -1);
+    defs(mProcess, "clock_gettime", process_clock, 0, -1);
+    setConst(mProcess, intern("CLOCK_MONOTONIC"), fix(1));
+    setConst(mProcess, intern("CLOCK_REALTIME"), fix(0));
+    defnPriv(mKernel, "__dir__", k_dir, 0, 0);
+    setConst(cObject, intern("RUBY_VERSION"), strFrozen("3.4.9"));
+#ifdef _WIN32
+    setConst(cObject, intern("RUBY_PLATFORM"), strFrozen("x64-mingw-ucrt"));
+#else
+    setConst(cObject, intern("RUBY_PLATFORM"), strFrozen("x86_64-linux"));
+#endif
+    setConst(cObject, intern("RUBY_ENGINE"), strFrozen("ruby"));
+    setConst(cObject, intern("RUBY_ENGINE_VERSION"), strFrozen("3.4.9"));
+    V argv = ary();
+    for (const std::string &arg : g_scriptArgv)
+        aref(argv).push_back(str(arg));
+    setConst(cObject, intern("ARGV"), argv);
+    V env = newObject(cObject);
+    RClass *envClass = singletonOf(env);
+    defn(envClass, "[]", env_aref, 1, 1);
+    defn(envClass, "fetch", env_fetch, 1, 2);
+    defn(envClass, "key?", env_key_p, 1, 1);
+    defn(envClass, "has_key?", env_key_p, 1, 1);
+    defn(envClass, "include?", env_key_p, 1, 1);
+    setConst(cObject, intern("ENV"), env);
+    V in = newObject(cIO);
+    setConst(cObject, intern("STDIN"), in);
+    globals[intern("$stdin")] = in;
+    setConst(cObject, intern("ARGF"), in);
+    defnPriv(mKernel, "__file_kind", f_kind, 1, 1);
+    defnPriv(mKernel, "__file_read", f_read, 1, 1);
+    defnPriv(mKernel, "__file_write", f_write, 3, 3);
+    defnPriv(mKernel, "__file_delete", f_delete, 1, 1);
+    defnPriv(mKernel, "__file_rename", f_rename, 2, 2);
+    defnPriv(mKernel, "__dir_pwd", d_pwd, 0, 0);
+    defnPriv(mKernel, "__dir_make", d_make, 1, 1);
+    defnPriv(mKernel, "__dir_change", d_change, 1, 1);
+    defnPriv(mKernel, "__file_mtime", f_mtime, 1, 1);
+    defnPriv(mKernel, "__dir_list", d_list, 1, 1);
+    defs(mKernel, "__wall_clock", k_wall_clock, 0, 0);
+    defs(mKernel, "__utc_offset", k_utc_offset, 1, 1);
+    defs(mKernel, "__zone_name", k_zone_name, 0, 0);
+    defnPriv(mKernel, "rand", k_rand, 0, 1);
+    defnPriv(mKernel, "srand", k_srand, 0, 1);
+    defs(mKernel, "rand", k_rand, 0, 1);
+    defs(mKernel, "srand", k_srand, 0, 1);
+    cRandom->instType = T::Data;
+    defs(cRandom, "rand", random_s_rand, 0, 1);
+    defs(cRandom, "srand", k_srand, 0, 1);
+    defnPriv(cRandom, "initialize", random_init, 0, 1);
+    defn(cRandom, "rand", random_rand, 0, 1);
+    defn(cRandom, "seed", random_seed, 0, 0);
+    defn(cRandom, "bytes", random_bytes, 1, 1);
+    defn(cArray, "shuffle", ary_shuffle, 0, 1);
+    defn(cArray, "shuffle!", ary_shuffle_bang, 0, 1);
+    defn(cArray, "sample", ary_sample, 0, 2);
+    defn(cArray, "pack", ary_pack, 1, 2);
+    defn(cString, "unpack", str_unpack, 1, 2);
+    defn(cString, "unpack1", str_unpack1, 1, 2);
+    defs(mProcess, "pid", gc_nil, 0, 0);
+}
+
+void Interp::loadPrelude() {}
+
+void Interp::loadLibrary(const std::string &name)
+{
+    if (loaded.count(name))
+        return;
+    loaded[name] = true;
+    std::string file = name + ".sa";
+    if (name == "core_ext")
+    {
+        // what it adds to File, Time and the like needs those classes
+        loadLibrary("file");
+        loadLibrary("time");
+        loadingCoreExt = true;
+    }
+    for (const auto &lib : librarySources())
+        if (lib.first == file)
+        {
+            // loading must not disturb a jump in progress or the running frame's line
+            Unwind savedUnwind = unwind;
+            V savedVal = unwindVal;
+            unwind = U_NONE;
+            runSource(lib.second, "<internal:" + name + ">", mainObj, topLex);
+            unwind = savedUnwind;
+            unwindVal = savedVal;
+            loadingCoreExt = false;
+            return;
+        }
+    // a library of the standard distribution with nothing to load here
+    if (name == "monitor" || name == "thread")
+    {
+        loaded["monitor"] = true;
+        loaded["thread"] = true;
+        for (const auto &lib : librarySources())
+            if (lib.first == "thread.sa")
+                runSource(lib.second, "<internal:thread>", mainObj, topLex);
+        return;
+    }
+    static const char *known[] = {"bigdecimal", "securerandom", "English", "rational", "complex", "enumerator", "fiber", "etc", "matrix", "digest", "tempfile", "fileutils", "optparse", "open3", "logger", "erb", "csv", "shellwords", "abbrev", "weakref", "objspace", "ripper"};
+    for (const char *k : known)
+        if (name == k)
+            return;
+    V exc = makeExc(cLoadError, "cannot load such file -- " + name);
+    raiseExc(exc);
+}
+
+int runProgram(const std::string &source, const std::string &path, RunFailure &failure)
+{
+    auto *I = new Interp();
+    int status = I->run(source, path);
+    if (status != 0 && I->failed)
+    {
+        failure.failed = true;
+        failure.kind = I->failKind;
+        failure.message = I->failMessage;
+        failure.line = I->failLine;
+    }
+    return status;
+}
+
+} // namespace ruby

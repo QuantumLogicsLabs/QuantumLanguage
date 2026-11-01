@@ -5,7 +5,11 @@
 // stack.peek(), ...), functional-interface calls on functions (f.apply(x),
 // p.test(x), cmp.reversed()), and Java's string conversion. The methods are
 // switched on by __java_style__(), which the library calls first, so other
-// programs keep the existing meanings of these names.
+// programs keep the existing meanings of these names. Within a program they
+// come first everywhere but in its Ruby code (Chunk::rubyStyle), which keeps
+// Quantum's meanings (s.chars, xs.reduce { }, xs.min, "#{x}") and gets
+// a Java method only for a name Quantum's value lacks (list.add(x) on a Java
+// list). Char arithmetic is the Java classes' alone (Chunk::javaStyle).
 #include "Vm.h.sa"
 #include "Error.h.sa"
 #include <algorithm>
@@ -190,6 +194,12 @@ void VM::registerJavaStyleNatives()
         {
         javaStyle_ = true;
         return QV(); });
+    // Around the top-level Ruby statements of a file with Java-style code
+    // (Compiler::compileBlock): true before them, false after
+    reg("__ruby_code__", [this, arg](std::vector<QV> a) -> QV
+        {
+        scriptRuby_ = arg(a, 0).isTruthy();
+        return QV(); });
     reg("__jstr", [this, arg](std::vector<QV> a) -> QV { return QV(javaString(arg(a, 0))); });
     // The names of an instance's class and its superclasses, innermost first
     reg("__jclassChain", [arg](std::vector<QV> a) -> QV
@@ -239,6 +249,27 @@ void VM::registerJavaStyleNatives()
         std::cout.flush();
         std::exit((int)num(arg(a, 0)));
         return QV(); });
+}
+
+bool VM::javaStyleCode() const
+{
+    if (!javaStyle_)
+        return false;
+    if (frames_.empty())
+        return true;
+    // a Ruby function, or a top-level Ruby statement of the script
+    return !frames_.back().closure->chunk->rubyStyle && !(scriptRuby_ && frames_.size() == 1);
+}
+
+QuantumValue VM::javaStyleFallback(const QuantumValue &obj, const std::string &m,
+                                   const std::vector<QuantumValue> &args, bool &handled)
+{
+    handled = false;
+    if (!javaStyle_)
+        return QV();
+    QV self = obj;
+    std::vector<QV> a = args;
+    return javaStyleMethod(self, m, a, handled);
 }
 
 QuantumValue VM::javaStyleMethod(QuantumValue &obj, const std::string &m, std::vector<QuantumValue> &args, bool &handled)

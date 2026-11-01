@@ -1,0 +1,215 @@
+# Set, in Ruby, over a Hash.
+class Set
+  include Enumerable
+
+  def self.[](*items) = new(items)
+
+  def initialize(enum = nil, &blk)
+    @hash = {}
+    return if enum.nil?
+    if blk
+      enum.each { |x| @hash[blk.call(x)] = true }
+    else
+      enum.each { |x| @hash[x] = true }
+    end
+  end
+
+  def initialize_copy(o)
+    @hash = o.__hash.dup
+    self
+  end
+
+  def __hash = @hash
+
+  def compare_by_identity
+    @hash.compare_by_identity
+    self
+  end
+
+  def freeze
+    @hash.freeze
+    super
+  end
+
+  def __check
+    raise FrozenError.new("can't modify frozen Set: #{inspect}", receiver: self) if frozen?
+  end
+
+  def size = @hash.size
+  alias length size
+  def count(*a, &b) = a.empty? && !b ? @hash.size : to_a.count(*a, &b)
+  def empty? = @hash.empty?
+
+  def include?(x) = @hash.key?(x)
+  alias member? include?
+  alias === include?
+  alias contain? include?
+
+  def add(x)
+    __check
+    @hash[x] = true
+    self
+  end
+  alias << add
+
+  def add?(x)
+    return nil if @hash.key?(x)
+    add(x)
+  end
+
+  def delete(x)
+    __check
+    @hash.delete(x)
+    self
+  end
+
+  def delete?(x)
+    return nil unless @hash.key?(x)
+    delete(x)
+  end
+
+  def clear
+    __check
+    @hash.clear
+    self
+  end
+
+  def each(&blk)
+    return to_enum(:each) unless blk
+    @hash.each_key(&blk)
+    self
+  end
+
+  def to_a = @hash.keys
+  def to_set = self
+  def dup = self.class.new(to_a)
+  def first(*n) = n.empty? ? to_a.first : to_a.first(*n)
+  def min(*a, &b) = to_a.min(*a, &b)
+  def max(*a, &b) = to_a.max(*a, &b)
+
+  def merge(*enums)
+    __check
+    enums.each { |e| e.each { |x| @hash[x] = true } }
+    self
+  end
+
+  def subtract(enum)
+    __check
+    enum.each { |x| @hash.delete(x) }
+    self
+  end
+
+  def |(o) = dup.merge(o)
+  alias union |
+  alias + |
+
+  def -(o) = dup.subtract(o)
+  alias difference -
+
+  def &(o)
+    out = self.class.new
+    o.each { |x| out.add(x) if include?(x) }
+    out
+  end
+  alias intersection &
+
+  def ^(o)
+    out = self.class.new(o)
+    each { |x| out.include?(x) ? out.delete(x) : out.add(x) }
+    out
+  end
+
+  def subset?(o) = size <= o.size && all? { |x| o.include?(x) }
+  alias <= subset?
+  def superset?(o) = o.size <= size && o.all? { |x| include?(x) }
+  alias >= superset?
+  def proper_subset?(o) = size < o.size && all? { |x| o.include?(x) }
+  alias < proper_subset?
+  def proper_superset?(o) = o.size < size && o.all? { |x| include?(x) }
+  alias > proper_superset?
+
+  def <=>(o)
+    return nil unless o.is_a?(Set)
+    return 0 if self == o
+    return -1 if proper_subset?(o)
+    return 1 if proper_superset?(o)
+    nil
+  end
+
+  def disjoint?(o) = none? { |x| o.include?(x) }
+  def intersect?(o) = !disjoint?(o)
+
+  def ==(o)
+    return true if equal?(o)
+    o.is_a?(Set) && size == o.size && o.all? { |x| include?(x) }
+  end
+
+  def eql?(o) = o.is_a?(Set) && self == o
+  def hash = to_a.map(&:hash).sort.hash
+
+  def delete_if
+    __check
+    to_a.each { |x| @hash.delete(x) if yield(x) }
+    self
+  end
+
+  def reject!(&b)
+    n = size
+    delete_if(&b)
+    n == size ? nil : self
+  end
+
+  def keep_if
+    __check
+    to_a.each { |x| @hash.delete(x) unless yield(x) }
+    self
+  end
+
+  def select!(&b)
+    n = size
+    keep_if(&b)
+    n == size ? nil : self
+  end
+  alias filter! select!
+
+  def map!
+    __check
+    items = to_a.map { |x| yield(x) }
+    @hash.clear
+    items.each { |x| @hash[x] = true }
+    self
+  end
+  alias collect! map!
+
+  def flatten
+    out = self.class.new
+    each { |x| x.is_a?(Set) ? out.merge(x.flatten) : out.add(x) }
+    out
+  end
+
+  def join(sep = nil) = to_a.join(sep)
+
+  def replace(e)
+    clear
+    merge(e)
+  end
+
+  def reset = self
+  def compare_by_identity? = false
+
+  def flatten!
+    return nil if none? { |x| x.is_a?(Set) }
+    replace(flatten)
+  end
+
+  def divide(&b) = self.class.new(to_a.group_by(&b).values.map { |v| self.class.new(v) })
+
+  def classify
+    h = {}
+    each { |x| (h[yield(x)] ||= self.class.new).add(x) }
+    h
+  end
+
+  def inspect = "#<Set: {#{to_a.map(&:inspect).join(', ')}}>"
+  alias to_s inspect
+end

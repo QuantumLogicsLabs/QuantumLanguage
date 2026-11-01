@@ -1,0 +1,1027 @@
+// quantum: cpp
+// Ruby front-end: Hash. Enumerable methods without a Hash definition run
+// over the [key, value] pairs (RubyEnum.sa).
+#include "RubyRt.h.sa"
+
+#include <cctype>
+
+namespace ruby
+{
+
+namespace
+{
+
+RHash *H(Interp &I, V v) { return I.href(v); }
+
+void modify(Interp &I, V self)
+{
+    if (op(self)->frozen)
+        I.frozenError(self);
+}
+
+// does a block take the pair as two parameters?
+bool twoParams(Blk *b)
+{
+    if (!b || b->kind != B_RUBY || !b->node)
+        return false;
+    ParamList &pl = b->node->params;
+    return pl.required + pl.optional + pl.post > 1 || (pl.hasRest && pl.required > 0);
+}
+
+V yieldPair(Interp &I, Blk *b, V k, V v)
+{
+    if (twoParams(b))
+        return I.yield2(b, k, v);
+    return I.yield(b, I.ary2(k, v));
+}
+
+V newHashLike(Interp &I, V self)
+{
+    (void)self;
+    return I.newHash();
+}
+
+V hash_s_new(Interp &I, V self, Args &a)
+{
+    V h = I.allocate(static_cast<RClass *>(op(self)));
+    Method *init = I.findMethod(op(h)->klass, I.s.initialize);
+    I.invoke(init, h, a, nullptr, I.frame);
+    return h;
+}
+
+V hash_initialize(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    RHash *kw = kwArg(a);
+    int argc = kw ? a.argc - 1 : a.argc;
+    if (argc > 0)
+        h->defVal = a.argv[0];
+    if (a.blk)
+        h->defProc = I.procFromBlk(a.blk, true);
+    return Qnil;
+}
+
+V hash_s_aref(Interp &I, V self, Args &a)
+{
+    V h = I.allocate(static_cast<RClass *>(op(self)));
+    if (a.argc == 1 && I.isHash(a.argv[0]))
+    {
+        RHash *o = H(I, a.argv[0]);
+        for (size_t i = 0; i < o->keys.size(); ++i)
+            if (o->keys[i] != Qundef)
+                I.hset(H(I, h), o->keys[i], o->vals[i]);
+        return h;
+    }
+    if (a.argc == 1 && I.isAry(a.argv[0]))
+    {
+        for (V pair : I.aref(a.argv[0]))
+        {
+            std::vector<V> &p = I.aref(pair);
+            I.hset(H(I, h), p[0], p.size() > 1 ? p[1] : Qnil);
+        }
+        return h;
+    }
+    if (a.argc % 2)
+        I.raise(I.cArgumentError, "odd number of arguments for Hash");
+    for (int i = 0; i + 1 < a.argc; i += 2)
+        I.hset(H(I, h), a.argv[i], a.argv[i + 1]);
+    return h;
+}
+
+V hash_aref(Interp &I, V self, Args &a) { return I.hfetch(self, a.argv[0]); }
+
+V hash_aset(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    I.hset(H(I, self), a.argv[0], a.argv[1]);
+    return a.argv[1];
+}
+
+V hash_fetch(Interp &I, V self, Args &a)
+{
+    bool found = false;
+    V v = I.hget(H(I, self), a.argv[0], &found);
+    if (found)
+        return v;
+    if (a.blk)
+        return I.yield(a.blk, a.argv[0]);
+    if (a.argc > 1)
+        return a.argv[1];
+    V exc = I.makeExc(I.cKeyError, "key not found: " + I.inspect(a.argv[0]));
+    I.ivarSet(exc, I.s.key, a.argv[0]);
+    I.ivarSet(exc, I.s.receiver, self);
+    I.raiseExc(exc);
+}
+
+V hash_key_p(Interp &I, V self, Args &a)
+{
+    bool found = false;
+    I.hget(H(I, self), a.argv[0], &found);
+    return boolv(found);
+}
+
+V hash_value_p(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef && I.eq(h->vals[i], a.argv[0]))
+            return Qtrue;
+    return Qfalse;
+}
+
+V hash_key(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef && I.eq(h->vals[i], a.argv[0]))
+            return h->keys[i];
+    return Qnil;
+}
+
+V hash_keys(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RHash *h = H(I, self);
+    V out = I.ary();
+    std::vector<V> &v = I.aref(out);
+    v.reserve(h->live);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            v.push_back(h->keys[i]);
+    return out;
+}
+
+V hash_values(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RHash *h = H(I, self);
+    V out = I.ary();
+    std::vector<V> &v = I.aref(out);
+    v.reserve(h->live);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            v.push_back(h->vals[i]);
+    return out;
+}
+
+V hash_values_at(Interp &I, V self, Args &a)
+{
+    V out = I.ary();
+    for (int i = 0; i < a.argc; ++i)
+        I.aref(out).push_back(I.hfetch(self, a.argv[i]));
+    return out;
+}
+
+V hash_fetch_values(Interp &I, V self, Args &a)
+{
+    V out = I.ary();
+    for (int i = 0; i < a.argc; ++i)
+    {
+        Args b;
+        b.argv = &a.argv[i];
+        b.argc = 1;
+        b.blk = a.blk;
+        I.aref(out).push_back(hash_fetch(I, self, b));
+    }
+    return out;
+}
+
+V hash_size(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix(H(I, self)->live);
+}
+
+V hash_empty(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return boolv(H(I, self)->live == 0);
+}
+
+V hash_delete(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    bool found = false;
+    V v = I.hdel(H(I, self), a.argv[0], &found);
+    if (!found && a.blk)
+        return I.yield(a.blk, a.argv[0]);
+    return v;
+}
+
+V hash_each(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each", a);
+    RHash *h = H(I, self);
+    bool two = twoParams(a.blk);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        V k = h->keys[i];
+        if (k == Qundef)
+            continue;
+        if (two)
+            I.yield2(a.blk, k, h->vals[i]);
+        else
+            I.yield(a.blk, I.ary2(k, h->vals[i]));
+    }
+    return self;
+}
+
+V hash_each_key(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each_key", a);
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            I.yield(a.blk, h->keys[i]);
+    return self;
+}
+
+V hash_each_value(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "each_value", a);
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            I.yield(a.blk, h->vals[i]);
+    return self;
+}
+
+V hashFilter(Interp &I, V self, Args &a, bool keep, const char *name)
+{
+    if (!a.blk)
+        return enumFor(I, self, name, a);
+    RHash *h = H(I, self);
+    V out = I.newHash();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        V k = h->keys[i];
+        if (k == Qundef)
+            continue;
+        V v = h->vals[i];
+        if (truthy(I.yield2(a.blk, k, v)) == keep)
+            I.hset(H(I, out), k, v);
+    }
+    return out;
+}
+
+V hash_select(Interp &I, V self, Args &a) { return hashFilter(I, self, a, true, "select"); }
+V hash_reject(Interp &I, V self, Args &a) { return hashFilter(I, self, a, false, "reject"); }
+
+V hashFilterBang(Interp &I, V self, Args &a, bool keep, bool nilIfSame)
+{
+    modify(I, self);
+    RHash *h = H(I, self);
+    std::vector<V> drop;
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        V k = h->keys[i];
+        if (k == Qundef)
+            continue;
+        if (truthy(I.yield2(a.blk, k, h->vals[i])) != keep)
+            drop.push_back(k);
+    }
+    for (V k : drop)
+        I.hdel(h, k);
+    if (nilIfSame && drop.empty())
+        return Qnil;
+    return self;
+}
+
+V hash_select_bang(Interp &I, V self, Args &a) { return hashFilterBang(I, self, a, true, true); }
+V hash_keep_if(Interp &I, V self, Args &a) { return hashFilterBang(I, self, a, true, false); }
+V hash_reject_bang(Interp &I, V self, Args &a) { return hashFilterBang(I, self, a, false, true); }
+V hash_delete_if(Interp &I, V self, Args &a) { return hashFilterBang(I, self, a, false, false); }
+
+V hash_to_a(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return I.arrayOf(self);
+}
+
+V hash_to_h(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+    {
+        if (I.realClassOf(self) == I.cHash)
+            return self;
+        V h = I.newHash();
+        RHash *o = H(I, self);
+        for (size_t i = 0; i < o->keys.size(); ++i)
+            if (o->keys[i] != Qundef)
+                I.hset(H(I, h), o->keys[i], o->vals[i]);
+        return h;
+    }
+    RHash *o = H(I, self);
+    V h = I.newHash();
+    for (size_t i = 0; i < o->keys.size(); ++i)
+    {
+        if (o->keys[i] == Qundef)
+            continue;
+        V pair = yieldPair(I, a.blk, o->keys[i], o->vals[i]);
+        V arr = I.toAry(pair);
+        if (arr == Qnil || I.aref(arr).size() != 2)
+            I.raise(I.cTypeError, "wrong element type " + I.className(I.realClassOf(pair)) + " (expected array)");
+        I.hset(H(I, h), I.aref(arr)[0], I.aref(arr)[1]);
+    }
+    return h;
+}
+
+std::string keyInspect(Interp &I, V k)
+{
+    if (isSymV(k))
+    {
+        std::string si = symInspect(symName(vsym(k)));
+        // :name prints as `name: `, :"odd name" as `"odd name": `
+        if (si.size() > 1 && si[1] == '"')
+            return si.substr(1) + ": ";
+        const std::string &n = symName(vsym(k));
+        bool simple = !n.empty() && (std::isalpha((unsigned char)n[0]) || n[0] == '_' || (unsigned char)n[0] >= 0x80);
+        for (size_t i = 1; simple && i < n.size(); ++i)
+        {
+            unsigned char c = (unsigned char)n[i];
+            if (!(std::isalnum(c) || c == '_' || c >= 0x80 || ((c == '?' || c == '!') && i + 1 == n.size())))
+                simple = false;
+        }
+        if (simple)
+            return n + ": ";
+        return strInspect(n) + ": ";
+    }
+    return I.inspect(k) + " => ";
+}
+
+V hash_inspect(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RHash *h = H(I, self);
+    if (h->live == 0)
+        return I.str("{}");
+    for (V seen : I.inspecting)
+        if (seen == self)
+            return I.str("{...}");
+    I.inspecting.push_back(self);
+    std::string out = "{";
+    bool first = true;
+    try
+    {
+        for (size_t i = 0; i < h->keys.size(); ++i)
+        {
+            if (h->keys[i] == Qundef)
+                continue;
+            if (!first)
+                out += ", ";
+            first = false;
+            out += keyInspect(I, h->keys[i]) + I.inspect(h->vals[i]);
+        }
+    }
+    catch (...)
+    {
+        I.inspecting.pop_back();
+        throw;
+    }
+    I.inspecting.pop_back();
+    return I.str(out + "}");
+}
+
+V hash_merge_into(Interp &I, V target, Args &a)
+{
+    for (int k = 0; k < a.argc; ++k)
+    {
+        V other = a.argv[k];
+        if (!I.isHash(other))
+            other = I.call0(other, I.s.to_hash);
+        RHash *o = H(I, other);
+        for (size_t i = 0; i < o->keys.size(); ++i)
+        {
+            V key = o->keys[i];
+            if (key == Qundef)
+                continue;
+            V val = o->vals[i];
+            if (a.blk)
+            {
+                bool found = false;
+                V old = I.hget(H(I, target), key, &found);
+                if (found)
+                {
+                    V av[3] = {key, old, val};
+                    val = I.callBlock(a.blk, 3, av);
+                }
+            }
+            I.hset(H(I, target), key, val);
+        }
+    }
+    return target;
+}
+
+V hash_merge(Interp &I, V self, Args &a)
+{
+    V copy = I.newHash();
+    RHash *src = H(I, self), *dst = H(I, copy);
+    dst->keys = src->keys;
+    dst->vals = src->vals;
+    dst->hashes = src->hashes;
+    dst->index = src->index;
+    dst->live = src->live;
+    dst->defVal = src->defVal;
+    dst->defProc = src->defProc;
+    dst->byId = src->byId;
+    return hash_merge_into(I, copy, a);
+}
+
+V hash_update(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    return hash_merge_into(I, self, a);
+}
+
+V hash_transform_values(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "transform_values", a);
+    RHash *h = H(I, self);
+    V out = I.newHash();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            I.hset(H(I, out), h->keys[i], I.yield(a.blk, h->vals[i]));
+    return out;
+}
+
+V hash_transform_values_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            h->vals[i] = I.yield(a.blk, h->vals[i]);
+    return self;
+}
+
+V hash_transform_keys(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    V out = I.newHash();
+    V mapping = a.argc > 0 && I.isHash(a.argv[0]) ? a.argv[0] : Qnil;
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        V k = h->keys[i];
+        if (k == Qundef)
+            continue;
+        V nk;
+        bool found = false;
+        if (mapping != Qnil)
+        {
+            nk = I.hget(H(I, mapping), k, &found);
+            if (!found)
+                nk = a.blk ? I.yield(a.blk, k) : k;
+        }
+        else
+            nk = I.yield(a.blk, k);
+        I.hset(H(I, out), nk, h->vals[i]);
+    }
+    return out;
+}
+
+V hash_transform_keys_bang(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    V r = hash_transform_keys(I, self, a);
+    RHash *h = H(I, self), *o = H(I, r);
+    h->keys = o->keys;
+    h->vals = o->vals;
+    h->hashes = o->hashes;
+    h->index = o->index;
+    h->live = o->live;
+    return self;
+}
+
+V hash_invert(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RHash *h = H(I, self);
+    V out = I.newHash();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            I.hset(H(I, out), h->vals[i], h->keys[i]);
+    return out;
+}
+
+V hash_dig(Interp &I, V self, Args &a)
+{
+    V cur = self;
+    for (int i = 0; i < a.argc; ++i)
+    {
+        if (cur == Qnil)
+            return Qnil;
+        cur = I.call1(cur, I.s.aref, a.argv[i]);
+    }
+    return cur;
+}
+
+V hash_default(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return H(I, self)->defVal;
+}
+
+V hash_set_default(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    H(I, self)->defVal = a.argv[0];
+    return a.argv[0];
+}
+
+V hash_default_proc(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return H(I, self)->defProc;
+}
+
+V hash_set_default_proc(Interp &I, V self, Args &a)
+{
+    H(I, self)->defProc = a.argv[0];
+    return a.argv[0];
+}
+
+V hash_compare_by_identity(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RHash *h = H(I, self);
+    h->byId = true;
+    std::vector<V> ks = h->keys, vs = h->vals;
+    I.hclear(h);
+    for (size_t i = 0; i < ks.size(); ++i)
+        if (ks[i] != Qundef)
+            I.hset(h, ks[i], vs[i]);
+    return self;
+}
+
+V hash_slice(Interp &I, V self, Args &a)
+{
+    V out = I.newHash();
+    for (int i = 0; i < a.argc; ++i)
+    {
+        bool found = false;
+        V v = I.hget(H(I, self), a.argv[i], &found);
+        if (found)
+            I.hset(H(I, out), a.argv[i], v);
+    }
+    return out;
+}
+
+V hash_except(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    V out = I.newHash();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        V k = h->keys[i];
+        if (k == Qundef)
+            continue;
+        bool skip = false;
+        for (int j = 0; j < a.argc; ++j)
+            if (I.eql(k, a.argv[j]))
+                skip = true;
+        if (!skip)
+            I.hset(H(I, out), k, h->vals[i]);
+    }
+    return out;
+}
+
+V hash_eq(Interp &I, V self, Args &a)
+{
+    if (!I.isHash(a.argv[0]))
+        return Qfalse;
+    return boolv(I.eq(self, a.argv[0]));
+}
+
+V hash_hash(Interp &I, V self, Args &a)
+{
+    (void)a;
+    return fix((int64_t)(I.hashOf(self) >> 2));
+}
+
+V hash_compact(Interp &I, V self, Args &a)
+{
+    (void)a;
+    RHash *h = H(I, self);
+    V out = I.newHash();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef && h->vals[i] != Qnil)
+            I.hset(H(I, out), h->keys[i], h->vals[i]);
+    return out;
+}
+
+V hash_clear(Interp &I, V self, Args &a)
+{
+    (void)a;
+    modify(I, self);
+    I.hclear(H(I, self));
+    return self;
+}
+
+V hash_replace(Interp &I, V self, Args &a)
+{
+    modify(I, self);
+    RHash *h = H(I, self), *o = H(I, a.argv[0]);
+    h->keys = o->keys;
+    h->vals = o->vals;
+    h->hashes = o->hashes;
+    h->index = o->index;
+    h->live = o->live;
+    return self;
+}
+
+V hash_shift(Interp &I, V self, Args &a)
+{
+    (void)a;
+    modify(I, self);
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+        {
+            V k = h->keys[i], v = h->vals[i];
+            I.hdel(h, k);
+            return I.ary2(k, v);
+        }
+    return Qnil;
+}
+
+V hash_any(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        if (h->keys[i] == Qundef)
+            continue;
+        if (!a.blk)
+            return Qtrue;
+        if (truthy(yieldPair(I, a.blk, h->keys[i], h->vals[i])))
+            return Qtrue;
+    }
+    return Qfalse;
+}
+
+V hash_count(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    if (!a.blk && a.argc == 0)
+        return fix(h->live);
+    int64_t n = 0;
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        if (h->keys[i] == Qundef)
+            continue;
+        if (a.argc > 0 ? I.eq(I.ary2(h->keys[i], h->vals[i]), a.argv[0]) : truthy(yieldPair(I, a.blk, h->keys[i], h->vals[i])))
+            ++n;
+    }
+    return fix(n);
+}
+
+V hash_filter_map(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    V out = I.ary();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        if (h->keys[i] == Qundef)
+            continue;
+        V r = yieldPair(I, a.blk, h->keys[i], h->vals[i]);
+        if (truthy(r))
+            I.aref(out).push_back(r);
+    }
+    return out;
+}
+
+V hash_map(Interp &I, V self, Args &a)
+{
+    if (!a.blk)
+        return enumFor(I, self, "map", a);
+    RHash *h = H(I, self);
+    V out = I.ary();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            I.aref(out).push_back(yieldPair(I, a.blk, h->keys[i], h->vals[i]));
+    return out;
+}
+
+V hash_sum(Interp &I, V self, Args &a)
+{
+    std::vector<V> items = I.aref(I.arrayOf(self));
+    V init = a.argc > 0 ? a.argv[0] : fix(0);
+    if (!a.blk)
+        return arySum(I, items, init, a.argc > 0, nullptr);
+    std::vector<V> vals;
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            vals.push_back(yieldPair(I, a.blk, h->keys[i], h->vals[i]));
+    return arySum(I, vals, init, a.argc > 0, nullptr);
+}
+
+V hash_find(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef && truthy(yieldPair(I, a.blk, h->keys[i], h->vals[i])))
+            return I.ary2(h->keys[i], h->vals[i]);
+    return Qnil;
+}
+
+V hash_all(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef && !truthy(yieldPair(I, a.blk, h->keys[i], h->vals[i])))
+            return Qfalse;
+    return Qtrue;
+}
+
+V hash_none(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef && truthy(yieldPair(I, a.blk, h->keys[i], h->vals[i])))
+            return Qfalse;
+    return Qtrue;
+}
+
+V hash_subset(Interp &I, V self, Args &a, bool strict)
+{
+    RHash *h = H(I, self), *o = H(I, a.argv[0]);
+    if (strict ? h->live >= o->live : h->live > o->live)
+        return Qfalse;
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        if (h->keys[i] == Qundef)
+            continue;
+        bool found = false;
+        V v = I.hget(o, h->keys[i], &found);
+        if (!found || !I.eq(v, h->vals[i]))
+            return Qfalse;
+    }
+    return Qtrue;
+}
+
+V hash_le(Interp &I, V self, Args &a) { return hash_subset(I, self, a, false); }
+V hash_lt(Interp &I, V self, Args &a) { return hash_subset(I, self, a, true); }
+V hash_ge(Interp &I, V self, Args &a)
+{
+    Args b;
+    V s = self;
+    b.argv = &s;
+    b.argc = 1;
+    return hash_subset(I, a.argv[0], b, false);
+}
+V hash_gt(Interp &I, V self, Args &a)
+{
+    Args b;
+    V s = self;
+    b.argv = &s;
+    b.argc = 1;
+    return hash_subset(I, a.argv[0], b, true);
+}
+
+V hash_deconstruct_keys(Interp &I, V self, Args &a)
+{
+    (void)I;
+    (void)a;
+    return self;
+}
+
+V hash_assoc(Interp &I, V self, Args &a)
+{
+    bool found = false;
+    V v = I.hget(H(I, self), a.argv[0], &found);
+    return found ? I.ary2(a.argv[0], v) : Qnil;
+}
+
+V hash_rassoc(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef && I.eq(h->vals[i], a.argv[0]))
+            return I.ary2(h->keys[i], h->vals[i]);
+    return Qnil;
+}
+
+V hash_each_with_index(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    int64_t idx = 0;
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            I.yield2(a.blk, I.ary2(h->keys[i], h->vals[i]), fix(idx++));
+    return self;
+}
+
+V hash_group_by(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    V out = I.newHash();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        if (h->keys[i] == Qundef)
+            continue;
+        V pair = I.ary2(h->keys[i], h->vals[i]);
+        V k = yieldPair(I, a.blk, h->keys[i], h->vals[i]);
+        bool found = false;
+        V list = I.hget(H(I, out), k, &found);
+        if (!found)
+        {
+            list = I.ary();
+            I.hset(H(I, out), k, list);
+        }
+        I.aref(list).push_back(pair);
+    }
+    return out;
+}
+
+V hash_partition(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    V yes = I.ary(), no = I.ary();
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        if (h->keys[i] == Qundef)
+            continue;
+        V pair = I.ary2(h->keys[i], h->vals[i]);
+        I.aref(truthy(yieldPair(I, a.blk, h->keys[i], h->vals[i])) ? yes : no).push_back(pair);
+    }
+    return I.ary2(yes, no);
+}
+
+V hash_min_max_by(Interp &I, V self, Args &a, int sign)
+{
+    RHash *h = H(I, self);
+    V best = Qnil, bestKey = Qnil;
+    bool have = false;
+    for (size_t i = 0; i < h->keys.size(); ++i)
+    {
+        if (h->keys[i] == Qundef)
+            continue;
+        V k = yieldPair(I, a.blk, h->keys[i], h->vals[i]);
+        if (!have || I.cmp(k, bestKey) * sign > 0)
+        {
+            best = I.ary2(h->keys[i], h->vals[i]);
+            bestKey = k;
+            have = true;
+        }
+    }
+    return best;
+}
+
+V hash_min_by(Interp &I, V self, Args &a)
+{
+    if (a.argc > 0)
+        return I.callArgs(I.arrayOf(self), intern("min_by"), a);
+    return hash_min_max_by(I, self, a, -1);
+}
+
+V hash_max_by(Interp &I, V self, Args &a)
+{
+    if (a.argc > 0)
+        return I.callArgs(I.arrayOf(self), intern("max_by"), a);
+    return hash_min_max_by(I, self, a, 1);
+}
+
+V hash_sort_by(Interp &I, V self, Args &a)
+{
+    std::vector<V> pairs = I.aref(I.arrayOf(self));
+    if (twoParams(a.blk))
+    {
+        // the key block takes |k, v|: keys come from the pair, splatted
+        rbSortBy(I, pairs, a.blk);
+        return I.ary(pairs);
+    }
+    rbSortBy(I, pairs, a.blk);
+    return I.ary(pairs);
+}
+
+V hash_each_with_object(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    V memo = a.argv[0];
+    for (size_t i = 0; i < h->keys.size(); ++i)
+        if (h->keys[i] != Qundef)
+            I.yield2(a.blk, I.ary2(h->keys[i], h->vals[i]), memo);
+    return memo;
+}
+
+V hash_first(Interp &I, V self, Args &a)
+{
+    RHash *h = H(I, self);
+    if (a.argc == 0)
+    {
+        for (size_t i = 0; i < h->keys.size(); ++i)
+            if (h->keys[i] != Qundef)
+                return I.ary2(h->keys[i], h->vals[i]);
+        return Qnil;
+    }
+    int64_t n = I.intOf(a.argv[0]);
+    V out = I.ary();
+    for (size_t i = 0; i < h->keys.size() && (int64_t)I.aref(out).size() < n; ++i)
+        if (h->keys[i] != Qundef)
+            I.aref(out).push_back(I.ary2(h->keys[i], h->vals[i]));
+    return out;
+}
+
+V hash_store_compat(Interp &I, V self, Args &a) { return hash_aset(I, self, a); }
+
+} // namespace
+
+void Interp::initHash()
+{
+    RClass *c = cHash;
+    defs(c, "new", hash_s_new, 0, -1);
+    defs(c, "[]", hash_s_aref, 0, -1);
+    defnPriv(c, "initialize", hash_initialize, 0, -1);
+    defn(c, "[]", hash_aref, 1, 1);
+    defn(c, "[]=", hash_aset, 2, 2);
+    defn(c, "store", hash_store_compat, 2, 2);
+    defn(c, "fetch", hash_fetch, 1, 2);
+    defn(c, "key?", hash_key_p, 1, 1);
+    defn(c, "has_key?", hash_key_p, 1, 1);
+    defn(c, "include?", hash_key_p, 1, 1);
+    defn(c, "member?", hash_key_p, 1, 1);
+    defn(c, "value?", hash_value_p, 1, 1);
+    defn(c, "has_value?", hash_value_p, 1, 1);
+    defn(c, "key", hash_key, 1, 1);
+    defn(c, "keys", hash_keys, 0, 0);
+    defn(c, "values", hash_values, 0, 0);
+    defn(c, "values_at", hash_values_at, 0, -1);
+    defn(c, "fetch_values", hash_fetch_values, 0, -1);
+    defn(c, "length", hash_size, 0, 0);
+    defn(c, "size", hash_size, 0, 0);
+    defn(c, "empty?", hash_empty, 0, 0);
+    defn(c, "delete", hash_delete, 1, 1);
+    defn(c, "each", hash_each, 0, 0);
+    defn(c, "each_pair", hash_each, 0, 0);
+    defn(c, "each_key", hash_each_key, 0, 0);
+    defn(c, "each_value", hash_each_value, 0, 0);
+    defn(c, "select", hash_select, 0, 0);
+    defn(c, "filter", hash_select, 0, 0);
+    defn(c, "reject", hash_reject, 0, 0);
+    defn(c, "select!", hash_select_bang, 0, 0);
+    defn(c, "filter!", hash_select_bang, 0, 0);
+    defn(c, "keep_if", hash_keep_if, 0, 0);
+    defn(c, "reject!", hash_reject_bang, 0, 0);
+    defn(c, "delete_if", hash_delete_if, 0, 0);
+    defn(c, "to_a", hash_to_a, 0, 0);
+    defn(c, "entries", hash_to_a, 0, 0);
+    defn(c, "to_h", hash_to_h, 0, 0);
+    defn(c, "to_hash", hash_to_h, 0, 0);
+    defn(c, "inspect", hash_inspect, 0, 0);
+    defn(c, "to_s", hash_inspect, 0, 0);
+    defn(c, "merge", hash_merge, 0, -1);
+    defn(c, "merge!", hash_update, 0, -1);
+    defn(c, "update", hash_update, 0, -1);
+    defn(c, "transform_values", hash_transform_values, 0, 0);
+    defn(c, "transform_values!", hash_transform_values_bang, 0, 0);
+    defn(c, "transform_keys", hash_transform_keys, 0, 1);
+    defn(c, "transform_keys!", hash_transform_keys_bang, 0, 1);
+    defn(c, "invert", hash_invert, 0, 0);
+    defn(c, "dig", hash_dig, 1, -1);
+    defn(c, "default", hash_default, 0, 1);
+    defn(c, "default=", hash_set_default, 1, 1);
+    defn(c, "default_proc", hash_default_proc, 0, 0);
+    defn(c, "default_proc=", hash_set_default_proc, 1, 1);
+    defn(c, "compare_by_identity", hash_compare_by_identity, 0, 0);
+    defn(c, "slice", hash_slice, 0, -1);
+    defn(c, "except", hash_except, 0, -1);
+    defn(c, "==", hash_eq, 1, 1);
+    defn(c, "eql?", hash_eq, 1, 1);
+    defn(c, "hash", hash_hash, 0, 0);
+    defn(c, "compact", hash_compact, 0, 0);
+    defn(c, "clear", hash_clear, 0, 0);
+    defn(c, "replace", hash_replace, 1, 1);
+    defn(c, "shift", hash_shift, 0, 0);
+    defn(c, "any?", hash_any, 0, 1);
+    defn(c, "count", hash_count, 0, 1);
+    defn(c, "filter_map", hash_filter_map, 0, 0);
+    defn(c, "map", hash_map, 0, 0);
+    defn(c, "collect", hash_map, 0, 0);
+    defn(c, "sum", hash_sum, 0, 1);
+    defn(c, "find", hash_find, 0, 1);
+    defn(c, "detect", hash_find, 0, 1);
+    defn(c, "all?", hash_all, 0, 1);
+    defn(c, "none?", hash_none, 0, 1);
+    defn(c, "<=", hash_le, 1, 1);
+    defn(c, "<", hash_lt, 1, 1);
+    defn(c, ">=", hash_ge, 1, 1);
+    defn(c, ">", hash_gt, 1, 1);
+    defn(c, "deconstruct_keys", hash_deconstruct_keys, 1, 1);
+    defn(c, "assoc", hash_assoc, 1, 1);
+    defn(c, "rassoc", hash_rassoc, 1, 1);
+    defn(c, "each_with_index", hash_each_with_index, 0, 0);
+    defn(c, "group_by", hash_group_by, 0, 0);
+    defn(c, "partition", hash_partition, 0, 0);
+    defn(c, "min_by", hash_min_by, 0, 1);
+    defn(c, "max_by", hash_max_by, 0, 1);
+    defn(c, "sort_by", hash_sort_by, 0, 0);
+    defn(c, "each_with_object", hash_each_with_object, 1, 1);
+    defn(c, "first", hash_first, 0, 1);
+}
+
+} // namespace ruby

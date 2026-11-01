@@ -1,0 +1,36 @@
+module Forwardable
+  def instance_delegate(hash)
+    hash.each do |methods, accessor|
+      Array(methods).each { |m| def_instance_delegator(accessor, m) }
+    end
+  end
+  alias delegate instance_delegate
+
+  def def_instance_delegators(accessor, *methods)
+    methods.each do |m|
+      next if m.to_s == "__send__" || m.to_s == "__id__"
+      def_instance_delegator(accessor, m)
+    end
+  end
+  alias def_delegators def_instance_delegators
+
+  def def_instance_delegator(accessor, method, ali = method)
+    acc = accessor.to_s
+    target = self.is_a?(Module) ? self : singleton_class
+    target.send(:define_method, ali) do |*args, **kw, &blk|
+      recv = if acc.start_with?("@@")
+               self.class.class_variable_get(acc)
+             elsif acc.start_with?("@")
+               instance_variable_get(acc)
+             elsif acc =~ /\A[A-Z]/
+               Object.const_get(acc)
+             else
+               __send__(acc)
+             end
+      recv.__send__(method, *args, **kw, &blk)
+    end
+    ali.to_sym
+  end
+  alias def_delegator def_instance_delegator
+end
+SingleForwardable = Forwardable

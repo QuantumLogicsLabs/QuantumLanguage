@@ -17,6 +17,7 @@
 // (spliced includes, lowered namespaces, merged member definitions).
 
 #include <filesystem>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,6 +43,11 @@ bool isMarkedCppSource(const std::string &source);
 // syntax in one of the other dialects sharing the file.
 std::string applyRubyDialect(const std::string &source, bool strict);
 
+// The lines of a mixed (.sa) file that are Ruby code, when the file also
+// has Java-style code: the Ruby pass lists them on its last line,
+// `// quantum: ruby-lines 3-20 25` (empty for other source).
+std::set<int> rubyStyleLines(const std::string &source);
+
 // The synthesized Ruby `Enumerable` mixin, as Ruby source lines. Spliced in
 // wherever a class does `include Enumerable`; every method is defined purely
 // in terms of the including class's own `each`.
@@ -52,10 +58,13 @@ const std::vector<std::string> &rubyEnumerableModuleSource();
 // the common syntax, with the file's line numbers kept. A file showing no
 // Java (System.out.print..., import java..., access modifiers on members,
 // implements, @Override, String[]) comes back unchanged. A rewritten file
-// ends with the marker line `// quantum: java-style`, which makes
-// compileSource() load the Java-style library (src/dialect/javastyle/).
+// ends with the marker line `// quantum: java-style <classes>`, which makes
+// compileSource() load the Java-style library (src/dialect/javastyle/) and
+// names the classes whose methods are Java code (Chunk::javaStyle).
 std::string applyJavaDialect(const std::string &source);
 bool isJavaStyleSource(const std::string &source);
+// The class names on the marker line (empty for other source)
+std::set<std::string> javaStyleClasses(const std::string &source);
 namespace javastyle
 {
 // The library's source files (src/generated/JavaStyleData.sa)

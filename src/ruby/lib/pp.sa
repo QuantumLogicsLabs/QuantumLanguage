@@ -1,0 +1,92 @@
+# Kernel#pp for values too wide for one line (narrower ones just inspect).
+module PP
+  @width = 79
+
+  def self.layout(v, col, tail)
+    flat = v.inspect
+    return flat if col + flat.size + tail <= @width
+    case v
+    when Array
+      return flat if v.empty?
+      "[" + __list(v, col + 1, tail) + "]"
+    when Hash
+      return flat if v.empty?
+      inner = col + 1
+      n = v.size
+      "{" + v.each_with_index.map do |(k, x), i|
+        key = __key(k)
+        t = i == n - 1 ? tail + 1 : 1
+        one = x.inspect
+        if inner + key.size + 1 + one.size + t <= @width
+          "#{key} #{one}"
+        else
+          "#{key}\n#{' ' * (inner + 1)}#{layout(x, inner + 1, t)}"
+        end
+      end.join(",\n" + " " * inner) + "}"
+    when Struct
+      __fields("#<struct #{v.class.name}", v.members.zip(v.to_a), col, tail)
+    else
+      if defined?(Set) && v.is_a?(Set)
+        return flat if v.empty?
+        body = "{" + v.to_a.map(&:inspect).join(", ") + "}"
+        return "#<Set:\n #{' ' * col}#{body}>" if col + 1 + body.size + tail + 1 <= @width
+        "#<Set:\n #{' ' * col}{" + __list(v.to_a, col + 2, tail + 1) + "}>"
+      elsif defined?(Data) && v.is_a?(Data)
+        name = v.class.name
+        __fields("#<data #{name}".rstrip, v.class.members.map { |m| [m, v.public_send(m)] }, col, tail)
+      else
+        ivs = v.instance_variables
+        return flat if ivs.empty? || v.method(:inspect).owner != Kernel
+        head = Kernel.instance_method(:to_s).bind_call(v).chomp(">")
+        __fields(head, ivs.sort.map { |iv| [iv, v.instance_variable_get(iv)] }, col, tail)
+      end
+    end
+  end
+
+  def self.__list(items, inner, tail)
+    last = items.size - 1
+    items.each_with_index.map { |x, i| layout(x, inner, i == last ? tail + 1 : 1) }.join(",\n" + " " * inner)
+  end
+
+  # name=value lines; a value that does not fit goes on its own line
+  def self.__fields(head, fields, col, tail)
+    inner = col + 1
+    n = fields.size
+    body = fields.each_with_index.map do |(name, x), i|
+      t = i == n - 1 ? tail + 1 : 1
+      one = x.inspect
+      if inner + name.to_s.size + 1 + one.size + t <= @width
+        "#{name}=#{one}"
+      else
+        "#{name}=\n#{' ' * (inner + 1)}#{layout(x, inner + 1, t)}"
+      end
+    end
+    "#{head}\n#{' ' * inner}" + body.join(",\n" + " " * inner) + ">"
+  end
+
+  def self.__key(k)
+    return "#{k.inspect} =>" unless k.is_a?(Symbol)
+    s = { k => 0 }.inspect
+    s[1...-3]
+  end
+
+  def self.__format(v) = layout(v, 0, 0)
+
+  def self.pp(obj, out = $stdout, width = 79)
+    saved = @width
+    @width = width
+    out << __format(obj) << "\n"
+    out
+  ensure
+    @width = saved
+  end
+
+  def self.singleline_pp(obj, out = $stdout)
+    out << obj.inspect
+    out
+  end
+end
+
+module Kernel
+  def pretty_inspect = PP.__format(self) + "\n"
+end
