@@ -1,0 +1,4 @@
+'use strict';
+// The timers module.
+const promises = require('timers/promises');
+module.exports = { setTimeout, setInterval, setImmediate, clearTimeout, clearInterval, clearImmediate, promises };

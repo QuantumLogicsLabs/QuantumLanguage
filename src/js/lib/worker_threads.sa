@@ -1,0 +1,3 @@
+'use strict';
+// This program is the only thread there is.
+module.exports = { isMainThread: true, parentPort: null, workerData: null, threadId: 0 };

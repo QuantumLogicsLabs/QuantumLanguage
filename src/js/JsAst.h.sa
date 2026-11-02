@@ -1,0 +1,257 @@
+// quantum: cpp
+#pragma once
+// JavaScript front-end: the syntax tree. One node type serves every construct;
+// what each field means for a kind is noted on the kind. Names resolve to
+// frame slots or environment slots once a whole program has been parsed.
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace js
+{
+
+typedef uint64_t V;
+
+struct Node;
+struct FuncNode;
+struct Scope;
+struct Shape;
+
+enum N : uint8_t
+{
+    // literals
+    N_NUM,        // val
+    N_STR,        // val
+    N_UNDEF,      // `undefined` when not shadowed is an ordinary global; this is void-free constant
+    N_NULL,
+    N_TRUE,
+    N_FALSE,
+    N_BIGINT,     // val
+    N_REGEX,      // val source, val2 flags
+    N_TEMPLATE,   // items: strings (N_STR) and expressions in turn
+    N_TAGGED,     // a tag, b N_TEMPLATEOBJ, items substitutions
+    N_TEMPLATEOBJ,// items cooked (N_STR or N_UNDEF), raws in list2; val caches the array
+    N_ARRAY,      // items: expressions, N_SPREAD, N_HOLE
+    N_OBJECT,     // items: N_PROP
+    N_FUNC,       // func
+    N_CLASS,      // val name, a superclass, items N_MEMBERDEF, scope, func constructor
+    // names (N_IDENT becomes one of the next three when resolved)
+    N_IDENT,      // val name
+    N_LOCAL,      // slot, val name
+    N_ENVVAR,     // slot, hops, val name
+    N_GLOBAL,     // val name
+    N_DYNAMIC,    // val name: found at run time (`with`, direct eval)
+    N_THIS,
+    N_NEWTARGET,
+    // operators
+    N_UNARY,      // op, a
+    N_TYPEOF,     // a
+    N_DELETE,     // a
+    N_UPDATE,     // op (+1/-1 in slot), prefix flag, a
+    N_BINARY,     // op, a, b
+    N_AND,        // a, b
+    N_OR,
+    N_NULLISH,
+    N_COND,       // a ? b : c
+    N_ASSIGN,     // a target, b value
+    N_OPASSIGN,   // op, a target, b value
+    N_LOGASSIGN,  // op (N_AND/N_OR/N_NULLISH), a, b
+    N_SEQ,        // items
+    N_MEMBER,     // a . val; opt flag for ?.
+    N_INDEX,      // a [ b ]; opt
+    N_PRIVATE,    // a . #b (b: ident of the private name)
+    N_PRIVATEIN,  // #b in a
+    N_SUPERMEMBER,// super . val
+    N_SUPERINDEX, // super [ b ]
+    N_CHAIN,      // a: an optional chain ending here
+    N_CALL,       // a callee, items args; opt; spread; suspend: an argument can yield
+    N_NEW,        // a, items
+    N_SUPERCALL,  // items
+    N_SPREAD,     // a
+    N_HOLE,
+    N_YIELD,      // a; flag delegate
+    N_AWAIT,      // a
+    // property and class members
+    N_PROP,       // op: P_*; key: val or computed a; b value
+    N_MEMBERDEF,  // op: P_*; key: val or computed a, or private (c ident); b value; flag static
+    // patterns
+    N_ARRAYPAT,   // items: targets, N_HOLE, N_DEFAULT, N_REST
+    N_OBJECTPAT,  // items: N_PATPROP, N_REST
+    N_PATPROP,    // key: val or computed a; b target (or N_DEFAULT)
+    N_DEFAULT,    // a target, b default
+    N_REST,       // a target
+    // statements
+    N_EXPR,       // a
+    N_VAR,        // op: D_*; items N_DECL
+    N_DECL,       // a target, b init
+    N_BLOCK,      // items, scope
+    N_IF,         // a, b, c
+    N_FOR,        // a init, b test, c update, d body, scope
+    N_FORIN,      // a target (N_VAR or target), b object, d body, scope
+    N_FOROF,      // same; flag: for await
+    N_WHILE,      // a, d
+    N_DOWHILE,    // a, d
+    N_RETURN,     // a
+    N_BREAK,      // val label (0: none)
+    N_CONTINUE,   // val label
+    N_THROW,      // a
+    N_TRY,        // a block, b param, c handler, d finalizer, scope (the catch's)
+    N_SWITCH,     // a, items N_CASE, scope
+    N_CASE,       // a test (null: default), items
+    N_LABELED,    // val, a
+    N_EMPTY,
+    N_FUNCDECL,   // func, slot etc: runs as a statement only for the sloppy var copy
+    N_CLASSDECL,  // a target, b class
+    N_WITH,       // a, b, scope
+    N_EXPRBODY    // a: an arrow's expression body
+};
+
+enum Op : uint8_t
+{
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_EXP,
+    OP_BITAND, OP_BITOR, OP_BITXOR, OP_SHL, OP_SHR, OP_USHR,
+    OP_EQ, OP_NE, OP_SEQ, OP_SNE, OP_LT, OP_LE, OP_GT, OP_GE,
+    OP_IN, OP_INSTANCEOF,
+    OP_NEG, OP_PLUS, OP_NOT, OP_BITNOT, OP_VOID
+};
+
+enum PropKind : uint8_t
+{
+    P_INIT,
+    P_GET,
+    P_SET,
+    P_METHOD,
+    P_SPREAD,
+    P_PROTO,       // __proto__: v in a literal
+    P_FIELD,
+    P_STATICBLOCK
+};
+
+enum DeclKind : uint8_t
+{
+    D_VAR,
+    D_LET,
+    D_CONST
+};
+
+struct Node
+{
+    N k;
+    uint8_t op;
+    bool flag;      // prefix, delegate, static, for-await
+    bool opt;       // ?. here
+    bool spread;    // a call's arguments hold a spread
+    bool suspend;   // an argument can suspend the frame
+    bool strict;    // the code around it is strict
+    bool computed;  // a key held in `a`
+    bool tdz;       // a read must check for an uninitialized binding
+    bool isConst;   // writing to this name throws
+    int line, col;
+    int slot, hops;
+    int n;          // items
+    int n2;         // list2
+    Node *a, *b, *c, *d;
+    Node **items;
+    Node **list2;
+    V val, val2;
+    FuncNode *func;
+    Scope *scope;
+    // inline cache: a get or set of a property
+    Shape *icShape;
+    int icSlot;
+    int icKeep;
+    Shape *icProtoShape;
+    void *icHolder;
+    int srcStart, srcEnd; // for messages that quote the source
+};
+
+struct Binding
+{
+    V name;
+    uint8_t kind;    // B_*
+    bool captured;
+    bool isConst;
+    bool lexical;    // has a dead zone
+    int slot;
+};
+
+enum BindKind : uint8_t
+{
+    B_VAR,
+    B_PARAM,
+    B_FUNC,
+    B_LET,
+    B_CONST,
+    B_CLASS,
+    B_CATCH,
+    B_SELF,   // a function expression's own name
+    B_ARGS,   // the implicit `arguments`
+    B_PRIVATE // a class's #name
+};
+
+struct Scope
+{
+    Scope *parent = nullptr;
+    FuncNode *func = nullptr;
+    bool isFunc = false;
+    bool isWith = false;
+    bool isEval = false;
+    bool hasEnv = false;
+    bool dynamic = false;    // holds a direct eval or `with`: every name stays findable
+    bool resolved = false;
+    int nEnv = 0;
+    std::vector<Binding *> vars;
+    std::vector<Scope *> kids;
+    std::vector<Node *> refs;         // names used directly in this scope
+    std::vector<Node *> funcDecls;    // functions to create on entry
+    std::vector<int> tdzLocals;       // frame slots to mark uninitialized on entry
+    std::vector<int> tdzEnv;          // environment slots likewise
+    int *tdzLocalsP = nullptr;
+    int nTdzLocals = 0;
+    int nTdzEnv = 0;
+    int nFuncDecls = 0;
+    Node **funcDeclsP = nullptr;
+    bool plain = false;              // nothing to do on entry or exit
+    Binding *find(V name);
+    Binding *add(V name, uint8_t kind);
+};
+
+struct FuncNode
+{
+    V name = 0;
+    std::vector<Node *> params;
+    Node **paramsP = nullptr;
+    int *paramSlots = nullptr;      // simple parameters: frame slot, or -1 - env slot
+    int nParams = 0;
+    int length = 0;
+    bool simple = true;
+    bool isArrow = false;
+    bool isAsync = false;
+    bool isGen = false;
+    bool isMethod = false;     // a method: has a home object and cannot be constructed
+    bool isGetSet = false;
+    bool isClassCtor = false;
+    bool isDerived = false;
+    bool isFieldInit = false;
+    bool strict = false;
+    bool usesArgs = false;
+    bool usesThis = false;
+    bool hasEval = false;
+    bool isProgram = false;
+    bool heapFrame = false;    // generators: the frame outlives the call
+    bool defaultCtor = false;
+    Binding *selfBinding = nullptr;
+    Binding *argsBinding = nullptr;
+    Node *body = nullptr;
+    Scope *scope = nullptr;
+    int nLocals = 0;
+    int line = 0, col = 0;
+    int srcStart = 0, srcEnd = 0;
+    const uint16_t *src = nullptr;
+    int suspendPoints = 0;
+    std::string *file = nullptr;
+    std::vector<Node *> fields;  // a class constructor: instance fields
+    void *shapeCache = nullptr;
+};
+
+} // namespace js

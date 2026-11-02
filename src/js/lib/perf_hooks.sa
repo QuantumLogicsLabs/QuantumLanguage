@@ -1,0 +1,18 @@
+'use strict';
+// performance.
+const start = internal.now();
+const performance = {
+  now: () => internal.now() - start,
+  timeOrigin: start,
+  mark() {},
+  measure() {},
+  getEntries: () => [],
+  getEntriesByName: () => [],
+  getEntriesByType: () => [],
+  clearMarks() {},
+  clearMeasures() {},
+  toJSON() { return { timeOrigin: start }; },
+  [Symbol.toStringTag]: 'Performance',
+};
+internal.installGlobal('performance', performance);
+module.exports = { performance, PerformanceObserver: class { observe() {} disconnect() {} } };

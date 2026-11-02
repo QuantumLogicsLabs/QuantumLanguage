@@ -1,0 +1,418 @@
+'use strict';
+// A compact version of Node's streams: enough for Readable.from, pipes,
+// Transform, pipeline and async iteration.
+const EventEmitter = require('events');
+
+class Stream extends EventEmitter {
+  pipe(dest, options) {
+    this.on('data', (chunk) => {
+      if (dest.write(chunk) === false && this.pause) {
+        this.pause();
+        dest.once('drain', () => this.resume());
+      }
+    });
+    if (!options || options.end !== false) this.on('end', () => dest.end());
+    this.on('error', (e) => dest.emit('error', e));
+    dest.emit('pipe', this);
+    return dest;
+  }
+}
+
+class Readable extends Stream {
+  constructor(options = {}) {
+    super();
+    this.readable = true;
+    this.readableObjectMode = !!(options.objectMode || options.readableObjectMode);
+    this.readableHighWaterMark = options.highWaterMark ?? (this.readableObjectMode ? 16 : 16384);
+    this.destroyed = false;
+    this.readableEnded = false;
+    this.readableFlowing = null;
+    this._buffer = [];
+    this._sourceEnded = false;
+    this._reading = false;
+    this._scheduled = false;
+    this._encoding = options.encoding ?? null;
+    if (typeof options.read === 'function') this._read = options.read;
+    if (typeof options.destroy === 'function') this._destroy = options.destroy;
+  }
+  _read() {}
+  setEncoding(enc) {
+    this._encoding = enc;
+    return this;
+  }
+  _convert(chunk) {
+    if (this.readableObjectMode) return chunk;
+    if (this._encoding) return typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString(this._encoding);
+    return typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+  }
+  push(chunk, enc) {
+    this._reading = false;
+    if (chunk === null) {
+      this._sourceEnded = true;
+      this._schedule();
+      return false;
+    }
+    this._buffer.push(this._convert(chunk));
+    this._schedule();
+    return this._buffer.length < this.readableHighWaterMark;
+  }
+  unshift(chunk) {
+    this._buffer.unshift(this._convert(chunk));
+  }
+  _schedule() {
+    if (this._scheduled) return;
+    this._scheduled = true;
+    process.nextTick(() => {
+      this._scheduled = false;
+      this._flow();
+    });
+  }
+  _flow() {
+    if (this.readableFlowing) {
+      while (this.readableFlowing && this._buffer.length) this.emit('data', this._buffer.shift());
+    }
+    if (this.readableFlowing || this._waiter) {
+      if (!this._buffer.length && !this._sourceEnded && !this._reading) {
+        this._reading = true;
+        try { this._read(this.readableHighWaterMark); } catch (e) { this.destroy(e); return; }
+        if (this._buffer.length || this._sourceEnded) this._schedule();
+      }
+    }
+    if (this._waiter) {
+      const w = this._waiter;
+      this._waiter = null;
+      w();
+    }
+    if (this.readableFlowing !== false && this._sourceEnded && !this._buffer.length && !this.readableEnded && (this.readableFlowing || this._iterating)) {
+      this.readableEnded = true;
+      this.readable = false;
+      process.nextTick(() => {
+        this.emit('end');
+        this.emit('close');
+      });
+    }
+  }
+  on(ev, fn) {
+    super.on(ev, fn);
+    if (ev === 'data' && this.readableFlowing !== false) this.resume();
+    if (ev === 'readable') this._schedule();
+    return this;
+  }
+  resume() {
+    this.readableFlowing = true;
+    this._schedule();
+    return this;
+  }
+  pause() {
+    this.readableFlowing = false;
+    return this;
+  }
+  isPaused() { return this.readableFlowing === false; }
+  read() {
+    if (!this._buffer.length) {
+      if (!this._sourceEnded && !this._reading) {
+        this._reading = true;
+        this._read(this.readableHighWaterMark);
+      }
+      if (!this._buffer.length) return null;
+    }
+    return this._buffer.shift();
+  }
+  destroy(err) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    const done = (e) => {
+      process.nextTick(() => {
+        if (e || err) this.emit('error', e || err);
+        this.emit('close');
+      });
+    };
+    if (this._destroy) this._destroy(err ?? null, done);
+    else done();
+    return this;
+  }
+  async *[Symbol.asyncIterator]() {
+    this._iterating = true;
+    let failure = null;
+    this.on('error', (e) => {
+      failure = e;
+      if (this._waiter) { const w = this._waiter; this._waiter = null; w(); }
+    });
+    try {
+      for (;;) {
+        if (failure) throw failure;
+        if (this._buffer.length) {
+          yield this._buffer.shift();
+          continue;
+        }
+        if (this._sourceEnded) break;
+        await new Promise((resolve) => {
+          this._waiter = resolve;
+          this._schedule();
+        });
+      }
+    } finally {
+      this._iterating = false;
+      if (!this.readableEnded) this.destroy();
+    }
+  }
+  static from(iterable, options) {
+    const objectMode = options?.objectMode ?? true;
+    const r = new Readable({ objectMode, ...options });
+    if (typeof iterable === 'string' || iterable instanceof Uint8Array) {
+      r.push(iterable);
+      r.push(null);
+      return r;
+    }
+    const isAsync = !!iterable[Symbol.asyncIterator];
+    const it = isAsync ? iterable[Symbol.asyncIterator]() : iterable[Symbol.iterator]();
+    let busy = false;
+    r._read = async function () {
+      if (busy) return;
+      busy = true;
+      try {
+        for (;;) {
+          const { value, done } = isAsync ? await it.next() : it.next();
+          if (done) {
+            r.push(null);
+            break;
+          }
+          const v = value && typeof value.then === 'function' ? await value : value;
+          if (!r.push(v)) break;
+        }
+      } catch (e) {
+        r.destroy(e);
+      }
+      busy = false;
+    };
+    return r;
+  }
+}
+
+class Writable extends Stream {
+  constructor(options = {}) {
+    super();
+    this.writable = true;
+    this.writableObjectMode = !!(options.objectMode || options.writableObjectMode);
+    this.writableHighWaterMark = options.highWaterMark ?? (this.writableObjectMode ? 16 : 16384);
+    this.destroyed = false;
+    this.writableFinished = false;
+    this.writableEnded = false;
+    this._queue = [];
+    this._writing = false;
+    this._decode = options.decodeStrings !== false;
+    if (typeof options.write === 'function') this._write = options.write;
+    if (typeof options.final === 'function') this._final = options.final;
+    if (typeof options.destroy === 'function') this._destroy = options.destroy;
+  }
+  _write(chunk, enc, cb) { cb(); }
+  write(chunk, enc, cb) {
+    if (typeof enc === 'function') { cb = enc; enc = undefined; }
+    if (this.writableEnded) {
+      const e = internal.nodeError(Error, 'ERR_STREAM_WRITE_AFTER_END', 'write after end');
+      process.nextTick(() => {
+        if (cb) cb(e);
+        this.emit('error', e);
+      });
+      return false;
+    }
+    let data = chunk;
+    if (!this.writableObjectMode && this._decode && typeof data === 'string') data = Buffer.from(data, enc);
+    this._queue.push({ data, enc: typeof data === 'string' ? enc ?? 'utf8' : 'buffer', cb });
+    this._pump();
+    return this._queue.length < this.writableHighWaterMark;
+  }
+  _pump() {
+    if (this._writing) return;
+    const item = this._queue.shift();
+    if (!item) {
+      if (this._needDrain) {
+        this._needDrain = false;
+        this.emit('drain');
+      }
+      if (this.writableEnded && !this.writableFinished) this._finish();
+      return;
+    }
+    this._writing = true;
+    let sync = true;
+    const done = (err) => {
+      this._writing = false;
+      if (err) {
+        if (item.cb) item.cb(err);
+        this.destroy(err);
+        return;
+      }
+      if (item.cb) item.cb();
+      if (sync) process.nextTick(() => this._pump());
+      else this._pump();
+    };
+    try {
+      this._write(item.data, item.enc, done);
+    } catch (e) {
+      done(e);
+    }
+    sync = false;
+  }
+  _finish() {
+    if (this._finishing) return;
+    this._finishing = true;
+    const fin = (err) => {
+      if (err) { this.destroy(err); return; }
+      this.writableFinished = true;
+      this.writable = false;
+      process.nextTick(() => {
+        this.emit('finish');
+        this.emit('close');
+      });
+    };
+    if (this._final) this._final(fin);
+    else fin();
+  }
+  end(chunk, enc, cb) {
+    if (typeof chunk === 'function') { cb = chunk; chunk = undefined; }
+    else if (typeof enc === 'function') { cb = enc; enc = undefined; }
+    if (chunk !== undefined && chunk !== null) this.write(chunk, enc);
+    if (cb) this.once('finish', cb);
+    this.writableEnded = true;
+    this._pump();
+    return this;
+  }
+  cork() {}
+  uncork() {}
+  destroy(err) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    const done = (e) => {
+      process.nextTick(() => {
+        if (e || err) this.emit('error', e || err);
+        this.emit('close');
+      });
+    };
+    if (this._destroy) this._destroy(err ?? null, done);
+    else done();
+    return this;
+  }
+}
+
+class Duplex extends Readable {
+  constructor(options = {}) {
+    super(options);
+    Writable.prototype.__init.call(this, options);
+  }
+}
+Writable.prototype.__init = function (options) {
+  this.writable = true;
+  this.writableObjectMode = !!(options.objectMode || options.writableObjectMode);
+  this.writableHighWaterMark = options.highWaterMark ?? (this.writableObjectMode ? 16 : 16384);
+  this.writableFinished = false;
+  this.writableEnded = false;
+  this._queue = [];
+  this._writing = false;
+  this._decode = options.decodeStrings !== false;
+  if (typeof options.write === 'function') this._write = options.write;
+  if (typeof options.final === 'function') this._final = options.final;
+  if (options.readableObjectMode) this.readableObjectMode = true;
+};
+for (const k of ['write', '_pump', '_finish', 'end', 'cork', 'uncork']) Duplex.prototype[k] = Writable.prototype[k];
+Duplex.prototype._write = function (c, e, cb) { cb(); };
+
+class Transform extends Duplex {
+  constructor(options = {}) {
+    super(options);
+    if (typeof options.transform === 'function') this._transform = options.transform;
+    if (typeof options.flush === 'function') this._flush = options.flush;
+    this._final = (cb) => {
+      const fin = (err, data) => {
+        if (err) { cb(err); return; }
+        if (data !== undefined && data !== null) this.push(data);
+        this.push(null);
+        cb();
+      };
+      if (this._flush) this._flush(fin);
+      else fin();
+    };
+  }
+  _transform(chunk, enc, cb) {
+    cb(new Error('The _transform() method is not implemented'));
+  }
+  _write(chunk, enc, cb) {
+    this._transform(chunk, enc, (err, data) => {
+      if (err) { cb(err); return; }
+      if (data !== undefined && data !== null) this.push(data);
+      cb();
+    });
+  }
+}
+
+class PassThrough extends Transform {
+  _transform(chunk, enc, cb) { cb(null, chunk); }
+}
+
+function finished(stream, opts, cb) {
+  if (typeof opts === 'function') { cb = opts; opts = {}; }
+  let called = false;
+  const done = (err) => {
+    if (called) return;
+    called = true;
+    cb(err);
+  };
+  stream.on('error', done);
+  const isW = typeof stream.write === 'function' && stream.writable !== undefined;
+  const isR = typeof stream.read === 'function' && stream.readable !== undefined && !isW;
+  if (isW) stream.on('finish', () => done());
+  if (isR) stream.on('end', () => done());
+  stream.on('close', () => done());
+  return () => { called = true; };
+}
+
+function toStream(s) {
+  if (s && typeof s.on === 'function') return s;
+  if (typeof s === 'function') return s;
+  return Readable.from(s);
+}
+
+function pipeline(...streams) {
+  const cb = typeof streams[streams.length - 1] === 'function' && !(streams[streams.length - 1].prototype instanceof Stream) && streams.length > 1 ? streams.pop() : () => {};
+  if (streams.length === 1 && Array.isArray(streams[0])) streams = streams[0];
+  const list = [];
+  let cur;
+  streams.forEach((s, i) => {
+    if (typeof s === 'function') {
+      const gen = i === 0 ? s() : s(cur);
+      cur = gen && typeof gen.then !== 'function' && (gen[Symbol.asyncIterator] || gen[Symbol.iterator]) ? Readable.from(gen) : gen;
+    } else if (i === 0) cur = toStream(s);
+    else {
+      if (cur.pipe) cur.pipe(s);
+      cur = s;
+    }
+    list.push(cur);
+  });
+  let done = false;
+  const finish = (err) => {
+    if (done) return;
+    done = true;
+    if (err) for (const s of list) if (s && s.destroy && !s.destroyed) s.destroy();
+    cb(err);
+  };
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    if (!s) continue;
+    if (s.on) s.on('error', finish);
+  }
+  const last = list[list.length - 1];
+  if (last && typeof last.then === 'function') last.then(() => finish(), finish);
+  else if (last) {
+    const isW = typeof last.write === 'function';
+    last.on(isW ? 'finish' : 'end', () => finish());
+    if (!isW && last.resume) last.resume();
+  }
+  return last;
+}
+
+const promises = {
+  pipeline: (...s) => new Promise((resolve, reject) => pipeline(...s, (e) => (e ? reject(e) : resolve()))),
+  finished: (s, o) => new Promise((resolve, reject) => finished(s, o ?? {}, (e) => (e ? reject(e) : resolve()))),
+};
+
+Object.assign(Stream, { Stream, Readable, Writable, Duplex, Transform, PassThrough, finished, pipeline, promises });
+module.exports = Stream;

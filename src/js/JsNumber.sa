@@ -1,0 +1,1305 @@
+// quantum: cpp
+// JavaScript front-end: Number, Math and BigInt.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+namespace js
+{
+
+namespace
+{
+
+double thisNum(V v, const char *method)
+{
+    if (isNum(v))
+        return numOf(v);
+    if (isObj(v) && op(v)->cls == C_NUMBER)
+        return numOf(static_cast<JPrim *>(op(v))->val);
+    throwType(std::string("Number.prototype.") + method + " requires that 'this' be a Number");
+}
+
+// every significant digit of |d| (exact), and the exponent of the first
+void exactDigits(double d, std::string &digits, int &exp10)
+{
+    char buf[1200];
+    snprintf(buf, sizeof buf, "%.800e", d < 0 ? -d : d);
+    digits.clear();
+    const char *p = buf;
+    for (; *p && *p != 'e'; ++p)
+        if (*p != '.')
+            digits += *p;
+    exp10 = std::atoi(p + 1);
+}
+
+// rounds to n digits, a tie going up; true if it grew by a digit
+bool roundDigits(std::string &digits, int n)
+{
+    if (n >= (int)digits.size())
+    {
+        digits.append((size_t)n - digits.size(), '0');
+        return false;
+    }
+    bool up = n >= 0 && digits[(size_t)n] >= '5';
+    digits.resize((size_t)(n < 0 ? 0 : n));
+    if (!up)
+        return false;
+    int i = n - 1;
+    while (i >= 0 && digits[(size_t)i] == '9')
+    {
+        digits[(size_t)i] = '0';
+        --i;
+    }
+    if (i >= 0)
+    {
+        digits[(size_t)i]++;
+        return false;
+    }
+    digits.insert(digits.begin(), '1');
+    return true;
+}
+
+V numberCtor(V, V *args, int argc)
+{
+    double d = 0;
+    if (argc)
+    {
+        V n = toNumeric(args[0]);
+        d = isBig(n) ? bigToDouble(bigp(n)) : numOf(n);
+    }
+    if (g_nativeNewTarget == Undefined)
+        return num(d);
+    JPrim *p = static_cast<JPrim *>(allocObj(sizeof(JPrim), C_NUMBER, protoFromCtor(g_nativeNewTarget, PR.number)));
+    p->val = num(d);
+    return objv(p);
+}
+
+V nToFixed(V thisV, V *args, int argc)
+{
+    double d = thisNum(thisV, "toFixed");
+    double f = toIntegerOrInf(argOr(args, argc, 0));
+    if (f < 0 || f > 100)
+        throwRange("toFixed() digits argument must be between 0 and 100");
+    if (d != d)
+        return strA("NaN");
+    if (d >= 1e21 || d <= -1e21)
+        return numberToStr(d);
+    int fd = (int)f;
+    std::string digits;
+    int e;
+    exactDigits(d, digits, e);
+    bool neg = d < 0 || (d == 0 && std::signbit(d) && false);
+    std::string out;
+    if (d == 0)
+    {
+        out = "0";
+        if (fd)
+            out += "." + std::string((size_t)fd, '0');
+        return str(out);
+    }
+    // keep e + 1 + fd digits
+    int keep = e + 1 + fd;
+    bool grew = false;
+    if (keep < 0)
+    {
+        digits = "";
+        keep = 0;
+    }
+    else
+        grew = roundDigits(digits, keep);
+    int intDigits = e + 1 + (grew ? 1 : 0);
+    std::string whole, frac;
+    if (intDigits <= 0)
+    {
+        whole = "0";
+        frac = std::string((size_t)-intDigits, '0') + digits;
+    }
+    else
+    {
+        whole = digits.substr(0, (size_t)intDigits);
+        frac = digits.substr((size_t)intDigits);
+    }
+    if ((int)frac.size() < fd)
+        frac.append((size_t)fd - frac.size(), '0');
+    frac.resize((size_t)fd);
+    out = whole;
+    if (fd)
+        out += "." + frac;
+    bool allZero = true;
+    for (char c : out)
+        if (c != '0' && c != '.')
+            allZero = false;
+    if (neg && !allZero)
+        out = "-" + out;
+    else if (neg)
+        out = "-" + out;
+    return str(out);
+}
+
+std::string expForm(const std::string &digits, int e)
+{
+    std::string out = digits.substr(0, 1);
+    if (digits.size() > 1)
+        out += "." + digits.substr(1);
+    out += e < 0 ? "e-" : "e+";
+    out += std::to_string(e < 0 ? -e : e);
+    return out;
+}
+
+V nToExponential(V thisV, V *args, int argc)
+{
+    double d = thisNum(thisV, "toExponential");
+    V fv = argOr(args, argc, 0);
+    double f = toIntegerOrInf(fv);
+    if (d != d || d - d != 0)
+        return numberToStr(d);
+    if (f < 0 || f > 100)
+        throwRange("toExponential() argument must be between 0 and 100");
+    std::string digits;
+    int e;
+    if (d == 0)
+    {
+        digits = std::string((size_t)(f + 1), '0');
+        e = 0;
+    }
+    else if (fv == Undefined)
+        shortestDigits(d < 0 ? -d : d, digits, e);
+    else
+    {
+        exactDigits(d, digits, e);
+        if (roundDigits(digits, (int)f + 1))
+        {
+            ++e;
+            digits.resize((size_t)f + 1);
+        }
+    }
+    return str((d < 0 ? "-" : "") + expForm(digits, e));
+}
+
+V nToPrecision(V thisV, V *args, int argc)
+{
+    double d = thisNum(thisV, "toPrecision");
+    V pv = argOr(args, argc, 0);
+    if (pv == Undefined)
+        return numberToStr(d);
+    double pd = toIntegerOrInf(pv);
+    if (d != d || d - d != 0)
+        return numberToStr(d);
+    if (pd < 1 || pd > 100)
+        throwRange("toPrecision() argument must be between 1 and 100");
+    int p = (int)pd;
+    std::string sign = d < 0 ? "-" : "";
+    std::string digits;
+    int e;
+    if (d == 0)
+    {
+        digits = std::string((size_t)p, '0');
+        e = 0;
+    }
+    else
+    {
+        exactDigits(d, digits, e);
+        if (roundDigits(digits, p))
+        {
+            ++e;
+            digits.resize((size_t)p);
+        }
+    }
+    if (e < -6 || e >= p)
+        return str(sign + expForm(digits, e));
+    if (e == p - 1)
+        return str(sign + digits);
+    if (e >= 0)
+        return str(sign + digits.substr(0, (size_t)e + 1) + "." + digits.substr((size_t)e + 1));
+    return str(sign + "0." + std::string((size_t)(-e - 1), '0') + digits);
+}
+
+V nValueOf(V thisV, V *, int)
+{
+    return num(thisNum(thisV, "valueOf"));
+}
+
+V nToStringFn(V thisV, V *args, int argc)
+{
+    double d = thisNum(thisV, "toString");
+    V r = argOr(args, argc, 0);
+    double radix = r == Undefined ? 10 : toIntegerOrInf(r);
+    if (radix < 2 || radix > 36)
+        throwRange("toString() radix argument must be between 2 and 36");
+    if (radix == 10)
+        return numberToStr(d);
+    return str(numberToRadix(d, (int)radix));
+}
+
+V nToLocale(V thisV, V *args, int argc)
+{
+    double d = thisNum(thisV, "toLocaleString");
+    V intl = getProp(objv(g_global), atomOf("Intl"));
+    V nf = getProp(intl, atomOf("NumberFormat"));
+    V a[2] = {argOr(args, argc, 0), argOr(args, argc, 1)};
+    V f = construct(nf, a, 2, nf);
+    V x = num(d);
+    return invoke(f, atomOf("format"), &x, 1);
+}
+
+V nIsInteger(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isNum(v))
+        return False;
+    double d = numOf(v);
+    return boolv(d - d == 0 && std::floor(d) == d);
+}
+
+V nIsSafeInteger(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isNum(v))
+        return False;
+    double d = numOf(v);
+    return boolv(d - d == 0 && std::floor(d) == d && std::fabs(d) <= 9007199254740991.0);
+}
+
+V nIsFinite(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isNum(v))
+        return False;
+    double d = numOf(v);
+    return boolv(d - d == 0);
+}
+
+V nIsNaN(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isNum(v))
+        return False;
+    double d = numOf(v);
+    return boolv(d != d);
+}
+
+// ── Math ─────────────────────────────────────────────────────────────────
+
+#define MATH1(name, expr)                       \
+    V name(V, V *args, int argc)                \
+    {                                           \
+        double x = toNumber(argOr(args, argc, 0)); \
+        return num(expr);                       \
+    }
+
+MATH1(mAbs, std::fabs(x))
+MATH1(mFloor, std::floor(x))
+MATH1(mCeil, std::ceil(x))
+MATH1(mTrunc, std::trunc(x))
+MATH1(mSqrt, std::sqrt(x))
+MATH1(mCbrt, mathCbrt(x))
+MATH1(mSin, mathSin(x))
+MATH1(mCos, mathCos(x))
+MATH1(mTan, mathTan(x))
+MATH1(mAsin, mathAsin(x))
+MATH1(mAcos, mathAcos(x))
+MATH1(mAtan, mathAtan(x))
+MATH1(mSinh, mathSinh(x))
+MATH1(mCosh, mathCosh(x))
+MATH1(mTanh, mathTanh(x))
+MATH1(mAsinh, mathAsinh(x))
+MATH1(mAcosh, mathAcosh(x))
+MATH1(mAtanh, mathAtanh(x))
+MATH1(mExp, mathExp(x))
+MATH1(mExpm1, mathExpm1(x))
+MATH1(mLog, mathLog(x))
+MATH1(mLog2, mathLog2(x))
+MATH1(mLog10, mathLog10(x))
+MATH1(mLog1p, mathLog1p(x))
+MATH1(mSign, x != x ? x : x > 0 ? 1.0 : x < 0 ? -1.0 : x)
+MATH1(mFround, (double)(float)x)
+
+V mRound(V, V *args, int argc)
+{
+    double x = toNumber(argOr(args, argc, 0));
+    if (x != x || x - x != 0)
+        return num(x);
+    double r = std::floor(x);
+    if (x - r >= 0.5)
+        r += 1;
+    if (r == 0 && x < 0)
+        r = -0.0;
+    return num(r);
+}
+
+V mAtan2(V, V *args, int argc)
+{
+    return num(mathAtan2(toNumber(argOr(args, argc, 0)), toNumber(argOr(args, argc, 1))));
+}
+
+V mPow(V, V *args, int argc)
+{
+    double a = toNumber(argOr(args, argc, 0)), b = toNumber(argOr(args, argc, 1));
+    if (b != b)
+        return num(b);
+    if (b == 0)
+        return num(1);
+    if ((a == 1 || a == -1) && b - b != 0)
+        return num(0.0 / 0.0);
+    return num(mathPow(a, b));
+}
+
+V mMax(V, V *args, int argc)
+{
+    double r = -1.0 / 0.0;
+    bool nan = false;
+    for (int i = 0; i < argc; ++i)
+    {
+        double x = toNumber(args[i]);
+        if (x != x)
+            nan = true;
+        if (x > r || (x == 0 && r == 0 && !std::signbit(x)))
+            r = x;
+    }
+    return num(nan ? 0.0 / 0.0 : r);
+}
+
+V mMin(V, V *args, int argc)
+{
+    double r = 1.0 / 0.0;
+    bool nan = false;
+    for (int i = 0; i < argc; ++i)
+    {
+        double x = toNumber(args[i]);
+        if (x != x)
+            nan = true;
+        if (x < r || (x == 0 && r == 0 && std::signbit(x)))
+            r = x;
+    }
+    return num(nan ? 0.0 / 0.0 : r);
+}
+
+V mHypot(V, V *args, int argc)
+{
+    double s = 0;
+    bool inf = false, nan = false;
+    double mx = 0;
+    for (int i = 0; i < argc; ++i)
+    {
+        double x = std::fabs(toNumber(args[i]));
+        if (x - x != 0 && x == x)
+            inf = true;
+        if (x != x)
+            nan = true;
+        if (x > mx)
+            mx = x;
+    }
+    if (inf)
+        return num(1.0 / 0.0);
+    if (nan)
+        return num(0.0 / 0.0);
+    if (mx == 0)
+        return num(0);
+    // Kahan summation of squares scaled by the largest, as V8 does
+    double comp = 0;
+    for (int i = 0; i < argc; ++i)
+    {
+        double x = std::fabs(toNumber(args[i])) / mx;
+        double y = x * x - comp;
+        double t = s + y;
+        comp = (t - s) - y;
+        s = t;
+    }
+    return num(std::sqrt(s) * mx);
+}
+
+V mImul(V, V *args, int argc)
+{
+    int32_t a = toInt32(argOr(args, argc, 0)), b = toInt32(argOr(args, argc, 1));
+    return num((double)(int32_t)((uint32_t)a * (uint32_t)b));
+}
+
+V mClz32(V, V *args, int argc)
+{
+    uint32_t x = toUint32(argOr(args, argc, 0));
+    int n = 0;
+    if (!x)
+        return num(32);
+    while (!(x & 0x80000000u))
+    {
+        x <<= 1;
+        ++n;
+    }
+    return num((double)n);
+}
+
+uint64_t g_rand0 = 0, g_rand1 = 0;
+
+V mRandom(V, V *, int)
+{
+    if (!g_rand0 && !g_rand1)
+    {
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
+        g_rand0 = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() | 1;
+        g_rand1 = g_rand0 * 0x9E3779B97F4A7C15ULL + 1;
+    }
+    uint64_t s1 = g_rand0, s0 = g_rand1;
+    g_rand0 = s0;
+    s1 ^= s1 << 23;
+    g_rand1 = s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5);
+    uint64_t r = g_rand1 + s0;
+    return num((double)(r >> 11) / 9007199254740992.0);
+}
+
+} // namespace
+
+std::string numberToRadix(double value, int radix)
+{
+    if (value != value)
+        return "NaN";
+    if (value == 1.0 / 0.0)
+        return "Infinity";
+    if (value == -1.0 / 0.0)
+        return "-Infinity";
+    if (value == 0)
+        return "0";
+    static const char chars[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    const int bufferSize = 2200;
+    std::string buffer((size_t)bufferSize, ' ');
+    int integerCursor = bufferSize / 2;
+    int fractionCursor = integerCursor;
+    bool negative = value < 0;
+    if (negative)
+        value = -value;
+    double integer = std::floor(value);
+    double fraction = value - integer;
+    // only as many fractional digits as the double can tell apart
+    uint64_t bits = *reinterpret_cast<uint64_t *>(&value);
+    uint64_t nextBits = bits + 1;
+    double nextValue = *reinterpret_cast<double *>(&nextBits);
+    double delta = 0.5 * (nextValue - value);
+    uint64_t smallest = 1;
+    double minDelta = *reinterpret_cast<double *>(&smallest);
+    if (delta < minDelta)
+        delta = minDelta;
+    double halfGap = delta;
+    if (fraction >= delta)
+    {
+        buffer[(size_t)fractionCursor++] = '.';
+        do
+        {
+            fraction *= radix;
+            delta *= radix;
+            int digit = (int)fraction;
+            buffer[(size_t)fractionCursor++] = chars[digit];
+            fraction -= digit;
+            if (fraction > 0.5 || (fraction == 0.5 && (digit & 1)))
+            {
+                if (fraction + delta > 1)
+                {
+                    // back over what is written, in case of a carry
+                    for (;;)
+                    {
+                        fractionCursor--;
+                        if (fractionCursor == bufferSize / 2)
+                        {
+                            integer += 1;
+                            break;
+                        }
+                        char c = buffer[(size_t)fractionCursor];
+                        int d = c > '9' ? (c - 'a' + 10) : (c - '0');
+                        if (d + 1 < radix)
+                        {
+                            buffer[(size_t)fractionCursor++] = chars[d + 1];
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        } while (fraction >= delta);
+    }
+    // digits the double does not hold are zeros
+    while (halfGap >= radix && halfGap < 1.0 / 0.0)
+    {
+        integer /= radix;
+        halfGap /= radix;
+        --integerCursor;
+        buffer[(size_t)integerCursor] = '0';
+    }
+    do
+    {
+        double remainder = std::fmod(integer, (double)radix);
+        --integerCursor;
+        buffer[(size_t)integerCursor] = chars[(int)remainder];
+        integer = (integer - remainder) / radix;
+    } while (integer > 0);
+    if (negative)
+    {
+        --integerCursor;
+        buffer[(size_t)integerCursor] = '-';
+    }
+    return buffer.substr((size_t)integerCursor, (size_t)(fractionCursor - integerCursor));
+}
+
+void initNumberBuiltins()
+{
+    JFunc *c = defCtor("Number", numberCtor, 1, PR.number);
+    defVal(c, "MAX_VALUE", num(1.7976931348623157e308), 0);
+    defVal(c, "MIN_VALUE", num(5e-324), 0);
+    defVal(c, "EPSILON", num(2.220446049250313e-16), 0);
+    defVal(c, "MAX_SAFE_INTEGER", num(9007199254740991.0), 0);
+    defVal(c, "MIN_SAFE_INTEGER", num(-9007199254740991.0), 0);
+    defVal(c, "NaN", num(0.0 / 0.0), 0);
+    defVal(c, "POSITIVE_INFINITY", num(1.0 / 0.0), 0);
+    defVal(c, "NEGATIVE_INFINITY", num(-1.0 / 0.0), 0);
+    defFn(c, "isInteger", nIsInteger, 1);
+    defFn(c, "isSafeInteger", nIsSafeInteger, 1);
+    defFn(c, "isFinite", nIsFinite, 1);
+    defFn(c, "isNaN", nIsNaN, 1);
+    defineOwn(c, atomOf("parseInt"), getProp(objv(g_global), atomOf("parseInt")), PF_W | PF_C);
+    defineOwn(c, atomOf("parseFloat"), getProp(objv(g_global), atomOf("parseFloat")), PF_W | PF_C);
+    Obj *p = PR.number;
+    defFn(p, "toString", nToStringFn, 1);
+    defFn(p, "toFixed", nToFixed, 1);
+    defFn(p, "toExponential", nToExponential, 1);
+    defFn(p, "toPrecision", nToPrecision, 1);
+    defFn(p, "toLocaleString", nToLocale, 0);
+    defFn(p, "valueOf", nValueOf, 0);
+}
+
+void initMathBuiltins()
+{
+    Obj *m = newObject();
+    defineOwn(g_global, atomOf("Math"), objv(m), PF_W | PF_C);
+    defineOwn(m, WK.toStringTag, atomOf("Math"), PF_C);
+    defVal(m, "PI", num(3.141592653589793), 0);
+    defVal(m, "E", num(2.718281828459045), 0);
+    defVal(m, "LN2", num(0.6931471805599453), 0);
+    defVal(m, "LN10", num(2.302585092994046), 0);
+    defVal(m, "LOG2E", num(1.4426950408889634), 0);
+    defVal(m, "LOG10E", num(0.4342944819032518), 0);
+    defVal(m, "SQRT2", num(1.4142135623730951), 0);
+    defVal(m, "SQRT1_2", num(0.7071067811865476), 0);
+    defFn(m, "abs", mAbs, 1);
+    defFn(m, "floor", mFloor, 1);
+    defFn(m, "ceil", mCeil, 1);
+    defFn(m, "round", mRound, 1);
+    defFn(m, "trunc", mTrunc, 1);
+    defFn(m, "sign", mSign, 1);
+    defFn(m, "sqrt", mSqrt, 1);
+    defFn(m, "cbrt", mCbrt, 1);
+    defFn(m, "sin", mSin, 1);
+    defFn(m, "cos", mCos, 1);
+    defFn(m, "tan", mTan, 1);
+    defFn(m, "asin", mAsin, 1);
+    defFn(m, "acos", mAcos, 1);
+    defFn(m, "atan", mAtan, 1);
+    defFn(m, "atan2", mAtan2, 2);
+    defFn(m, "sinh", mSinh, 1);
+    defFn(m, "cosh", mCosh, 1);
+    defFn(m, "tanh", mTanh, 1);
+    defFn(m, "asinh", mAsinh, 1);
+    defFn(m, "acosh", mAcosh, 1);
+    defFn(m, "atanh", mAtanh, 1);
+    defFn(m, "exp", mExp, 1);
+    defFn(m, "expm1", mExpm1, 1);
+    defFn(m, "log", mLog, 1);
+    defFn(m, "log2", mLog2, 1);
+    defFn(m, "log10", mLog10, 1);
+    defFn(m, "log1p", mLog1p, 1);
+    defFn(m, "pow", mPow, 2);
+    defFn(m, "max", mMax, 2);
+    defFn(m, "min", mMin, 2);
+    defFn(m, "hypot", mHypot, 2);
+    defFn(m, "imul", mImul, 2);
+    defFn(m, "clz32", mClz32, 1);
+    defFn(m, "fround", mFround, 1);
+    defFn(m, "random", mRandom, 0);
+}
+
+// ── BigInt: sign and magnitude, 32-bit limbs ─────────────────────────────
+
+namespace
+{
+
+JBig *bigNew(int n)
+{
+    JBig *b = NEW(JBig);
+    b->n = n;
+    b->d = static_cast<uint32_t *>(bump(sizeof(uint32_t) * (size_t)(n ? n : 1)));
+    return b;
+}
+
+void bigTrim(JBig *b)
+{
+    while (b->n > 0 && b->d[b->n - 1] == 0)
+        --b->n;
+    if (!b->n)
+        b->neg = false;
+}
+
+int magCmp(JBig *a, JBig *b)
+{
+    if (a->n != b->n)
+        return a->n < b->n ? -1 : 1;
+    for (int i = a->n - 1; i >= 0; --i)
+        if (a->d[i] != b->d[i])
+            return a->d[i] < b->d[i] ? -1 : 1;
+    return 0;
+}
+
+JBig *magAdd(JBig *a, JBig *b)
+{
+    if (a->n < b->n)
+        std::swap(a, b);
+    JBig *r = bigNew(a->n + 1);
+    uint64_t c = 0;
+    for (int i = 0; i < a->n; ++i)
+    {
+        uint64_t s = (uint64_t)a->d[i] + (i < b->n ? b->d[i] : 0) + c;
+        r->d[i] = (uint32_t)s;
+        c = s >> 32;
+    }
+    r->d[a->n] = (uint32_t)c;
+    bigTrim(r);
+    return r;
+}
+
+// |a| >= |b|
+JBig *magSub(JBig *a, JBig *b)
+{
+    JBig *r = bigNew(a->n);
+    int64_t c = 0;
+    for (int i = 0; i < a->n; ++i)
+    {
+        int64_t s = (int64_t)a->d[i] - (i < b->n ? b->d[i] : 0) + c;
+        if (s < 0)
+        {
+            s += 4294967296LL;
+            c = -1;
+        }
+        else
+            c = 0;
+        r->d[i] = (uint32_t)s;
+    }
+    bigTrim(r);
+    return r;
+}
+
+JBig *bigClone(JBig *a)
+{
+    JBig *r = bigNew(a->n);
+    if (a->n)
+        std::memcpy(r->d, a->d, sizeof(uint32_t) * (size_t)a->n);
+    r->neg = a->neg;
+    return r;
+}
+
+// schoolbook long division on 32-bit limbs (Knuth D)
+void magDivMod(JBig *a, JBig *b, JBig **q, JBig **r)
+{
+    if (magCmp(a, b) < 0)
+    {
+        *q = bigNew(0);
+        *r = bigClone(a);
+        (*r)->neg = false;
+        return;
+    }
+    if (b->n == 1)
+    {
+        JBig *qq = bigNew(a->n);
+        uint64_t rem = 0;
+        for (int i = a->n - 1; i >= 0; --i)
+        {
+            uint64_t cur = (rem << 32) | a->d[i];
+            qq->d[i] = (uint32_t)(cur / b->d[0]);
+            rem = cur % b->d[0];
+        }
+        bigTrim(qq);
+        JBig *rr = bigNew(1);
+        rr->d[0] = (uint32_t)rem;
+        bigTrim(rr);
+        *q = qq;
+        *r = rr;
+        return;
+    }
+    int shift = 0;
+    uint32_t top = b->d[b->n - 1];
+    while (!(top & 0x80000000u))
+    {
+        top <<= 1;
+        ++shift;
+    }
+    int n = b->n, m = a->n - b->n;
+    std::vector<uint32_t> u((size_t)a->n + 1), v((size_t)n);
+    for (int i = n - 1; i >= 0; --i)
+        v[(size_t)i] = (b->d[i] << shift) | (shift && i ? b->d[i - 1] >> (32 - shift) : 0);
+    u[(size_t)a->n] = shift ? a->d[a->n - 1] >> (32 - shift) : 0;
+    for (int i = a->n - 1; i >= 0; --i)
+        u[(size_t)i] = (a->d[i] << shift) | (shift && i ? a->d[i - 1] >> (32 - shift) : 0);
+    JBig *qq = bigNew(m + 1);
+    for (int j = m; j >= 0; --j)
+    {
+        uint64_t num2 = ((uint64_t)u[(size_t)j + n] << 32) | u[(size_t)j + n - 1];
+        uint64_t qhat = num2 / v[(size_t)n - 1];
+        uint64_t rhat = num2 % v[(size_t)n - 1];
+        while (qhat >= 4294967296ULL || qhat * v[(size_t)n - 2] > ((rhat << 32) | u[(size_t)j + n - 2]))
+        {
+            --qhat;
+            rhat += v[(size_t)n - 1];
+            if (rhat >= 4294967296ULL)
+                break;
+        }
+        int64_t borrow = 0;
+        uint64_t carry = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            uint64_t p = qhat * v[(size_t)i] + carry;
+            carry = p >> 32;
+            int64_t t = (int64_t)u[(size_t)i + j] - borrow - (int64_t)(p & 0xFFFFFFFFULL);
+            u[(size_t)i + j] = (uint32_t)t;
+            borrow = t < 0 ? 1 : 0;
+        }
+        int64_t t = (int64_t)u[(size_t)j + n] - borrow - (int64_t)carry;
+        u[(size_t)j + n] = (uint32_t)t;
+        if (t < 0)
+        {
+            --qhat;
+            uint64_t c = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                uint64_t s = (uint64_t)u[(size_t)i + j] + v[(size_t)i] + c;
+                u[(size_t)i + j] = (uint32_t)s;
+                c = s >> 32;
+            }
+            u[(size_t)j + n] += (uint32_t)c;
+        }
+        qq->d[j] = (uint32_t)qhat;
+    }
+    bigTrim(qq);
+    JBig *rr = bigNew(n);
+    for (int i = 0; i < n; ++i)
+        rr->d[i] = (u[(size_t)i] >> shift) | (shift ? (uint32_t)((uint64_t)u[(size_t)i + 1] << (32 - shift)) : 0);
+    bigTrim(rr);
+    *q = qq;
+    *r = rr;
+}
+
+// two's complement limbs, enough of them to hold the sign
+std::vector<uint32_t> toTwos(JBig *a, int n)
+{
+    std::vector<uint32_t> o((size_t)n, 0);
+    for (int i = 0; i < a->n && i < n; ++i)
+        o[(size_t)i] = a->d[i];
+    if (a->neg)
+    {
+        uint64_t c = 1;
+        for (int i = 0; i < n; ++i)
+        {
+            uint64_t s = (uint64_t)(uint32_t)~o[(size_t)i] + c;
+            o[(size_t)i] = (uint32_t)s;
+            c = s >> 32;
+        }
+    }
+    return o;
+}
+
+V fromTwos(std::vector<uint32_t> &o)
+{
+    bool neg = !o.empty() && (o.back() & 0x80000000u);
+    if (neg)
+    {
+        uint64_t c = 1;
+        for (size_t i = 0; i < o.size(); ++i)
+        {
+            uint64_t s = (uint64_t)(uint32_t)~o[i] + c;
+            o[i] = (uint32_t)s;
+            c = s >> 32;
+        }
+    }
+    JBig *r = bigNew((int)o.size());
+    for (size_t i = 0; i < o.size(); ++i)
+        r->d[i] = o[i];
+    r->neg = neg;
+    bigTrim(r);
+    return bigv(r);
+}
+
+} // namespace
+
+JBig *bigFromDouble(double d)
+{
+    bool neg = d < 0;
+    if (neg)
+        d = -d;
+    std::vector<uint32_t> limbs;
+    d = std::floor(d);
+    while (d > 0)
+    {
+        double rem = std::fmod(d, 4294967296.0);
+        limbs.push_back((uint32_t)rem);
+        d = (d - rem) / 4294967296.0;
+    }
+    JBig *b = bigNew((int)limbs.size());
+    for (size_t i = 0; i < limbs.size(); ++i)
+        b->d[i] = limbs[i];
+    b->neg = neg;
+    bigTrim(b);
+    return b;
+}
+
+V bigFromU64(uint64_t x, bool neg)
+{
+    JBig *b = bigNew(2);
+    b->d[0] = (uint32_t)x;
+    b->d[1] = (uint32_t)(x >> 32);
+    b->neg = neg;
+    bigTrim(b);
+    return bigv(b);
+}
+
+uint64_t bigToU64(JBig *a)
+{
+    uint64_t x = 0;
+    if (a->n > 0)
+        x |= a->d[0];
+    if (a->n > 1)
+        x |= (uint64_t)a->d[1] << 32;
+    return a->neg ? (uint64_t)0 - x : x;
+}
+
+static JBig *bigFromDigits(const std::string &t, int radix, bool *ok)
+{
+    JBig *r = bigNew(0);
+    std::vector<uint32_t> limbs;
+    for (char c : t)
+    {
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10 : c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 99;
+        if (d >= radix)
+        {
+            *ok = false;
+            return r;
+        }
+        uint64_t carry = (uint64_t)d;
+        for (size_t i = 0; i < limbs.size(); ++i)
+        {
+            uint64_t s = (uint64_t)limbs[i] * (uint64_t)radix + carry;
+            limbs[i] = (uint32_t)s;
+            carry = s >> 32;
+        }
+        if (carry)
+            limbs.push_back((uint32_t)carry);
+    }
+    r = bigNew((int)limbs.size());
+    for (size_t i = 0; i < limbs.size(); ++i)
+        r->d[i] = limbs[i];
+    bigTrim(r);
+    return r;
+}
+
+V bigParseLiteral(const std::string &digits)
+{
+    bool ok = true;
+    if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'))
+        return bigv(bigFromDigits(digits.substr(2), 16, &ok));
+    if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'o' || digits[1] == 'O'))
+        return bigv(bigFromDigits(digits.substr(2), 8, &ok));
+    if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B'))
+        return bigv(bigFromDigits(digits.substr(2), 2, &ok));
+    return bigv(bigFromDigits(digits, 10, &ok));
+}
+
+JBig *bigFromStr(JStr *s, bool *ok)
+{
+    *ok = true;
+    std::string t = toUtf8(s);
+    size_t b = 0, e = t.size();
+    while (b < e && (t[b] == ' ' || t[b] == '\n' || t[b] == '\t' || t[b] == '\r'))
+        ++b;
+    while (e > b && (t[e - 1] == ' ' || t[e - 1] == '\n' || t[e - 1] == '\t' || t[e - 1] == '\r'))
+        --e;
+    t = t.substr(b, e - b);
+    if (t.empty())
+        return bigNew(0);
+    bool neg = false;
+    if (t[0] == '+' || t[0] == '-')
+    {
+        neg = t[0] == '-';
+        t = t.substr(1);
+        if (t.empty())
+        {
+            *ok = false;
+            return bigNew(0);
+        }
+    }
+    JBig *r;
+    if (!neg && t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X'))
+        r = bigFromDigits(t.substr(2), 16, ok);
+    else if (!neg && t.size() > 2 && t[0] == '0' && (t[1] == 'o' || t[1] == 'O'))
+        r = bigFromDigits(t.substr(2), 8, ok);
+    else if (!neg && t.size() > 2 && t[0] == '0' && (t[1] == 'b' || t[1] == 'B'))
+        r = bigFromDigits(t.substr(2), 2, ok);
+    else
+        r = bigFromDigits(t, 10, ok);
+    r->neg = neg && r->n > 0;
+    return r;
+}
+
+std::string bigToStr(JBig *b, int radix)
+{
+    if (!b->n)
+        return "0";
+    std::string out;
+    std::vector<uint32_t> cur(b->d, b->d + b->n);
+    // peel off as many digits as fit in a limb at a time
+    uint32_t chunk = (uint32_t)radix;
+    int perChunk = 1;
+    while ((uint64_t)chunk * (uint64_t)radix < 4294967296ULL)
+    {
+        chunk *= (uint32_t)radix;
+        ++perChunk;
+    }
+    static const char *chars = "0123456789abcdefghijklmnopqrstuvwxyz";
+    while (!cur.empty())
+    {
+        uint64_t rem = 0;
+        for (size_t i = cur.size(); i-- > 0;)
+        {
+            uint64_t v = (rem << 32) | cur[i];
+            cur[i] = (uint32_t)(v / chunk);
+            rem = v % chunk;
+        }
+        while (!cur.empty() && cur.back() == 0)
+            cur.pop_back();
+        for (int k = 0; k < perChunk; ++k)
+        {
+            if (cur.empty() && rem == 0)
+                break;
+            out += chars[rem % (uint64_t)radix];
+            rem /= (uint64_t)radix;
+        }
+    }
+    if (b->neg)
+        out += '-';
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+double bigToDouble(JBig *b)
+{
+    // through the decimal text: rounding comes out right
+    return std::strtod(bigToStr(b).c_str(), nullptr);
+}
+
+bool bigIsZero(JBig *a)
+{
+    return a->n == 0;
+}
+
+int bigCmp(JBig *a, JBig *b)
+{
+    if (a->neg != b->neg)
+        return a->neg ? -1 : 1;
+    int c = magCmp(a, b);
+    return a->neg ? -c : c;
+}
+
+int bigCmpDouble(JBig *a, double d)
+{
+    if (d == 1.0 / 0.0)
+        return -1;
+    if (d == -1.0 / 0.0)
+        return 1;
+    double fl = std::floor(d);
+    int c = bigCmp(a, bigFromDouble(fl));
+    if (c)
+        return c;
+    return d > fl ? -1 : 0;
+}
+
+V bigAdd(JBig *a, JBig *b)
+{
+    JBig *r;
+    if (a->neg == b->neg)
+    {
+        r = magAdd(a, b);
+        r->neg = a->neg;
+    }
+    else if (magCmp(a, b) >= 0)
+    {
+        r = magSub(a, b);
+        r->neg = a->neg;
+    }
+    else
+    {
+        r = magSub(b, a);
+        r->neg = b->neg;
+    }
+    bigTrim(r);
+    return bigv(r);
+}
+
+V bigNeg(JBig *a)
+{
+    JBig *r = bigClone(a);
+    r->neg = !a->neg && a->n;
+    return bigv(r);
+}
+
+V bigSub(JBig *a, JBig *b)
+{
+    JBig *nb = bigClone(b);
+    nb->neg = !b->neg && b->n;
+    return bigAdd(a, nb);
+}
+
+V bigMul(JBig *a, JBig *b)
+{
+    JBig *r = bigNew(a->n + b->n);
+    for (int i = 0; i < a->n; ++i)
+    {
+        uint64_t c = 0;
+        uint64_t x = a->d[i];
+        for (int j = 0; j < b->n; ++j)
+        {
+            uint64_t s = x * b->d[j] + r->d[i + j] + c;
+            r->d[i + j] = (uint32_t)s;
+            c = s >> 32;
+        }
+        r->d[i + b->n] = (uint32_t)c;
+    }
+    r->neg = a->neg != b->neg;
+    bigTrim(r);
+    return bigv(r);
+}
+
+V bigDiv(JBig *a, JBig *b)
+{
+    if (!b->n)
+        throwRange("Division by zero");
+    JBig *q, *r;
+    magDivMod(a, b, &q, &r);
+    q->neg = a->neg != b->neg;
+    bigTrim(q);
+    return bigv(q);
+}
+
+V bigMod(JBig *a, JBig *b)
+{
+    if (!b->n)
+        throwRange("Division by zero");
+    JBig *q, *r;
+    magDivMod(a, b, &q, &r);
+    r->neg = a->neg;
+    bigTrim(r);
+    return bigv(r);
+}
+
+V bigExp(JBig *a, JBig *b)
+{
+    if (b->neg)
+        throwRange("undefined must be positive");
+    if (!b->n)
+        return bigFromU64(1, false);
+    if (b->n > 1)
+    {
+        if (a->n == 0 || (a->n == 1 && a->d[0] == 1))
+            return bigv(a->neg && !(b->d[0] & 1) ? bigp(bigNeg(a)) : a);
+        throwRange("Maximum BigInt size exceeded");
+    }
+    uint32_t e = b->d[0];
+    V result = bigFromU64(1, false);
+    V base = bigv(a);
+    while (e)
+    {
+        if (e & 1)
+            result = bigMul(bigp(result), bigp(base));
+        e >>= 1;
+        if (e)
+            base = bigMul(bigp(base), bigp(base));
+    }
+    return result;
+}
+
+V bigShift(JBig *a, JBig *b, bool left)
+{
+    if (b->neg)
+    {
+        left = !left;
+    }
+    if (b->n > 1)
+    {
+        if (left && a->n)
+            throwRange("Maximum BigInt size exceeded");
+        return a->neg ? bigFromU64(1, true) : bigFromU64(0, false);
+    }
+    uint32_t s = b->n ? b->d[0] : 0;
+    int limbs = (int)(s / 32);
+    int bits = (int)(s % 32);
+    if (left)
+    {
+        JBig *r = bigNew(a->n + limbs + 1);
+        for (int i = 0; i < a->n; ++i)
+        {
+            uint64_t v = (uint64_t)a->d[i] << bits;
+            r->d[i + limbs] |= (uint32_t)v;
+            r->d[i + limbs + 1] |= (uint32_t)(v >> 32);
+        }
+        r->neg = a->neg;
+        bigTrim(r);
+        return bigv(r);
+    }
+    if (limbs >= a->n)
+        return a->neg ? bigFromU64(1, true) : bigFromU64(0, false);
+    JBig *r = bigNew(a->n - limbs);
+    bool lost = false;
+    for (int i = 0; i < limbs; ++i)
+        if (a->d[i])
+            lost = true;
+    if (bits && (a->d[limbs] & ((1u << bits) - 1)))
+        lost = true;
+    for (int i = limbs; i < a->n; ++i)
+    {
+        uint64_t v = a->d[i];
+        if (i + 1 < a->n)
+            v |= (uint64_t)a->d[i + 1] << 32;
+        r->d[i - limbs] = (uint32_t)(v >> bits);
+    }
+    r->neg = a->neg;
+    bigTrim(r);
+    // rounds toward negative infinity
+    if (a->neg && lost)
+        return bigSub(r, bigp(bigFromU64(1, false)));
+    return bigv(r);
+}
+
+V bigBit(JBig *a, JBig *b, int o)
+{
+    int n = (a->n > b->n ? a->n : b->n) + 1;
+    std::vector<uint32_t> x = toTwos(a, n), y = toTwos(b, n);
+    for (int i = 0; i < n; ++i)
+        x[(size_t)i] = o == OP_BITAND ? x[(size_t)i] & y[(size_t)i] : o == OP_BITOR ? x[(size_t)i] | y[(size_t)i] : x[(size_t)i] ^ y[(size_t)i];
+    return fromTwos(x);
+}
+
+V bigNot(JBig *a)
+{
+    return bigSub(bigp(bigNeg(a)), bigp(bigFromU64(1, false)));
+}
+
+namespace
+{
+
+V bigintCtor(V, V *args, int argc)
+{
+    if (g_nativeNewTarget != Undefined)
+        throwType("BigInt is not a constructor");
+    V v = toPrimitive(argOr(args, argc, 0), 1);
+    if (isNum(v))
+    {
+        double d = numOf(v);
+        if (d != d || d - d != 0 || std::floor(d) != d)
+            throwRange("The number " + numberToStd(d) + " cannot be converted to a BigInt because it is not an integer");
+        return bigv(bigFromDouble(d));
+    }
+    if (isBig(v))
+        return v;
+    if (isBool(v))
+        return bigFromU64(v == True ? 1 : 0, false);
+    if (isStr(v))
+    {
+        bool ok = true;
+        JBig *b = bigFromStr(sp_(v), &ok);
+        if (!ok)
+            throwError(E_SYNTAX, "Cannot convert " + toUtf8(sp_(v)) + " to a BigInt");
+        return bigv(b);
+    }
+    throwType("Cannot convert " + inspectBrief(v) + " to a BigInt");
+}
+
+V thisBig(V v, const char *method)
+{
+    if (isBig(v))
+        return v;
+    if (isObj(v) && op(v)->cls == C_BIGINT)
+        return static_cast<JPrim *>(op(v))->val;
+    throwType(std::string("BigInt.prototype.") + method + " requires that 'this' be a BigInt");
+}
+
+V bToString(V thisV, V *args, int argc)
+{
+    V b = thisBig(thisV, "toString");
+    V r = argOr(args, argc, 0);
+    double radix = r == Undefined ? 10 : toIntegerOrInf(r);
+    if (radix < 2 || radix > 36)
+        throwRange("toString() radix argument must be between 2 and 36");
+    return str(bigToStr(bigp(b), (int)radix));
+}
+
+V bValueOf(V thisV, V *, int)
+{
+    return thisBig(thisV, "valueOf");
+}
+
+V bToLocale(V thisV, V *, int)
+{
+    std::string t = bigToStr(bigp(thisBig(thisV, "toLocaleString")));
+    bool neg = !t.empty() && t[0] == '-';
+    if (neg)
+        t = t.substr(1);
+    std::string o;
+    int c = 0;
+    for (size_t i = t.size(); i-- > 0;)
+    {
+        o += t[i];
+        if (++c % 3 == 0 && i)
+            o += ',';
+    }
+    if (neg)
+        o += '-';
+    std::reverse(o.begin(), o.end());
+    return str(o);
+}
+
+V bAsN(V *args, int argc, bool isSigned)
+{
+    double bits = toIntegerOrInf(argOr(args, argc, 0));
+    V v = argOr(args, argc, 1);
+    if (!isBig(v))
+        throwType("Cannot convert " + inspectBrief(v) + " to a BigInt");
+    if (bits < 0)
+        throwRange("Invalid value: not (convertible to) a safe integer");
+    if (bits == 0)
+        return bigFromU64(0, false);
+    V two = bigFromU64(2, false);
+    V mod = bigExp(bigp(two), bigp(bigv(bigFromDouble(bits))));
+    V m = bigMod(bigp(v), bigp(mod));
+    if (bigp(m)->neg)
+        m = bigAdd(bigp(m), bigp(mod));
+    if (isSigned)
+    {
+        V half = bigExp(bigp(two), bigp(bigv(bigFromDouble(bits - 1))));
+        if (bigCmp(bigp(m), bigp(half)) >= 0)
+            m = bigSub(bigp(m), bigp(mod));
+    }
+    return m;
+}
+
+V bAsIntN(V, V *args, int argc) { return bAsN(args, argc, true); }
+V bAsUintN(V, V *args, int argc) { return bAsN(args, argc, false); }
+
+} // namespace
+
+void initBigIntBuiltins()
+{
+    JFunc *c = defCtor("BigInt", bigintCtor, 1, PR.bigint);
+    defFn(c, "asIntN", bAsIntN, 2);
+    defFn(c, "asUintN", bAsUintN, 2);
+    defFn(PR.bigint, "toString", bToString, 0);
+    defFn(PR.bigint, "valueOf", bValueOf, 0);
+    defFn(PR.bigint, "toLocaleString", bToLocale, 0);
+    defineOwn(PR.bigint, WK.toStringTag, atomOf("BigInt"), PF_C);
+}
+
+} // namespace js

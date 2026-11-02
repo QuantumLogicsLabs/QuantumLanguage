@@ -1,0 +1,166 @@
+'use strict';
+// Event, EventTarget, AbortController, AbortSignal and DOMException.
+const custom = Symbol.for('nodejs.util.inspect.custom');
+
+class Event {
+  #type; #target = null; #currentTarget = null; #defaultPrevented = false; #bubbles; #cancelable; #composed; #stop = false;
+  constructor(type, options = {}) {
+    if (arguments.length === 0) {
+      throw internal.nodeError(TypeError, 'ERR_MISSING_ARGS', 'The "type" argument must be specified');
+    }
+    this.#type = String(type);
+    this.#bubbles = !!options?.bubbles;
+    this.#cancelable = !!options?.cancelable;
+    this.#composed = !!options?.composed;
+  }
+  get type() { return this.#type; }
+  get target() { return this.#target; }
+  get currentTarget() { return this.#currentTarget; }
+  get srcElement() { return this.#target; }
+  get bubbles() { return this.#bubbles; }
+  get cancelable() { return this.#cancelable; }
+  get composed() { return this.#composed; }
+  get defaultPrevented() { return this.#defaultPrevented; }
+  get returnValue() { return !this.#defaultPrevented; }
+  get eventPhase() { return this.#currentTarget ? 2 : 0; }
+  get timeStamp() { return 0; }
+  get isTrusted() { return false; }
+  preventDefault() { if (this.#cancelable) this.#defaultPrevented = true; }
+  stopPropagation() {}
+  stopImmediatePropagation() { this.#stop = true; }
+  composedPath() { return this.#target ? [this.#target] : []; }
+  __begin(t) { this.#target = t; this.#currentTarget = t; }
+  __end() { this.#currentTarget = null; }
+  get __stopped() { return this.#stop; }
+  get [Symbol.toStringTag]() { return 'Event'; }
+  [custom](depth, opts, inspect) {
+    return `${this.constructor.name} ${inspect({ type: this.type, defaultPrevented: this.defaultPrevented, cancelable: this.cancelable, timeStamp: this.timeStamp }, opts)}`;
+  }
+}
+for (const k of ['__begin', '__end', '__stopped']) Object.defineProperty(Event.prototype, k, { enumerable: false });
+
+class EventTarget {
+  #listeners = new Map();
+  addEventListener(type, listener, options) {
+    if (listener == null) return;
+    type = String(type);
+    const once = typeof options === 'object' && options ? !!options.once : false;
+    const signal = typeof options === 'object' && options ? options.signal : undefined;
+    if (signal?.aborted) return;
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = []));
+    if (list.some((l) => l.listener === listener)) return;
+    list.push({ listener, once });
+    if (signal) signal.addEventListener('abort', () => this.removeEventListener(type, listener), { once: true });
+  }
+  removeEventListener(type, listener) {
+    const list = this.#listeners.get(String(type));
+    if (!list) return;
+    const i = list.findIndex((l) => l.listener === listener);
+    if (i >= 0) list.splice(i, 1);
+  }
+  dispatchEvent(event) {
+    if (!(event instanceof Event)) {
+      throw internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "event" argument must be an instance of Event. Received ${internal.received(event)}`);
+    }
+    event.__begin(this);
+    const handler = this['on' + event.type];
+    const list = (this.#listeners.get(event.type) ?? []).slice();
+    for (const l of list) {
+      if (l.once) this.removeEventListener(event.type, l.listener);
+      const run = () => {
+        if (typeof l.listener === 'function') l.listener.call(this, event);
+        else if (typeof l.listener?.handleEvent === 'function') l.listener.handleEvent(event);
+      };
+      try { run(); } catch (err) { process.nextTick(() => { throw err; }); }
+      if (event.__stopped) break;
+    }
+    if (typeof handler === 'function') handler.call(this, event);
+    event.__end();
+    return !event.defaultPrevented;
+  }
+  get [Symbol.toStringTag]() { return 'EventTarget'; }
+}
+
+const CODES = { AbortError: 20, TimeoutError: 23, InvalidCharacterError: 5, DataCloneError: 25, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, NotFoundError: 8 };
+
+class DOMException extends Error {
+  #name; #code;
+  constructor(message = '', options) {
+    super(String(message));
+    this.#name = typeof options === 'string' ? options : options?.name ?? 'Error';
+    this.#code = CODES[this.#name] ?? 0;
+    if (typeof options === 'object' && options && 'cause' in options) this.cause = options.cause;
+  }
+  get name() { return this.#name; }
+  get code() { return this.#code; }
+  get [Symbol.toStringTag]() { return 'DOMException'; }
+}
+
+class AbortSignal extends EventTarget {
+  #aborted = false; #reason;
+  onabort = null;
+  get aborted() { return this.#aborted; }
+  get reason() { return this.#reason; }
+  throwIfAborted() { if (this.#aborted) throw this.#reason; }
+  __abort(reason) {
+    if (this.#aborted) return;
+    this.#aborted = true;
+    this.#reason = reason === undefined ? new DOMException('This operation was aborted', 'AbortError') : reason;
+    this.dispatchEvent(new Event('abort'));
+  }
+  static abort(reason) {
+    const s = new AbortSignal();
+    s.__abort(reason);
+    return s;
+  }
+  static timeout(ms) {
+    const s = new AbortSignal();
+    const t = setTimeout(() => s.__abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), ms);
+    t.unref();
+    return s;
+  }
+  static any(list) {
+    const s = new AbortSignal();
+    for (const x of list) {
+      if (x.aborted) { s.__abort(x.reason); break; }
+      x.addEventListener('abort', () => s.__abort(x.reason), { once: true });
+    }
+    return s;
+  }
+  get [Symbol.toStringTag]() { return 'AbortSignal'; }
+  [custom](depth, opts, inspect) {
+    return `AbortSignal ${inspect({ aborted: this.aborted }, opts)}`;
+  }
+}
+Object.defineProperty(AbortSignal.prototype, '__abort', { enumerable: false });
+// fields of the class above are not meant to show
+const realSignal = AbortSignal;
+
+class AbortController {
+  #signal = new realSignal();
+  get signal() { return this.#signal; }
+  abort(reason) { this.#signal.__abort(reason); }
+  get [Symbol.toStringTag]() { return 'AbortController'; }
+  [custom](depth, opts, inspect) {
+    return `AbortController ${inspect({ signal: this.signal }, opts)}`;
+  }
+}
+
+class CustomEvent extends Event {
+  #detail;
+  constructor(type, options = {}) {
+    super(type, options);
+    this.#detail = options?.detail ?? null;
+  }
+  get detail() { return this.#detail; }
+  get [Symbol.toStringTag]() { return 'CustomEvent'; }
+}
+
+internal.installGlobal('Event', Event);
+internal.installGlobal('CustomEvent', CustomEvent);
+internal.installGlobal('EventTarget', EventTarget);
+internal.installGlobal('AbortSignal', AbortSignal);
+internal.installGlobal('AbortController', AbortController);
+internal.installGlobal('DOMException', DOMException);
+module.exports = { Event, CustomEvent, EventTarget, AbortSignal, AbortController, DOMException };

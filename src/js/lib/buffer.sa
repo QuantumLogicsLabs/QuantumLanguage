@@ -1,0 +1,263 @@
+'use strict';
+// Node's Buffer, on Uint8Array.
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+function encodeBytes(str, enc) {
+  enc = String(enc ?? 'utf8').toLowerCase();
+  switch (enc) {
+    case 'utf8':
+    case 'utf-8':
+      return internal.utf8Encode(str);
+    case 'hex': {
+      const out = [];
+      for (let i = 0; i + 1 < str.length; i += 2) {
+        const v = parseInt(str.substr(i, 2), 16);
+        if (Number.isNaN(v)) break;
+        out.push(v);
+      }
+      return out;
+    }
+    case 'base64':
+    case 'base64url': {
+      const out = [];
+      let bits = 0, acc = 0;
+      for (const c of str) {
+        let v = B64.indexOf(c);
+        if (v < 0) v = B64URL.indexOf(c);
+        if (v < 0) continue;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+          bits -= 8;
+          out.push((acc >> bits) & 255);
+        }
+      }
+      return out;
+    }
+    case 'ascii':
+    case 'latin1':
+    case 'binary': {
+      const out = [];
+      for (let i = 0; i < str.length; i++) out.push(str.charCodeAt(i) & 255);
+      return out;
+    }
+    case 'ucs2':
+    case 'ucs-2':
+    case 'utf16le':
+    case 'utf-16le': {
+      const out = [];
+      for (let i = 0; i < str.length; i++) {
+        const c = str.charCodeAt(i);
+        out.push(c & 255, c >> 8);
+      }
+      return out;
+    }
+    default: {
+      throw internal.nodeError(TypeError, 'ERR_UNKNOWN_ENCODING', `Unknown encoding: ${enc}`);
+    }
+  }
+}
+
+function decodeBytes(b, enc, start, end) {
+  enc = String(enc ?? 'utf8').toLowerCase();
+  const view = start === 0 && end === b.length ? b : b.subarray(start, end);
+  switch (enc) {
+    case 'utf8':
+    case 'utf-8':
+      return internal.utf8Decode(view);
+    case 'hex': {
+      let s = '';
+      for (let i = 0; i < view.length; i++) s += view[i].toString(16).padStart(2, '0');
+      return s;
+    }
+    case 'base64':
+    case 'base64url': {
+      const A = enc === 'base64' ? B64 : B64URL;
+      let s = '';
+      const n = view.length;
+      for (let i = 0; i < n; i += 3) {
+        const x = (view[i] << 16) | ((i + 1 < n ? view[i + 1] : 0) << 8) | (i + 2 < n ? view[i + 2] : 0);
+        s += A[(x >> 18) & 63] + A[(x >> 12) & 63];
+        if (i + 1 < n) s += A[(x >> 6) & 63];
+        else if (enc === 'base64') s += '=';
+        if (i + 2 < n) s += A[x & 63];
+        else if (enc === 'base64') s += '=';
+      }
+      return s;
+    }
+    case 'ascii': {
+      let s = '';
+      for (let i = 0; i < view.length; i++) s += String.fromCharCode(view[i] & 127);
+      return s;
+    }
+    case 'latin1':
+    case 'binary': {
+      let s = '';
+      for (let i = 0; i < view.length; i++) s += String.fromCharCode(view[i]);
+      return s;
+    }
+    case 'ucs2':
+    case 'ucs-2':
+    case 'utf16le':
+    case 'utf-16le': {
+      let s = '';
+      for (let i = 0; i + 1 < view.length; i += 2) s += String.fromCharCode(view[i] | (view[i + 1] << 8));
+      return s;
+    }
+    default: {
+      throw internal.nodeError(TypeError, 'ERR_UNKNOWN_ENCODING', `Unknown encoding: ${enc}`);
+    }
+  }
+}
+
+class Buffer extends Uint8Array {
+  static from(value, a, b) {
+    if (typeof value === 'string') return make(encodeBytes(value, a));
+    if (value instanceof ArrayBuffer) return new Buffer(value, a, b);
+    if (ArrayBuffer.isView(value) || Array.isArray(value)) return make(Array.from(value));
+    if (value && value.type === 'Buffer' && Array.isArray(value.data)) return make(value.data);
+    if (value != null && typeof value === 'object') {
+      const p = value.valueOf && value.valueOf();
+      if (p != null && p !== value) return Buffer.from(p, a, b);
+      if (typeof value.length === 'number') return make(Array.from(value));
+    }
+    throw internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received ${internal.received(value)}`);
+  }
+  static alloc(n, fill, enc) {
+    if (typeof n !== 'number') {
+      throw internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "size" argument must be of type number. Received ${internal.received(n)}`);
+    }
+    if (!(n >= 0 && n <= 2 ** 32)) {
+      throw internal.nodeError(RangeError, 'ERR_OUT_OF_RANGE', `The value of "size" is out of range. It must be >= 0 && <= 4294967296. Received ${n}`);
+    }
+    const b = new Buffer(n);
+    if (fill !== undefined && fill !== 0) b.fill(fill, 0, n, enc);
+    return b;
+  }
+  static allocUnsafe(n) { return new Buffer(n); }
+  static allocUnsafeSlow(n) { return new Buffer(n); }
+  static isBuffer(b) { return b instanceof Buffer; }
+  static isEncoding(e) {
+    return typeof e === 'string' && ['utf8', 'utf-8', 'hex', 'base64', 'base64url', 'ascii', 'latin1', 'binary', 'ucs2', 'ucs-2', 'utf16le', 'utf-16le'].includes(e.toLowerCase());
+  }
+  static byteLength(v, enc) {
+    if (typeof v === 'string') return encodeBytes(v, enc).length;
+    return v.byteLength;
+  }
+  static concat(list, total) {
+    if (total === undefined) total = list.reduce((s, b) => s + b.length, 0);
+    const out = new Buffer(total);
+    let at = 0;
+    for (const b of list) {
+      for (let i = 0; i < b.length && at < total; i++) out[at++] = b[i];
+    }
+    return out;
+  }
+  static compare(a, b) {
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+    return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
+  }
+  toString(enc, start = 0, end = this.length) {
+    return decodeBytes(this, enc, Math.max(start, 0), Math.min(end, this.length));
+  }
+  toJSON() { return { type: 'Buffer', data: Array.from(this) }; }
+  equals(o) { return Buffer.compare(this, o) === 0; }
+  compare(o) { return Buffer.compare(this, o); }
+  write(str, offset = 0, length, enc) {
+    if (typeof offset === 'string') { enc = offset; offset = 0; length = undefined; }
+    else if (typeof length === 'string') { enc = length; length = undefined; }
+    const bytes = encodeBytes(str, enc);
+    const n = Math.min(bytes.length, this.length - offset, length ?? Infinity);
+    for (let i = 0; i < n; i++) this[offset + i] = bytes[i];
+    return n;
+  }
+  fill(v, s = 0, e = this.length, enc) {
+    if (typeof s === 'string') { enc = s; s = 0; e = this.length; }
+    if (typeof v === 'string') {
+      const b = encodeBytes(v, enc);
+      if (!b.length) return super.fill(0, s, e);
+      for (let i = s, k = 0; i < e; i++, k++) this[i] = b[k % b.length];
+      return this;
+    }
+    return super.fill(v, s, e);
+  }
+  slice(s, e) { return this.subarray(s, e); }
+  subarray(s, e) {
+    const n = this.length;
+    const a = s === undefined ? 0 : s < 0 ? Math.max(n + s, 0) : Math.min(s, n);
+    const b = e === undefined ? n : e < 0 ? Math.max(n + e, 0) : Math.min(e, n);
+    return new Buffer(this.buffer, this.byteOffset + a, Math.max(b - a, 0));
+  }
+  copy(target, ts = 0, ss = 0, se = this.length) {
+    let n = 0;
+    for (let i = ss; i < se && ts + n < target.length; i++, n++) target[ts + n] = this[i];
+    return n;
+  }
+  indexOf(v, from = 0, enc) {
+    if (typeof v === 'number') return super.indexOf(v & 255, from);
+    const needle = typeof v === 'string' ? encodeBytes(v, enc) : v;
+    outer: for (let i = from; i + needle.length <= this.length; i++) {
+      for (let k = 0; k < needle.length; k++) if (this[i + k] !== needle[k]) continue outer;
+      return i;
+    }
+    return -1;
+  }
+  includes(v, from, enc) { return this.indexOf(v, from, enc) !== -1; }
+  readUInt8(o = 0) { return this[o]; }
+  readInt8(o = 0) { return (this[o] << 24) >> 24; }
+  readUInt16LE(o = 0) { return this[o] | (this[o + 1] << 8); }
+  readUInt16BE(o = 0) { return (this[o] << 8) | this[o + 1]; }
+  readInt16LE(o = 0) { return (this.readUInt16LE(o) << 16) >> 16; }
+  readInt16BE(o = 0) { return (this.readUInt16BE(o) << 16) >> 16; }
+  readUInt32LE(o = 0) { return (this[o] | (this[o + 1] << 8) | (this[o + 2] << 16) | (this[o + 3] << 24)) >>> 0; }
+  readUInt32BE(o = 0) { return ((this[o] << 24) | (this[o + 1] << 16) | (this[o + 2] << 8) | this[o + 3]) >>> 0; }
+  readInt32LE(o = 0) { return this.readUInt32LE(o) | 0; }
+  readInt32BE(o = 0) { return this.readUInt32BE(o) | 0; }
+  writeUInt8(v, o = 0) { this[o] = v; return o + 1; }
+  writeInt8(v, o = 0) { this[o] = v; return o + 1; }
+  writeUInt16LE(v, o = 0) { this[o] = v; this[o + 1] = v >> 8; return o + 2; }
+  writeUInt16BE(v, o = 0) { this[o] = v >> 8; this[o + 1] = v; return o + 2; }
+  writeInt16LE(v, o = 0) { return this.writeUInt16LE(v, o); }
+  writeInt16BE(v, o = 0) { return this.writeUInt16BE(v, o); }
+  writeUInt32LE(v, o = 0) { this[o] = v; this[o + 1] = v >>> 8; this[o + 2] = v >>> 16; this[o + 3] = v >>> 24; return o + 4; }
+  writeUInt32BE(v, o = 0) { this[o] = v >>> 24; this[o + 1] = v >>> 16; this[o + 2] = v >>> 8; this[o + 3] = v; return o + 4; }
+  writeInt32LE(v, o = 0) { return this.writeUInt32LE(v, o); }
+  writeInt32BE(v, o = 0) { return this.writeUInt32BE(v, o); }
+  [Symbol.for('nodejs.util.inspect.custom')]() {
+    const shown = Array.from(this.subarray(0, 50), (x) => x.toString(16).padStart(2, '0')).join(' ');
+    const more = this.length > 50 ? ` ... ${this.length - 50} more byte${this.length > 51 ? 's' : ''}` : '';
+    return `<Buffer${shown ? ' ' + shown : ''}${more}>`;
+  }
+}
+
+function make(list) {
+  const b = new Buffer(list.length);
+  for (let i = 0; i < list.length; i++) b[i] = list[i];
+  return b;
+}
+
+const btoa = (s) => {
+  s = String(s);
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) > 255) {
+      const e = new DOMExceptionLike('Invalid character', 'InvalidCharacterError');
+      throw e;
+    }
+  }
+  return Buffer.from(s, 'latin1').toString('base64');
+};
+const atob = (s) => Buffer.from(String(s), 'base64').toString('latin1');
+
+class DOMExceptionLike extends Error {
+  constructor(message, name) {
+    super(message);
+    Object.defineProperty(this, 'name', { value: name, configurable: true });
+  }
+}
+
+internal.installGlobal('Buffer', Buffer);
+internal.installGlobal('btoa', btoa);
+internal.installGlobal('atob', atob);
+module.exports = { Buffer, btoa, atob, kMaxLength: 2 ** 32, constants: { MAX_LENGTH: 2 ** 32, MAX_STRING_LENGTH: 536870888 } };

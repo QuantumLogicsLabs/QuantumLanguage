@@ -1,0 +1,2258 @@
+// quantum: cpp
+// JavaScript front-end: regular expressions. A pattern compiles to a graph of
+// nodes, each knowing what follows it, walked by a backtracking matcher. A
+// lookbehind is the same thing compiled to run right to left.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <algorithm>
+#include <cmath>
+#include <unordered_map>
+
+namespace js
+{
+
+JStr *expandReplacement(JStr *rep, JStr *subject, int pos, JStr *matched, const std::vector<V> &caps, V named);
+
+namespace
+{
+
+// ── character sets ───────────────────────────────────────────────────────
+
+std::vector<const std::vector<int> *> g_propTables;
+
+bool propTest(int p, int c)
+{
+    return uniRangesHas(*g_propTables[(size_t)p], c);
+}
+
+int propByName(const std::string &name)
+{
+    const std::vector<int> *r = uniProperty(name);
+    if (!r)
+        return -1;
+    g_propTables.push_back(r);
+    return (int)g_propTables.size() - 1;
+}
+
+struct RSet
+{
+    std::vector<int> lo, hi;
+    std::vector<int> props;      // >= 0: has it; < 0: -1 - id, does not have it
+    std::vector<RSet *> subs;    // a union of nested sets
+    std::vector<RSet *> andSets; // && (each must hold)
+    std::vector<RSet *> notSets; // -- (none may hold)
+    bool neg = false;
+    bool digit = false, word = false, space = false;
+    bool ndigit = false, nword = false, nspace = false;
+    uint8_t ascii[16];
+    bool asciiReady = false;
+};
+
+bool isWordUnit(int c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+bool isReSpace(int c)
+{
+    return c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0xFEFF || c == 0x2028 || c == 0x2029 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+bool setHasRaw(RSet *s, int c)
+{
+    bool in = false;
+    for (size_t i = 0; i < s->lo.size(); ++i)
+        if (c >= s->lo[i] && c <= s->hi[i])
+        {
+            in = true;
+            break;
+        }
+    if (!in && s->digit && c >= '0' && c <= '9')
+        in = true;
+    if (!in && s->ndigit && !(c >= '0' && c <= '9'))
+        in = true;
+    if (!in && s->word && isWordUnit(c))
+        in = true;
+    if (!in && s->nword && !isWordUnit(c))
+        in = true;
+    if (!in && s->space && isReSpace(c))
+        in = true;
+    if (!in && s->nspace && !isReSpace(c))
+        in = true;
+    if (!in)
+        for (int p : s->props)
+            if (p >= 0 ? propTest(p, c) : !propTest(-1 - p, c))
+            {
+                in = true;
+                break;
+            }
+    if (!in)
+        for (RSet *x : s->subs)
+            if (setHasRaw(x, c))
+            {
+                in = true;
+                break;
+            }
+    if (in)
+        for (RSet *x : s->andSets)
+            if (!setHasRaw(x, c))
+            {
+                in = false;
+                break;
+            }
+    if (in)
+        for (RSet *x : s->notSets)
+            if (setHasRaw(x, c))
+            {
+                in = false;
+                break;
+            }
+    return s->neg ? !in : in;
+}
+
+// ── the syntax tree of a pattern ─────────────────────────────────────────
+
+enum RK : uint8_t
+{
+    RT_EMPTY, RT_CHAR, RT_ANY, RT_SET, RT_SEQ, RT_ALT, RT_GROUP, RT_QUANT, RT_BOL, RT_EOL, RT_WB, RT_NWB, RT_BACKREF, RT_LOOK
+};
+
+struct RT
+{
+    RK k;
+    int c = 0;           // RT_CHAR; group index
+    RSet *set = nullptr;
+    std::vector<RT *> list;
+    RT *sub = nullptr;
+    int min = 0, max = 0;
+    bool greedy = true;
+    bool neg = false, behind = false;
+    int capFrom = 0, capTo = 0;
+    std::string name;    // a named back reference until the names are known
+};
+
+// ── the graph ────────────────────────────────────────────────────────────
+
+enum RN : uint8_t
+{
+    RN_CHAR, RN_CHARB, RN_ANY, RN_ANYB, RN_SET, RN_SETB, RN_BOL, RN_EOL, RN_WB, RN_NWB, RN_SAVE, RN_BACKREF, RN_BACKREFB, RN_SPLIT, RN_LOOK, RN_LOOKEND,
+    RN_SIMPLE, RN_LOOPINIT, RN_LOOP, RN_LOOPEND, RN_MATCH
+};
+
+struct RNode
+{
+    RN k;
+    bool greedy;
+    bool neg;
+    bool back;
+    int c;        // char; save slot; group; loop id
+    int min, max;
+    int capFrom, capTo;
+    RSet *set;
+    RNode *next;
+    RNode *alt;   // split: the other way; loop: the body; look: the sub-pattern
+    RNode *one;   // simple loop: the single-character node
+};
+
+struct RProg
+{
+    RNode *start = nullptr;
+    int nGroups = 1;   // with group 0
+    int nLoops = 0;
+    std::vector<std::string> names; // by group, "" when unnamed
+    bool ignoreCase = false, multiline = false, dotAll = false, unicode = false, sets = false, global = false, sticky = false, indices = false;
+    bool hasNames = false;
+    int firstUnit = -1;
+};
+
+struct ReError
+{
+    std::string msg;
+};
+
+// ── parsing a pattern ────────────────────────────────────────────────────
+
+struct ReParser
+{
+    const uint16_t *s;
+    int n;
+    int p = 0;
+    bool uni;
+    bool vmode;
+    bool ic;
+    int groupCount = 1;
+    int totalGroups = 1;
+    bool hasNamed = false;
+    std::vector<std::string> names;
+    std::vector<RT *> namedRefs;
+
+    RT *mk(RK k)
+    {
+        RT *t = new RT();
+        t->k = k;
+        return t;
+    }
+
+    [[noreturn]] void fail(const std::string &m)
+    {
+        throw ReError{m};
+    }
+
+    // how many capture groups there are, before parsing: \N depends on it
+    void prescan()
+    {
+        bool inClass = false;
+        for (int i = 0; i < n; ++i)
+        {
+            int c = s[i];
+            if (c == '\\')
+            {
+                ++i;
+                continue;
+            }
+            if (inClass)
+            {
+                if (c == ']')
+                    inClass = false;
+                continue;
+            }
+            if (c == '[')
+                inClass = true;
+            else if (c == '(')
+            {
+                if (i + 1 < n && s[i + 1] == '?')
+                {
+                    if (i + 2 < n && s[i + 2] == '<' && i + 3 < n && s[i + 3] != '=' && s[i + 3] != '!')
+                    {
+                        ++totalGroups;
+                        hasNamed = true;
+                    }
+                }
+                else
+                    ++totalGroups;
+            }
+        }
+        names.resize((size_t)totalGroups + 1);
+    }
+
+    int peek()
+    {
+        return p < n ? s[p] : -1;
+    }
+
+    bool eat(int c)
+    {
+        if (p < n && s[p] == c)
+        {
+            ++p;
+            return true;
+        }
+        return false;
+    }
+
+    RT *disjunction()
+    {
+        std::vector<RT *> alts;
+        alts.push_back(alternative());
+        while (eat('|'))
+            alts.push_back(alternative());
+        if (alts.size() == 1)
+            return alts[0];
+        RT *a = mk(RT_ALT);
+        a->list = alts;
+        return a;
+    }
+
+    RT *alternative()
+    {
+        RT *seq = mk(RT_SEQ);
+        while (p < n && s[p] != '|' && s[p] != ')')
+            seq->list.push_back(term());
+        if (seq->list.size() == 1)
+            return seq->list[0];
+        return seq;
+    }
+
+    int readDecimal()
+    {
+        int64_t v = 0;
+        bool any = false;
+        while (p < n && s[p] >= '0' && s[p] <= '9')
+        {
+            v = v * 10 + (s[p] - '0');
+            if (v > 2147483647)
+                v = 2147483647;
+            ++p;
+            any = true;
+        }
+        return any ? (int)v : -1;
+    }
+
+    RT *term()
+    {
+        int capBefore = groupCount;
+        int c = s[p];
+        RT *atom = nullptr;
+        bool quantifiable = true;
+        switch (c)
+        {
+        case '^':
+            ++p;
+            atom = mk(RT_BOL);
+            quantifiable = false;
+            break;
+        case '$':
+            ++p;
+            atom = mk(RT_EOL);
+            quantifiable = false;
+            break;
+        case '(':
+            atom = group(&quantifiable);
+            break;
+        case '.':
+            ++p;
+            atom = mk(RT_ANY);
+            break;
+        case '[':
+            atom = charClass();
+            break;
+        case '\\':
+            atom = escape(&quantifiable);
+            break;
+        case '*':
+        case '+':
+        case '?':
+            fail("Nothing to repeat");
+        case '{':
+            if (uni)
+                fail("Nothing to repeat");
+            // a { that really is a quantifier has nothing to repeat
+            {
+                int save = p;
+                ++p;
+                int a = readDecimal();
+                bool isQ = a >= 0;
+                if (isQ && eat(','))
+                    readDecimal();
+                if (isQ && !eat('}'))
+                    isQ = false;
+                p = save;
+                if (isQ)
+                    fail("Nothing to repeat");
+            }
+            ++p;
+            atom = mk(RT_CHAR);
+            atom->c = '{';
+            break;
+        case '}':
+        case ']':
+            if (uni)
+                fail("Lone quantifier brackets");
+            ++p;
+            atom = mk(RT_CHAR);
+            atom->c = c;
+            break;
+        default:
+            atom = mk(RT_CHAR);
+            atom->c = readCp();
+        }
+        return quantifier(atom, capBefore, quantifiable);
+    }
+
+    int readCp()
+    {
+        int c = s[p++];
+        if (uni && c >= 0xD800 && c < 0xDC00 && p < n && s[p] >= 0xDC00 && s[p] < 0xE000)
+        {
+            c = 0x10000 + ((c - 0xD800) << 10) + (s[p] - 0xDC00);
+            ++p;
+        }
+        return c;
+    }
+
+    RT *quantifier(RT *atom, int capBefore, bool quantifiable)
+    {
+        int c = peek();
+        int mn, mx;
+        if (c == '*')
+        {
+            mn = 0;
+            mx = -1;
+            ++p;
+        }
+        else if (c == '+')
+        {
+            mn = 1;
+            mx = -1;
+            ++p;
+        }
+        else if (c == '?')
+        {
+            mn = 0;
+            mx = 1;
+            ++p;
+        }
+        else if (c == '{')
+        {
+            int save = p;
+            ++p;
+            int a = readDecimal();
+            if (a < 0)
+            {
+                p = save;
+                if (uni)
+                    fail("Incomplete quantifier");
+                return atom;
+            }
+            int b = a;
+            if (eat(','))
+            {
+                b = readDecimal();
+                if (b < 0)
+                    b = -1;
+            }
+            if (!eat('}'))
+            {
+                p = save;
+                if (uni)
+                    fail("Incomplete quantifier");
+                return atom;
+            }
+            if (b != -1 && b < a)
+                fail("numbers out of order in {} quantifier");
+            mn = a;
+            mx = b;
+        }
+        else
+            return atom;
+        if (!quantifiable)
+            fail("Nothing to repeat");
+        RT *q = mk(RT_QUANT);
+        q->sub = atom;
+        q->min = mn;
+        q->max = mx;
+        q->greedy = !eat('?');
+        q->capFrom = capBefore;
+        q->capTo = groupCount;
+        return q;
+    }
+
+    RT *group(bool *quantifiable)
+    {
+        ++p; // (
+        if (eat('?'))
+        {
+            int c = peek();
+            if (c == ':')
+            {
+                ++p;
+                RT *d = disjunction();
+                closeGroup();
+                return d;
+            }
+            if (c == '=' || c == '!')
+            {
+                ++p;
+                RT *l = mk(RT_LOOK);
+                l->neg = c == '!';
+                l->sub = disjunction();
+                closeGroup();
+                *quantifiable = !uni;
+                return l;
+            }
+            if (c == '<')
+            {
+                int d = p + 1 < n ? s[p + 1] : -1;
+                if (d == '=' || d == '!')
+                {
+                    p += 2;
+                    RT *l = mk(RT_LOOK);
+                    l->neg = d == '!';
+                    l->behind = true;
+                    l->sub = disjunction();
+                    closeGroup();
+                    *quantifiable = false;
+                    return l;
+                }
+                ++p;
+                std::string name = groupName();
+                for (const std::string &x : names)
+                    if (x == name)
+                        fail("Duplicate capture group name");
+                int idx = groupCount++;
+                names[(size_t)idx] = name;
+                RT *g = mk(RT_GROUP);
+                g->c = idx;
+                g->sub = disjunction();
+                closeGroup();
+                return g;
+            }
+            fail("Invalid group");
+        }
+        int idx = groupCount++;
+        RT *g = mk(RT_GROUP);
+        g->c = idx;
+        g->sub = disjunction();
+        closeGroup();
+        return g;
+    }
+
+    void closeGroup()
+    {
+        if (!eat(')'))
+            fail("Unterminated group");
+    }
+
+    std::string groupName()
+    {
+        std::vector<uint16_t> u;
+        for (;;)
+        {
+            if (p >= n)
+                fail("Invalid capture group name");
+            int c = s[p++];
+            if (c == '>')
+                break;
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_' || c >= 128 || (!u.empty() && c >= '0' && c <= '9');
+            if (!ok)
+                fail("Invalid capture group name");
+            u.push_back((uint16_t)c);
+        }
+        if (u.empty())
+            fail("Invalid capture group name");
+        return toUtf8(newStrFromUnitsVec(u));
+    }
+
+    int hexN(int count)
+    {
+        int v = 0;
+        for (int i = 0; i < count; ++i)
+        {
+            int c = p + i < n ? s[p + i] : -1;
+            int h = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (h < 0)
+                return -1;
+            v = v * 16 + h;
+        }
+        p += count;
+        return v;
+    }
+
+    // after \u
+    int unicodeEscape()
+    {
+        if (uni && peek() == '{')
+        {
+            ++p;
+            int v = 0, cnt = 0;
+            while (p < n && s[p] != '}')
+            {
+                int c = s[p];
+                int h = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+                if (h < 0)
+                    fail("Invalid Unicode escape");
+                v = v * 16 + h;
+                if (v > 0x10FFFF)
+                    fail("Invalid Unicode escape");
+                ++p;
+                ++cnt;
+            }
+            if (!eat('}') || !cnt)
+                fail("Invalid Unicode escape");
+            return v;
+        }
+        int v = hexN(4);
+        if (v < 0)
+        {
+            if (uni)
+                fail("Invalid Unicode escape");
+            return -1;
+        }
+        if (uni && v >= 0xD800 && v < 0xDC00 && p + 1 < n && s[p] == '\\' && s[p + 1] == 'u')
+        {
+            int save = p;
+            p += 2;
+            int w = hexN(4);
+            if (w >= 0xDC00 && w < 0xE000)
+                return 0x10000 + ((v - 0xD800) << 10) + (w - 0xDC00);
+            p = save;
+        }
+        return v;
+    }
+
+    // a set escape after the backslash, if it is one
+    bool classEscape(int c, RSet *into)
+    {
+        switch (c)
+        {
+        case 'd': into->digit = true; return true;
+        case 'D': into->ndigit = true; return true;
+        case 'w': into->word = true; return true;
+        case 'W': into->nword = true; return true;
+        case 's': into->space = true; return true;
+        case 'S': into->nspace = true; return true;
+        case 'p':
+        case 'P':
+            if (!uni)
+                return false;
+            {
+                if (!eat('{'))
+                    fail("Invalid property name");
+                std::string name;
+                while (p < n && s[p] != '}')
+                    name += (char)s[p++];
+                if (!eat('}'))
+                    fail("Invalid property name");
+                int id = propByName(name);
+                if (id < 0)
+                    fail("Invalid property name");
+                into->props.push_back(c == 'p' ? id : -1 - id);
+                return true;
+            }
+        default:
+            return false;
+        }
+    }
+
+    RT *escape(bool *quantifiable)
+    {
+        ++p; // backslash
+        if (p >= n)
+            fail("\\ at end of pattern");
+        int c = s[p++];
+        if (c == 'b' || c == 'B')
+        {
+            *quantifiable = false;
+            return mk(c == 'b' ? RT_WB : RT_NWB);
+        }
+        if (c >= '1' && c <= '9')
+        {
+            int save = p;
+            --p;
+            int v = readDecimal();
+            if (v < totalGroups)
+            {
+                RT *b = mk(RT_BACKREF);
+                b->c = v;
+                return b;
+            }
+            if (uni)
+                fail("Invalid escape");
+            p = save - 1;
+            // not a group: an octal escape, or the digit itself
+            if (c >= '8')
+            {
+                ++p;
+                RT *ch = mk(RT_CHAR);
+                ch->c = c;
+                return ch;
+            }
+            RT *ch = mk(RT_CHAR);
+            ch->c = legacyOctal();
+            return ch;
+        }
+        if (c == 'k')
+        {
+            if (hasNamed || uni)
+            {
+                if (!eat('<'))
+                    fail("Invalid named reference");
+                std::string name = groupName();
+                RT *b = mk(RT_BACKREF);
+                b->name = name;
+                namedRefs.push_back(b);
+                return b;
+            }
+            RT *ch = mk(RT_CHAR);
+            ch->c = 'k';
+            return ch;
+        }
+        RSet tmp;
+        int pSave = p;
+        if (classEscape(c, &tmp))
+        {
+            RT *t = mk(RT_SET);
+            t->set = new RSet(tmp);
+            return t;
+        }
+        p = pSave;
+        RT *ch = mk(RT_CHAR);
+        ch->c = characterEscape(c);
+        return ch;
+    }
+
+    int legacyOctal()
+    {
+        int v = 0;
+        int cnt = 0;
+        while (cnt < 3 && p < n && s[p] >= '0' && s[p] <= '7')
+        {
+            int nv = v * 8 + (s[p] - '0');
+            if (nv > 255)
+                break;
+            v = nv;
+            ++p;
+            ++cnt;
+        }
+        return v;
+    }
+
+    // what a backslash-c means as one character (c already read)
+    int characterEscape(int c)
+    {
+        switch (c)
+        {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case 'v': return 0x0B;
+        case 'f': return 0x0C;
+        case '0':
+            if (peek() >= '0' && peek() <= '9')
+            {
+                if (uni)
+                    fail("Invalid decimal escape");
+                --p;
+                return legacyOctal();
+            }
+            return 0;
+        case 'c':
+        {
+            int d = peek();
+            if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z'))
+            {
+                ++p;
+                return d % 32;
+            }
+            if (uni)
+                fail("Invalid unicode escape");
+            --p;
+            return '\\';
+        }
+        case 'x':
+        {
+            int v = hexN(2);
+            if (v < 0)
+            {
+                if (uni)
+                    fail("Invalid escape");
+                return 'x';
+            }
+            return v;
+        }
+        case 'u':
+        {
+            int v = unicodeEscape();
+            return v < 0 ? 'u' : v;
+        }
+        default:
+            if (uni && !(c == '^' || c == '$' || c == '\\' || c == '.' || c == '*' || c == '+' || c == '?' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '|' || c == '/'))
+                fail("Invalid escape");
+            if (uni && c >= 0xD800 && c < 0xDC00 && p < n && s[p] >= 0xDC00 && s[p] < 0xE000)
+            {
+                int cp = 0x10000 + ((c - 0xD800) << 10) + (s[p] - 0xDC00);
+                ++p;
+                return cp;
+            }
+            return c;
+        }
+    }
+
+    // one member of a class: a character, or -1 when it was a set (added to `set`)
+    int classAtom(RSet *set)
+    {
+        int c = s[p];
+        if (c == '\\')
+        {
+            ++p;
+            if (p >= n)
+                fail("\\ at end of pattern");
+            int d = s[p++];
+            if (d == 'b')
+                return '\b';
+            if (d == '-' && uni)
+                return '-';
+            if (d >= '1' && d <= '9' && !uni)
+            {
+                --p;
+                if (d >= '8')
+                {
+                    ++p;
+                    return d;
+                }
+                return legacyOctal();
+            }
+            int save = p;
+            if (classEscape(d, set))
+                return -1;
+            p = save;
+            if (d == 'k' && !uni)
+                return 'k';
+            return characterEscape(d);
+        }
+        return readCp();
+    }
+
+    RSet *classBody()
+    {
+        RSet *set = new RSet();
+        if (eat('^'))
+            set->neg = true;
+        for (;;)
+        {
+            if (p >= n)
+                fail("Unterminated character class");
+            if (s[p] == ']')
+            {
+                ++p;
+                return set;
+            }
+            if (vmode)
+            {
+                if (s[p] == '[')
+                {
+                    ++p;
+                    set->subs.push_back(classBody());
+                    continue;
+                }
+                if (s[p] == '&' && p + 1 < n && s[p + 1] == '&')
+                {
+                    p += 2;
+                    set->andSets.push_back(classOperand());
+                    continue;
+                }
+                if (s[p] == '-' && p + 1 < n && s[p + 1] == '-')
+                {
+                    p += 2;
+                    set->notSets.push_back(classOperand());
+                    continue;
+                }
+            }
+            int a = classAtom(set);
+            if (p + 1 < n && s[p] == '-' && s[p + 1] != ']' && !(vmode && s[p + 1] == '-'))
+            {
+                ++p;
+                int b = classAtom(set);
+                if (a < 0 || b < 0)
+                {
+                    if (uni)
+                        fail("Invalid character class");
+                    if (a >= 0)
+                    {
+                        set->lo.push_back(a);
+                        set->hi.push_back(a);
+                    }
+                    set->lo.push_back('-');
+                    set->hi.push_back('-');
+                    if (b >= 0)
+                    {
+                        set->lo.push_back(b);
+                        set->hi.push_back(b);
+                    }
+                    continue;
+                }
+                if (b < a)
+                    fail("Range out of order in character class");
+                set->lo.push_back(a);
+                set->hi.push_back(b);
+                continue;
+            }
+            if (a >= 0)
+            {
+                set->lo.push_back(a);
+                set->hi.push_back(a);
+            }
+        }
+    }
+
+    RSet *classOperand()
+    {
+        if (eat('['))
+            return classBody();
+        RSet *set = new RSet();
+        int a = classAtom(set);
+        if (a >= 0)
+        {
+            set->lo.push_back(a);
+            set->hi.push_back(a);
+        }
+        return set;
+    }
+
+    RT *charClass()
+    {
+        ++p; // [
+        RT *t = mk(RT_SET);
+        t->set = classBody();
+        return t;
+    }
+};
+
+// ── graph building ───────────────────────────────────────────────────────
+
+RNode *rnode(RN k, RNode *next)
+{
+    RNode *n = static_cast<RNode *>(bump(sizeof(RNode)));
+    n->k = k;
+    n->next = next;
+    return n;
+}
+
+bool isSingle(RT *t)
+{
+    return t->k == RT_CHAR || t->k == RT_ANY || t->k == RT_SET;
+}
+
+RNode *gen(RT *t, RNode *next, bool back, RProg *prog);
+
+RNode *genSingle(RT *t, RNode *next, bool back)
+{
+    RNode *n;
+    if (t->k == RT_CHAR)
+    {
+        n = rnode(back ? RN_CHARB : RN_CHAR, next);
+        n->c = t->c;
+    }
+    else if (t->k == RT_ANY)
+        n = rnode(back ? RN_ANYB : RN_ANY, next);
+    else
+    {
+        n = rnode(back ? RN_SETB : RN_SET, next);
+        n->set = t->set;
+    }
+    return n;
+}
+
+RNode *gen(RT *t, RNode *next, bool back, RProg *prog)
+{
+    switch (t->k)
+    {
+    case RT_EMPTY:
+        return next;
+    case RT_CHAR:
+    case RT_ANY:
+    case RT_SET:
+        return genSingle(t, next, back);
+    case RT_SEQ:
+    {
+        RNode *cur = next;
+        if (back)
+            for (size_t i = 0; i < t->list.size(); ++i)
+                cur = gen(t->list[i], cur, back, prog);
+        else
+            for (size_t i = t->list.size(); i-- > 0;)
+                cur = gen(t->list[i], cur, back, prog);
+        return cur;
+    }
+    case RT_ALT:
+    {
+        RNode *cur = gen(t->list[t->list.size() - 1], next, back, prog);
+        for (size_t i = t->list.size() - 1; i-- > 0;)
+        {
+            RNode *sp = rnode(RN_SPLIT, gen(t->list[i], next, back, prog));
+            sp->alt = cur;
+            cur = sp;
+        }
+        return cur;
+    }
+    case RT_GROUP:
+    {
+        RNode *close = rnode(RN_SAVE, next);
+        close->c = back ? t->c * 2 : t->c * 2 + 1;
+        RNode *body = gen(t->sub, close, back, prog);
+        RNode *open = rnode(RN_SAVE, body);
+        open->c = back ? t->c * 2 + 1 : t->c * 2;
+        return open;
+    }
+    case RT_BOL:
+        return rnode(RN_BOL, next);
+    case RT_EOL:
+        return rnode(RN_EOL, next);
+    case RT_WB:
+        return rnode(RN_WB, next);
+    case RT_NWB:
+        return rnode(RN_NWB, next);
+    case RT_BACKREF:
+    {
+        RNode *n = rnode(back ? RN_BACKREFB : RN_BACKREF, next);
+        n->c = t->c;
+        return n;
+    }
+    case RT_LOOK:
+    {
+        RNode *end = rnode(RN_LOOKEND, nullptr);
+        RNode *n = rnode(RN_LOOK, next);
+        n->alt = gen(t->sub, end, t->behind, prog);
+        n->neg = t->neg;
+        return n;
+    }
+    case RT_QUANT:
+    {
+        if (isSingle(t->sub))
+        {
+            RNode *n = rnode(RN_SIMPLE, next);
+            n->one = genSingle(t->sub, nullptr, back);
+            n->min = t->min;
+            n->max = t->max;
+            n->greedy = t->greedy;
+            n->back = back;
+            return n;
+        }
+        int id = prog->nLoops++;
+        RNode *loop = rnode(RN_LOOP, next);
+        RNode *end = rnode(RN_LOOPEND, loop);
+        end->c = id;
+        loop->alt = gen(t->sub, end, back, prog);
+        loop->c = id;
+        loop->min = t->min;
+        loop->max = t->max;
+        loop->greedy = t->greedy;
+        loop->capFrom = t->capFrom;
+        loop->capTo = t->capTo;
+        RNode *init = rnode(RN_LOOPINIT, loop);
+        init->c = id;
+        return init;
+    }
+    }
+    return next;
+}
+
+// ── matching ─────────────────────────────────────────────────────────────
+
+const uint8_t *g_a;
+const uint16_t *g_w;
+int g_len;
+int *g_caps;
+int *g_cnt;
+int *g_starts;
+bool g_ic, g_uni, g_multi, g_dotAll;
+int g_steps;
+
+#define UNIT(i) (g_w ? (int)g_w[i] : (int)g_a[i])
+
+int canon(int c)
+{
+    if (c < 128)
+        return c >= 'a' && c <= 'z' ? c - 32 : c;
+    return uniCaseRoot(c, g_uni);
+}
+
+bool setHas(RSet *s, int c)
+{
+    if (c < 128)
+    {
+        if (!s->asciiReady)
+        {
+            std::memset(s->ascii, 0, 16);
+            for (int i = 0; i < 128; ++i)
+                if (setHasRaw(s, i))
+                    s->ascii[i >> 3] |= (uint8_t)(1 << (i & 7));
+            s->asciiReady = true;
+        }
+        return (s->ascii[c >> 3] >> (c & 7)) & 1;
+    }
+    return setHasRaw(s, c);
+}
+
+bool setMatches(RSet *s, int c)
+{
+    if (!g_ic)
+        return setHas(s, c);
+    // ASCII without the u flag only ever has its other case
+    if (c < 128 && !g_uni)
+    {
+        int other = c >= 'a' && c <= 'z' ? c - 32 : c >= 'A' && c <= 'Z' ? c + 32 : c;
+        if (s->neg)
+            return setHas(s, c) && setHas(s, other);
+        return setHas(s, c) || setHas(s, other);
+    }
+    const std::vector<int> *alike = uniCaseClass(c, g_uni);
+    if (!alike)
+        return setHas(s, c);
+    // a negated set must hold for every case variant
+    for (int m : *alike)
+    {
+        bool has = setHas(s, m);
+        if (s->neg && !has)
+            return false;
+        if (!s->neg && has)
+            return true;
+    }
+    return s->neg;
+}
+
+bool isWordAt(int i)
+{
+    if (i < 0 || i >= g_len)
+        return false;
+    int c = UNIT(i);
+    return isWordUnit(c);
+}
+
+// reads the character at pos going forward: its code and width; -1 at the end
+int readFwd(int pos, int *width)
+{
+    if (pos >= g_len)
+        return -1;
+    int c = UNIT(pos);
+    *width = 1;
+    if (g_uni && c >= 0xD800 && c < 0xDC00 && pos + 1 < g_len)
+    {
+        int d = UNIT(pos + 1);
+        if (d >= 0xDC00 && d < 0xE000)
+        {
+            *width = 2;
+            return 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+        }
+    }
+    return c;
+}
+
+int readBack(int pos, int *width)
+{
+    if (pos <= 0)
+        return -1;
+    int c = UNIT(pos - 1);
+    *width = 1;
+    if (g_uni && c >= 0xDC00 && c < 0xE000 && pos >= 2)
+    {
+        int d = UNIT(pos - 2);
+        if (d >= 0xD800 && d < 0xDC00)
+        {
+            *width = 2;
+            return 0x10000 + ((d - 0xD800) << 10) + (c - 0xDC00);
+        }
+    }
+    return c;
+}
+
+bool isLineEnd(int c)
+{
+    return c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029;
+}
+
+// one single-character node at pos: the width consumed, or 0
+int stepOne(RNode *n, int pos)
+{
+    int w = 1;
+    switch (n->k)
+    {
+    case RN_CHAR:
+    {
+        int c = readFwd(pos, &w);
+        if (c < 0)
+            return 0;
+        if (c == n->c || (g_ic && canon(c) == canon(n->c)))
+            return w;
+        return 0;
+    }
+    case RN_CHARB:
+    {
+        int c = readBack(pos, &w);
+        if (c < 0)
+            return 0;
+        if (c == n->c || (g_ic && canon(c) == canon(n->c)))
+            return w;
+        return 0;
+    }
+    case RN_ANY:
+    {
+        int c = readFwd(pos, &w);
+        if (c < 0 || (!g_dotAll && isLineEnd(c)))
+            return 0;
+        return w;
+    }
+    case RN_ANYB:
+    {
+        int c = readBack(pos, &w);
+        if (c < 0 || (!g_dotAll && isLineEnd(c)))
+            return 0;
+        return w;
+    }
+    case RN_SET:
+    {
+        int c = readFwd(pos, &w);
+        if (c < 0)
+            return 0;
+        return setMatches(n->set, c) ? w : 0;
+    }
+    case RN_SETB:
+    {
+        int c = readBack(pos, &w);
+        if (c < 0)
+            return 0;
+        return setMatches(n->set, c) ? w : 0;
+    }
+    default:
+        return 0;
+    }
+}
+
+bool rmatch(RNode *n, int pos);
+
+bool simpleLoop(RNode *n, int pos)
+{
+    RNode *one = n->one;
+    bool back = n->back;
+    int mn = n->min, mx = n->max;
+    int count = 0;
+    int p = pos;
+    while (count < mn)
+    {
+        int w = stepOne(one, p);
+        if (!w)
+            return false;
+        p += back ? -w : w;
+        ++count;
+    }
+    if (!n->greedy)
+    {
+        for (;;)
+        {
+            if (rmatch(n->next, p))
+                return true;
+            if (mx >= 0 && count >= mx)
+                return false;
+            int w = stepOne(one, p);
+            if (!w)
+                return false;
+            p += back ? -w : w;
+            ++count;
+        }
+    }
+    int minPos = p;
+    while (mx < 0 || count < mx)
+    {
+        int w = stepOne(one, p);
+        if (!w)
+            break;
+        p += back ? -w : w;
+        ++count;
+    }
+    for (;;)
+    {
+        if (rmatch(n->next, p))
+            return true;
+        if (p == minPos)
+            return false;
+        if (back)
+        {
+            int w = 1;
+            if (g_uni)
+                readFwd(p, &w);
+            p += w;
+        }
+        else
+        {
+            int w = 1;
+            if (g_uni)
+                readBack(p, &w);
+            p -= w;
+        }
+    }
+}
+
+bool loopBody(RNode *n, int pos)
+{
+    int id = n->c;
+    int oldCnt = g_cnt[id], oldStart = g_starts[id];
+    int from = n->capFrom * 2, to = n->capTo * 2;
+    int count = to - from;
+    int small[16];
+    std::vector<int> big;
+    int *saved = small;
+    if (count > 16)
+    {
+        big.resize((size_t)count);
+        saved = big.data();
+    }
+    for (int i = 0; i < count; ++i)
+    {
+        saved[i] = g_caps[from + i];
+        g_caps[from + i] = -1;
+    }
+    g_cnt[id] = oldCnt + 1;
+    g_starts[id] = pos;
+    if (rmatch(n->alt, pos))
+        return true;
+    g_cnt[id] = oldCnt;
+    g_starts[id] = oldStart;
+    for (int i = 0; i < count; ++i)
+        g_caps[from + i] = saved[i];
+    return false;
+}
+
+bool rmatch(RNode *n, int pos)
+{
+    for (;;)
+    {
+        switch (n->k)
+        {
+        case RN_MATCH:
+            g_caps[1] = pos;
+            return true;
+        case RN_LOOKEND:
+            g_caps[1] = pos;
+            return true;
+        case RN_CHAR:
+            if (pos < g_len && !g_ic && !g_uni)
+            {
+                if (UNIT(pos) != n->c)
+                    return false;
+                ++pos;
+                n = n->next;
+                continue;
+            }
+            // falls through to the general way
+        case RN_CHARB:
+        case RN_ANY:
+        case RN_ANYB:
+        case RN_SET:
+        case RN_SETB:
+        {
+            int w = stepOne(n, pos);
+            if (!w)
+                return false;
+            pos += (n->k == RN_CHARB || n->k == RN_ANYB || n->k == RN_SETB) ? -w : w;
+            n = n->next;
+            continue;
+        }
+        case RN_BOL:
+            if (pos != 0 && !(g_multi && isLineEnd(UNIT(pos - 1))))
+                return false;
+            n = n->next;
+            continue;
+        case RN_EOL:
+            if (pos != g_len && !(g_multi && isLineEnd(UNIT(pos))))
+                return false;
+            n = n->next;
+            continue;
+        case RN_WB:
+            if (isWordAt(pos - 1) == isWordAt(pos))
+                return false;
+            n = n->next;
+            continue;
+        case RN_NWB:
+            if (isWordAt(pos - 1) != isWordAt(pos))
+                return false;
+            n = n->next;
+            continue;
+        case RN_SAVE:
+        {
+            int old = g_caps[n->c];
+            g_caps[n->c] = pos;
+            if (rmatch(n->next, pos))
+                return true;
+            g_caps[n->c] = old;
+            return false;
+        }
+        case RN_SPLIT:
+            if (rmatch(n->next, pos))
+                return true;
+            n = n->alt;
+            continue;
+        case RN_BACKREF:
+        case RN_BACKREFB:
+        {
+            int b = g_caps[n->c * 2], e = g_caps[n->c * 2 + 1];
+            if (b < 0 || e < 0)
+            {
+                n = n->next;
+                continue;
+            }
+            int l = e - b;
+            if (n->k == RN_BACKREF)
+            {
+                if (pos + l > g_len)
+                    return false;
+                for (int i = 0; i < l; ++i)
+                {
+                    int x = UNIT(b + i), y = UNIT(pos + i);
+                    if (x != y && !(g_ic && canon(x) == canon(y)))
+                        return false;
+                }
+                pos += l;
+            }
+            else
+            {
+                if (pos - l < 0)
+                    return false;
+                for (int i = 0; i < l; ++i)
+                {
+                    int x = UNIT(b + i), y = UNIT(pos - l + i);
+                    if (x != y && !(g_ic && canon(x) == canon(y)))
+                        return false;
+                }
+                pos -= l;
+            }
+            n = n->next;
+            continue;
+        }
+        case RN_LOOK:
+        {
+            int saved1 = g_caps[1];
+            std::vector<int> snapshot;
+            // captures inside stay after a positive lookaround that holds
+            int total = g_steps;
+            snapshot.assign(g_caps, g_caps + total);
+            bool ok = rmatch(n->alt, pos);
+            if (n->neg)
+            {
+                std::memcpy(g_caps, snapshot.data(), sizeof(int) * (size_t)total);
+                if (ok)
+                    return false;
+                g_caps[1] = saved1;
+                n = n->next;
+                continue;
+            }
+            if (!ok)
+            {
+                std::memcpy(g_caps, snapshot.data(), sizeof(int) * (size_t)total);
+                return false;
+            }
+            g_caps[1] = saved1;
+            if (rmatch(n->next, pos))
+                return true;
+            std::memcpy(g_caps, snapshot.data(), sizeof(int) * (size_t)total);
+            return false;
+        }
+        case RN_SIMPLE:
+            return simpleLoop(n, pos);
+        case RN_LOOPINIT:
+        {
+            int id = n->c;
+            int oldCnt = g_cnt[id], oldStart = g_starts[id];
+            g_cnt[id] = 0;
+            g_starts[id] = -1;
+            if (rmatch(n->next, pos))
+                return true;
+            g_cnt[id] = oldCnt;
+            g_starts[id] = oldStart;
+            return false;
+        }
+        case RN_LOOPEND:
+        {
+            int id = n->c;
+            RNode *loop = n->next;
+            // an empty iteration past the minimum ends the loop
+            if (pos == g_starts[id] && g_cnt[id] > loop->min)
+                return false;
+            n = loop;
+            continue;
+        }
+        case RN_LOOP:
+        {
+            int id = n->c;
+            int c = g_cnt[id];
+            if (c < n->min)
+                return loopBody(n, pos);
+            if (n->max >= 0 && c >= n->max)
+            {
+                n = n->next;
+                continue;
+            }
+            if (n->greedy)
+            {
+                if (loopBody(n, pos))
+                    return true;
+                n = n->next;
+                continue;
+            }
+            int savedCnt = g_cnt[id], savedStart = g_starts[id];
+            if (rmatch(n->next, pos))
+                return true;
+            g_cnt[id] = savedCnt;
+            g_starts[id] = savedStart;
+            return loopBody(n, pos);
+        }
+        default:
+            return false;
+        }
+    }
+}
+
+// ── compiled patterns, shared by spelling ────────────────────────────────
+
+std::unordered_map<std::string, RProg *> *g_progCache = nullptr;
+
+RProg *compilePattern(JStr *src, const std::string &flags)
+{
+    src = flat_(src);
+    std::string key = flags + "/" + toUtf8(src);
+    if (!g_progCache)
+        g_progCache = new std::unordered_map<std::string, RProg *>();
+    auto it = g_progCache->find(key);
+    if (it != g_progCache->end())
+        return it->second;
+    RProg *prog = new RProg();
+    for (char f : flags)
+    {
+        bool *b = nullptr;
+        switch (f)
+        {
+        case 'g': b = &prog->global; break;
+        case 'i': b = &prog->ignoreCase; break;
+        case 'm': b = &prog->multiline; break;
+        case 's': b = &prog->dotAll; break;
+        case 'u': b = &prog->unicode; break;
+        case 'v': b = &prog->sets; break;
+        case 'y': b = &prog->sticky; break;
+        case 'd': b = &prog->indices; break;
+        default: break;
+        }
+        if (!b || *b)
+            throwError(E_SYNTAX, "Invalid flags supplied to RegExp constructor '" + flags + "'");
+        *b = true;
+    }
+    if (prog->unicode && prog->sets)
+        throwError(E_SYNTAX, "Invalid flags supplied to RegExp constructor '" + flags + "'");
+    std::vector<uint16_t> units((size_t)src->len + 1);
+    for (int i = 0; i < src->len; ++i)
+        units[(size_t)i] = (uint16_t)unitAt(src, i);
+    ReParser rp;
+    rp.s = units.data();
+    rp.n = src->len;
+    rp.uni = prog->unicode || prog->sets;
+    rp.vmode = prog->sets;
+    rp.ic = prog->ignoreCase;
+    std::string error;
+    bool failed = false;
+    RT *tree = nullptr;
+    JsState st0;
+    try
+    {
+        rp.prescan();
+        tree = rp.disjunction();
+        if (rp.p < rp.n)
+        {
+            if (rp.s[rp.p] == ')')
+                throw ReError{"Unmatched ')'"};
+            throw ReError{"Unexpected character"};
+        }
+        for (RT *b : rp.namedRefs)
+        {
+            int found = -1;
+            for (size_t i = 0; i < rp.names.size(); ++i)
+                if (rp.names[i] == b->name)
+                    found = (int)i;
+            if (found < 0)
+                throw ReError{"Invalid named capture referenced"};
+            b->c = found;
+        }
+    }
+    catch (ReError &e)
+    {
+        st0.restore();
+        failed = true;
+        error = e.msg;
+    }
+    if (failed)
+        throwError(E_SYNTAX, "Invalid regular expression: /" + toUtf8(src) + "/" + flags + ": " + error);
+    prog->nGroups = rp.groupCount;
+    prog->names = rp.names;
+    prog->hasNames = rp.hasNamed;
+    prog->names.resize((size_t)prog->nGroups);
+    RNode *end = rnode(RN_MATCH, nullptr);
+    prog->start = gen(tree, end, false, prog);
+    if (prog->start->k == RN_CHAR && !prog->ignoreCase && prog->start->c < 0x10000)
+        prog->firstUnit = prog->start->c;
+    (*g_progCache)[key] = prog;
+    return prog;
+}
+
+// a match of prog in subject from `start`: fills caps; sticky stays at start
+std::vector<int> g_capsBuf;
+std::vector<int> g_cntBuf, g_startBuf;
+
+bool runProg(RProg *prog, JStr *subject, int start, bool sticky)
+{
+    subject = flat_(subject);
+    g_a = subject->wide ? nullptr : subject->a;
+    g_w = subject->wide ? subject->w : nullptr;
+    g_len = subject->len;
+    int total = prog->nGroups * 2;
+    if ((int)g_capsBuf.size() < total)
+        g_capsBuf.resize((size_t)total);
+    if ((int)g_cntBuf.size() < prog->nLoops + 1)
+    {
+        g_cntBuf.resize((size_t)prog->nLoops + 1);
+        g_startBuf.resize((size_t)prog->nLoops + 1);
+    }
+    g_caps = g_capsBuf.data();
+    g_cnt = g_cntBuf.data();
+    g_starts = g_startBuf.data();
+    g_ic = prog->ignoreCase;
+    g_uni = prog->unicode || prog->sets;
+    g_multi = prog->multiline;
+    g_dotAll = prog->dotAll;
+    g_steps = total;
+    int first = prog->firstUnit;
+    for (int i = start; i <= g_len; ++i)
+    {
+        if (first >= 0 && !sticky)
+        {
+            while (i < g_len && UNIT(i) != first)
+                ++i;
+            if (i >= g_len)
+                return false;
+        }
+        for (int k = 0; k < total; ++k)
+            g_caps[k] = -1;
+        for (int k = 0; k < prog->nLoops; ++k)
+        {
+            g_cnt[k] = 0;
+            g_starts[k] = -1;
+        }
+        g_caps[0] = i;
+        if (rmatch(prog->start, i))
+        {
+            g_caps[0] = i;
+            return true;
+        }
+        if (sticky)
+            return false;
+        // never starts inside a surrogate pair in unicode mode
+        if (g_uni && i < g_len)
+        {
+            int w = 1;
+            readFwd(i, &w);
+            if (w == 2)
+                ++i;
+        }
+    }
+    return false;
+}
+
+struct JRegExp : Obj
+{
+    V source;
+    V flagsV;
+    RProg *prog;
+};
+
+// ── RegExp objects ───────────────────────────────────────────────────────
+
+V escapeSource(V src)
+{
+    JStr *s = flat_(sp_(src));
+    if (!s->len)
+        return strA("(?:)");
+    std::vector<uint16_t> u;
+    bool inClass = false;
+    bool changed = false;
+    for (int i = 0; i < s->len; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c == '\\')
+        {
+            u.push_back('\\');
+            if (i + 1 < s->len)
+            {
+                int d = unitAt(s, ++i);
+                if (d == '\n')
+                {
+                    u.push_back('n');
+                    changed = true;
+                }
+                else
+                    u.push_back((uint16_t)d);
+            }
+            continue;
+        }
+        if (c == '[')
+            inClass = true;
+        else if (c == ']')
+            inClass = false;
+        if (c == '/' && !inClass)
+        {
+            u.push_back('\\');
+            u.push_back('/');
+            changed = true;
+        }
+        else if (c == '\n')
+        {
+            u.push_back('\\');
+            u.push_back('n');
+            changed = true;
+        }
+        else if (c == '\r')
+        {
+            u.push_back('\\');
+            u.push_back('r');
+            changed = true;
+        }
+        else
+            u.push_back((uint16_t)c);
+    }
+    return changed ? strv(newStrFromUnitsVec(u)) : strv(s);
+}
+
+JRegExp *thisRe(V v, const char *method)
+{
+    if (!isObj(v) || op(v)->cls != C_REGEXP)
+        throwType(std::string("Method RegExp.prototype.") + method + " called on incompatible receiver " + inspectBrief(v));
+    return static_cast<JRegExp *>(op(v));
+}
+
+// legacy statics: the last successful match
+JStr *g_lastSubject = nullptr;
+std::vector<int> g_lastCaps;
+
+V capturesGroups(RProg *prog, JStr *subject, const int *caps)
+{
+    if (!prog->hasNames)
+        return Undefined;
+    Obj *g = newObjectProto(nullptr);
+    for (int i = 1; i < prog->nGroups; ++i)
+        if (!prog->names[(size_t)i].empty())
+        {
+            V val = caps[i * 2] < 0 || caps[i * 2 + 1] < 0 ? Undefined : strv(substr(subject, caps[i * 2], caps[i * 2 + 1]));
+            defineOwn(g, atomStr(fromUtf8(prog->names[(size_t)i])), val, PF_DEFAULT);
+        }
+    return objv(g);
+}
+
+Shape *g_matchShape = nullptr;
+
+// RegExpBuiltinExec
+V builtinExec(JRegExp *re, JStr *s)
+{
+    RProg *prog = re->prog;
+    V rv = objv(re);
+    V li = re->slots[0];
+    double lastIndex = isNum(li) ? numOf(li) : toIntegerOrInf(li);
+    bool useLast = prog->global || prog->sticky;
+    if (!useLast)
+        lastIndex = 0;
+    if (lastIndex > s->len || lastIndex < 0)
+    {
+        if (useLast)
+            putProp(rv, A.lastIndex, num(0), true);
+        return Null;
+    }
+    if (!runProg(prog, s, (int)lastIndex, prog->sticky))
+    {
+        if (useLast)
+            putProp(rv, A.lastIndex, num(0), true);
+        return Null;
+    }
+    std::vector<int> caps(g_capsBuf.begin(), g_capsBuf.begin() + prog->nGroups * 2);
+    if (useLast)
+        putProp(rv, A.lastIndex, num((double)caps[1]), true);
+    g_lastSubject = s;
+    g_lastCaps = caps;
+    JArray *a = newArray((uint32_t)prog->nGroups);
+    for (int i = 0; i < prog->nGroups; ++i)
+    {
+        if (caps[(size_t)i * 2] < 0 || caps[(size_t)i * 2 + 1] < 0)
+            arrayPush(a, Undefined);
+        else
+            arrayPush(a, strv(substr(s, caps[(size_t)i * 2], caps[(size_t)i * 2 + 1])));
+    }
+    addProp(a, A.index, num((double)caps[0]), PF_DEFAULT);
+    addProp(a, A.input, strv(s), PF_DEFAULT);
+    addProp(a, A.groups, capturesGroups(prog, s, caps.data()), PF_DEFAULT);
+    if (prog->indices)
+    {
+        JArray *ind = newArray((uint32_t)prog->nGroups);
+        Obj *groups = prog->hasNames ? newObjectProto(nullptr) : nullptr;
+        for (int i = 0; i < prog->nGroups; ++i)
+        {
+            V pair = Undefined;
+            if (caps[(size_t)i * 2] >= 0 && caps[(size_t)i * 2 + 1] >= 0)
+            {
+                V p[2] = {num((double)caps[(size_t)i * 2]), num((double)caps[(size_t)i * 2 + 1])};
+                pair = objv(newArrayFrom(p, 2));
+            }
+            arrayPush(ind, pair);
+            if (groups && !prog->names[(size_t)i].empty())
+                defineOwn(groups, atomStr(fromUtf8(prog->names[(size_t)i])), pair, PF_DEFAULT);
+        }
+        addProp(ind, A.groups, groups ? objv(groups) : Undefined, PF_DEFAULT);
+        addProp(a, A.indices, objv(ind), PF_DEFAULT);
+    }
+    return objv(a);
+}
+
+V g_execFn = 0;
+
+// RegExpExec: a user's own exec is honoured
+V regExec(V re, JStr *s)
+{
+    V ex = getProp(re, A.exec);
+    if (ex == g_execFn && op(re)->cls == C_REGEXP)
+        return builtinExec(static_cast<JRegExp *>(op(re)), s);
+    if (isCallable(ex))
+    {
+        V a = strv(s);
+        V r = call(ex, re, &a, 1);
+        if (!isObj(r) && r != Null)
+            throwType("object null is not a function");
+        return r;
+    }
+    return builtinExec(thisRe(re, "exec"), s);
+}
+
+V makeRegExp(V pattern, V flags, Obj *proto)
+{
+    JStr *src = pattern == Undefined ? sp_(A.empty) : toStr(pattern);
+    std::string fl = flags == Undefined ? std::string() : toUtf8V(flags);
+    RProg *prog = compilePattern(src, fl);
+    JRegExp *re = static_cast<JRegExp *>(allocObj(sizeof(JRegExp), C_REGEXP, proto));
+    re->source = strv(flat_(src));
+    re->flagsV = str(fl);
+    re->prog = prog;
+    addProp(re, A.lastIndex, num(0), PF_W);
+    return objv(re);
+}
+
+V regexpCtor(V, V *args, int argc)
+{
+    V pattern = argOr(args, argc, 0);
+    V flags = argOr(args, argc, 1);
+    bool isRe = isObj(pattern) && op(pattern)->cls == C_REGEXP;
+    if (g_nativeNewTarget == Undefined && isRe && flags == Undefined)
+    {
+        V c = getProp(pattern, A.constructor);
+        if (c == objv(g_nativeCallee))
+            return pattern;
+    }
+    if (isRe)
+    {
+        JRegExp *r = static_cast<JRegExp *>(op(pattern));
+        if (flags == Undefined)
+            flags = r->flagsV;
+        pattern = r->source;
+    }
+    Obj *proto = g_nativeNewTarget != Undefined ? protoFromCtor(g_nativeNewTarget, PR.regexp) : PR.regexp;
+    return makeRegExp(pattern, flags, proto);
+}
+
+V reExec(V thisV, V *args, int argc)
+{
+    JRegExp *re = thisRe(thisV, "exec");
+    return builtinExec(re, flat_(toStr(argOr(args, argc, 0))));
+}
+
+V reTest(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("Method RegExp.prototype.test called on incompatible receiver undefined");
+    return boolv(regExec(thisV, flat_(toStr(argOr(args, argc, 0)))) != Null);
+}
+
+V reToString(V thisV, V *, int)
+{
+    if (!isObj(thisV))
+        throwType("Method RegExp.prototype.toString called on incompatible receiver undefined");
+    JStr *a = toStr(getProp(thisV, A.source));
+    JStr *b = toStr(getProp(thisV, A.flags));
+    return strv(concatStr(concatStr(concatStr(newStrAscii("/"), a), newStrAscii("/")), b));
+}
+
+V reCompile(V thisV, V *args, int argc)
+{
+    JRegExp *re = thisRe(thisV, "compile");
+    V pattern = argOr(args, argc, 0);
+    V flags = argOr(args, argc, 1);
+    JStr *src = pattern == Undefined ? sp_(A.empty) : toStr(pattern);
+    std::string fl = flags == Undefined ? std::string() : toUtf8V(flags);
+    re->prog = compilePattern(src, fl);
+    re->source = strv(flat_(src));
+    re->flagsV = str(fl);
+    re->slots[0] = num(0);
+    return thisV;
+}
+
+V reSource(V thisV, V *, int)
+{
+    if (isObj(thisV) && thisV == objv(PR.regexp))
+        return strA("(?:)");
+    return escapeSource(thisRe(thisV, "source")->source);
+}
+
+V reFlags(V thisV, V *, int)
+{
+    if (!isObj(thisV))
+        throwType("RegExp.prototype.flags getter called on non-object " + inspectBrief(thisV));
+    std::string out;
+    static const char *const names[] = {"hasIndices", "global", "ignoreCase", "multiline", "dotAll", "unicode", "unicodeSets", "sticky"};
+    static const char letters[] = "dgimsuvy";
+    for (int i = 0; i < 8; ++i)
+        if (truthy(getProp(thisV, atomOf(names[i]))))
+            out += letters[i];
+    return str(out);
+}
+
+#define RE_FLAG_GETTER(fname, field)                               \
+    V fname(V thisV, V *, int)                                     \
+    {                                                              \
+        if (isObj(thisV) && thisV == objv(PR.regexp))              \
+            return Undefined;                                      \
+        return boolv(thisRe(thisV, #field)->prog->field);          \
+    }
+
+RE_FLAG_GETTER(reGlobal, global)
+RE_FLAG_GETTER(reIgnoreCase, ignoreCase)
+RE_FLAG_GETTER(reMultiline, multiline)
+RE_FLAG_GETTER(reDotAll, dotAll)
+RE_FLAG_GETTER(reUnicode, unicode)
+RE_FLAG_GETTER(reSets, sets)
+RE_FLAG_GETTER(reSticky, sticky)
+RE_FLAG_GETTER(reIndices, indices)
+
+int advanceIndex(JStr *s, int i, bool unicode)
+{
+    if (!unicode || i + 1 >= s->len)
+        return i + 1;
+    int c = unitAt(s, i);
+    if (c >= 0xD800 && c < 0xDC00)
+    {
+        int d = unitAt(s, i + 1);
+        if (d >= 0xDC00 && d < 0xE000)
+            return i + 2;
+    }
+    return i + 1;
+}
+
+bool isUnicodeFlags(const std::string &f)
+{
+    return f.find('u') != std::string::npos || f.find('v') != std::string::npos;
+}
+
+V reSymMatch(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("Method RegExp.prototype.@@match called on incompatible receiver undefined");
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    std::string flags = toUtf8V(getProp(thisV, A.flags));
+    if (flags.find('g') == std::string::npos)
+        return regExec(thisV, s);
+    bool uni = isUnicodeFlags(flags);
+    putProp(thisV, A.lastIndex, num(0), true);
+    JArray *out = newArray();
+    for (;;)
+    {
+        V r = regExec(thisV, s);
+        if (r == Null)
+            return out->len ? objv(out) : Null;
+        V m = toStringV(getIdx(r, 0));
+        arrayPush(out, m);
+        if (!sp_(m)->len)
+        {
+            double li = toIntegerOrInf(getProp(thisV, A.lastIndex));
+            putProp(thisV, A.lastIndex, num((double)advanceIndex(s, (int)li, uni)), true);
+        }
+    }
+}
+
+V reSymSearch(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("Method RegExp.prototype.@@search called on incompatible receiver undefined");
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    V prev = getProp(thisV, A.lastIndex);
+    putProp(thisV, A.lastIndex, num(0), true);
+    V r = regExec(thisV, s);
+    putProp(thisV, A.lastIndex, prev, true);
+    if (r == Null)
+        return num(-1);
+    return getProp(r, A.index);
+}
+
+V reSymReplace(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("Method RegExp.prototype.@@replace called on incompatible receiver undefined");
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    V rep = argOr(args, argc, 1);
+    bool fn = isCallable(rep);
+    JStr *rs = fn ? nullptr : toStr(rep);
+    std::string flags = toUtf8V(getProp(thisV, A.flags));
+    bool global = flags.find('g') != std::string::npos;
+    bool uni = isUnicodeFlags(flags);
+    if (global)
+        putProp(thisV, A.lastIndex, num(0), true);
+    std::vector<V> results;
+    for (;;)
+    {
+        V r = regExec(thisV, s);
+        if (r == Null)
+            break;
+        results.push_back(r);
+        if (!global)
+            break;
+        if (!toStr(getIdx(r, 0))->len)
+        {
+            double li = toIntegerOrInf(getProp(thisV, A.lastIndex));
+            putProp(thisV, A.lastIndex, num((double)advanceIndex(s, (int)li, uni)), true);
+        }
+    }
+    JStr *out = sp_(A.empty);
+    int next = 0;
+    for (V r : results)
+    {
+        int64_t nCaps = toLength(getProp(r, A.length));
+        JStr *matched = toStr(getIdx(r, 0));
+        double posD = toIntegerOrInf(getProp(r, A.index));
+        int pos = posD < 0 ? 0 : posD > s->len ? s->len : (int)posD;
+        std::vector<V> caps;
+        for (int64_t i = 1; i < nCaps; ++i)
+        {
+            V c = getIdx(r, (double)i);
+            caps.push_back(c == Undefined ? c : toStringV(c));
+        }
+        V named = getProp(r, A.groups);
+        JStr *replacement;
+        if (fn)
+        {
+            std::vector<V> a;
+            a.push_back(strv(matched));
+            for (V c : caps)
+                a.push_back(c);
+            a.push_back(num((double)pos));
+            a.push_back(strv(s));
+            if (named != Undefined)
+                a.push_back(named);
+            V *mem = static_cast<V *>(bump(sizeof(V) * a.size()));
+            for (size_t i = 0; i < a.size(); ++i)
+                mem[i] = a[i];
+            replacement = toStr(call(rep, Undefined, mem, (int)a.size()));
+        }
+        else
+            replacement = expandReplacement(rs, s, pos, matched, caps, named == Undefined ? Undefined : toObject(named));
+        if (pos >= next)
+        {
+            out = concatStr(out, substr(s, next, pos));
+            out = concatStr(out, replacement);
+            next = pos + matched->len;
+        }
+    }
+    if (next < s->len)
+        out = concatStr(out, substr(s, next, s->len));
+    return strv(out);
+}
+
+V reSymSplit(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("Method RegExp.prototype.@@split called on incompatible receiver undefined");
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    V limV = argOr(args, argc, 1);
+    uint32_t lim = limV == Undefined ? 4294967295u : toUint32(limV);
+    JRegExp *re = thisRe(thisV, "split");
+    RProg *prog = re->prog;
+    JArray *out = newArray();
+    if (!lim)
+        return objv(out);
+    bool uni = prog->unicode || prog->sets;
+    if (!s->len)
+    {
+        if (!runProg(prog, s, 0, true))
+            arrayPush(out, strv(s));
+        return objv(out);
+    }
+    int p = 0, q = 0;
+    while (q < s->len)
+    {
+        if (!runProg(prog, s, q, false))
+            break;
+        int b = g_capsBuf[0], e = g_capsBuf[1];
+        if (b >= s->len)
+            break;
+        // an empty match where the last piece ended: move on
+        if (e == b && b == p)
+        {
+            q = advanceIndex(s, b > q ? b : q, uni);
+            if (b > p)
+                q = b;
+            if (!(b > p))
+                continue;
+        }
+        if (e == p && e == b)
+        {
+            q = advanceIndex(s, q, uni);
+            continue;
+        }
+        std::vector<int> caps(g_capsBuf.begin(), g_capsBuf.begin() + prog->nGroups * 2);
+        arrayPush(out, strv(substr(s, p, b)));
+        if (out->len >= lim)
+            return objv(out);
+        p = e;
+        for (int i = 1; i < prog->nGroups; ++i)
+        {
+            V c = caps[(size_t)i * 2] < 0 || caps[(size_t)i * 2 + 1] < 0 ? Undefined : strv(substr(s, caps[(size_t)i * 2], caps[(size_t)i * 2 + 1]));
+            arrayPush(out, c);
+            if (out->len >= lim)
+                return objv(out);
+        }
+        q = e == b ? advanceIndex(s, e, uni) : e;
+    }
+    arrayPush(out, strv(substr(s, p, s->len)));
+    return objv(out);
+}
+
+struct RegExpIter : Obj
+{
+    V re;
+    JStr *s;
+    bool global, unicode, done;
+};
+
+V reSymMatchAll(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("Method RegExp.prototype.@@matchAll called on incompatible receiver undefined");
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    V flags = toStringV(getProp(thisV, A.flags));
+    V src = op(thisV)->cls == C_REGEXP ? static_cast<JRegExp *>(op(thisV))->source : getProp(thisV, A.source);
+    V clone = makeRegExp(src, flags, PR.regexp);
+    putProp(clone, A.lastIndex, getProp(thisV, A.lastIndex), true);
+    std::string f = toUtf8(sp_(flags));
+    RegExpIter *it = static_cast<RegExpIter *>(allocObj(sizeof(RegExpIter), C_REGEXPITER, PR.regexpIter));
+    it->re = clone;
+    it->s = s;
+    it->global = f.find('g') != std::string::npos;
+    it->unicode = isUnicodeFlags(f);
+    return objv(it);
+}
+
+V regexpIterNext(V thisV, V *, int)
+{
+    if (!isObj(thisV) || op(thisV)->cls != C_REGEXPITER)
+        throwType("next method called on incompatible receiver " + inspectBrief(thisV));
+    RegExpIter *it = static_cast<RegExpIter *>(op(thisV));
+    if (it->done)
+        return iterResult(Undefined, true);
+    V r = regExec(it->re, it->s);
+    if (r == Null)
+    {
+        it->done = true;
+        return iterResult(Undefined, true);
+    }
+    if (!it->global)
+    {
+        it->done = true;
+        return iterResult(r, false);
+    }
+    if (!toStr(getIdx(r, 0))->len)
+    {
+        double li = toIntegerOrInf(getProp(it->re, A.lastIndex));
+        putProp(it->re, A.lastIndex, num((double)advanceIndex(it->s, (int)li, it->unicode)), true);
+    }
+    return iterResult(r, false);
+}
+
+V staticGroup(V, V *, int)
+{
+    int i = (int)numOf(NATIVE_DATA());
+    if (!g_lastSubject || (size_t)i * 2 + 1 >= g_lastCaps.size() || g_lastCaps[(size_t)i * 2] < 0)
+        return A.empty;
+    return strv(substr(g_lastSubject, g_lastCaps[(size_t)i * 2], g_lastCaps[(size_t)i * 2 + 1]));
+}
+
+V staticLastParen(V, V *, int)
+{
+    size_t n = g_lastCaps.size() / 2;
+    if (!g_lastSubject || n < 2 || g_lastCaps[(n - 1) * 2] < 0)
+        return A.empty;
+    return strv(substr(g_lastSubject, g_lastCaps[(n - 1) * 2], g_lastCaps[(n - 1) * 2 + 1]));
+}
+
+V staticIgnore(V, V *, int)
+{
+    return Undefined;
+}
+
+V staticInput(V, V *, int)
+{
+    return g_lastSubject ? strv(g_lastSubject) : A.empty;
+}
+
+V staticLeft(V, V *, int)
+{
+    return g_lastSubject ? strv(substr(g_lastSubject, 0, g_lastCaps[0])) : A.empty;
+}
+
+V staticRight(V, V *, int)
+{
+    return g_lastSubject ? strv(substr(g_lastSubject, g_lastCaps[1], g_lastSubject->len)) : A.empty;
+}
+
+V speciesSelf(V thisV, V *, int)
+{
+    return thisV;
+}
+
+} // namespace
+
+V regexpNew(V source, V flags)
+{
+    return makeRegExp(source, flags, PR.regexp);
+}
+
+bool isRegExp(V v)
+{
+    return isObj(v) && op(v)->cls == C_REGEXP;
+}
+
+V regexpFlagsOf(V re)
+{
+    return static_cast<JRegExp *>(op(re))->flagsV;
+}
+
+void initRegExpBuiltins()
+{
+    JFunc *c = defCtor("RegExp", regexpCtor, 2, PR.regexp);
+    PR.ctorRegExp = objv(c);
+    defGetterSym(c, WK.species, "[Symbol.species]", speciesSelf);
+    Obj *p = PR.regexp;
+    JFunc *ex = newNative("exec", reExec, 1);
+    g_execFn = objv(ex);
+    defineOwn(p, A.exec, g_execFn, PF_W | PF_C);
+    defFn(p, "test", reTest, 1);
+    defFn(p, "toString", reToString, 0);
+    defFn(p, "compile", reCompile, 2);
+    defGetter(p, "source", reSource);
+    defGetter(p, "flags", reFlags);
+    defGetter(p, "global", reGlobal);
+    defGetter(p, "ignoreCase", reIgnoreCase);
+    defGetter(p, "multiline", reMultiline);
+    defGetter(p, "dotAll", reDotAll);
+    defGetter(p, "unicode", reUnicode);
+    defGetter(p, "unicodeSets", reSets);
+    defGetter(p, "sticky", reSticky);
+    defGetter(p, "hasIndices", reIndices);
+    defFnSym(p, WK.match, "[Symbol.match]", reSymMatch, 1);
+    defFnSym(p, WK.matchAll, "[Symbol.matchAll]", reSymMatchAll, 1);
+    defFnSym(p, WK.replace, "[Symbol.replace]", reSymReplace, 2);
+    defFnSym(p, WK.search, "[Symbol.search]", reSymSearch, 1);
+    defFnSym(p, WK.split, "[Symbol.split]", reSymSplit, 2);
+    defFn(PR.regexpIter, "next", regexpIterNext, 0);
+    defineOwn(PR.regexpIter, WK.toStringTag, atomOf("RegExp String Iterator"), PF_C);
+    V ignoreSet = objv(newNative("set", staticIgnore, 1));
+    for (int i = 1; i <= 9; ++i)
+    {
+        std::string nm = "$" + std::to_string(i);
+        JFunc *g = newClosure(("get " + nm).c_str(), staticGroup, 0, num((double)i));
+        defineAccessor(c, atomOf(nm.c_str()), objv(g), ignoreSet, PF_E | PF_C);
+    }
+    JFunc *whole = newClosure("get lastMatch", staticGroup, 0, num(0));
+    defineAccessor(c, atomOf("lastMatch"), objv(whole), ignoreSet, PF_C);
+    defineAccessor(c, atomOf("$&"), objv(whole), ignoreSet, PF_C);
+    JFunc *lastParen = newNative("get lastParen", staticLastParen, 0);
+    defineAccessor(c, atomOf("lastParen"), objv(lastParen), ignoreSet, PF_C);
+    defineAccessor(c, atomOf("$+"), objv(lastParen), ignoreSet, PF_C);
+    JFunc *inp = newNative("get input", staticInput, 0);
+    defineAccessor(c, A.input, objv(inp), ignoreSet, PF_C);
+    defineAccessor(c, atomOf("$_"), objv(inp), ignoreSet, PF_C);
+    JFunc *left = newNative("get leftContext", staticLeft, 0);
+    defineAccessor(c, atomOf("leftContext"), objv(left), ignoreSet, PF_C);
+    defineAccessor(c, atomOf("$`"), objv(left), ignoreSet, PF_C);
+    JFunc *right = newNative("get rightContext", staticRight, 0);
+    defineAccessor(c, atomOf("rightContext"), objv(right), ignoreSet, PF_C);
+    defineAccessor(c, atomOf("$'"), objv(right), ignoreSet, PF_C);
+}
+
+} // namespace js

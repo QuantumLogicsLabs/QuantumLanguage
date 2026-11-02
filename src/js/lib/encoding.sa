@@ -1,0 +1,59 @@
+'use strict';
+// TextEncoder and TextDecoder.
+class TextEncoder {
+  get encoding() { return 'utf-8'; }
+  encode(s = '') { return new Uint8Array(internal.utf8Encode(String(s))); }
+  encodeInto(s, dest) {
+    const bytes = internal.utf8Encode(String(s));
+    const n = Math.min(bytes.length, dest.length);
+    for (let i = 0; i < n; i++) dest[i] = bytes[i];
+    return { read: String(s).length, written: n };
+  }
+  get [Symbol.toStringTag]() { return 'TextEncoder'; }
+}
+
+class TextDecoder {
+  #enc; #fatal; #bom;
+  constructor(label = 'utf-8', options = {}) {
+    const l = String(label).toLowerCase().trim();
+    const utf8 = ['utf-8', 'utf8', 'unicode-1-1-utf-8'];
+    const latin = ['latin1', 'iso-8859-1', 'ascii', 'us-ascii', 'windows-1252'];
+    const u16 = ['utf-16le', 'utf-16', 'ucs-2'];
+    if (utf8.includes(l)) this.#enc = 'utf-8';
+    else if (latin.includes(l)) this.#enc = 'windows-1252';
+    else if (u16.includes(l)) this.#enc = 'utf-16le';
+    else {
+      throw internal.nodeError(RangeError, 'ERR_ENCODING_NOT_SUPPORTED', `The "${label}" encoding is not supported`);
+    }
+    this.#fatal = !!options.fatal;
+    this.#bom = !!options.ignoreBOM;
+  }
+  get encoding() { return this.#enc; }
+  get fatal() { return this.#fatal; }
+  get ignoreBOM() { return this.#bom; }
+  decode(input) {
+    if (input === undefined) return '';
+    const b = input instanceof ArrayBuffer ? new Uint8Array(input) : new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    if (this.#enc === 'windows-1252') {
+      let s = '';
+      for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+      return s;
+    }
+    if (this.#enc === 'utf-16le') {
+      let s = '';
+      for (let i = 0; i + 1 < b.length; i += 2) s += String.fromCharCode(b[i] | (b[i + 1] << 8));
+      return s;
+    }
+    let s = internal.utf8Decode(b);
+    if (!this.#bom && s.charCodeAt(0) === 0xfeff) s = s.slice(1);
+    if (this.#fatal && s.includes('�')) {
+      throw internal.nodeError(TypeError, 'ERR_ENCODING_INVALID_ENCODED_DATA', 'The encoded data was not valid for encoding utf-8');
+    }
+    return s;
+  }
+  get [Symbol.toStringTag]() { return 'TextDecoder'; }
+}
+
+internal.installGlobal('TextEncoder', TextEncoder);
+internal.installGlobal('TextDecoder', TextDecoder);
+module.exports = { TextEncoder, TextDecoder };

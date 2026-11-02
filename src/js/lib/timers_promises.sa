@@ -1,0 +1,30 @@
+'use strict';
+// timers/promises.
+function abortError(signal) {
+  const { DOMException } = require('eventtarget');
+  const e = new Error('The operation was aborted');
+  e.name = 'AbortError';
+  e.code = 'ABORT_ERR';
+  if (signal.reason !== undefined) e.cause = signal.reason;
+  return e;
+}
+function delayed(start, cancel, value, options) {
+  const signal = options?.signal;
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError(signal));
+    const h = start(() => resolve(value));
+    if (options?.ref === false) h.unref?.();
+    signal?.addEventListener('abort', () => { cancel(h); reject(abortError(signal)); }, { once: true });
+  });
+}
+module.exports = {
+  setTimeout: (ms, value, options) => delayed((f) => setTimeout(f, ms), clearTimeout, value, options),
+  setImmediate: (value, options) => delayed((f) => setImmediate(f), clearImmediate, value, options),
+  async *setInterval(ms, value) {
+    for (;;) {
+      await new Promise((r) => setTimeout(r, ms));
+      yield value;
+    }
+  },
+  scheduler: { wait: (ms, o) => delayed((f) => setTimeout(f, ms), clearTimeout, undefined, o), yield: () => new Promise((r) => setImmediate(r)) },
+};

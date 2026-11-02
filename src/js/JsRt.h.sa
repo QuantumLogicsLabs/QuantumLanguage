@@ -1,0 +1,630 @@
+// quantum: cpp
+#pragma once
+// JavaScript front-end: the runtime. A value is a 64-bit word: a double, or a
+// NaN whose top bits say what the rest points at. Memory comes from a bump
+// allocator and is never freed: the programs this runs are short.
+#include "JsAst.h.sa"
+#include "JsUnicode.h.sa"
+
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace js
+{
+
+// Macros, not functions: the native backend does not inline, and these are
+// the interpreter's hottest operations. Arguments must have no side effects.
+#define JTAG_MIN ((V)0xFFF9000000000000ULL)
+#define JTAG_STR ((V)0xFFFA000000000000ULL)
+#define JTAG_OBJ ((V)0xFFFB000000000000ULL)
+#define JTAG_SYM ((V)0xFFFC000000000000ULL)
+#define JTAG_BIG ((V)0xFFFD000000000000ULL)
+#define JPTR_MASK ((V)0x0000FFFFFFFFFFFFULL)
+#define Undefined ((V)0xFFF9000000000001ULL)
+#define Null ((V)0xFFF9000000000002ULL)
+#define False ((V)0xFFF9000000000003ULL)
+#define True ((V)0xFFF9000000000004ULL)
+#define Hole ((V)0xFFF9000000000005ULL)    // an array hole; a binding in its dead zone
+#define OptShort ((V)0xFFF9000000000006ULL) // an optional chain stopped here
+#define isNum(v) ((V)(v) < JTAG_MIN)
+#define isStr(v) (((V)(v) >> 48) == 0xFFFA)
+#define isObj(v) (((V)(v) >> 48) == 0xFFFB)
+#define isSym(v) (((V)(v) >> 48) == 0xFFFC)
+#define isBig(v) (((V)(v) >> 48) == 0xFFFD)
+#define isBool(v) ((V)(v) == True || (V)(v) == False)
+#define isNullish(v) ((V)(v) == Undefined || (V)(v) == Null)
+#define boolv(b) ((b) ? True : False)
+#define strv(p) ((V)(uintptr_t)(p) | JTAG_STR)
+#define objv(p) ((V)(uintptr_t)(p) | JTAG_OBJ)
+#define symv(p) ((V)(uintptr_t)(p) | JTAG_SYM)
+#define bigv(p) ((V)(uintptr_t)(p) | JTAG_BIG)
+#define sp_(v) (reinterpret_cast<JStr *>((V)(v) & JPTR_MASK))
+#define op(v) (reinterpret_cast<Obj *>((V)(v) & JPTR_MASK))
+#define symp(v) (reinterpret_cast<JSym *>((V)(v) & JPTR_MASK))
+#define bigp(v) (reinterpret_cast<JBig *>((V)(v) & JPTR_MASK))
+// D needs an lvalue; BITS needs a double lvalue
+#define D(x) (*reinterpret_cast<double *>(&(x)))
+#define BITS(d) (*reinterpret_cast<V *>(&(d)))
+
+struct Obj;
+struct JFunc;
+struct Frame;
+struct Env;
+
+// ── strings: UTF-16 semantics; bytes when every unit fits; ropes until read ──
+
+struct JStr
+{
+    int32_t len;
+    uint8_t wide;
+    uint8_t flat;
+    uint8_t isAtom;
+    uint8_t isIdx;   // an atom spelling an array index
+    uint32_t hash;   // 0: not computed
+    uint32_t idx;
+    const uint8_t *a;
+    const uint16_t *w;
+    JStr *left, *right; // not flat
+    JStr *atom;      // this string's atom, once known
+};
+
+struct JSym
+{
+    V desc;      // string or Undefined
+    bool isPrivate;
+    bool registered;
+    uint32_t hash;
+};
+
+struct JBig
+{
+    bool neg;
+    int n;
+    uint32_t *d; // little-endian limbs, n > 0 except for zero
+};
+
+#define unitAt(s, i) ((s)->wide ? (int)(s)->w[i] : (int)(s)->a[i])
+
+JStr *flatten(JStr *s);
+#define flat_(s) ((s)->flat ? (s) : flatten(s))
+
+// ── objects ──────────────────────────────────────────────────────────────
+
+enum PF : uint8_t
+{
+    PF_W = 1,        // writable
+    PF_E = 2,        // enumerable
+    PF_C = 4,        // configurable
+    PF_ACCESSOR = 8, // the slot holds an Accessor
+    PF_DEFAULT = 7
+};
+
+struct KeyTable; // key -> index, open addressing
+
+struct Shape
+{
+    Shape *parent;
+    V key;
+    int32_t index;   // of the last property added; slots used = index + 1
+    int32_t count;
+    uint8_t flags;
+    bool isDict;     // owned by one object; `dkeys` below is its truth
+    bool hasIndexKeys;
+    Shape *t1;       // first transition
+    KeyTable *trans; // the rest (key+flags -> Shape*)
+    KeyTable *table; // key -> index+flags, built on demand
+    // a dictionary's properties in order (deleted: key 0)
+    V *dkeys;
+    uint8_t *dflags;
+    int32_t dused, dcap;
+    V *keysCache;    // own keys in order, for walking
+};
+
+enum Cls : uint8_t
+{
+    C_OBJECT,
+    C_ARRAY,
+    C_FUNCTION,
+    C_ERROR,
+    C_BOOLEAN,
+    C_NUMBER,
+    C_STRING,
+    C_SYMBOL,
+    C_BIGINT,
+    C_DATE,
+    C_REGEXP,
+    C_MAP,
+    C_SET,
+    C_WEAKMAP,
+    C_WEAKSET,
+    C_WEAKREF,
+    C_ARGUMENTS,
+    C_PROMISE,
+    C_GENERATOR,
+    C_ASYNCGENERATOR,
+    C_PROXY,
+    C_ARRAYBUFFER,
+    C_TYPEDARRAY,
+    C_DATAVIEW,
+    C_ARRAYITER,
+    C_STRINGITER,
+    C_MAPITER,
+    C_SETITER,
+    C_REGEXPITER,
+    C_ACCESSOR,       // internal: a getter and a setter
+    C_MODULENS
+};
+
+enum ObjFlags : uint8_t
+{
+    OF_NONEXT = 1,    // not extensible
+    OF_FROZEN = 2,    // an array's elements are frozen
+    OF_SEALED = 4,    // an array's elements are sealed
+    OF_LAZYFN = 8,    // a function that has not made name/length/prototype yet
+    OF_CALLABLE = 16,
+    OF_CTOR = 32,
+    OF_NOINDEXFLAGS = 64
+};
+
+struct Obj
+{
+    Shape *shape;
+    V *slots;
+    Obj *proto;
+    int32_t cap;
+    uint8_t cls;
+    uint8_t flags;
+    uint16_t pad;
+};
+
+struct Accessor : Obj
+{
+    V get, set;
+};
+
+struct JArray : Obj
+{
+    V *el;
+    uint32_t len;   // the array's length
+    uint32_t used;  // elements stored; those above are holes
+    uint32_t elCap;
+};
+
+// wraps a primitive; a Date's time (num); an error
+struct JPrim : Obj
+{
+    V val;
+    double num;
+};
+
+typedef V (*NativeFn)(V thisV, V *args, int argc);
+
+enum FnKind : uint8_t
+{
+    FK_NATIVE,
+    FK_NORMAL,
+    FK_ARROW,
+    FK_GENERATOR,
+    FK_ASYNC,
+    FK_ASYNCGEN,
+    FK_CLASS,
+    FK_BOUND,
+    FK_PROXY
+};
+
+struct JFunc : Obj
+{
+    uint8_t kind;
+    bool isCtorNative;
+    NativeFn nat;
+    FuncNode *node;
+    Env *env;
+    V thisV;       // an arrow's this; a bound function's this
+    V newTarget;   // an arrow's new.target
+    V home;        // a method's home object
+    V fnName;      // a native's name
+    int natLen;
+    V target;      // bound: the target
+    V *boundArgs;
+    int nBound;
+    V *fieldsInit; // a class: instance fields [key, kindflag, valueFunc]...
+    int nFields;
+    Env *fieldEnv;
+    V data;        // a native closure's data
+    V data2;
+    V classHeritageProto;
+};
+
+// an environment: captured variables of one scope instance
+struct Env
+{
+    Env *parent;
+    Scope *scope;
+    V *slots;
+    V withObj;     // `with`
+    Obj *dyn;      // variables a sloppy eval added
+};
+
+struct Frame
+{
+    V receiver;      // an arrow's: only for naming it in stack traces
+    V *locals;
+    Env *env;
+    V thisV;
+    JFunc *fn;
+    FuncNode *node;
+    V newTarget;
+    V *args;
+    int argc;
+    Frame *prev;
+    Node *cur;      // the call in progress, for stack traces
+    void *co;       // this frame's coroutine
+    bool thisInit;  // false in a derived constructor before super()
+    bool isNative;
+};
+
+struct JsThrow
+{
+    V val;
+};
+
+// Generator.prototype.return unwinding a suspended frame: runs finally blocks
+struct GenReturn
+{
+    V val;
+};
+
+// process.exit
+struct JsExit
+{
+    int code;
+};
+
+enum Comp : uint8_t
+{
+    CO_NONE,
+    CO_BREAK,
+    CO_CONTINUE,
+    CO_RETURN
+};
+
+// ── the runtime's state ──────────────────────────────────────────────────
+
+struct Atoms
+{
+    V length, prototype, constructor, name, message, stack, cause, errors, value, done, next, ret, throw_, get, set, writable, enumerable,
+        configurable, toString, valueOf, toJSON, callee, caller, arguments_, index, input, groups, indices, lastIndex, source, flags, raw, then,
+        empty, undefined, null_, true_, false_, object, function, number, string, boolean, symbol, bigint, default_, join, proto, global, deref,
+        size, has, add, keys, exec, code, anonymous;
+};
+
+struct WellKnown
+{
+    V iterator, asyncIterator, hasInstance, toPrimitive, toStringTag, species, isConcatSpreadable, unscopables, match, matchAll, replace, search,
+        split;
+};
+
+struct Protos
+{
+    Obj *object, *function, *array, *string, *number, *boolean, *symbol, *bigint, *error, *iterator, *arrayIter, *stringIter, *mapIter, *setIter,
+        *regexpIter, *generator, *asyncGenerator, *generatorFunction, *asyncFunction, *asyncGenFunction, *asyncIterator, *regexp, *date, *map, *set,
+        *weakmap, *weakset, *weakref, *promise, *arraybuffer, *typedarray, *dataview;
+    Obj *errorTypes[8]; // by ErrorType
+    V ctorArray, ctorObject, ctorPromise, ctorFunction, ctorRegExp, ctorMap, ctorSet;
+};
+
+enum ErrorType
+{
+    E_ERROR,
+    E_TYPE,
+    E_RANGE,
+    E_SYNTAX,
+    E_REFERENCE,
+    E_EVAL,
+    E_URI,
+    E_AGGREGATE
+};
+
+extern V *g_sp;
+extern V *g_spBase, *g_spEnd;
+extern Frame *g_frame;
+extern uint8_t g_comp;
+extern V g_compLabel;
+extern V g_retVal;
+extern char *g_stackLimit;
+extern Atoms A;
+extern WellKnown WK;
+extern Protos PR;
+extern Obj *g_global;
+extern Shape *g_rootShape;
+extern std::string g_out;
+extern std::string g_scriptPath;
+
+// memory
+// Math, as V8 computes it (JsMath.sa)
+double mathSin(double x);
+double mathCos(double x);
+double mathTan(double x);
+double mathExp(double x);
+double mathLog(double x);
+double mathLog1p(double x);
+double mathLog2(double x);
+double mathLog10(double x);
+double mathExpm1(double x);
+double mathAtan(double x);
+double mathAsin(double x);
+double mathAcos(double x);
+double mathSinh(double x);
+double mathCosh(double x);
+double mathTanh(double x);
+double mathAsinh(double x);
+double mathAcosh(double x);
+double mathAtanh(double x);
+double mathCbrt(double x);
+double mathAtan2(double y, double x);
+double mathPow(double x, double y);
+
+void *zalloc(size_t size);
+void *bump(size_t size);
+#define NEW(T) (reinterpret_cast<T *>(bump(sizeof(T))))
+
+// strings
+JStr *newStrAscii(const char *s);
+JStr *newStrBytes(const char *s, int len);
+JStr *newStrUnits(const uint16_t *w, int len);
+JStr *newStrFromUnitsVec(const std::vector<uint16_t> &u);
+JStr *fromUtf8(const std::string &s);
+std::string toUtf8(JStr *s);
+JStr *concatStr(JStr *a, JStr *b);
+JStr *substr(JStr *s, int from, int to);
+JStr *charStr(int unit);
+int compareStr(JStr *a, JStr *b);
+bool eqStr(JStr *a, JStr *b);
+uint32_t hashStr(JStr *s);
+V str(const std::string &utf8);
+V strA(const char *ascii);
+V atomOf(const char *s);
+V atomStr(JStr *s);
+V atomIndex(uint32_t i);
+V num(double d);
+double numOf(V v);
+void setAtoms();
+int indexOfStr(JStr *hay, JStr *needle, int from);
+
+// conversions
+bool truthy(V v);
+double toNumber(V v);
+V toNumeric(V v);
+int32_t toInt32(V v);
+uint32_t toUint32(V v);
+double toIntegerOrInf(V v);
+JStr *toStr(V v);
+V toStringV(V v);
+std::string toUtf8V(V v);
+V toPrimitive(V v, int hint); // 0 default, 1 number, 2 string
+V toObject(V v);
+V toKey(V v);                 // an atom or a symbol
+V numberToStr(double d);
+std::string numberToStd(double d);
+std::string numberToRadix(double d, int radix);
+double strToNumber(JStr *s);
+bool strictEq(V a, V b);
+bool looseEq(V a, V b);
+bool sameValue(V a, V b);
+bool sameValueZero(V a, V b);
+V typeOf(V v);
+int64_t toLength(V v);
+V keyToValue(V key); // a property key as a program sees it
+void shortestDigits(double d, std::string &digits, int &exp10);
+
+// objects
+Obj *newObject();
+Obj *newObjectProto(Obj *proto);
+Obj *allocObj(size_t size, uint8_t cls, Obj *proto);
+JArray *newArray(uint32_t reserve = 0);
+JArray *newArrayFrom(V *items, int n);
+void arrayPush(JArray *a, V v);
+void arrayEnsure(JArray *a, uint32_t need);
+bool getOwnSlot(Obj *o, V key, V *out, uint8_t *flags);
+V getProp(V base, V key);          // full [[Get]]
+V getPropObj(Obj *o, V key, V receiver);
+V getIdx(V base, double idx);
+void putProp(V base, V key, V val, bool strict = true);
+bool setPropObj(Obj *o, V key, V val, V receiver);
+void defineOwn(Obj *o, V key, V val, uint8_t flags = PF_DEFAULT);
+void defineAccessor(Obj *o, V key, V getter, V setter, uint8_t flags);
+bool hasProp(Obj *o, V key);
+bool hasOwn(Obj *o, V key);
+bool deleteProp(Obj *o, V key);
+V getV(V base, const char *name);
+void setHidden(Obj *o, const char *name, V val);
+void ownKeys(Obj *o, std::vector<V> &out, bool strings = true, bool symbols = true, bool onlyEnumerable = false);
+Obj *protoOf(Obj *o);
+bool setProtoOf(Obj *o, Obj *proto);
+bool isExtensible(Obj *o);
+bool preventExt(Obj *o);
+bool getOwnDesc(Obj *o, V key, V *val, V *getter, V *setter, uint8_t *flags);
+bool defineFromDesc(Obj *o, V key, V desc, bool throwing);
+V descToObject(V val, V getter, V setter, uint8_t flags);
+void materializeFn(JFunc *f);
+void freezeObj(Obj *o, bool freeze);
+bool isFrozenObj(Obj *o, bool frozen);
+
+// functions
+#define isCallable(v) (isObj(v) && (op(v)->flags & OF_CALLABLE))
+#define isCtor(v) (isObj(v) && (op(v)->flags & OF_CTOR))
+JFunc *newNative(const char *name, NativeFn fn, int length);
+JFunc *newNativeKey(V name, NativeFn fn, int length);
+void defFn(Obj *o, const char *name, NativeFn fn, int length);
+void defFnSym(Obj *o, V sym, const char *name, NativeFn fn, int length);
+void defGetter(Obj *o, const char *name, NativeFn fn);
+void defGetterSym(Obj *o, V sym, const char *name, NativeFn fn);
+void defVal(Obj *o, const char *name, V v, uint8_t flags = PF_W | PF_C);
+JFunc *defCtor(const char *name, NativeFn fn, int length, Obj *proto);
+V call(V fn, V thisV, V *args, int argc);
+V call0(V fn, V thisV);
+V call1(V fn, V thisV, V a);
+V call2(V fn, V thisV, V a, V b);
+V construct(V fn, V *args, int argc, V newTarget);
+V invoke(V base, V key, V *args, int argc);
+extern V g_nativeNewTarget;      // inside a native constructor
+extern JFunc *g_nativeCallee;    // the native function running
+bool instanceOf(V v, V target);
+V getMethod(V base, V key);
+Obj *protoFromCtor(V newTarget, Obj *fallback);
+
+// errors
+[[noreturn]] void throwError(int type, const std::string &msg);
+[[noreturn]] void throwType(const std::string &msg);
+[[noreturn]] void throwRange(const std::string &msg);
+[[noreturn]] void throwError(int type, const char *msg);
+[[noreturn]] void throwType(const char *msg);
+[[noreturn]] void throwRange(const char *msg);
+[[noreturn]] void throwV(V v);
+V makeError(int type, const std::string &msg);
+void captureStack(Obj *err, V skipUntil);
+void materializeStack(Obj *o);
+V makeNodeError(V error, const std::string &code);
+enum HostContext
+{
+    HOST_MAIN,
+    HOST_TIMER,
+    HOST_IMMEDIATE,
+    HOST_TICK,
+    HOST_TICKCB,
+    HOST_NONE
+};
+extern int g_hostContext;       // what the event loop is doing
+extern JFunc *g_hostCallback;   // the callback it called
+extern Frame *g_hostBase;       // the frame below that callback
+
+// what a catch must put back: the throw left the stacks where it happened
+struct JsState
+{
+    V *sp;
+    Frame *frame;
+    JFunc *callee;
+    V newTarget;
+    JsState() : sp(g_sp), frame(g_frame), callee(g_nativeCallee), newTarget(g_nativeNewTarget) {}
+    void restore()
+    {
+        g_sp = sp;
+        g_frame = frame;
+        g_nativeCallee = callee;
+        g_nativeNewTarget = newTarget;
+    }
+};
+std::string stackTraceText(V header, V skipUntil);
+
+// iteration
+struct Iter
+{
+    V iter, next;
+    JArray *fastArr;   // an array with the built-in iterator
+    uint32_t fastI;
+    bool done;
+};
+void iterOpen(Iter &it, V iterable);
+bool iterStep(Iter &it, V *out);
+void iterClose(Iter &it);
+void iterableToVec(V iterable, std::vector<V> &out);
+V iterResult(V value, bool done);
+bool isFastArrayIter(V v);
+std::string describeForIter(V v);
+
+// big integers
+JBig *bigFromDouble(double d);
+JBig *bigFromStr(JStr *s, bool *ok);
+V bigParseLiteral(const std::string &digits);
+std::string bigToStr(JBig *b, int radix = 10);
+double bigToDouble(JBig *b);
+V bigAdd(JBig *a, JBig *b);
+V bigSub(JBig *a, JBig *b);
+V bigMul(JBig *a, JBig *b);
+V bigDiv(JBig *a, JBig *b);
+V bigMod(JBig *a, JBig *b);
+V bigExp(JBig *a, JBig *b);
+V bigNeg(JBig *a);
+V bigShift(JBig *a, JBig *b, bool left);
+V bigBit(JBig *a, JBig *b, int op);
+V bigNot(JBig *a);
+int bigCmp(JBig *a, JBig *b);
+int bigCmpDouble(JBig *a, double d);
+bool bigIsZero(JBig *a);
+uint64_t bigToU64(JBig *a);
+V bigFromU64(uint64_t x, bool neg);
+
+// the interpreter
+V evalNode(Node *n, Frame *f);
+void execNode(Node *n, Frame *f);
+V callFunc(JFunc *fn, V thisV, V *args, int argc, V newTarget);
+FuncNode *parseProgramSource(const std::string &utf8, const std::string &file, Scope *evalParent, bool strictEval, bool isWrapper, const std::vector<std::string> *wrapperParams);
+V makeClosure(FuncNode *node, Env *env, Frame *f);
+V directEval(V src, Frame *f, bool strictCaller);
+V indirectEval(V src);
+V makeFunctionFromStrings(int kind, V *args, int argc);
+std::string nodeToCallText(Node *n);
+
+// coroutines (JsAsync.sa)
+V generatorStart(JFunc *fn, V thisV, V *args, int argc);
+V asyncStart(JFunc *fn, V thisV, V *args, int argc);
+V asyncGenStart(JFunc *fn, V thisV, V *args, int argc);
+V doYield(V val, Frame *f);
+V doYieldStar(V iterable, Frame *f);
+V doAwait(V val, Frame *f);
+void runBody(JFunc *fn, Frame *f);
+void runEventLoop();
+void drainMicrotasks();
+V promiseResolved(V v);
+V newPromise();
+void promiseResolve(V p, V val);
+void promiseReject(V p, V reason);
+void promiseThen(V p, V onOk, V onBad, V result);
+void enqueueJob(V fn, V a, V b);
+struct AsyncForAwait;
+
+// loading
+V requireModule(const std::string &name);
+void loadLib(const std::string &name);
+bool autoloadGlobal(V name);
+std::vector<std::pair<std::string, std::string>> librarySources();
+void flushOut();
+void writeOut(const std::string &s);
+void writeErr(const std::string &s);
+
+// setup, one per builtin area
+void initCore();
+void initObjectBuiltins();
+void initFunctionBuiltins();
+void initErrorBuiltins();
+void initSymbolBuiltins();
+void initArrayBuiltins();
+void initStringBuiltins();
+void initNumberBuiltins();
+void initMathBuiltins();
+void initBigIntBuiltins();
+void initJsonBuiltins();
+void initRegExpBuiltins();
+void initCollectionBuiltins();
+void initReflectBuiltins();
+void initAsyncBuiltins();
+void initDateBuiltins();
+void initBinaryBuiltins();
+void initNodeBuiltins();
+
+// regular expressions (JsRegExp.sa)
+V regexpNew(V source, V flags);
+V regexpExecRaw(V re, V strv_);
+bool isRegExp(V v);
+V regexpFlagsOf(V re);
+
+// helpers the natives share
+inline V argOr(V *args, int argc, int i)
+{
+    return i < argc ? args[i] : Undefined;
+}
+std::string inspectBrief(V v);
+
+} // namespace js

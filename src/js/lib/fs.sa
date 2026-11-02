@@ -1,0 +1,38 @@
+'use strict';
+// A small fs: whole files.
+function notFound(path, syscall) {
+  const e = new Error(`ENOENT: no such file or directory, ${syscall} '${path}'`);
+  e.errno = -4058;
+  e.code = 'ENOENT';
+  e.syscall = syscall;
+  e.path = path;
+  return e;
+}
+const fs = {
+  existsSync: (p) => internal.fileExists(String(p)),
+  readFileSync(p, opts) {
+    const text = p === 0 ? internal.readStdin() : internal.readFile(String(p));
+    if (text === null) throw notFound(p, 'open');
+    const enc = typeof opts === 'string' ? opts : opts?.encoding;
+    return enc ? text : Buffer.from(text);
+  },
+  writeFileSync(p, data) { internal.writeFile(String(p), typeof data === 'string' ? data : Buffer.from(data).toString(), false); },
+  appendFileSync(p, data) { internal.writeFile(String(p), typeof data === 'string' ? data : Buffer.from(data).toString(), true); },
+  readFile(p, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    let r, e = null;
+    try { r = fs.readFileSync(p, opts); } catch (x) { e = x; }
+    process.nextTick(() => cb(e, r));
+  },
+  writeFile(p, d, opts, cb) {
+    if (typeof opts === 'function') cb = opts;
+    fs.writeFileSync(p, d);
+    process.nextTick(() => cb(null));
+  },
+  promises: {
+    readFile: async (p, o) => fs.readFileSync(p, o),
+    writeFile: async (p, d) => fs.writeFileSync(p, d),
+    appendFile: async (p, d) => fs.appendFileSync(p, d),
+  },
+};
+module.exports = fs;

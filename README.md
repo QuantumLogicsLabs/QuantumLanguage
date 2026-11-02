@@ -505,6 +505,8 @@ Quantum-Language/
 │   ├── vm/                       # Bytecode VM, natives, dialect runtimes
 │   ├── cpp/                      # Typed C-family front-end
 │   ├── java/                     # Java front-end; lang/ io/ util/: its standard library
+│   ├── js/                       # JavaScript front-end; lib/: its library, in JavaScript
+│   ├── ruby/                     # Ruby front-end; lib/: its library, in Ruby
 │   ├── dialect/                  # Python / JS / Ruby / C dialect passes
 │   ├── cli/                      # CLI, bundler, test runner, self-host hooks
 │   ├── qpm/                      # qpm package manager

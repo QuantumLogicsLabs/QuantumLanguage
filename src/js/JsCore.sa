@@ -1,0 +1,1885 @@
+// quantum: cpp
+// JavaScript front-end: start-up, errors and stack traces, and the builtins at
+// the root of everything: Object, Function, Symbol, Boolean, the global functions.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <cmath>
+#include <cstdlib>
+
+namespace js
+{
+
+namespace
+{
+V g_hasInstanceDefault = 0;
+V g_thrower = 0;
+
+[[noreturn]] void strTooLong()
+{
+    throwRange("Invalid string length");
+}
+} // namespace
+
+V PR_hasInstanceDefault()
+{
+    return g_hasInstanceDefault;
+}
+
+V throwerFn()
+{
+    return g_thrower;
+}
+
+JFunc *newClosure(const char *name, NativeFn fn, int length, V data, V data2)
+{
+    JFunc *f = newNative(name, fn, length);
+    f->data = data;
+    f->data2 = data2;
+    return f;
+}
+
+// ── stack traces ─────────────────────────────────────────────────────────
+
+namespace
+{
+
+std::string frameLocation(Frame *f);
+
+// V8's way of naming a frame
+std::string frameFunctionName(Frame *f)
+{
+    if (f->isNative)
+    {
+        JFunc *fn = f->fn;
+        std::string name = fn->fnName && isStr(fn->fnName) ? toUtf8(sp_(fn->fnName)) : "";
+        if (f->newTarget != Undefined)
+            return "new " + name;
+        if (isObj(f->thisV))
+        {
+            Obj *o = op(f->thisV);
+            if (o == g_global)
+                return name;
+            if (o->flags & OF_CALLABLE)
+                return "Function." + name;
+            return ctorNameOf(o) + "." + name;
+        }
+        if (isStr(f->thisV))
+            return "String." + name;
+        if (isNum(f->thisV))
+            return "Number." + name;
+        return name;
+    }
+    FuncNode *n = f->node;
+    if (!n)
+        return "";
+    if (n->isProgram && n->file && *n->file == "<anonymous>")
+        return "eval";
+    if (n->isProgram && f->fn && !f->fn->node->isArrow)
+        return "Object.<anonymous>";
+    JFunc *fn = f->fn;
+    V nameV = fn && fn->fnName ? fn->fnName : n->name;
+    std::string name = nameV && isStr(nameV) ? toUtf8(sp_(nameV)) : "";
+    if (fn && fn == g_hostCallback && f->prev == g_hostBase)
+    {
+        // V8 names these after the object the event loop called them on
+        if (g_hostContext == HOST_TIMER)
+            return name.empty() ? std::string("Timeout._onTimeout") : "Timeout." + name + " [as _onTimeout]";
+        if (g_hostContext == HOST_IMMEDIATE)
+            return name.empty() ? std::string("Immediate._onImmediate") : "Immediate." + name + " [as _onImmediate]";
+    }
+    if (n->isProgram)
+        return "eval";
+    if (n->isClassCtor || f->newTarget != Undefined)
+        return "new " + (name.empty() ? std::string("<anonymous>") : name);
+    if (n->isGetSet && name.size() > 4)
+        return name + " [as " + name.substr(4) + "]";
+    // an arrow's this is its own, but the frame is named after the receiver
+    V receiver = n->isArrow ? f->receiver : f->thisV;
+    if (isObj(receiver))
+    {
+        Obj *o = op(receiver);
+        if (o == g_global)
+            return name;
+        if (o->flags & OF_CALLABLE)
+        {
+            // a static method: the class's name
+            V cn = getPropObj(o, A.name, receiver);
+            std::string prefix = isStr(cn) && sp_(cn)->len ? toUtf8(sp_(cn)) : "Function";
+            return prefix + "." + (name.empty() ? std::string("<anonymous>") : name);
+        }
+        std::string prefix = ctorNameOf(o);
+        return prefix + "." + (name.empty() ? std::string("<anonymous>") : name);
+    }
+    return name;
+}
+
+std::string frameLocation(Frame *f)
+{
+    if (f->isNative)
+        return "<anonymous>";
+    FuncNode *n = f->node;
+    if (!n || !n->file)
+        return "<anonymous>";
+    Node *c = f->cur;
+    std::string here = *n->file + ":" + std::to_string(c ? c->line : n->line) + ":" + std::to_string(c ? c->col : n->col);
+    if (n->isProgram && *n->file == "<anonymous>")
+    {
+        // eval says where it was called from
+        Frame *from = f->prev;
+        while (from && from->isNative)
+            from = from->prev;
+        if (from)
+        {
+            std::string who = frameFunctionName(from);
+            size_t dot = who.rfind('.');
+            if (dot != std::string::npos)
+                who = who.substr(dot + 1);
+            if (who.empty())
+                who = "<anonymous>";
+            return "eval at " + who + " (" + frameLocation(from) + "), " + here;
+        }
+    }
+    return here;
+}
+
+// what follows the frames of the running program in Node
+const char *g_nodeFrames[] = {
+    "Module._compile (node:internal/modules/cjs/loader:1521:14)",
+    "Module._extensions..js (node:internal/modules/cjs/loader:1623:10)",
+    "Module.load (node:internal/modules/cjs/loader:1266:32)",
+    "Module._load (node:internal/modules/cjs/loader:1091:12)",
+    "Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:164:12)",
+    "node:internal/main/run_main_module:28:49",
+};
+
+int stackLimit()
+{
+    V ctor = getProp(objv(PR.errorTypes[E_ERROR]), A.constructor);
+    V l = getProp(ctor, atomOf("stackTraceLimit"));
+    if (!isNum(l))
+        return -1;
+    double d = numOf(l);
+    return d < 0 ? 0 : d > 200 ? 200 : (int)d;
+}
+
+struct SiteInfo
+{
+    bool host;
+    std::string fn, loc;
+    Frame *f;
+};
+
+void collectSites(V skipUntil, int limit, std::vector<SiteInfo> &out, bool *reachedEnd)
+{
+    Frame *f = g_frame;
+    if (skipUntil != Undefined)
+    {
+        // everything above and including the given function goes
+        Frame *x = f;
+        while (x && !(x->fn && objv(x->fn) == skipUntil))
+            x = x->prev;
+        if (x)
+            f = x->prev;
+    }
+    else
+    {
+        // the Error constructor itself is not shown
+        while (f && f->isNative && f->newTarget != Undefined)
+            f = f->prev;
+        if (f && f->isNative && f->fn && f->fn->fnName && isStr(f->fn->fnName))
+        {
+            std::string nm = toUtf8(sp_(f->fn->fnName));
+            if (nm == "Error" || nm == "captureStackTrace" || nm == "TypeError" || nm == "RangeError")
+                f = f->prev;
+        }
+    }
+    *reachedEnd = true;
+    for (; f; f = f->prev)
+    {
+        if ((int)out.size() >= limit)
+        {
+            *reachedEnd = false;
+            return;
+        }
+        // library code written in JavaScript is the runtime's own
+        if (!f->isNative && f->node && f->node->file && f->node->file->rfind("node:", 0) == 0)
+            continue;
+        if (f->isNative && !(f->fn && f->fn->fnName && isStr(f->fn->fnName) && sp_(f->fn->fnName)->len))
+            continue;
+        SiteInfo s;
+        s.fn = frameFunctionName(f);
+        s.loc = frameLocation(f);
+        s.f = f;
+        s.host = false;
+        out.push_back(s);
+    }
+}
+
+V siteMethod(V thisV, V *args, int argc)
+{
+    (void)args;
+    (void)argc;
+    (void)thisV;
+    return NATIVE_DATA();
+}
+
+Obj *makeCallSite(const SiteInfo &s)
+{
+    Obj *o = newObject();
+    size_t c1 = s.loc.rfind(':');
+    size_t c2 = c1 == std::string::npos || c1 == 0 ? std::string::npos : s.loc.rfind(':', c1 - 1);
+    std::string file = c2 == std::string::npos ? s.loc : s.loc.substr(0, c2);
+    double line = c2 == std::string::npos ? 0 : std::atof(s.loc.c_str() + c2 + 1);
+    double col = c1 == std::string::npos ? 0 : std::atof(s.loc.c_str() + c1 + 1);
+    // the function's own name, without the receiver's
+    std::string name = s.fn;
+    size_t as = name.find(" [as");
+    if (as != std::string::npos)
+        name = name.substr(0, as);
+    size_t dot = name.rfind('.');
+    if (s.host)
+    {
+        // the host's functions carry their dotted names
+        if (name.rfind("Function.", 0) == 0)
+            name = name.substr(9);
+    }
+    else if (name.rfind("new ", 0) == 0)
+        name = name.substr(4);
+    else if (dot != std::string::npos)
+        name = name.substr(dot + 1);
+    if (name == "<anonymous>")
+        name = "";
+    V nameV = name.empty() ? Null : str(name);
+    defineOwn(o, atomOf("getFunctionName"), objv(newClosure("getFunctionName", siteMethod, 0, nameV)), PF_W | PF_C);
+    defineOwn(o, atomOf("getFileName"), objv(newClosure("getFileName", siteMethod, 0, str(file))), PF_W | PF_C);
+    defineOwn(o, atomOf("getLineNumber"), objv(newClosure("getLineNumber", siteMethod, 0, num(line))), PF_W | PF_C);
+    defineOwn(o, atomOf("getColumnNumber"), objv(newClosure("getColumnNumber", siteMethod, 0, num(col))), PF_W | PF_C);
+    defineOwn(o, atomOf("getTypeName"), objv(newClosure("getTypeName", siteMethod, 0, Null)), PF_W | PF_C);
+    defineOwn(o, atomOf("getMethodName"), objv(newClosure("getMethodName", siteMethod, 0, nameV)), PF_W | PF_C);
+    defineOwn(o, atomOf("isNative"), objv(newClosure("isNative", siteMethod, 0, boolv(s.loc == "<anonymous>"))), PF_W | PF_C);
+    defineOwn(o, atomOf("toString"), objv(newClosure("toString", siteMethod, 0, str(s.fn.empty() ? s.loc : s.fn + " (" + s.loc + ")"))), PF_W | PF_C);
+    return o;
+}
+
+} // namespace
+
+namespace
+{
+
+struct LazyStack
+{
+    std::vector<SiteInfo> sites;
+    std::vector<std::string> lines;
+};
+
+std::vector<LazyStack *> g_lazyStacks;
+V g_stackGetter = 0, g_stackSetter = 0;
+V g_defaultPrepare = 0;
+extern V g_nodeErrorMark;
+
+std::string stackHeader(V ev)
+{
+    std::string head;
+    bool failed = false;
+    JsState st;
+    try
+    {
+        V nm = getProp(ev, A.name);
+        V msg = getProp(ev, A.message);
+        std::string ns = nm == Undefined ? "Error" : toUtf8V(nm);
+        uint8_t fl = 0;
+        if (g_nodeErrorMark && isObj(ev) && shapeFind(op(ev)->shape, g_nodeErrorMark, &fl) >= 0)
+        {
+            V code = getProp(ev, A.code);
+            if (isStr(code))
+                ns += " [" + toUtf8(sp_(code)) + "]";
+        }
+        std::string ms = msg == Undefined ? "" : toUtf8V(msg);
+        head = ns.empty() ? ms : ms.empty() ? ns : ns + ": " + ms;
+    }
+    catch (JsThrow &)
+    {
+        st.restore();
+        failed = true;
+    }
+    return failed ? std::string("<error>") : head;
+}
+
+V formatStack(V ev, LazyStack *ls)
+{
+    V ctor = getProp(objv(PR.errorTypes[E_ERROR]), A.constructor);
+    V prep = getProp(ctor, atomOf("prepareStackTrace"));
+    if (isCallable(prep) && prep != g_defaultPrepare)
+    {
+        JArray *arr = newArray();
+        for (const SiteInfo &s : ls->sites)
+            arrayPush(arr, objv(makeCallSite(s)));
+        V a[2] = {ev, objv(arr)};
+        return call(prep, ctor, a, 2);
+    }
+    std::string text = stackHeader(ev);
+    for (const std::string &l : ls->lines)
+        text += "\n    at " + l;
+    return str(text);
+}
+
+Obj *stackHolder(V thisV)
+{
+    if (!isObj(thisV))
+        return nullptr;
+    for (Obj *o = op(thisV); o; o = o->proto)
+        if (o->cls == C_ERROR && isNum(static_cast<JPrim *>(o)->val))
+            return o;
+    return nullptr;
+}
+
+V stackGet(V thisV, V *, int)
+{
+    Obj *o = stackHolder(thisV);
+    if (!o)
+        return Undefined;
+    JPrim *e = static_cast<JPrim *>(o);
+    LazyStack *ls = g_lazyStacks[(size_t)numOf(e->val)];
+    e->val = Undefined;
+    // reads from inside the formatting see no stack yet
+    defineOwn(o, A.stack, Undefined, PF_W | PF_C);
+    V text = formatStack(objv(o), ls);
+    defineOwn(o, A.stack, text, PF_W | PF_C);
+    return text;
+}
+
+V stackSet(V thisV, V *args, int argc)
+{
+    if (isObj(thisV))
+    {
+        Obj *o = op(thisV);
+        if (o->cls == C_ERROR)
+            static_cast<JPrim *>(o)->val = Undefined;
+        defineOwn(o, A.stack, argOr(args, argc, 0), PF_W | PF_C);
+    }
+    return Undefined;
+}
+
+// where the event loop called from, below the program's own frames
+const char *g_timerFrames[] = {
+    "listOnTimeout (node:internal/timers:581:17)",
+    "process.processTimers (node:internal/timers:519:7)",
+};
+const char *g_immediateFrames[] = {
+    "process.processImmediate (node:internal/timers:483:21)",
+};
+const char *g_tickCallbackFrames[] = {
+    "process.processTicksAndRejections (node:internal/process/task_queues:77:11)",
+};
+const char *g_tickFrames[] = {
+    "process.processTicksAndRejections (node:internal/process/task_queues:95:5)",
+};
+
+} // namespace
+
+V errorPrepareDefault(V, V *args, int argc)
+{
+    V err = argOr(args, argc, 0);
+    std::string text = stackHeader(err);
+    V sites = argOr(args, argc, 1);
+    if (isObj(sites))
+    {
+        int64_t n = toLength(getProp(sites, A.length));
+        for (int64_t i = 0; i < n; ++i)
+            text += "\n    at " + toUtf8V(getProp(sites, atomKeyOf(i)));
+    }
+    return str(text);
+}
+
+V nodeErrorToString(V thisV, V *, int)
+{
+    return str(toUtf8V(getProp(thisV, A.name)) + " [" + toUtf8V(getProp(thisV, A.code)) + "]: " + toUtf8V(getProp(thisV, A.message)));
+}
+
+V g_nodeErrorMark = 0;
+
+V makeNodeError(V error, const std::string &code)
+{
+    if (!g_nodeErrorMark)
+        g_nodeErrorMark = newSymbol(strA("kIsNodeError"));
+    Obj *o = op(error);
+    defineOwn(o, g_nodeErrorMark, True, PF_C | PF_W);
+    defineOwn(o, A.toString, objv(newNative("toString", nodeErrorToString, 0)), PF_W | PF_C);
+    defineOwn(o, A.code, str(code), PF_DEFAULT);
+    return error;
+}
+
+int g_hostContext = HOST_MAIN;
+JFunc *g_hostCallback = nullptr;
+Frame *g_hostBase = nullptr;
+
+void materializeStack(Obj *o)
+{
+    if (o->cls == C_ERROR && isNum(static_cast<JPrim *>(o)->val))
+        stackGet(objv(o), nullptr, 0);
+}
+
+void captureStack(Obj *err, V skipUntil)
+{
+    int limit = stackLimit();
+    if (limit < 0)
+        return;
+    LazyStack *ls = new LazyStack();
+    bool reachedEnd = true;
+    collectSites(skipUntil, limit, ls->sites, &reachedEnd);
+    for (const SiteInfo &s : ls->sites)
+        ls->lines.push_back(s.fn.empty() ? s.loc : s.fn + " (" + s.loc + ")");
+    if (reachedEnd)
+    {
+        // the host's frames, as far as the limit goes
+        const char *const *hosts = nullptr;
+        int hostCount = 0;
+        if (g_hostContext == HOST_MAIN)
+        {
+            hosts = g_nodeFrames;
+            hostCount = 6;
+        }
+        else if (g_hostContext == HOST_TIMER)
+        {
+            hosts = g_timerFrames;
+            hostCount = 2;
+        }
+        else if (g_hostContext == HOST_IMMEDIATE)
+        {
+            hosts = g_immediateFrames;
+            hostCount = 1;
+        }
+        else if (g_hostContext == HOST_TICK)
+        {
+            hosts = g_tickFrames;
+            hostCount = 1;
+        }
+        else if (g_hostContext == HOST_TICKCB)
+        {
+            hosts = g_tickCallbackFrames;
+            hostCount = 1;
+        }
+        for (int i = 0; i < hostCount && (int)ls->lines.size() < limit; ++i)
+        {
+            std::string h = hosts[i];
+            ls->lines.push_back(h);
+            SiteInfo site;
+            size_t open = h.find(" (");
+            site.fn = open == std::string::npos ? std::string() : h.substr(0, open);
+            site.loc = open == std::string::npos ? h : h.substr(open + 2, h.size() - open - 3);
+            site.f = nullptr;
+            site.host = true;
+            ls->sites.push_back(site);
+        }
+    }
+    if (err->cls == C_ERROR)
+    {
+        if (!g_stackGetter)
+        {
+            g_stackGetter = objv(newNative("stack", stackGet, 0));
+            g_stackSetter = objv(newNative("stack", stackSet, 1));
+        }
+        g_lazyStacks.push_back(ls);
+        static_cast<JPrim *>(err)->val = num((double)(g_lazyStacks.size() - 1));
+        defineAccessor(err, A.stack, g_stackGetter, g_stackSetter, PF_C);
+        return;
+    }
+    defineOwn(err, A.stack, formatStack(objv(err), ls), PF_W | PF_C);
+}
+
+V makeError(int type, const std::string &msg)
+{
+    JPrim *e = static_cast<JPrim *>(allocObj(sizeof(JPrim), C_ERROR, PR.errorTypes[type]));
+    e->val = Undefined;
+    // V8 makes `stack` first; the message goes after
+    addProp(e, A.stack, Undefined, PF_W | PF_C);
+    addProp(e, A.message, str(msg), PF_W | PF_C);
+    captureStack(e, Undefined);
+    return objv(e);
+}
+
+void throwError(int type, const std::string &msg)
+{
+    throw JsThrow{makeError(type, msg)};
+}
+
+void throwType(const std::string &msg)
+{
+    throwError(E_TYPE, msg);
+}
+
+void throwError(int type, const char *msg)
+{
+    throwError(type, std::string(msg));
+}
+
+void throwType(const char *msg)
+{
+    throwError(E_TYPE, std::string(msg));
+}
+
+void throwRange(const char *msg)
+{
+    throwError(E_RANGE, std::string(msg));
+}
+
+void throwRange(const std::string &msg)
+{
+    throwError(E_RANGE, msg);
+}
+
+void throwV(V v)
+{
+    throw JsThrow{v};
+}
+
+// ── Error ────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+int errorTypeOf(JFunc *callee)
+{
+    V d = callee->data;
+    return isNum(d) ? (int)numOf(d) : 0;
+}
+
+V errorCtor(V thisV, V *args, int argc)
+{
+    (void)thisV;
+    int type = errorTypeOf(g_nativeCallee);
+    V nt = g_nativeNewTarget;
+    Obj *fallback = PR.errorTypes[type];
+    Obj *proto = nt != Undefined ? protoFromCtor(nt, fallback) : fallback;
+    JPrim *e = static_cast<JPrim *>(allocObj(sizeof(JPrim), C_ERROR, proto));
+    e->val = Undefined;
+    V ev = objv(e);
+    addProp(e, A.stack, Undefined, PF_W | PF_C);
+    int base = 0;
+    if (type == E_AGGREGATE)
+        base = 1;
+    V msg = argOr(args, argc, base);
+    if (msg != Undefined)
+        addProp(e, A.message, toStringV(msg), PF_W | PF_C);
+    V opts = argOr(args, argc, base + 1);
+    if (isObj(opts) && hasProp(op(opts), A.cause))
+        addProp(e, A.cause, getProp(opts, A.cause), PF_W | PF_C);
+    if (type == E_AGGREGATE)
+    {
+        JArray *errs = newArray();
+        std::vector<V> items;
+        iterableToVec(argOr(args, argc, 0), items);
+        for (V x : items)
+            arrayPush(errs, x);
+        addProp(e, A.errors, objv(errs), PF_W | PF_C);
+    }
+    captureStack(e, Undefined);
+    return ev;
+}
+
+V errorToString(V thisV, V *args, int argc)
+{
+    (void)args;
+    (void)argc;
+    if (!isObj(thisV))
+        throwType("Method Error.prototype.toString called on incompatible receiver " + inspectBrief(thisV));
+    V nm = getProp(thisV, A.name);
+    V msg = getProp(thisV, A.message);
+    std::string ns = nm == Undefined ? "Error" : toUtf8V(nm);
+    std::string ms = msg == Undefined ? "" : toUtf8V(msg);
+    if (ns.empty())
+        return str(ms);
+    if (ms.empty())
+        return str(ns);
+    return str(ns + ": " + ms);
+}
+
+V errorCapture(V thisV, V *args, int argc)
+{
+    (void)thisV;
+    V target = argOr(args, argc, 0);
+    if (!isObj(target))
+        throwType("Invalid argument");
+    captureStack(op(target), argOr(args, argc, 1));
+    return Undefined;
+}
+
+} // namespace
+
+void initErrorBuiltins()
+{
+    static const char *names[] = {"Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError", "AggregateError"};
+    JFunc *base = nullptr;
+    for (int i = 0; i < 8; ++i)
+    {
+        Obj *proto = i == 0 ? newObject() : newObjectProto(PR.errorTypes[0]);
+        PR.errorTypes[i] = proto;
+        JFunc *f = defCtor(names[i], errorCtor, i == 7 ? 2 : 1, proto);
+        f->data = num((double)i);
+        defineOwn(proto, A.name, atomOf(names[i]), PF_W | PF_C);
+        defineOwn(proto, A.message, A.empty, PF_W | PF_C);
+        if (i == 0)
+        {
+            base = f;
+            defFn(proto, "toString", errorToString, 0);
+        }
+        else
+            f->proto = base;
+    }
+    defFn(base, "captureStackTrace", errorCapture, 2);
+    {
+        JFunc *prep = newNative("ErrorPrepareStackTrace", errorPrepareDefault, 2);
+        g_defaultPrepare = objv(prep);
+        defineOwn(base, atomOf("prepareStackTrace"), g_defaultPrepare, PF_W | PF_C);
+    }
+    defVal(base, "stackTraceLimit", num(10), PF_DEFAULT);
+}
+
+// ── Object ───────────────────────────────────────────────────────────────
+
+namespace
+{
+
+V objectCtor(V thisV, V *args, int argc)
+{
+    (void)thisV;
+    if (g_nativeNewTarget != Undefined && g_nativeNewTarget != objv(g_nativeCallee))
+        return objv(newObjectProto(protoFromCtor(g_nativeNewTarget, PR.object)));
+    V v = argOr(args, argc, 0);
+    if (isNullish(v))
+        return objv(newObject());
+    return toObject(v);
+}
+
+V objKeysLike(V target, int mode)
+{
+    V ov = toObject(target);
+    std::vector<V> keys;
+    Obj *o = op(ov);
+    ownKeys(o, keys, true, false, false);
+    JArray *out = newArray();
+    for (V k : keys)
+    {
+        V val, g, s;
+        uint8_t fl = 0;
+        if (!getOwnDesc(o, k, &val, &g, &s, &fl) || !(fl & PF_E))
+            continue;
+        if (mode == 0)
+            arrayPush(out, k);
+        else
+        {
+            V v = getPropObj(o, k, ov);
+            if (mode == 1)
+                arrayPush(out, v);
+            else
+            {
+                V pair[2] = {k, v};
+                arrayPush(out, objv(newArrayFrom(pair, 2)));
+            }
+        }
+    }
+    return objv(out);
+}
+
+V objKeys(V, V *args, int argc) { return objKeysLike(argOr(args, argc, 0), 0); }
+V objValues(V, V *args, int argc) { return objKeysLike(argOr(args, argc, 0), 1); }
+V objEntries(V, V *args, int argc) { return objKeysLike(argOr(args, argc, 0), 2); }
+
+V objAssign(V, V *args, int argc)
+{
+    V to = toObject(argOr(args, argc, 0));
+    for (int i = 1; i < argc; ++i)
+    {
+        V src = args[i];
+        if (isNullish(src))
+            continue;
+        V so = toObject(src);
+        std::vector<V> keys;
+        ownKeys(op(so), keys, true, true, false);
+        for (V k : keys)
+        {
+            V val, g, s;
+            uint8_t fl = 0;
+            if (getOwnDesc(op(so), k, &val, &g, &s, &fl) && (fl & PF_E))
+                putProp(to, k, getPropObj(op(so), k, so), true);
+        }
+    }
+    return to;
+}
+
+V objFreeze(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (isObj(v))
+        freezeObj(op(v), true);
+    return v;
+}
+
+V objSeal(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (isObj(v))
+        freezeObj(op(v), false);
+    return v;
+}
+
+V objPreventExt(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (isObj(v))
+        preventExt(op(v));
+    return v;
+}
+
+V objIsFrozen(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    return boolv(!isObj(v) || isFrozenObj(op(v), true));
+}
+
+V objIsSealed(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    return boolv(!isObj(v) || isFrozenObj(op(v), false));
+}
+
+V objIsExtensible(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    return boolv(isObj(v) && isExtensible(op(v)));
+}
+
+V objGetProto(V, V *args, int argc)
+{
+    V o = toObject(argOr(args, argc, 0));
+    Obj *p = protoOf(op(o));
+    return p ? objv(p) : Null;
+}
+
+V objSetProto(V, V *args, int argc)
+{
+    V o = argOr(args, argc, 0);
+    V p = argOr(args, argc, 1);
+    if (isNullish(o))
+        throwType("Object.setPrototypeOf called on null or undefined");
+    if (!isObj(p) && p != Null)
+        throwType("Object prototype may only be an Object or null: " + inspectBrief(p));
+    if (!isObj(o))
+        return o;
+    if (!setProtoOf(op(o), p == Null ? nullptr : op(p)))
+    {
+        if (!isExtensible(op(o)))
+            throwType(inspectBrief(o) + " is not extensible");
+        throwType("Cyclic __proto__ value");
+    }
+    return o;
+}
+
+V objCreate(V, V *args, int argc)
+{
+    V p = argOr(args, argc, 0);
+    if (!isObj(p) && p != Null)
+        throwType("Object prototype may only be an Object or null: " + inspectBrief(p));
+    Obj *o = newObjectProto(p == Null ? nullptr : op(p));
+    V props = argOr(args, argc, 1);
+    if (props != Undefined)
+    {
+        V pv = toObject(props);
+        std::vector<V> keys;
+        ownKeys(op(pv), keys, true, true, false);
+        for (V k : keys)
+        {
+            V val, g, s;
+            uint8_t fl = 0;
+            if (getOwnDesc(op(pv), k, &val, &g, &s, &fl) && (fl & PF_E))
+                defineFromDesc(o, k, getPropObj(op(pv), k, pv), true);
+        }
+    }
+    return objv(o);
+}
+
+V objDefineProperty(V, V *args, int argc)
+{
+    V o = argOr(args, argc, 0);
+    if (!isObj(o))
+        throwType("Object.defineProperty called on non-object");
+    V key = toKey(argOr(args, argc, 1));
+    defineFromDesc(op(o), key, argOr(args, argc, 2), true);
+    return o;
+}
+
+V objDefineProperties(V, V *args, int argc)
+{
+    V o = argOr(args, argc, 0);
+    if (!isObj(o))
+        throwType("Object.defineProperties called on non-object");
+    V pv = toObject(argOr(args, argc, 1));
+    std::vector<V> keys;
+    ownKeys(op(pv), keys, true, true, false);
+    for (V k : keys)
+    {
+        V val, g, s;
+        uint8_t fl = 0;
+        if (getOwnDesc(op(pv), k, &val, &g, &s, &fl) && (fl & PF_E))
+            defineFromDesc(op(o), k, getPropObj(op(pv), k, pv), true);
+    }
+    return o;
+}
+
+V descOf(Obj *o, V key)
+{
+    V val = Undefined, g = Undefined, s = Undefined;
+    uint8_t fl = 0;
+    if (!getOwnDesc(o, key, &val, &g, &s, &fl))
+        return Undefined;
+    return descToObject(val, g, s, fl);
+}
+
+V objGetOwnDesc(V, V *args, int argc)
+{
+    V o = toObject(argOr(args, argc, 0));
+    materializeStack(op(o));
+    return descOf(op(o), toKey(argOr(args, argc, 1)));
+}
+
+V objGetOwnDescs(V, V *args, int argc)
+{
+    V ov = toObject(argOr(args, argc, 0));
+    materializeStack(op(ov));
+    Obj *r = newObject();
+    std::vector<V> keys;
+    ownKeys(op(ov), keys, true, true, false);
+    for (V k : keys)
+    {
+        V d = descOf(op(ov), k);
+        if (d != Undefined)
+            defineOwn(r, k, d, PF_DEFAULT);
+    }
+    return objv(r);
+}
+
+V objGetOwnNames(V, V *args, int argc)
+{
+    V ov = toObject(argOr(args, argc, 0));
+    std::vector<V> keys;
+    ownKeys(op(ov), keys, true, false, false);
+    JArray *a = newArray((uint32_t)keys.size());
+    for (V k : keys)
+        arrayPush(a, k);
+    return objv(a);
+}
+
+V objGetOwnSyms(V, V *args, int argc)
+{
+    V ov = toObject(argOr(args, argc, 0));
+    std::vector<V> keys;
+    ownKeys(op(ov), keys, false, true, false);
+    JArray *a = newArray((uint32_t)keys.size());
+    for (V k : keys)
+        arrayPush(a, k);
+    return objv(a);
+}
+
+V objFromEntries(V, V *args, int argc)
+{
+    Obj *o = newObject();
+    Iter it;
+    iterOpen(it, argOr(args, argc, 0));
+    V e;
+    while (iterStep(it, &e))
+    {
+        if (!isObj(e))
+            throwType("Iterator value " + inspectBrief(e) + " is not an entry object");
+        V k = getIdx(e, 0);
+        V v = getIdx(e, 1);
+        defineOwn(o, toKey(k), v, PF_DEFAULT);
+    }
+    return objv(o);
+}
+
+V objIs(V, V *args, int argc)
+{
+    return boolv(sameValue(argOr(args, argc, 0), argOr(args, argc, 1)));
+}
+
+V objHasOwn(V, V *args, int argc)
+{
+    V o = toObject(argOr(args, argc, 0));
+    return boolv(hasOwn(op(o), toKey(argOr(args, argc, 1))));
+}
+
+V objGroupBy(V, V *args, int argc)
+{
+    Obj *o = newObjectProto(nullptr);
+    V fn = argOr(args, argc, 1);
+    Iter it;
+    iterOpen(it, argOr(args, argc, 0));
+    V e;
+    double i = 0;
+    while (iterStep(it, &e))
+    {
+        V k = toKey(call2(fn, Undefined, e, num(i++)));
+        V cur = getPropObj(o, k, objv(o));
+        if (cur == Undefined)
+        {
+            cur = objv(newArray());
+            defineOwn(o, k, cur, PF_DEFAULT);
+        }
+        arrayPush(static_cast<JArray *>(op(cur)), e);
+    }
+    return objv(o);
+}
+
+// Object.prototype
+V protoHasOwn(V thisV, V *args, int argc)
+{
+    V key = toKey(argOr(args, argc, 0));
+    V o = toObject(thisV);
+    return boolv(hasOwn(op(o), key));
+}
+
+V protoIsProtoOf(V thisV, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isObj(v))
+        return False;
+    V self = toObject(thisV);
+    for (Obj *p = protoOf(op(v)); p; p = protoOf(p))
+        if (p == op(self))
+            return True;
+    return False;
+}
+
+V protoPropIsEnum(V thisV, V *args, int argc)
+{
+    V key = toKey(argOr(args, argc, 0));
+    V o = toObject(thisV);
+    V val, g, s;
+    uint8_t fl = 0;
+    if (!getOwnDesc(op(o), key, &val, &g, &s, &fl))
+        return False;
+    return boolv(fl & PF_E);
+}
+
+V protoValueOf(V thisV, V *, int)
+{
+    return toObject(thisV);
+}
+
+V protoToLocale(V thisV, V *, int)
+{
+    return invoke(thisV, A.toString, nullptr, 0);
+}
+
+V protoToString(V thisV, V *, int)
+{
+    if (thisV == Undefined)
+        return strA("[object Undefined]");
+    if (thisV == Null)
+        return strA("[object Null]");
+    V ov = toObject(thisV);
+    Obj *o = op(ov);
+    V tag = getPropObj(o, WK.toStringTag, thisV);
+    if (isStr(tag))
+        return strv(concatStr(concatStr(newStrAscii("[object "), sp_(tag)), newStrAscii("]")));
+    const char *n = "Object";
+    if (o->flags & OF_CALLABLE)
+        n = "Function";
+    else
+        switch (o->cls)
+        {
+        case C_ARRAY: n = "Array"; break;
+        case C_ERROR: n = "Error"; break;
+        case C_BOOLEAN: n = "Boolean"; break;
+        case C_NUMBER: n = "Number"; break;
+        case C_STRING: n = "String"; break;
+        case C_DATE: n = "Date"; break;
+        case C_REGEXP: n = "RegExp"; break;
+        case C_ARGUMENTS: n = "Arguments"; break;
+        case C_PROXY:
+        {
+            // an array behind a proxy counts as one
+            V t = static_cast<JFunc *>(o)->data;
+            if (isObj(t) && op(t)->cls == C_ARRAY)
+                n = "Array";
+            break;
+        }
+        default: break;
+        }
+    return strA((std::string("[object ") + n + "]").c_str());
+}
+
+V protoGetProto(V thisV, V *, int)
+{
+    V o = toObject(thisV);
+    Obj *p = protoOf(op(o));
+    return p ? objv(p) : Null;
+}
+
+V protoSetProto(V thisV, V *args, int argc)
+{
+    V p = argOr(args, argc, 0);
+    if (!isObj(thisV) || (!isObj(p) && p != Null))
+        return Undefined;
+    if (!setProtoOf(op(thisV), p == Null ? nullptr : op(p)))
+        throwType("Cyclic __proto__ value");
+    return Undefined;
+}
+
+V protoDefineGetter(V thisV, V *args, int argc)
+{
+    V o = toObject(thisV);
+    defineAccessor(op(o), toKey(argOr(args, argc, 0)), argOr(args, argc, 1), Hole, PF_E | PF_C);
+    return Undefined;
+}
+
+V protoDefineSetter(V thisV, V *args, int argc)
+{
+    V o = toObject(thisV);
+    defineAccessor(op(o), toKey(argOr(args, argc, 0)), Hole, argOr(args, argc, 1), PF_E | PF_C);
+    return Undefined;
+}
+
+V protoLookupGetter(V thisV, V *args, int argc)
+{
+    V o = toObject(thisV);
+    V key = toKey(argOr(args, argc, 0));
+    for (Obj *p = op(o); p; p = protoOf(p))
+    {
+        V val, g, s;
+        uint8_t fl = 0;
+        if (getOwnDesc(p, key, &val, &g, &s, &fl))
+            return (fl & PF_ACCESSOR) ? g : Undefined;
+    }
+    return Undefined;
+}
+
+V protoLookupSetter(V thisV, V *args, int argc)
+{
+    V o = toObject(thisV);
+    V key = toKey(argOr(args, argc, 0));
+    for (Obj *p = op(o); p; p = protoOf(p))
+    {
+        V val, g, s;
+        uint8_t fl = 0;
+        if (getOwnDesc(p, key, &val, &g, &s, &fl))
+            return (fl & PF_ACCESSOR) ? s : Undefined;
+    }
+    return Undefined;
+}
+
+} // namespace
+
+void initObjectBuiltins()
+{
+    JFunc *c = defCtor("Object", objectCtor, 1, PR.object);
+    PR.ctorObject = objv(c);
+    defFn(c, "keys", objKeys, 1);
+    defFn(c, "values", objValues, 1);
+    defFn(c, "entries", objEntries, 1);
+    defFn(c, "assign", objAssign, 2);
+    defFn(c, "freeze", objFreeze, 1);
+    defFn(c, "seal", objSeal, 1);
+    defFn(c, "preventExtensions", objPreventExt, 1);
+    defFn(c, "isFrozen", objIsFrozen, 1);
+    defFn(c, "isSealed", objIsSealed, 1);
+    defFn(c, "isExtensible", objIsExtensible, 1);
+    defFn(c, "getPrototypeOf", objGetProto, 1);
+    defFn(c, "setPrototypeOf", objSetProto, 2);
+    defFn(c, "create", objCreate, 2);
+    defFn(c, "defineProperty", objDefineProperty, 3);
+    defFn(c, "defineProperties", objDefineProperties, 2);
+    defFn(c, "getOwnPropertyDescriptor", objGetOwnDesc, 2);
+    defFn(c, "getOwnPropertyDescriptors", objGetOwnDescs, 1);
+    defFn(c, "getOwnPropertyNames", objGetOwnNames, 1);
+    defFn(c, "getOwnPropertySymbols", objGetOwnSyms, 1);
+    defFn(c, "fromEntries", objFromEntries, 1);
+    defFn(c, "is", objIs, 2);
+    defFn(c, "hasOwn", objHasOwn, 2);
+    Obj *p = PR.object;
+    defFn(p, "hasOwnProperty", protoHasOwn, 1);
+    defFn(p, "isPrototypeOf", protoIsProtoOf, 1);
+    defFn(p, "propertyIsEnumerable", protoPropIsEnum, 1);
+    defFn(p, "valueOf", protoValueOf, 0);
+    defFn(p, "toLocaleString", protoToLocale, 0);
+    defFn(p, "toString", protoToString, 0);
+    defFn(p, "__defineGetter__", protoDefineGetter, 2);
+    defFn(p, "__defineSetter__", protoDefineSetter, 2);
+    defFn(p, "__lookupGetter__", protoLookupGetter, 1);
+    defFn(p, "__lookupSetter__", protoLookupSetter, 1);
+    defineAccessor(p, A.proto, objv(newNative("get __proto__", protoGetProto, 0)), objv(newNative("set __proto__", protoSetProto, 1)), PF_C);
+}
+
+// ── Function ─────────────────────────────────────────────────────────────
+
+V functionToString(V fn)
+{
+    JFunc *f = static_cast<JFunc *>(op(fn));
+    if (f->kind != FK_NATIVE && f->kind != FK_BOUND && f->kind != FK_PROXY && f->node && f->node->src)
+    {
+        FuncNode *n = f->node;
+        if (n->srcEnd > n->srcStart)
+            return strv(newStrUnits(n->src + n->srcStart, n->srcEnd - n->srcStart));
+    }
+    std::string name = f->fnName && isStr(f->fnName) ? toUtf8(sp_(f->fnName)) : "";
+    return str("function " + name + "() { [native code] }");
+}
+
+V makeBoundFunction(V target, V thisV, V *args, int argc)
+{
+    if (!isCallable(target))
+        throwType("Bind must be called on a function");
+    JFunc *t = static_cast<JFunc *>(op(target));
+    JFunc *f = static_cast<JFunc *>(allocObj(sizeof(JFunc), C_FUNCTION, protoOf(t)));
+    f->kind = FK_BOUND;
+    f->flags = OF_CALLABLE | OF_LAZYFN | (t->flags & OF_CTOR);
+    f->target = target;
+    f->thisV = thisV;
+    f->newTarget = Undefined;
+    f->home = Undefined;
+    f->data = Undefined;
+    f->data2 = Undefined;
+    int n = argc > 0 ? argc : 0;
+    f->nBound = n;
+    if (n)
+    {
+        f->boundArgs = static_cast<V *>(bump(sizeof(V) * (size_t)n));
+        for (int i = 0; i < n; ++i)
+            f->boundArgs[i] = args[i];
+    }
+    V nm = getProp(target, A.name);
+    f->fnName = atomStr(concatStr(newStrAscii("bound "), isStr(nm) ? sp_(nm) : sp_(A.empty)));
+    double len = 0;
+    if (hasOwn(t, A.length))
+    {
+        V l = getProp(target, A.length);
+        if (isNum(l))
+        {
+            len = toIntegerOrInf(l) - n;
+            if (len < 0)
+                len = 0;
+        }
+    }
+    f->natLen = (int)len;
+    return objv(f);
+}
+
+namespace
+{
+
+V functionCtor(V, V *args, int argc)
+{
+    return makeFunctionFromStrings(0, args, argc);
+}
+
+V generatorFunctionCtor(V, V *args, int argc)
+{
+    return makeFunctionFromStrings(1, args, argc);
+}
+
+V asyncFunctionCtor(V, V *args, int argc)
+{
+    return makeFunctionFromStrings(2, args, argc);
+}
+
+V asyncGeneratorFunctionCtor(V, V *args, int argc)
+{
+    return makeFunctionFromStrings(3, args, argc);
+}
+
+V restrictedAccess(V, V *, int)
+{
+    throwType("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them");
+}
+
+V fnCall(V thisV, V *args, int argc)
+{
+    if (!isCallable(thisV))
+        throwType("Function.prototype.call was called on " + inspectBrief(thisV) + ", which is not a function");
+    return callFunc(static_cast<JFunc *>(op(thisV)), argOr(args, argc, 0), argc > 1 ? args + 1 : nullptr, argc > 1 ? argc - 1 : 0, Undefined);
+}
+
+V fnApply(V thisV, V *args, int argc)
+{
+    if (!isCallable(thisV))
+        throwType("Function.prototype.apply was called on " + inspectBrief(thisV) + ", which is not a function");
+    V list = argOr(args, argc, 1);
+    if (isNullish(list))
+        return callFunc(static_cast<JFunc *>(op(thisV)), argOr(args, argc, 0), nullptr, 0, Undefined);
+    if (!isObj(list))
+        throwType("CreateListFromArrayLike called on non-object");
+    int64_t n = toLength(getProp(list, A.length));
+    V *mem = static_cast<V *>(bump(sizeof(V) * (size_t)(n + 1)));
+    for (int64_t i = 0; i < n; ++i)
+        mem[i] = getIdx(list, (double)i);
+    return callFunc(static_cast<JFunc *>(op(thisV)), argOr(args, argc, 0), mem, (int)n, Undefined);
+}
+
+V fnBind(V thisV, V *args, int argc)
+{
+    return makeBoundFunction(thisV, argOr(args, argc, 0), argc > 1 ? args + 1 : nullptr, argc > 1 ? argc - 1 : 0);
+}
+
+V fnToString(V thisV, V *, int)
+{
+    if (!isCallable(thisV))
+        throwType("Function.prototype.toString requires that 'this' be a Function");
+    return functionToString(thisV);
+}
+
+V fnHasInstance(V thisV, V *args, int argc)
+{
+    return boolv(ordinaryHasInstance(thisV, argOr(args, argc, 0)));
+}
+
+V fnProtoCall(V, V *, int)
+{
+    return Undefined;
+}
+
+V throwTypeErrorFn(V, V *, int)
+{
+    throwType("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them");
+}
+
+} // namespace
+
+void initFunctionBuiltins()
+{
+    JFunc *c = defCtor("Function", functionCtor, 1, PR.function);
+    PR.ctorFunction = objv(c);
+    Obj *p = PR.function;
+    JFunc *pf = static_cast<JFunc *>(p);
+    pf->kind = FK_NATIVE;
+    pf->nat = fnProtoCall;
+    pf->fnName = A.empty;
+    pf->natLen = 0;
+    pf->flags = OF_CALLABLE | OF_LAZYFN;
+    pf->thisV = Undefined;
+    pf->newTarget = Undefined;
+    pf->home = Undefined;
+    pf->data = Undefined;
+    pf->data2 = Undefined;
+    pf->target = Undefined;
+    materializeFn(pf);
+    defFn(p, "call", fnCall, 1);
+    {
+        JFunc *thrower = newNative("", restrictedAccess, 0);
+        defineAccessor(p, atomOf("arguments"), objv(thrower), objv(thrower), PF_C);
+        defineAccessor(p, atomOf("caller"), objv(thrower), objv(thrower), PF_C);
+    }
+    defFn(p, "apply", fnApply, 2);
+    defFn(p, "bind", fnBind, 1);
+    defFn(p, "toString", fnToString, 0);
+    JFunc *hi = newNative("[Symbol.hasInstance]", fnHasInstance, 1);
+    g_hasInstanceDefault = objv(hi);
+    defineOwn(p, WK.hasInstance, objv(hi), 0);
+    g_thrower = objv(newNative("", throwTypeErrorFn, 0));
+    // the constructors of functions of other kinds are reachable only through these
+    JFunc *gf = newNative("GeneratorFunction", generatorFunctionCtor, 1);
+    gf->flags |= OF_CTOR;
+    materializeFn(gf);
+    gf->proto = c;
+    defineOwn(gf, A.prototype, objv(PR.generatorFunction), 0);
+    defineOwn(PR.generatorFunction, A.constructor, objv(gf), PF_C);
+    JFunc *af = newNative("AsyncFunction", asyncFunctionCtor, 1);
+    af->flags |= OF_CTOR;
+    materializeFn(af);
+    af->proto = c;
+    defineOwn(af, A.prototype, objv(PR.asyncFunction), 0);
+    defineOwn(PR.asyncFunction, A.constructor, objv(af), PF_C);
+    JFunc *agf = newNative("AsyncGeneratorFunction", asyncGeneratorFunctionCtor, 1);
+    agf->flags |= OF_CTOR;
+    materializeFn(agf);
+    agf->proto = c;
+    defineOwn(agf, A.prototype, objv(PR.asyncGenFunction), 0);
+    defineOwn(PR.asyncGenFunction, A.constructor, objv(agf), PF_C);
+}
+
+// ── Symbol ───────────────────────────────────────────────────────────────
+
+namespace
+{
+
+Obj *g_symRegistry = nullptr;
+
+V newSymbol(V desc)
+{
+    JSym *s = NEW(JSym);
+    s->desc = desc;
+    return symv(s);
+}
+
+V symbolCtor(V, V *args, int argc)
+{
+    if (g_nativeNewTarget != Undefined)
+        throwType("Symbol is not a constructor");
+    V d = argOr(args, argc, 0);
+    return newSymbol(d == Undefined ? Undefined : toStringV(d));
+}
+
+V symbolFor(V, V *args, int argc)
+{
+    V key = toKey(toStringV(argOr(args, argc, 0)));
+    V cur = getPropObj(g_symRegistry, key, objv(g_symRegistry));
+    if (cur != Undefined)
+        return cur;
+    V s = newSymbol(key);
+    symp(s)->registered = true;
+    defineOwn(g_symRegistry, key, s, PF_DEFAULT);
+    return s;
+}
+
+V symbolKeyFor(V, V *args, int argc)
+{
+    V s = argOr(args, argc, 0);
+    if (!isSym(s))
+        throwType(inspectBrief(s) + " is not a symbol");
+    return symp(s)->registered ? symp(s)->desc : Undefined;
+}
+
+V thisSym(V thisV, const char *method)
+{
+    if (isSym(thisV))
+        return thisV;
+    if (isObj(thisV) && op(thisV)->cls == C_SYMBOL)
+        return static_cast<JPrim *>(op(thisV))->val;
+    throwType(std::string("Symbol.prototype.") + method + " requires that 'this' be a Symbol");
+}
+
+V symToString(V thisV, V *, int)
+{
+    return str(keyText(thisSym(thisV, "toString")));
+}
+
+V symValueOf(V thisV, V *, int)
+{
+    return thisSym(thisV, "valueOf");
+}
+
+V symDescription(V thisV, V *, int)
+{
+    return symp(thisSym(thisV, "description"))->desc;
+}
+
+V makeWellKnown(const char *name)
+{
+    return newSymbol(strA(name));
+}
+
+} // namespace
+
+void initSymbolBuiltins()
+{
+    g_symRegistry = newObjectProto(nullptr);
+    JFunc *c = defCtor("Symbol", symbolCtor, 0, PR.symbol);
+    defFn(c, "for", symbolFor, 1);
+    defFn(c, "keyFor", symbolKeyFor, 1);
+    defVal(c, "iterator", WK.iterator, 0);
+    defVal(c, "asyncIterator", WK.asyncIterator, 0);
+    defVal(c, "dispose", makeWellKnown("Symbol.dispose"), 0);
+    defVal(c, "asyncDispose", makeWellKnown("Symbol.asyncDispose"), 0);
+    defVal(c, "hasInstance", WK.hasInstance, 0);
+    defVal(c, "toPrimitive", WK.toPrimitive, 0);
+    defVal(c, "toStringTag", WK.toStringTag, 0);
+    defVal(c, "species", WK.species, 0);
+    defVal(c, "isConcatSpreadable", WK.isConcatSpreadable, 0);
+    defVal(c, "unscopables", WK.unscopables, 0);
+    defVal(c, "match", WK.match, 0);
+    defVal(c, "matchAll", WK.matchAll, 0);
+    defVal(c, "replace", WK.replace, 0);
+    defVal(c, "search", WK.search, 0);
+    defVal(c, "split", WK.split, 0);
+    Obj *p = PR.symbol;
+    defFn(p, "toString", symToString, 0);
+    defFn(p, "valueOf", symValueOf, 0);
+    defGetter(p, "description", symDescription);
+    defineOwn(p, WK.toPrimitive, objv(newNative("[Symbol.toPrimitive]", symValueOf, 1)), PF_C);
+    defineOwn(p, WK.toStringTag, atomOf("Symbol"), PF_C);
+}
+
+// ── Boolean ──────────────────────────────────────────────────────────────
+
+namespace
+{
+
+V booleanCtor(V, V *args, int argc)
+{
+    bool b = truthy(argOr(args, argc, 0));
+    if (g_nativeNewTarget == Undefined)
+        return boolv(b);
+    JPrim *p = static_cast<JPrim *>(allocObj(sizeof(JPrim), C_BOOLEAN, protoFromCtor(g_nativeNewTarget, PR.boolean)));
+    p->val = boolv(b);
+    return objv(p);
+}
+
+V thisBool(V v, const char *method)
+{
+    if (isBool(v))
+        return v;
+    if (isObj(v) && op(v)->cls == C_BOOLEAN)
+        return static_cast<JPrim *>(op(v))->val;
+    throwType(std::string("Boolean.prototype.") + method + " requires that 'this' be a Boolean");
+}
+
+V boolToString(V thisV, V *, int)
+{
+    return thisBool(thisV, "toString") == True ? A.true_ : A.false_;
+}
+
+V boolValueOf(V thisV, V *, int)
+{
+    return thisBool(thisV, "valueOf");
+}
+
+// ── global functions ─────────────────────────────────────────────────────
+
+V gParseInt(V, V *args, int argc)
+{
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    int32_t radix = toInt32(argOr(args, argc, 1));
+    int i = 0, n = s->len;
+    while (i < n)
+    {
+        int c = unitAt(s, i);
+        if (c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0xFEFF || c == 0x2028 || c == 0x2029)
+            ++i;
+        else
+            break;
+    }
+    bool neg = false;
+    if (i < n && (unitAt(s, i) == '+' || unitAt(s, i) == '-'))
+    {
+        neg = unitAt(s, i) == '-';
+        ++i;
+    }
+    bool strip = true;
+    if (radix != 0)
+    {
+        if (radix < 2 || radix > 36)
+            return num(0.0 / 0.0);
+        if (radix != 16)
+            strip = false;
+    }
+    else
+        radix = 10;
+    if (strip && i + 1 < n && unitAt(s, i) == '0' && (unitAt(s, i + 1) == 'x' || unitAt(s, i + 1) == 'X'))
+    {
+        i += 2;
+        radix = 16;
+    }
+    int start = i;
+    double v = 0;
+    std::string digits;
+    for (; i < n; ++i)
+    {
+        int c = unitAt(s, i);
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10 : c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 99;
+        if (d >= radix)
+            break;
+        v = v * radix + d;
+        digits += (char)c;
+    }
+    if (i == start)
+        return num(0.0 / 0.0);
+    if (radix == 10 && digits.size() > 15)
+        v = std::strtod(digits.c_str(), nullptr);
+    return num(neg ? -v : v);
+}
+
+V gParseFloat(V, V *args, int argc)
+{
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    int i = 0, n = s->len;
+    while (i < n)
+    {
+        int c = unitAt(s, i);
+        if (c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0xFEFF || c == 0x2028 || c == 0x2029)
+            ++i;
+        else
+            break;
+    }
+    std::string t;
+    if (i < n && (unitAt(s, i) == '+' || unitAt(s, i) == '-'))
+        t += (char)unitAt(s, i++);
+    static const char *inf = "Infinity";
+    int k = 0;
+    while (k < 8 && i + k < n && unitAt(s, i + k) == inf[k])
+        ++k;
+    if (k == 8)
+        return num(t == "-" ? -1.0 / 0.0 : 1.0 / 0.0);
+    int digits = 0;
+    while (i < n && unitAt(s, i) >= '0' && unitAt(s, i) <= '9')
+    {
+        t += (char)unitAt(s, i++);
+        ++digits;
+    }
+    if (i < n && unitAt(s, i) == '.')
+    {
+        t += '.';
+        ++i;
+        while (i < n && unitAt(s, i) >= '0' && unitAt(s, i) <= '9')
+        {
+            t += (char)unitAt(s, i++);
+            ++digits;
+        }
+    }
+    if (!digits)
+        return num(0.0 / 0.0);
+    if (i < n && (unitAt(s, i) == 'e' || unitAt(s, i) == 'E'))
+    {
+        int j = i + 1;
+        std::string e = "e";
+        if (j < n && (unitAt(s, j) == '+' || unitAt(s, j) == '-'))
+            e += (char)unitAt(s, j++);
+        int ed = 0;
+        while (j < n && unitAt(s, j) >= '0' && unitAt(s, j) <= '9')
+        {
+            e += (char)unitAt(s, j++);
+            ++ed;
+        }
+        if (ed)
+            t += e;
+    }
+    return num(std::strtod(t.c_str(), nullptr));
+}
+
+V gIsNaN(V, V *args, int argc)
+{
+    double d = toNumber(argOr(args, argc, 0));
+    return boolv(d != d);
+}
+
+V gIsFinite(V, V *args, int argc)
+{
+    double d = toNumber(argOr(args, argc, 0));
+    return boolv(d - d == 0);
+}
+
+V gEval(V, V *args, int argc)
+{
+    return indirectEval(argOr(args, argc, 0));
+}
+
+std::string uriEncode(JStr *s, const char *keep)
+{
+    s = flat_(s);
+    std::string out;
+    static const char *hex = "0123456789ABCDEF";
+    for (int i = 0; i < s->len; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c < 128 && c != 0 && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || std::strchr(keep, c)))
+        {
+            out += (char)c;
+            continue;
+        }
+        uint32_t cp = (uint32_t)c;
+        if (c >= 0xDC00 && c < 0xE000)
+            throwError(E_URI, "URI malformed");
+        if (c >= 0xD800 && c < 0xDC00)
+        {
+            if (i + 1 >= s->len)
+                throwError(E_URI, "URI malformed");
+            int d = unitAt(s, i + 1);
+            if (d < 0xDC00 || d >= 0xE000)
+                throwError(E_URI, "URI malformed");
+            cp = 0x10000 + (((uint32_t)c - 0xD800) << 10) + ((uint32_t)d - 0xDC00);
+            ++i;
+        }
+        unsigned char b[4];
+        int n;
+        if (cp < 0x80)
+        {
+            b[0] = (unsigned char)cp;
+            n = 1;
+        }
+        else if (cp < 0x800)
+        {
+            b[0] = (unsigned char)(0xC0 | (cp >> 6));
+            b[1] = (unsigned char)(0x80 | (cp & 63));
+            n = 2;
+        }
+        else if (cp < 0x10000)
+        {
+            b[0] = (unsigned char)(0xE0 | (cp >> 12));
+            b[1] = (unsigned char)(0x80 | ((cp >> 6) & 63));
+            b[2] = (unsigned char)(0x80 | (cp & 63));
+            n = 3;
+        }
+        else
+        {
+            b[0] = (unsigned char)(0xF0 | (cp >> 18));
+            b[1] = (unsigned char)(0x80 | ((cp >> 12) & 63));
+            b[2] = (unsigned char)(0x80 | ((cp >> 6) & 63));
+            b[3] = (unsigned char)(0x80 | (cp & 63));
+            n = 4;
+        }
+        for (int k = 0; k < n; ++k)
+        {
+            out += '%';
+            out += hex[b[k] >> 4];
+            out += hex[b[k] & 15];
+        }
+    }
+    return out;
+}
+
+int hexDigit(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+V uriDecode(JStr *s, const char *reserved)
+{
+    s = flat_(s);
+    std::vector<uint16_t> out;
+    for (int i = 0; i < s->len; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c != '%')
+        {
+            out.push_back((uint16_t)c);
+            continue;
+        }
+        int start = i;
+        if (i + 2 >= s->len || hexDigit(unitAt(s, i + 1)) < 0 || hexDigit(unitAt(s, i + 2)) < 0)
+            throwError(E_URI, "URI malformed");
+        int b = hexDigit(unitAt(s, i + 1)) * 16 + hexDigit(unitAt(s, i + 2));
+        i += 2;
+        if (b < 0x80)
+        {
+            if (std::strchr(reserved, b) && b)
+                for (int k = start; k <= i; ++k)
+                    out.push_back((uint16_t)unitAt(s, k));
+            else
+                out.push_back((uint16_t)b);
+            continue;
+        }
+        int more = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC0 ? 1 : -1;
+        if (more < 0 || b > 0xF4)
+            throwError(E_URI, "URI malformed");
+        uint32_t cp = (uint32_t)(b & (0x3F >> more));
+        for (int k = 0; k < more; ++k)
+        {
+            if (i + 3 >= s->len + 0 && i + 3 > s->len)
+                throwError(E_URI, "URI malformed");
+            if (i + 1 >= s->len || unitAt(s, i + 1) != '%' || i + 3 >= s->len + 1)
+                throwError(E_URI, "URI malformed");
+            int h1 = hexDigit(unitAt(s, i + 2)), h2 = i + 3 < s->len ? hexDigit(unitAt(s, i + 3)) : -1;
+            if (h1 < 0 || h2 < 0)
+                throwError(E_URI, "URI malformed");
+            int bb = h1 * 16 + h2;
+            if ((bb & 0xC0) != 0x80)
+                throwError(E_URI, "URI malformed");
+            cp = (cp << 6) | (uint32_t)(bb & 0x3F);
+            i += 3;
+        }
+        if (cp >= 0x10000)
+        {
+            cp -= 0x10000;
+            out.push_back((uint16_t)(0xD800 + (cp >> 10)));
+            out.push_back((uint16_t)(0xDC00 + (cp & 0x3FF)));
+        }
+        else
+            out.push_back((uint16_t)cp);
+    }
+    return strv(newStrFromUnitsVec(out));
+}
+
+V gEncodeURI(V, V *args, int argc)
+{
+    return str(uriEncode(toStr(argOr(args, argc, 0)), ";/?:@&=+$,-_.!~*'()#"));
+}
+
+V gEncodeURIComponent(V, V *args, int argc)
+{
+    return str(uriEncode(toStr(argOr(args, argc, 0)), "-_.!~*'()"));
+}
+
+V gDecodeURI(V, V *args, int argc)
+{
+    return uriDecode(toStr(argOr(args, argc, 0)), ";/?:@&=+$,#");
+}
+
+V gDecodeURIComponent(V, V *args, int argc)
+{
+    return uriDecode(toStr(argOr(args, argc, 0)), "");
+}
+
+V gEscape(V, V *args, int argc)
+{
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    std::string out;
+    static const char *hex = "0123456789ABCDEF";
+    for (int i = 0; i < s->len; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c < 128 && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c && std::strchr("@*_+-./", c))))
+            out += (char)c;
+        else if (c < 256)
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+        else
+        {
+            out += "%u";
+            out += hex[(c >> 12) & 15];
+            out += hex[(c >> 8) & 15];
+            out += hex[(c >> 4) & 15];
+            out += hex[c & 15];
+        }
+    }
+    return str(out);
+}
+
+V gUnescape(V, V *args, int argc)
+{
+    JStr *s = flat_(toStr(argOr(args, argc, 0)));
+    std::vector<uint16_t> out;
+    int n = s->len;
+    for (int i = 0; i < n; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c == '%')
+        {
+            if (i + 5 < n && unitAt(s, i + 1) == 'u' && hexDigit(unitAt(s, i + 2)) >= 0 && hexDigit(unitAt(s, i + 3)) >= 0 && hexDigit(unitAt(s, i + 4)) >= 0 && hexDigit(unitAt(s, i + 5)) >= 0)
+            {
+                out.push_back((uint16_t)(hexDigit(unitAt(s, i + 2)) * 4096 + hexDigit(unitAt(s, i + 3)) * 256 + hexDigit(unitAt(s, i + 4)) * 16 + hexDigit(unitAt(s, i + 5))));
+                i += 5;
+                continue;
+            }
+            if (i + 2 < n && hexDigit(unitAt(s, i + 1)) >= 0 && hexDigit(unitAt(s, i + 2)) >= 0)
+            {
+                out.push_back((uint16_t)(hexDigit(unitAt(s, i + 1)) * 16 + hexDigit(unitAt(s, i + 2))));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back((uint16_t)c);
+    }
+    return strv(newStrFromUnitsVec(out));
+}
+
+} // namespace
+
+// ── start-up ─────────────────────────────────────────────────────────────
+
+void initCore()
+{
+    setAtoms();
+    g_strTooLong = strTooLong;
+    initLookupCache();
+    g_rootShape = NEW(Shape);
+    g_rootShape->index = -1;
+    size_t stackBytes = sizeof(V) * (1u << 21);
+    g_spBase = static_cast<V *>(zalloc(stackBytes));
+    g_sp = g_spBase;
+    g_spEnd = g_spBase + (1u << 21);
+    char probe;
+    g_stackLimit = &probe - (58u << 20);
+
+    WK.iterator = symv(NEW(JSym));
+    symp(WK.iterator)->desc = strA("Symbol.iterator");
+    WK.asyncIterator = makeWellKnown("Symbol.asyncIterator");
+    WK.hasInstance = makeWellKnown("Symbol.hasInstance");
+    WK.toPrimitive = makeWellKnown("Symbol.toPrimitive");
+    WK.toStringTag = makeWellKnown("Symbol.toStringTag");
+    WK.species = makeWellKnown("Symbol.species");
+    WK.isConcatSpreadable = makeWellKnown("Symbol.isConcatSpreadable");
+    WK.unscopables = makeWellKnown("Symbol.unscopables");
+    WK.match = makeWellKnown("Symbol.match");
+    WK.matchAll = makeWellKnown("Symbol.matchAll");
+    WK.replace = makeWellKnown("Symbol.replace");
+    WK.search = makeWellKnown("Symbol.search");
+    WK.split = makeWellKnown("Symbol.split");
+
+    PR.object = allocObj(sizeof(Obj), C_OBJECT, nullptr);
+    PR.function = allocObj(sizeof(JFunc), C_FUNCTION, PR.object);
+    g_global = newObject();
+    PR.array = allocObj(sizeof(JArray), C_ARRAY, PR.object);
+    PR.string = allocObj(sizeof(JPrim), C_STRING, PR.object);
+    static_cast<JPrim *>(PR.string)->val = A.empty;
+    PR.number = allocObj(sizeof(JPrim), C_NUMBER, PR.object);
+    static_cast<JPrim *>(PR.number)->val = num(0);
+    PR.boolean = allocObj(sizeof(JPrim), C_BOOLEAN, PR.object);
+    static_cast<JPrim *>(PR.boolean)->val = False;
+    PR.symbol = newObject();
+    PR.bigint = newObject();
+    PR.iterator = newObject();
+    PR.arrayIter = newObjectProto(PR.iterator);
+    PR.stringIter = newObjectProto(PR.iterator);
+    PR.mapIter = newObjectProto(PR.iterator);
+    PR.setIter = newObjectProto(PR.iterator);
+    PR.regexpIter = newObjectProto(PR.iterator);
+    PR.generator = newObjectProto(PR.iterator);
+    PR.asyncIterator = newObject();
+    PR.asyncGenerator = newObjectProto(PR.asyncIterator);
+    PR.generatorFunction = newObjectProto(PR.function);
+    PR.asyncFunction = newObjectProto(PR.function);
+    PR.asyncGenFunction = newObjectProto(PR.function);
+    PR.regexp = newObject();
+    PR.date = newObject();
+    PR.map = newObject();
+    PR.set = newObject();
+    PR.weakmap = newObject();
+    PR.weakset = newObject();
+    PR.weakref = newObject();
+    PR.promise = newObject();
+    PR.arraybuffer = newObject();
+    PR.typedarray = newObject();
+    PR.dataview = newObject();
+
+    initFunctionBuiltins();
+    initObjectBuiltins();
+    initErrorBuiltins();
+    initSymbolBuiltins();
+    Obj *g = g_global;
+    defineOwn(g, atomOf("globalThis"), objv(g), PF_W | PF_C);
+    defineOwn(g, A.global, objv(g), PF_W | PF_C);
+    defineOwn(g, A.undefined, Undefined, 0);
+    defineOwn(g, atomOf("NaN"), num(0.0 / 0.0), 0);
+    defineOwn(g, atomOf("Infinity"), num(1.0 / 0.0), 0);
+    JFunc *b = defCtor("Boolean", booleanCtor, 1, PR.boolean);
+    (void)b;
+    defFn(PR.boolean, "toString", boolToString, 0);
+    defFn(PR.boolean, "valueOf", boolValueOf, 0);
+    defFn(g, "parseInt", gParseInt, 2);
+    defFn(g, "parseFloat", gParseFloat, 1);
+    defFn(g, "isNaN", gIsNaN, 1);
+    defFn(g, "isFinite", gIsFinite, 1);
+    JFunc *ev = newNative("eval", gEval, 1);
+    g_evalFn = objv(ev);
+    defineOwn(g, atomOf("eval"), g_evalFn, PF_W | PF_C);
+    defFn(g, "encodeURI", gEncodeURI, 1);
+    defFn(g, "encodeURIComponent", gEncodeURIComponent, 1);
+    defFn(g, "decodeURI", gDecodeURI, 1);
+    defFn(g, "decodeURIComponent", gDecodeURIComponent, 1);
+    defFn(g, "escape", gEscape, 1);
+    defFn(g, "unescape", gUnescape, 1);
+
+    initArrayBuiltins();
+    initStringBuiltins();
+    initNumberBuiltins();
+    initMathBuiltins();
+    initBigIntBuiltins();
+    initJsonBuiltins();
+    initRegExpBuiltins();
+    initCollectionBuiltins();
+    initReflectBuiltins();
+    initAsyncBuiltins();
+    initDateBuiltins();
+    initBinaryBuiltins();
+    initNodeBuiltins();
+}
+
+} // namespace js

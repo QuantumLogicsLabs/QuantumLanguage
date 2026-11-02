@@ -899,7 +899,8 @@ private:
                     rhs = next.text;
                 Token pasted = res.back();
                 res.pop_back();
-                Lexer lx(pasted.text + rhs, at.file);
+                std::string spelling = pasted.text + rhs; // outlives the lexer, which keeps a reference
+                Lexer lx(spelling, at.file);
                 auto toks = lx.run();
                 toks.pop_back();
                 for (auto &x : toks)

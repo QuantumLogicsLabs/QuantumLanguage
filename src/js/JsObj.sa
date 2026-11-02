@@ -1,0 +1,2238 @@
+// quantum: cpp
+// JavaScript front-end: objects and values. Objects share hidden-class shapes
+// until a property is deleted or changes its attributes; then the object gets
+// a dictionary of its own. Arrays, strings, typed arrays, arguments objects and
+// proxies differ in how indexes and `length` behave, which is decided here.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+namespace js
+{
+
+V *g_sp = nullptr;
+V *g_spBase = nullptr, *g_spEnd = nullptr;
+Frame *g_frame = nullptr;
+uint8_t g_comp = 0;
+V g_compLabel = 0;
+V g_retVal = Undefined;
+char *g_stackLimit = nullptr;
+WellKnown WK;
+Protos PR;
+Obj *g_global = nullptr;
+Shape *g_rootShape = nullptr;
+V g_nativeNewTarget = Undefined;
+JFunc *g_nativeCallee = nullptr;
+
+// ── key tables ───────────────────────────────────────────────────────────
+
+struct KeyTable
+{
+    V *keys;
+    int32_t *vals;
+    uint32_t cap, used;
+};
+
+#define KT_TOMB ((V)1)
+#define keyHash(k) ((uint32_t)(((k) >> 3) ^ ((k) >> 17)))
+
+static KeyTable *ktNew(uint32_t cap)
+{
+    KeyTable *t = NEW(KeyTable);
+    t->cap = cap;
+    t->used = 0;
+    t->keys = static_cast<V *>(bump(sizeof(V) * cap));
+    t->vals = static_cast<int32_t *>(bump(sizeof(int32_t) * cap));
+    return t;
+}
+
+static int ktGet(KeyTable *t, V key)
+{
+    uint32_t m = t->cap - 1;
+    uint32_t h = keyHash(key) & m;
+    for (;;)
+    {
+        V k = t->keys[h];
+        if (k == key)
+            return t->vals[h];
+        if (!k)
+            return -1;
+        h = (h + 1) & m;
+    }
+}
+
+static KeyTable *ktPut(KeyTable *t, V key, int val)
+{
+    if ((t->used + 1) * 2 > t->cap)
+    {
+        KeyTable *n = ktNew(t->cap * 2);
+        for (uint32_t i = 0; i < t->cap; ++i)
+            if (t->keys[i] && t->keys[i] != KT_TOMB)
+                ktPut(n, t->keys[i], t->vals[i]);
+        t = n;
+    }
+    uint32_t m = t->cap - 1;
+    uint32_t h = keyHash(key) & m;
+    for (;;)
+    {
+        V k = t->keys[h];
+        if (k == key)
+        {
+            t->vals[h] = val;
+            return t;
+        }
+        if (!k)
+        {
+            t->keys[h] = key;
+            t->vals[h] = val;
+            ++t->used;
+            return t;
+        }
+        h = (h + 1) & m;
+    }
+}
+
+static void ktRemove(KeyTable *t, V key)
+{
+    uint32_t m = t->cap - 1;
+    uint32_t h = keyHash(key) & m;
+    for (;;)
+    {
+        V k = t->keys[h];
+        if (k == key)
+        {
+            t->keys[h] = KT_TOMB;
+            t->vals[h] = -1;
+            return;
+        }
+        if (!k)
+            return;
+        h = (h + 1) & m;
+    }
+}
+
+// ── shapes ───────────────────────────────────────────────────────────────
+
+#define LOOKUP_SIZE 8192
+struct LookupEntry
+{
+    Shape *shape;
+    V key;
+    int32_t index;
+    uint8_t flags;
+};
+static LookupEntry *g_lookup = nullptr;
+
+void initLookupCache()
+{
+    g_lookup = static_cast<LookupEntry *>(zalloc(LOOKUP_SIZE * sizeof(LookupEntry)));
+}
+
+static Shape *shapeNew(Shape *parent, V key, uint8_t flags)
+{
+    Shape *s = NEW(Shape);
+    s->parent = parent;
+    s->key = key;
+    s->flags = flags;
+    s->count = parent ? parent->count + 1 : 0;
+    s->index = s->count - 1;
+    s->hasIndexKeys = parent && parent->hasIndexKeys;
+    if (key && isStr(key) && sp_(key)->isIdx)
+        s->hasIndexKeys = true;
+    return s;
+}
+
+static void shapeBuildTable(Shape *s)
+{
+    uint32_t cap = 16;
+    while (cap < (uint32_t)s->count * 3)
+        cap *= 2;
+    KeyTable *t = ktNew(cap);
+    for (Shape *x = s; x && x->key; x = x->parent)
+        if (ktGet(t, x->key) < 0)
+            t = ktPut(t, x->key, x->index << 4 | x->flags);
+    s->table = t;
+}
+
+// the property's slot index, or -1
+int shapeFind(Shape *s, V key, uint8_t *flags)
+{
+    if (s->isDict)
+    {
+        int r = ktGet(s->table, key);
+        if (r < 0)
+            return -1;
+        *flags = (uint8_t)(r & 15);
+        return r >> 4;
+    }
+    uint32_t h = (uint32_t)((((uintptr_t)s) >> 4) ^ (key >> 3) ^ (key >> 13)) & (LOOKUP_SIZE - 1);
+    LookupEntry *e = &g_lookup[h];
+    if (e->shape == s && e->key == key)
+    {
+        *flags = e->flags;
+        return e->index;
+    }
+    int idx = -1;
+    uint8_t fl = 0;
+    if (s->count <= 8)
+    {
+        for (Shape *x = s; x->key; x = x->parent)
+            if (x->key == key)
+            {
+                idx = x->index;
+                fl = x->flags;
+                break;
+            }
+    }
+    else
+    {
+        if (!s->table)
+            shapeBuildTable(s);
+        int r = ktGet(s->table, key);
+        if (r >= 0)
+        {
+            idx = r >> 4;
+            fl = (uint8_t)(r & 15);
+        }
+    }
+    e->shape = s;
+    e->key = key;
+    e->index = idx;
+    e->flags = fl;
+    *flags = fl;
+    return idx;
+}
+
+static Shape *shapeAdd(Shape *s, V key, uint8_t flags)
+{
+    if (s->t1 && s->t1->key == key && s->t1->flags == flags)
+        return s->t1;
+    if (!s->t1)
+    {
+        s->t1 = shapeNew(s, key, flags);
+        return s->t1;
+    }
+    V tk = key ^ ((V)flags << 40);
+    if (s->trans)
+    {
+        int64_t found = -1;
+        uint32_t m = s->trans->cap - 1;
+        uint32_t h = keyHash(tk) & m;
+        while (s->trans->keys[h])
+        {
+            if (s->trans->keys[h] == tk)
+            {
+                found = (int64_t)h;
+                break;
+            }
+            h = (h + 1) & m;
+        }
+        if (found >= 0)
+        {
+            Shape **vals = reinterpret_cast<Shape **>(s->trans->vals);
+            return vals[found];
+        }
+    }
+    else
+    {
+        KeyTable *t = NEW(KeyTable);
+        t->cap = 8;
+        t->keys = static_cast<V *>(bump(sizeof(V) * 8));
+        t->vals = reinterpret_cast<int32_t *>(bump(sizeof(Shape *) * 8));
+        s->trans = t;
+    }
+    if ((s->trans->used + 1) * 2 > s->trans->cap)
+    {
+        KeyTable *o = s->trans;
+        KeyTable *t = NEW(KeyTable);
+        t->cap = o->cap * 2;
+        t->keys = static_cast<V *>(bump(sizeof(V) * t->cap));
+        t->vals = reinterpret_cast<int32_t *>(bump(sizeof(Shape *) * t->cap));
+        Shape **ov = reinterpret_cast<Shape **>(o->vals);
+        Shape **nv = reinterpret_cast<Shape **>(t->vals);
+        for (uint32_t i = 0; i < o->cap; ++i)
+            if (o->keys[i])
+            {
+                uint32_t h = keyHash(o->keys[i]) & (t->cap - 1);
+                while (t->keys[h])
+                    h = (h + 1) & (t->cap - 1);
+                t->keys[h] = o->keys[i];
+                nv[h] = ov[i];
+                ++t->used;
+            }
+        s->trans = t;
+    }
+    Shape *c = shapeNew(s, key, flags);
+    uint32_t m = s->trans->cap - 1;
+    uint32_t h = keyHash(tk) & m;
+    while (s->trans->keys[h])
+        h = (h + 1) & m;
+    s->trans->keys[h] = tk;
+    reinterpret_cast<Shape **>(s->trans->vals)[h] = c;
+    ++s->trans->used;
+    return c;
+}
+
+// the object gets a dictionary of its own
+static void toDict(Obj *o)
+{
+    Shape *s = o->shape;
+    if (s->isDict)
+        return;
+    Shape *d = NEW(Shape);
+    d->isDict = true;
+    d->hasIndexKeys = s->hasIndexKeys;
+    int n = s->count;
+    int cap = n < 8 ? 16 : n * 2;
+    d->dkeys = static_cast<V *>(bump(sizeof(V) * (size_t)cap));
+    d->dflags = static_cast<uint8_t *>(bump((size_t)cap));
+    d->dcap = cap;
+    d->dused = n;
+    for (Shape *x = s; x->key; x = x->parent)
+    {
+        d->dkeys[x->index] = x->key;
+        d->dflags[x->index] = x->flags;
+    }
+    uint32_t tc = 32;
+    while (tc < (uint32_t)n * 3)
+        tc *= 2;
+    KeyTable *t = ktNew(tc);
+    for (int i = 0; i < n; ++i)
+        t = ktPut(t, d->dkeys[i], i << 4 | d->dflags[i]);
+    d->table = t;
+    d->count = n;
+    o->shape = d;
+}
+
+static void dictAdd(Obj *o, V key, uint8_t flags, V val);
+
+// a fresh dictionary without the holes deletions left
+static void dictCompact(Obj *o)
+{
+    Shape *d = o->shape;
+    int w = 0;
+    for (int i = 0; i < d->dused; ++i)
+        if (d->dkeys[i])
+        {
+            d->dkeys[w] = d->dkeys[i];
+            d->dflags[w] = d->dflags[i];
+            o->slots[w] = o->slots[i];
+            ++w;
+        }
+    for (int i = w; i < d->dused; ++i)
+        d->dkeys[i] = 0;
+    d->dused = w;
+    uint32_t tc = 32;
+    while (tc < (uint32_t)w * 3)
+        tc *= 2;
+    KeyTable *t = ktNew(tc);
+    for (int i = 0; i < w; ++i)
+        t = ktPut(t, d->dkeys[i], i << 4 | d->dflags[i]);
+    d->table = t;
+}
+
+static void ensureSlots(Obj *o, int need)
+{
+    if (need <= o->cap)
+        return;
+    int cap = o->cap ? o->cap * 2 : 4;
+    if (cap < need)
+        cap = need;
+    V *n = static_cast<V *>(bump(sizeof(V) * (size_t)cap));
+    if (o->cap)
+        std::memcpy(n, o->slots, sizeof(V) * (size_t)o->cap);
+    o->slots = n;
+    o->cap = cap;
+}
+
+static void dictAdd(Obj *o, V key, uint8_t flags, V val)
+{
+    Shape *d = o->shape;
+    if (d->dused >= d->dcap)
+    {
+        if (d->count * 2 < d->dused)
+            dictCompact(o);
+        else
+        {
+            int cap = d->dcap * 2;
+            V *nk = static_cast<V *>(bump(sizeof(V) * (size_t)cap));
+            uint8_t *nf = static_cast<uint8_t *>(bump((size_t)cap));
+            std::memcpy(nk, d->dkeys, sizeof(V) * (size_t)d->dused);
+            std::memcpy(nf, d->dflags, (size_t)d->dused);
+            d->dkeys = nk;
+            d->dflags = nf;
+            d->dcap = cap;
+        }
+    }
+    int i = d->dused++;
+    d->dkeys[i] = key;
+    d->dflags[i] = flags;
+    d->table = ktPut(d->table, key, i << 4 | flags);
+    d->count++;
+    d->keysCache = nullptr;
+    if (isStr(key) && sp_(key)->isIdx)
+        d->hasIndexKeys = true;
+    ensureSlots(o, i + 1);
+    o->slots[i] = val;
+}
+
+// add a property known not to exist
+void addProp(Obj *o, V key, V val, uint8_t flags)
+{
+    Shape *s = o->shape;
+    if (s->isDict)
+    {
+        dictAdd(o, key, flags, val);
+        return;
+    }
+    if (s->count >= 64)
+    {
+        toDict(o);
+        dictAdd(o, key, flags, val);
+        return;
+    }
+    Shape *n = shapeAdd(s, key, flags);
+    int idx = n->index;
+    if (idx >= o->cap)
+        ensureSlots(o, idx + 1);
+    o->slots[idx] = val;
+    o->shape = n;
+}
+
+static void setFlags(Obj *o, int idx, V key, uint8_t flags)
+{
+    toDict(o);
+    Shape *d = o->shape;
+    d->dflags[idx] = flags;
+    d->table = ktPut(d->table, key, idx << 4 | flags);
+}
+
+static void removeProp(Obj *o, V key, int idx)
+{
+    toDict(o);
+    Shape *d = o->shape;
+    d->dkeys[idx] = 0;
+    ktRemove(d->table, key);
+    d->count--;
+    o->slots[idx] = Undefined;
+}
+
+// ── allocation ───────────────────────────────────────────────────────────
+
+Obj *allocObj(size_t size, uint8_t cls, Obj *proto)
+{
+    Obj *o = static_cast<Obj *>(bump(size));
+    o->shape = g_rootShape;
+    o->proto = proto;
+    o->cls = cls;
+    return o;
+}
+
+Obj *newObject()
+{
+    return allocObj(sizeof(Obj), C_OBJECT, PR.object);
+}
+
+Obj *newObjectProto(Obj *proto)
+{
+    return allocObj(sizeof(Obj), C_OBJECT, proto);
+}
+
+JArray *newArray(uint32_t reserve)
+{
+    JArray *a = static_cast<JArray *>(allocObj(sizeof(JArray), C_ARRAY, PR.array));
+    if (reserve)
+    {
+        a->el = static_cast<V *>(bump(sizeof(V) * reserve));
+        a->elCap = reserve;
+    }
+    return a;
+}
+
+JArray *newArrayFrom(V *items, int n)
+{
+    JArray *a = newArray((uint32_t)n);
+    if (n)
+        std::memcpy(a->el, items, sizeof(V) * (size_t)n);
+    a->len = (uint32_t)n;
+    a->used = (uint32_t)n;
+    return a;
+}
+
+void arrayEnsure(JArray *a, uint32_t need)
+{
+    if (need <= a->elCap)
+        return;
+    uint32_t cap = a->elCap ? a->elCap + (a->elCap >> 1) + 4 : 4;
+    if (cap < need)
+        cap = need;
+    V *n = static_cast<V *>(bump(sizeof(V) * cap));
+    if (a->used)
+        std::memcpy(n, a->el, sizeof(V) * a->used);
+    a->el = n;
+    a->elCap = cap;
+}
+
+void arrayPush(JArray *a, V v)
+{
+    if (a->used < a->len)
+    {
+        arrayEnsure(a, a->len + 1);
+        for (uint32_t i = a->used; i < a->len; ++i)
+            a->el[i] = Hole;
+        a->used = a->len;
+    }
+    if (a->used >= a->elCap)
+        arrayEnsure(a, a->used + 1);
+    a->el[a->used++] = v;
+    a->len = a->used;
+}
+
+// ── a function's properties, made when first asked for ───────────────────
+
+void materializeFn(JFunc *f)
+{
+    if (!(f->flags & OF_LAZYFN))
+        return;
+    f->flags &= ~OF_LAZYFN;
+    // these may come after properties set before anything looked
+    if (f->kind == FK_NATIVE || f->kind == FK_BOUND)
+    {
+        defineOwn(f, A.length, num((double)f->natLen), PF_C);
+        defineOwn(f, A.name, f->fnName, PF_C);
+        return;
+    }
+    FuncNode *n = f->node;
+    defineOwn(f, A.length, num((double)n->length), PF_C);
+    defineOwn(f, A.name, f->fnName ? f->fnName : (n->name ? n->name : A.empty), PF_C);
+    if (f->kind == FK_NORMAL && !n->isMethod && !n->isArrow)
+    {
+        if (!n->strict)
+        {
+            defineOwn(f, atomOf("arguments"), Null, 0);
+            defineOwn(f, atomOf("caller"), Null, 0);
+        }
+        Obj *p = newObject();
+        addProp(p, A.constructor, objv(f), PF_W | PF_C);
+        defineOwn(f, A.prototype, objv(p), PF_W);
+    }
+    else if (f->kind == FK_GENERATOR)
+    {
+        Obj *p = newObjectProto(PR.generator);
+        defineOwn(f, A.prototype, objv(p), PF_W);
+    }
+    else if (f->kind == FK_ASYNCGEN)
+    {
+        Obj *p = newObjectProto(PR.asyncGenerator);
+        defineOwn(f, A.prototype, objv(p), PF_W);
+    }
+}
+
+#define LAZY(o) \
+    if ((o)->flags & OF_LAZYFN) \
+    materializeFn(static_cast<JFunc *>(o))
+
+// ── own properties ───────────────────────────────────────────────────────
+
+// exotic elements: 1 found, 0 not there, -1 not an element key
+static int exoticGet(Obj *o, V key, V *out)
+{
+    if (!isStr(key))
+        return -1;
+    JStr *k = sp_(key);
+    switch (o->cls)
+    {
+    case C_ARRAY:
+    {
+        JArray *a = static_cast<JArray *>(o);
+        if (k->isIdx)
+        {
+            if (k->idx < a->used && a->el[k->idx] != Hole)
+            {
+                *out = a->el[k->idx];
+                return 1;
+            }
+            return 0;
+        }
+        if (key == A.length)
+        {
+            *out = num((double)a->len);
+            return 1;
+        }
+        return -1;
+    }
+    case C_ARGUMENTS:
+    {
+        JArgs *a = static_cast<JArgs *>(o);
+        if (k->isIdx)
+        {
+            if (k->idx < a->used && a->el[k->idx] != Hole)
+            {
+                if ((int)k->idx < a->nMap && a->map[k->idx] >= 0)
+                    *out = a->env->slots[a->map[k->idx]];
+                else
+                    *out = a->el[k->idx];
+                return 1;
+            }
+            return 0;
+        }
+        return -1;
+    }
+    case C_STRING:
+    {
+        JStr *s = sp_(static_cast<JPrim *>(o)->val);
+        if (k->isIdx)
+        {
+            if ((int64_t)k->idx < s->len)
+            {
+                s = flat_(s);
+                *out = strv(charStr(unitAt(s, k->idx)));
+                return 1;
+            }
+            return -1;
+        }
+        if (key == A.length)
+        {
+            *out = num((double)s->len);
+            return 1;
+        }
+        return -1;
+    }
+    case C_TYPEDARRAY:
+        return typedGetKey(o, key, out);
+    default:
+        return -1;
+    }
+}
+
+bool getOwnSlot(Obj *o, V key, V *out, uint8_t *flags)
+{
+    LAZY(o);
+    int ex = exoticGet(o, key, out);
+    if (ex == 1)
+    {
+        *flags = PF_DEFAULT;
+        if (o->cls == C_ARRAY && key == A.length)
+            *flags = (o->flags & OF_FROZEN) ? 0 : PF_W;
+        else if (o->cls == C_STRING)
+            *flags = key == A.length ? 0 : PF_E;
+        else if (o->flags & OF_FROZEN)
+            *flags = PF_E;
+        else if (o->flags & OF_SEALED)
+            *flags = PF_W | PF_E;
+        return true;
+    }
+    if (ex == 0)
+        return false;
+    uint8_t fl;
+    int idx = shapeFind(o->shape, key, &fl);
+    if (idx < 0)
+        return false;
+    *out = o->slots[idx];
+    *flags = fl;
+    return true;
+}
+
+V getPropObj(Obj *o, V key, V receiver)
+{
+    for (; o; o = o->proto)
+    {
+        if (o->flags & OF_LAZYFN)
+            materializeFn(static_cast<JFunc *>(o));
+        if (o->cls != C_OBJECT)
+        {
+            if (o->cls == C_PROXY)
+                return proxyGet(o, key, receiver);
+            V out;
+            int ex = exoticGet(o, key, &out);
+            if (ex == 1)
+                return out;
+            if (ex == 0 && o->cls == C_TYPEDARRAY)
+                return Undefined;
+        }
+        uint8_t fl;
+        int idx = shapeFind(o->shape, key, &fl);
+        if (idx >= 0)
+        {
+            V v = o->slots[idx];
+            if (fl & PF_ACCESSOR)
+            {
+                Accessor *ac = static_cast<Accessor *>(op(v));
+                if (ac->get == Undefined)
+                    return Undefined;
+                return call(ac->get, receiver, nullptr, 0);
+            }
+            return v;
+        }
+    }
+    return Undefined;
+}
+
+V getProp(V base, V key)
+{
+    if (isObj(base))
+        return getPropObj(op(base), key, base);
+    if (isStr(base))
+    {
+        JStr *s = sp_(base);
+        if (key == A.length)
+            return num((double)s->len);
+        if (isStr(key) && sp_(key)->isIdx)
+        {
+            uint32_t i = sp_(key)->idx;
+            if ((int64_t)i < s->len)
+            {
+                s = flat_(s);
+                return strv(charStr(unitAt(s, i)));
+            }
+        }
+        return getPropObj(PR.string, key, base);
+    }
+    if (isNum(base))
+        return getPropObj(PR.number, key, base);
+    if (isBool(base))
+        return getPropObj(PR.boolean, key, base);
+    if (isSym(base))
+        return getPropObj(PR.symbol, key, base);
+    if (isBig(base))
+        return getPropObj(PR.bigint, key, base);
+    errReadNullish(base, key);
+}
+
+V getIdx(V base, double idx)
+{
+    if (isObj(base))
+    {
+        Obj *o = op(base);
+        if (o->cls == C_ARRAY)
+        {
+            JArray *a = static_cast<JArray *>(o);
+            uint32_t i = (uint32_t)idx;
+            if ((double)i == idx && i < a->used && a->el[i] != Hole)
+                return a->el[i];
+        }
+    }
+    V iv = num(idx);
+    return getProp(base, toKey(iv));
+}
+
+V getV(V base, const char *name)
+{
+    return getProp(base, atomOf(name));
+}
+
+bool hasOwn(Obj *o, V key)
+{
+    if (o->cls == C_PROXY)
+    {
+        V v, g, s;
+        uint8_t f;
+        return getOwnDesc(o, key, &v, &g, &s, &f);
+    }
+    V out;
+    uint8_t fl;
+    return getOwnSlot(o, key, &out, &fl);
+}
+
+bool hasProp(Obj *o, V key)
+{
+    for (; o; o = o->proto)
+    {
+        if (o->cls == C_PROXY)
+            return proxyHas(o, key);
+        if (o->cls == C_TYPEDARRAY)
+        {
+            V out;
+            int ex = typedGetKey(o, key, &out);
+            if (ex == 1)
+                return true;
+            if (ex == 0)
+                return false;
+        }
+        if (hasOwn(o, key))
+            return true;
+    }
+    return false;
+}
+
+void defineOwn(Obj *o, V key, V val, uint8_t flags)
+{
+    LAZY(o);
+    if (isStr(key))
+    {
+        JStr *k = sp_(key);
+        if (o->cls == C_ARRAY)
+        {
+            JArray *a = static_cast<JArray *>(o);
+            if (k->isIdx)
+            {
+                arraySetIndex(a, k->idx, val);
+                return;
+            }
+            if (key == A.length)
+            {
+                arraySetLength(a, val);
+                return;
+            }
+        }
+        else if (o->cls == C_ARGUMENTS && k->isIdx)
+        {
+            JArgs *a = static_cast<JArgs *>(o);
+            if (k->idx < a->used)
+            {
+                a->el[k->idx] = val;
+                if ((int)k->idx < a->nMap && a->map[k->idx] >= 0)
+                    a->env->slots[a->map[k->idx]] = val;
+                return;
+            }
+        }
+    }
+    uint8_t fl;
+    int idx = shapeFind(o->shape, key, &fl);
+    if (idx < 0)
+    {
+        addProp(o, key, val, flags);
+        return;
+    }
+    if (fl != flags)
+        setFlags(o, idx, key, flags);
+    o->slots[idx] = val;
+}
+
+void defineAccessor(Obj *o, V key, V getter, V setter, uint8_t flags)
+{
+    LAZY(o);
+    uint8_t fl;
+    int idx = shapeFind(o->shape, key, &fl);
+    if (idx >= 0 && (fl & PF_ACCESSOR))
+    {
+        Accessor *ac = static_cast<Accessor *>(op(o->slots[idx]));
+        // a second accessor object: shapes share nothing mutable
+        Accessor *n = static_cast<Accessor *>(allocObj(sizeof(Accessor), C_ACCESSOR, nullptr));
+        n->get = getter != Hole ? getter : ac->get;
+        n->set = setter != Hole ? setter : ac->set;
+        uint8_t nf = (uint8_t)((flags & (PF_E | PF_C)) | PF_ACCESSOR);
+        if (fl != nf)
+            setFlags(o, idx, key, nf);
+        o->slots[idx] = objv(n);
+        return;
+    }
+    Accessor *n = static_cast<Accessor *>(allocObj(sizeof(Accessor), C_ACCESSOR, nullptr));
+    n->get = getter != Hole ? getter : Undefined;
+    n->set = setter != Hole ? setter : Undefined;
+    uint8_t nf = (uint8_t)((flags & (PF_E | PF_C)) | PF_ACCESSOR);
+    if (idx >= 0)
+    {
+        setFlags(o, idx, key, nf);
+        o->slots[idx] = objv(n);
+    }
+    else
+        addProp(o, key, objv(n), nf);
+}
+
+// ── arrays ───────────────────────────────────────────────────────────────
+
+void arraySetIndex(JArray *a, uint32_t i, V val)
+{
+    if (i < a->used)
+    {
+        a->el[i] = val;
+        return;
+    }
+    if (i == a->used && a->used == a->len)
+    {
+        if (a->used >= a->elCap)
+            arrayEnsure(a, a->used + 1);
+        a->el[a->used++] = val;
+        a->len = a->used;
+        return;
+    }
+    // past the end: holes in between
+    arrayEnsure(a, i + 1);
+    for (uint32_t k = a->used; k < i; ++k)
+        a->el[k] = Hole;
+    a->el[i] = val;
+    a->used = i + 1;
+    if (a->len < a->used)
+        a->len = a->used;
+}
+
+void arraySetLength(JArray *a, V val)
+{
+    double d = toNumber(val);
+    uint32_t n = (uint32_t)d;
+    if ((double)n != d)
+        throwRange("Invalid array length");
+    if (n < a->used)
+        a->used = n;
+    a->len = n;
+}
+
+// ── writing ──────────────────────────────────────────────────────────────
+
+bool setPropObj(Obj *o, V key, V val, V receiver)
+{
+    bool onSelf = isObj(receiver) && op(receiver) == o;
+    if (o->flags & OF_LAZYFN)
+        materializeFn(static_cast<JFunc *>(o));
+    if (o->cls == C_PROXY)
+        return proxySet(o, key, val, receiver);
+    if (o->cls != C_OBJECT && isStr(key))
+    {
+        JStr *k = sp_(key);
+        switch (o->cls)
+        {
+        case C_ARRAY:
+            if (onSelf)
+            {
+                JArray *a = static_cast<JArray *>(o);
+                if (k->isIdx)
+                {
+                    if (o->flags & OF_FROZEN)
+                        return false;
+                    bool exists = k->idx < a->used && a->el[k->idx] != Hole;
+                    if (!exists)
+                    {
+                        if (o->flags & OF_NONEXT)
+                            return false;
+                        // a setter on the prototype chain is rare enough to ignore
+                    }
+                    arraySetIndex(a, k->idx, val);
+                    return true;
+                }
+                if (key == A.length)
+                {
+                    if (o->flags & OF_FROZEN)
+                        return false;
+                    arraySetLength(a, val);
+                    return true;
+                }
+            }
+            break;
+        case C_ARGUMENTS:
+            if (onSelf && k->isIdx)
+            {
+                JArgs *a = static_cast<JArgs *>(o);
+                if (k->idx < a->used)
+                {
+                    a->el[k->idx] = val;
+                    if ((int)k->idx < a->nMap && a->map[k->idx] >= 0)
+                        a->env->slots[a->map[k->idx]] = val;
+                    return true;
+                }
+            }
+            break;
+        case C_STRING:
+            if (k->isIdx && (int64_t)k->idx < sp_(static_cast<JPrim *>(o)->val)->len)
+                return false;
+            if (key == A.length)
+                return false;
+            break;
+        case C_TYPEDARRAY:
+        {
+            int r = typedSetKey(o, key, val);
+            if (r >= 0)
+                return true;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    uint8_t fl;
+    int idx = shapeFind(o->shape, key, &fl);
+    if (idx >= 0)
+    {
+        if (fl & PF_ACCESSOR)
+        {
+            Accessor *ac = static_cast<Accessor *>(op(o->slots[idx]));
+            if (ac->set == Undefined)
+                return false;
+            V a = val;
+            call(ac->set, receiver, &a, 1);
+            return true;
+        }
+        if (!(fl & PF_W))
+            return false;
+        if (onSelf)
+        {
+            o->slots[idx] = val;
+            return true;
+        }
+    }
+    else
+    {
+        // up the chain: setters and read-only properties there matter
+        for (Obj *p = o->proto; p; p = p->proto)
+        {
+            if (p->cls == C_PROXY)
+                return proxySet(p, key, val, receiver);
+            if (p->flags & OF_LAZYFN)
+                materializeFn(static_cast<JFunc *>(p));
+            uint8_t pf;
+            int pi = shapeFind(p->shape, key, &pf);
+            if (pi >= 0)
+            {
+                if (pf & PF_ACCESSOR)
+                {
+                    Accessor *ac = static_cast<Accessor *>(op(p->slots[pi]));
+                    if (ac->set == Undefined)
+                        return false;
+                    V a = val;
+                    call(ac->set, receiver, &a, 1);
+                    return true;
+                }
+                if (!(pf & PF_W))
+                    return false;
+                break;
+            }
+        }
+    }
+    if (!isObj(receiver))
+        return false;
+    Obj *r = op(receiver);
+    if (!onSelf)
+    {
+        if (r->cls == C_PROXY)
+        {
+            V v, g, s;
+            uint8_t f;
+            if (getOwnDesc(r, key, &v, &g, &s, &f))
+            {
+                if ((f & PF_ACCESSOR) || !(f & PF_W))
+                    return false;
+                Obj *d = newObject();
+                addProp(d, A.value, val, PF_DEFAULT);
+                return defineFromDesc(r, key, objv(d), false);
+            }
+            return defineFromDesc(r, key, descToObject(val, Hole, Hole, PF_DEFAULT), false);
+        }
+        uint8_t rf;
+        V cur;
+        if (getOwnSlot(r, key, &cur, &rf))
+        {
+            if ((rf & PF_ACCESSOR) || !(rf & PF_W))
+                return false;
+            defineOwn(r, key, val, rf);
+            return true;
+        }
+    }
+    if (r->flags & OF_NONEXT)
+        return false;
+    if (r->cls != C_OBJECT)
+    {
+        defineOwn(r, key, val, PF_DEFAULT);
+        return true;
+    }
+    addProp(r, key, val, PF_DEFAULT);
+    return true;
+}
+
+[[noreturn]] static void errStrictPut(int which, V base, V key)
+{
+    switch (which)
+    {
+    case 0:
+        throwType("Cannot set property " + keyText(key) + " of " + inspectBrief(base) + " which has only a getter");
+    case 1:
+        throwType("Cannot add property " + keyText(key) + ", object is not extensible");
+    case 2:
+        throwType("Cannot assign to read only property '" + keyText(key) + "' of object '" + inspectBrief(base) + "'");
+    case 3:
+        throwType("'set' on proxy: trap returned falsish for property '" + keyText(key) + "'");
+    case 4:
+        throwType("Cannot assign to read only property '" + keyText(key) + "' of string '" + toUtf8(sp_(base)) + "'");
+    default:
+        throwType("Cannot create property '" + keyText(key) + "' on " + toUtf8(sp_(typeOf(base))) + " '" + toUtf8V(base) + "'");
+    }
+}
+
+void putProp(V base, V key, V val, bool strict)
+{
+    if (isObj(base))
+    {
+        if (!setPropObj(op(base), key, val, base) && strict)
+        {
+            Obj *o = op(base);
+            uint8_t fl;
+            V cur;
+            // say what the failure was, as V8 does
+            if (o->cls != C_PROXY)
+            {
+                bool own = getOwnSlot(o, key, &cur, &fl);
+                bool accessor = false;
+                if (!own)
+                    for (Obj *p = o->proto; p; p = p->proto)
+                    {
+                        if (getOwnSlot(p, key, &cur, &fl))
+                        {
+                            accessor = (fl & PF_ACCESSOR) != 0;
+                            own = true;
+                            break;
+                        }
+                    }
+                else
+                    accessor = (fl & PF_ACCESSOR) != 0;
+                errStrictPut(accessor ? 0 : !own ? 1 : 2, base, key);
+            }
+            errStrictPut(3, base, key);
+        }
+        return;
+    }
+    if (isNullish(base))
+        errSetNullish(base, key);
+    // a primitive: setters on its prototype run; nothing else can stick
+    Obj *proto = isStr(base) ? PR.string : isNum(base) ? PR.number : isBool(base) ? PR.boolean : isSym(base) ? PR.symbol : PR.bigint;
+    if (isStr(base) && isStr(key) && (key == A.length || (sp_(key)->isIdx && (int64_t)sp_(key)->idx < sp_(base)->len)))
+    {
+        if (strict)
+            errStrictPut(4, base, key);
+        return;
+    }
+    if (!setPropObj(proto, key, val, base) && strict)
+        errStrictPut(5, base, key);
+}
+
+bool deleteProp(Obj *o, V key)
+{
+    LAZY(o);
+    if (o->cls == C_PROXY)
+        return proxyDelete(o, key);
+    if (isStr(key))
+    {
+        JStr *k = sp_(key);
+        if (o->cls == C_ARRAY || o->cls == C_ARGUMENTS)
+        {
+            JArray *a = static_cast<JArray *>(o);
+            if (k->isIdx)
+            {
+                if (k->idx < a->used && a->el[k->idx] != Hole)
+                {
+                    if (o->flags & (OF_FROZEN | OF_SEALED))
+                        return false;
+                    a->el[k->idx] = Hole;
+                    if (o->cls == C_ARGUMENTS && (int)k->idx < static_cast<JArgs *>(o)->nMap)
+                        static_cast<JArgs *>(o)->map[k->idx] = -1;
+                }
+                return true;
+            }
+            if (key == A.length && o->cls == C_ARRAY)
+                return false;
+        }
+        else if (o->cls == C_STRING)
+        {
+            if (key == A.length || (k->isIdx && (int64_t)k->idx < sp_(static_cast<JPrim *>(o)->val)->len))
+                return false;
+        }
+        else if (o->cls == C_TYPEDARRAY)
+        {
+            V out;
+            int ex = typedGetKey(o, key, &out);
+            if (ex >= 0)
+                return ex == 0;
+        }
+    }
+    uint8_t fl;
+    int idx = shapeFind(o->shape, key, &fl);
+    if (idx < 0)
+        return true;
+    if (!(fl & PF_C))
+        return false;
+    removeProp(o, key, idx);
+    return true;
+}
+
+static void shapeKeys(Shape *s, std::vector<V> &out)
+{
+    if (s->isDict)
+    {
+        for (int i = 0; i < s->dused; ++i)
+            if (s->dkeys[i])
+                out.push_back(s->dkeys[i]);
+        return;
+    }
+    size_t base = out.size();
+    out.resize(base + (size_t)s->count);
+    for (Shape *x = s; x->key; x = x->parent)
+        out[base + (size_t)x->index] = x->key;
+}
+
+void ownKeys(Obj *o, std::vector<V> &out, bool strings, bool symbols, bool onlyEnumerable)
+{
+    LAZY(o);
+    if (o->cls == C_PROXY)
+    {
+        proxyOwnKeys(o, out, strings, symbols, onlyEnumerable);
+        return;
+    }
+    if (strings)
+    {
+        if (o->cls == C_ARRAY || o->cls == C_ARGUMENTS)
+        {
+            JArray *a = static_cast<JArray *>(o);
+            for (uint32_t i = 0; i < a->used; ++i)
+                if (a->el[i] != Hole)
+                    out.push_back(atomIndex(i));
+        }
+        else if (o->cls == C_STRING)
+        {
+            int n = sp_(static_cast<JPrim *>(o)->val)->len;
+            for (int i = 0; i < n; ++i)
+                out.push_back(atomIndex((uint32_t)i));
+        }
+        else if (o->cls == C_TYPEDARRAY)
+        {
+            int64_t n = typedLength(o);
+            for (int64_t i = 0; i < n; ++i)
+                out.push_back(atomIndex((uint32_t)i));
+        }
+        if (!onlyEnumerable)
+        {
+            if (o->cls == C_ARRAY)
+                out.push_back(A.length);
+            else if (o->cls == C_STRING)
+                out.push_back(A.length);
+        }
+    }
+    std::vector<V> names;
+    shapeKeys(o->shape, names);
+    Shape *s = o->shape;
+    if (strings && s->hasIndexKeys)
+    {
+        std::vector<V> idx;
+        for (V k : names)
+            if (isStr(k) && sp_(k)->isIdx)
+            {
+                if (onlyEnumerable)
+                {
+                    uint8_t f;
+                    shapeFind(s, k, &f);
+                    if (!(f & PF_E))
+                        continue;
+                }
+                idx.push_back(k);
+            }
+        std::sort(idx.begin(), idx.end(), [](V x, V y) { return sp_(x)->idx < sp_(y)->idx; });
+        for (V k : idx)
+            out.push_back(k);
+    }
+    for (V k : names)
+    {
+        if (isStr(k))
+        {
+            if (!strings || sp_(k)->isIdx)
+                continue;
+        }
+        else
+            continue;
+        if (onlyEnumerable)
+        {
+            uint8_t f;
+            shapeFind(s, k, &f);
+            if (!(f & PF_E))
+                continue;
+        }
+        out.push_back(k);
+    }
+    if (symbols)
+        for (V k : names)
+        {
+            if (!isSym(k) || symp(k)->isPrivate)
+                continue;
+            if (onlyEnumerable)
+            {
+                uint8_t f;
+                shapeFind(s, k, &f);
+                if (!(f & PF_E))
+                    continue;
+            }
+            out.push_back(k);
+        }
+}
+
+Obj *protoOf(Obj *o)
+{
+    if (o->cls == C_PROXY)
+        return proxyGetProto(o);
+    return o->proto;
+}
+
+bool setProtoOf(Obj *o, Obj *proto)
+{
+    if (o->cls == C_PROXY)
+        return proxySetProto(o, proto);
+    if (o->proto == proto)
+        return true;
+    if (o->flags & OF_NONEXT)
+        return false;
+    for (Obj *p = proto; p; p = p->proto)
+    {
+        if (p == o)
+            return false;
+        if (p->cls == C_PROXY)
+            break;
+    }
+    o->proto = proto;
+    return true;
+}
+
+bool isExtensible(Obj *o)
+{
+    if (o->cls == C_PROXY)
+        return proxyIsExtensible(o);
+    return !(o->flags & OF_NONEXT);
+}
+
+bool preventExt(Obj *o)
+{
+    if (o->cls == C_PROXY)
+        return proxyPreventExt(o);
+    o->flags |= OF_NONEXT;
+    return true;
+}
+
+bool getOwnDesc(Obj *o, V key, V *val, V *getter, V *setter, uint8_t *flags)
+{
+    if (o->cls == C_PROXY)
+        return proxyGetOwnDesc(o, key, val, getter, setter, flags);
+    V out;
+    uint8_t fl;
+    if (!getOwnSlot(o, key, &out, &fl))
+        return false;
+    *flags = fl;
+    if (fl & PF_ACCESSOR)
+    {
+        Accessor *ac = static_cast<Accessor *>(op(out));
+        *getter = ac->get;
+        *setter = ac->set;
+        *val = Undefined;
+    }
+    else
+    {
+        *val = out;
+        *getter = Hole;
+        *setter = Hole;
+    }
+    return true;
+}
+
+V descToObject(V val, V getter, V setter, uint8_t flags)
+{
+    Obj *d = newObject();
+    if (flags & PF_ACCESSOR)
+    {
+        addProp(d, A.get, getter, PF_DEFAULT);
+        addProp(d, A.set, setter, PF_DEFAULT);
+    }
+    else
+    {
+        addProp(d, A.value, val, PF_DEFAULT);
+        addProp(d, A.writable, boolv(flags & PF_W), PF_DEFAULT);
+    }
+    addProp(d, A.enumerable, boolv(flags & PF_E), PF_DEFAULT);
+    addProp(d, A.configurable, boolv(flags & PF_C), PF_DEFAULT);
+    return objv(d);
+}
+
+bool defineFromDesc(Obj *o, V key, V desc, bool throwing)
+{
+    if (!isObj(desc))
+        throwType("Property description must be an object: " + inspectBrief(desc));
+    Obj *d = op(desc);
+    bool hasGet = hasProp(d, A.get), hasSet = hasProp(d, A.set), hasVal = hasProp(d, A.value), hasW = hasProp(d, A.writable);
+    bool hasE = hasProp(d, A.enumerable), hasC = hasProp(d, A.configurable);
+    V g = hasGet ? getPropObj(d, A.get, desc) : Undefined;
+    V s = hasSet ? getPropObj(d, A.set, desc) : Undefined;
+    V v = hasVal ? getPropObj(d, A.value, desc) : Undefined;
+    bool w = hasW && truthy(getPropObj(d, A.writable, desc));
+    bool e = hasE && truthy(getPropObj(d, A.enumerable, desc));
+    bool c = hasC && truthy(getPropObj(d, A.configurable, desc));
+    if (hasGet && g != Undefined && !isCallable(g))
+        throwType("Getter must be a function: " + inspectBrief(g));
+    if (hasSet && s != Undefined && !isCallable(s))
+        throwType("Setter must be a function: " + inspectBrief(s));
+    if ((hasGet || hasSet) && (hasVal || hasW))
+        throwType("Invalid property descriptor. Cannot both specify accessors and a value or writable attribute, #<Object>");
+    if (o->cls == C_PROXY)
+        return proxyDefine(o, key, desc, throwing);
+    V cur;
+    uint8_t fl = 0;
+    bool exists = getOwnSlot(o, key, &cur, &fl);
+    std::string keyS = keyText(key);
+    if (!exists)
+    {
+        if (o->flags & OF_NONEXT)
+        {
+            if (throwing)
+                throwType("Cannot define property " + keyS + ", object is not extensible");
+            return false;
+        }
+        uint8_t nf = (uint8_t)((w ? PF_W : 0) | (e ? PF_E : 0) | (c ? PF_C : 0));
+        if (hasGet || hasSet)
+            defineAccessor(o, key, g, s, nf);
+        else
+            defineOwn(o, key, v, nf);
+        return true;
+    }
+    if (!(fl & PF_C))
+    {
+        bool bad = c || (hasE && e != ((fl & PF_E) != 0));
+        if (!bad)
+        {
+            if (hasGet || hasSet)
+            {
+                if (!(fl & PF_ACCESSOR))
+                    bad = true;
+                else
+                {
+                    Accessor *ac = static_cast<Accessor *>(op(cur));
+                    if ((hasGet && g != ac->get) || (hasSet && s != ac->set))
+                        bad = true;
+                }
+            }
+            else if (fl & PF_ACCESSOR)
+                bad = hasVal || hasW;
+            else if (!(fl & PF_W))
+                bad = (hasW && w) || (hasVal && !sameValue(v, cur));
+        }
+        if (bad)
+        {
+            if (throwing)
+                throwType("Cannot redefine property: " + keyS);
+            return false;
+        }
+    }
+    uint8_t nf = fl & (PF_W | PF_E | PF_C);
+    if (hasE)
+        nf = (uint8_t)((nf & ~PF_E) | (e ? PF_E : 0));
+    if (hasC)
+        nf = (uint8_t)((nf & ~PF_C) | (c ? PF_C : 0));
+    if (hasGet || hasSet)
+    {
+        if (!(fl & PF_ACCESSOR))
+        {
+            nf &= ~PF_W;
+            defineAccessor(o, key, hasGet ? g : Undefined, hasSet ? s : Undefined, nf);
+        }
+        else
+        {
+            Accessor *ac = static_cast<Accessor *>(op(cur));
+            defineAccessor(o, key, hasGet ? g : ac->get, hasSet ? s : ac->set, nf);
+        }
+        return true;
+    }
+    if (fl & PF_ACCESSOR)
+    {
+        if (!hasVal && !hasW)
+        {
+            Accessor *ac = static_cast<Accessor *>(op(cur));
+            defineAccessor(o, key, ac->get, ac->set, nf);
+            return true;
+        }
+        nf = (uint8_t)((nf & ~PF_W) | (w ? PF_W : 0));
+        defineOwn(o, key, v, nf);
+        return true;
+    }
+    if (hasW)
+        nf = (uint8_t)((nf & ~PF_W) | (w ? PF_W : 0));
+    if (o->cls == C_ARRAY && isStr(key) && (sp_(key)->isIdx || key == A.length))
+    {
+        if (hasVal)
+            defineOwn(o, key, v, nf);
+        return true;
+    }
+    defineOwn(o, key, hasVal ? v : cur, nf);
+    return true;
+}
+
+void freezeObj(Obj *o, bool freeze)
+{
+    LAZY(o);
+    o->flags |= OF_NONEXT;
+    if (o->cls == C_ARRAY || o->cls == C_ARGUMENTS)
+        o->flags |= freeze ? (uint8_t)(OF_FROZEN | OF_SEALED) : (uint8_t)OF_SEALED;
+    std::vector<V> names;
+    shapeKeys(o->shape, names);
+    for (V k : names)
+    {
+        uint8_t f;
+        int idx = shapeFind(o->shape, k, &f);
+        if (idx < 0)
+            continue;
+        uint8_t nf = (uint8_t)(f & ~PF_C);
+        if (freeze && !(f & PF_ACCESSOR))
+            nf &= ~PF_W;
+        if (nf != f)
+            setFlags(o, idx, k, nf);
+    }
+}
+
+bool isFrozenObj(Obj *o, bool frozen)
+{
+    if (isExtensible(o))
+        return false;
+    if (o->cls == C_ARRAY || o->cls == C_ARGUMENTS)
+    {
+        JArray *a = static_cast<JArray *>(o);
+        bool anyEl = false;
+        for (uint32_t i = 0; i < a->used; ++i)
+            if (a->el[i] != Hole)
+                anyEl = true;
+        if (anyEl && !(o->flags & (frozen ? OF_FROZEN : OF_SEALED)))
+            return false;
+        if (frozen && !(o->flags & OF_FROZEN) && o->cls == C_ARRAY)
+            return false;
+    }
+    std::vector<V> keys;
+    ownKeys(o, keys, true, true, false);
+    for (V k : keys)
+    {
+        V v, g, s;
+        uint8_t f = 0;
+        if (!getOwnDesc(o, k, &v, &g, &s, &f))
+            continue;
+        if (f & PF_C)
+            return false;
+        if (frozen && !(f & PF_ACCESSOR) && (f & PF_W))
+            return false;
+    }
+    return true;
+}
+
+// ── conversions ──────────────────────────────────────────────────────────
+
+bool truthy(V v)
+{
+    if (isNum(v))
+    {
+        double d = D(v);
+        return d == d && d != 0;
+    }
+    if (v == True)
+        return true;
+    if (v == False || v == Undefined || v == Null)
+        return false;
+    if (isStr(v))
+        return sp_(v)->len != 0;
+    if (isBig(v))
+        return !bigIsZero(bigp(v));
+    return true;
+}
+
+V typeOf(V v)
+{
+    if (isNum(v))
+        return A.number;
+    if (isStr(v))
+        return A.string;
+    if (isObj(v))
+        return isCallable(v) ? A.function : A.object;
+    if (v == Undefined)
+        return A.undefined;
+    if (v == Null)
+        return A.object;
+    if (isBool(v))
+        return A.boolean;
+    if (isSym(v))
+        return A.symbol;
+    if (isBig(v))
+        return A.bigint;
+    return A.undefined;
+}
+
+static bool isJsSpace(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0B || c == 0x0C || c == 0xA0 || c == 0xFEFF || c == 0x2028 || c == 0x2029 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+double strToNumber(JStr *s)
+{
+    s = flat_(s);
+    int b = 0, e = s->len;
+    while (b < e && isJsSpace(unitAt(s, b)))
+        ++b;
+    while (e > b && isJsSpace(unitAt(s, e - 1)))
+        --e;
+    if (b == e)
+        return 0;
+    std::string t;
+    t.reserve((size_t)(e - b));
+    for (int i = b; i < e; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c >= 128)
+            return 0.0 / 0.0;
+        t += (char)c;
+    }
+    if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X' || t[1] == 'o' || t[1] == 'O' || t[1] == 'b' || t[1] == 'B'))
+    {
+        int radix = (t[1] == 'x' || t[1] == 'X') ? 16 : (t[1] == 'o' || t[1] == 'O') ? 8 : 2;
+        double v = 0;
+        for (size_t i = 2; i < t.size(); ++i)
+        {
+            int c = t[i];
+            int h = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 99;
+            if (h >= radix)
+                return 0.0 / 0.0;
+            v = v * radix + h;
+        }
+        return v;
+    }
+    size_t i = 0;
+    if (t[i] == '+' || t[i] == '-')
+        ++i;
+    if (t.compare(i, std::string::npos, "Infinity") == 0)
+        return t[0] == '-' ? -1.0 / 0.0 : 1.0 / 0.0;
+    int digits = 0;
+    while (i < t.size() && t[i] >= '0' && t[i] <= '9')
+    {
+        ++i;
+        ++digits;
+    }
+    if (i < t.size() && t[i] == '.')
+    {
+        ++i;
+        while (i < t.size() && t[i] >= '0' && t[i] <= '9')
+        {
+            ++i;
+            ++digits;
+        }
+    }
+    if (!digits)
+        return 0.0 / 0.0;
+    if (i < t.size() && (t[i] == 'e' || t[i] == 'E'))
+    {
+        ++i;
+        if (i < t.size() && (t[i] == '+' || t[i] == '-'))
+            ++i;
+        int ed = 0;
+        while (i < t.size() && t[i] >= '0' && t[i] <= '9')
+        {
+            ++i;
+            ++ed;
+        }
+        if (!ed)
+            return 0.0 / 0.0;
+    }
+    if (i != t.size())
+        return 0.0 / 0.0;
+    return std::strtod(t.c_str(), nullptr);
+}
+
+double toNumber(V v)
+{
+    if (isNum(v))
+        return D(v);
+    if (v == Undefined)
+        return 0.0 / 0.0;
+    if (v == Null || v == False)
+        return 0;
+    if (v == True)
+        return 1;
+    if (isStr(v))
+        return strToNumber(sp_(v));
+    if (isSym(v))
+        throwType("Cannot convert a Symbol value to a number");
+    if (isBig(v))
+        throwType("Cannot convert a BigInt value to a number");
+    return toNumber(toPrimitive(v, 1));
+}
+
+V toNumeric(V v)
+{
+    if (isNum(v) || isBig(v))
+        return v;
+    V p = toPrimitive(v, 1);
+    if (isBig(p))
+        return p;
+    return num(toNumber(p));
+}
+
+int32_t toInt32(V v)
+{
+    double d = isNum(v) ? D(v) : toNumber(v);
+    if (d >= -2147483648.0 && d <= 2147483647.0)
+        return (int32_t)d;
+    if (d != d || d - d != 0)
+        return 0;
+    double m = std::fmod(std::trunc(d), 4294967296.0);
+    if (m < 0)
+        m += 4294967296.0;
+    return (int32_t)(uint32_t)m;
+}
+
+uint32_t toUint32(V v)
+{
+    return (uint32_t)toInt32(v);
+}
+
+double toIntegerOrInf(V v)
+{
+    double d = toNumber(v);
+    if (d != d)
+        return 0;
+    if (d - d != 0)
+        return d;
+    d = std::trunc(d);
+    return d == 0 ? 0 : d;
+}
+
+int64_t toLength(V v)
+{
+    double d = toIntegerOrInf(v);
+    if (d <= 0)
+        return 0;
+    if (d > 9007199254740991.0)
+        return 9007199254740991LL;
+    return (int64_t)d;
+}
+
+V numberToStr(double d)
+{
+    if (d >= 0 && d < 1024)
+    {
+        uint32_t i = (uint32_t)d;
+        if ((double)i == d)
+            return atomIndex(i);
+    }
+    return strv(fromUtf8(numberToStd(d)));
+}
+
+JStr *toStr(V v)
+{
+    if (isStr(v))
+        return sp_(v);
+    if (isNum(v))
+        return sp_(numberToStr(D(v)));
+    if (v == Undefined)
+        return sp_(A.undefined);
+    if (v == Null)
+        return sp_(A.null_);
+    if (v == True)
+        return sp_(A.true_);
+    if (v == False)
+        return sp_(A.false_);
+    if (isSym(v))
+        throwType("Cannot convert a Symbol value to a string");
+    if (isBig(v))
+        return fromUtf8(bigToStr(bigp(v)));
+    return toStr(toPrimitive(v, 2));
+}
+
+V toStringV(V v)
+{
+    return strv(toStr(v));
+}
+
+std::string toUtf8V(V v)
+{
+    return toUtf8(toStr(v));
+}
+
+V toPrimitive(V v, int hint)
+{
+    if (!isObj(v))
+        return v;
+    V ex = getMethod(v, WK.toPrimitive);
+    if (ex != Undefined)
+    {
+        V h = hint == 0 ? A.default_ : hint == 1 ? A.number : A.string;
+        V r = call(ex, v, &h, 1);
+        if (isObj(r))
+            throwType("Cannot convert object to primitive value");
+        return r;
+    }
+    V order[2] = {hint == 2 ? A.toString : A.valueOf, hint == 2 ? A.valueOf : A.toString};
+    for (int i = 0; i < 2; ++i)
+    {
+        V m = getProp(v, order[i]);
+        if (isCallable(m))
+        {
+            V r = call(m, v, nullptr, 0);
+            if (!isObj(r))
+                return r;
+        }
+    }
+    throwType("Cannot convert object to primitive value");
+}
+
+V toObject(V v)
+{
+    if (isObj(v))
+        return v;
+    if (isNullish(v))
+        throwType("Cannot convert undefined or null to object");
+    uint8_t cls = isStr(v) ? (uint8_t)C_STRING : isNum(v) ? (uint8_t)C_NUMBER : isBool(v) ? (uint8_t)C_BOOLEAN : isSym(v) ? (uint8_t)C_SYMBOL : (uint8_t)C_BIGINT;
+    Obj *proto = isStr(v) ? PR.string : isNum(v) ? PR.number : isBool(v) ? PR.boolean : isSym(v) ? PR.symbol : PR.bigint;
+    JPrim *p = static_cast<JPrim *>(allocObj(sizeof(JPrim), cls, proto));
+    p->val = v;
+    return objv(p);
+}
+
+V toKey(V v)
+{
+    if (isStr(v))
+        return atomStr(sp_(v));
+    if (isNum(v))
+    {
+        double d = D(v);
+        if (d >= 0 && d < 4294967295.0)
+        {
+            uint32_t i = (uint32_t)d;
+            if ((double)i == d)
+                return atomIndex(i);
+        }
+        return atomStr(fromUtf8(numberToStd(d)));
+    }
+    if (isSym(v))
+        return v;
+    if (isObj(v))
+    {
+        V p = toPrimitive(v, 2);
+        return toKey(p);
+    }
+    return atomStr(toStr(v));
+}
+
+V keyToValue(V key)
+{
+    return key;
+}
+
+std::string keyText(V key)
+{
+    if (isSym(key))
+    {
+        V d = symp(key)->desc;
+        return "Symbol(" + (d == Undefined ? std::string() : toUtf8(sp_(d))) + ")";
+    }
+    return toUtf8(sp_(key));
+}
+
+bool strictEq(V a, V b)
+{
+    if (isNum(a))
+    {
+        if (!isNum(b))
+            return false;
+        return D(a) == D(b);
+    }
+    if (a == b)
+        return true;
+    if (isStr(a) && isStr(b))
+        return eqStr(sp_(a), sp_(b));
+    if (isBig(a) && isBig(b))
+        return bigCmp(bigp(a), bigp(b)) == 0;
+    return false;
+}
+
+bool looseEq(V a, V b)
+{
+    if (isNum(a) && isNum(b))
+        return D(a) == D(b);
+    if (isStr(a) && isStr(b))
+        return eqStr(sp_(a), sp_(b));
+    if (isNullish(a) || isNullish(b))
+        return isNullish(a) && isNullish(b);
+    if (isObj(a) && isObj(b))
+        return a == b;
+    if (isBool(a))
+        return looseEq(num(a == True ? 1.0 : 0.0), b);
+    if (isBool(b))
+        return looseEq(a, num(b == True ? 1.0 : 0.0));
+    if (isObj(a))
+        return looseEq(toPrimitive(a, 0), b);
+    if (isObj(b))
+        return looseEq(a, toPrimitive(b, 0));
+    if (isSym(a) || isSym(b))
+        return a == b;
+    if (isBig(a) && isBig(b))
+        return bigCmp(bigp(a), bigp(b)) == 0;
+    if (isBig(a) || isBig(b))
+    {
+        V big = isBig(a) ? a : b;
+        V other = isBig(a) ? b : a;
+        double d = isStr(other) ? strToNumber(sp_(other)) : D(other);
+        if (d != d)
+            return false;
+        return bigCmpDouble(bigp(big), d) == 0;
+    }
+    return toNumber(a) == toNumber(b);
+}
+
+bool sameValue(V a, V b)
+{
+    if (isNum(a) && isNum(b))
+    {
+        double x = D(a), y = D(b);
+        if (x != x)
+            return y != y;
+        return a == b;
+    }
+    return strictEq(a, b);
+}
+
+bool sameValueZero(V a, V b)
+{
+    if (isNum(a) && isNum(b))
+    {
+        double x = D(a), y = D(b);
+        if (x != x)
+            return y != y;
+        return x == y;
+    }
+    return strictEq(a, b);
+}
+
+// ── making builtins ──────────────────────────────────────────────────────
+
+JFunc *newNativeKey(V name, NativeFn fn, int length)
+{
+    JFunc *f = static_cast<JFunc *>(allocObj(sizeof(JFunc), C_FUNCTION, PR.function));
+    f->kind = FK_NATIVE;
+    f->nat = fn;
+    f->fnName = name;
+    f->natLen = length;
+    f->flags = OF_CALLABLE | OF_LAZYFN;
+    f->thisV = Undefined;
+    f->newTarget = Undefined;
+    f->home = Undefined;
+    f->data = Undefined;
+    f->data2 = Undefined;
+    f->target = Undefined;
+    return f;
+}
+
+JFunc *newNative(const char *name, NativeFn fn, int length)
+{
+    return newNativeKey(atomOf(name), fn, length);
+}
+
+void defFn(Obj *o, const char *name, NativeFn fn, int length)
+{
+    defineOwn(o, atomOf(name), objv(newNative(name, fn, length)), PF_W | PF_C);
+}
+
+void defFnSym(Obj *o, V sym, const char *name, NativeFn fn, int length)
+{
+    defineOwn(o, sym, objv(newNative(name, fn, length)), PF_W | PF_C);
+}
+
+void defGetter(Obj *o, const char *name, NativeFn fn)
+{
+    std::string full = std::string("get ") + name;
+    defineAccessor(o, atomOf(name), objv(newNative(full.c_str(), fn, 0)), Undefined, PF_C);
+}
+
+void defGetterSym(Obj *o, V sym, const char *name, NativeFn fn)
+{
+    std::string full = std::string("get ") + name;
+    defineAccessor(o, sym, objv(newNative(full.c_str(), fn, 0)), Undefined, PF_C);
+}
+
+void defVal(Obj *o, const char *name, V v, uint8_t flags)
+{
+    defineOwn(o, atomOf(name), v, flags);
+}
+
+JFunc *defCtor(const char *name, NativeFn fn, int length, Obj *proto)
+{
+    JFunc *f = newNative(name, fn, length);
+    f->flags |= OF_CTOR;
+    materializeFn(f);
+    if (proto)
+    {
+        defineOwn(f, A.prototype, objv(proto), 0);
+        defineOwn(proto, A.constructor, objv(f), PF_W | PF_C);
+    }
+    defineOwn(g_global, atomOf(name), objv(f), PF_W | PF_C);
+    return f;
+}
+
+void setHidden(Obj *o, const char *name, V val)
+{
+    defineOwn(o, atomOf(name), val, PF_W | PF_C);
+}
+
+V getMethod(V base, V key)
+{
+    V m = getProp(base, key);
+    if (isNullish(m))
+        return Undefined;
+    if (!isCallable(m))
+        throwType(inspectBrief(m) + " is not a function");
+    return m;
+}
+
+V call0(V fn, V thisV)
+{
+    return call(fn, thisV, nullptr, 0);
+}
+
+V call1(V fn, V thisV, V a)
+{
+    V args[1] = {a};
+    return call(fn, thisV, args, 1);
+}
+
+V call2(V fn, V thisV, V a, V b)
+{
+    V args[2] = {a, b};
+    return call(fn, thisV, args, 2);
+}
+
+V invoke(V base, V key, V *args, int argc)
+{
+    V m = getProp(base, key);
+    if (!isCallable(m))
+        throwType(keyText(key) + " is not a function");
+    return call(m, base, args, argc);
+}
+
+bool instanceOf(V v, V target)
+{
+    if (!isObj(target))
+        throwType("Right-hand side of 'instanceof' is not an object");
+    V h = getMethod(target, WK.hasInstance);
+    if (h != Undefined && h != PR_hasInstanceDefault())
+    {
+        V a = v;
+        return truthy(call(h, target, &a, 1));
+    }
+    if (!isCallable(target))
+        throwType("Right-hand side of 'instanceof' is not callable");
+    return ordinaryHasInstance(target, v);
+}
+
+bool ordinaryHasInstance(V target, V v)
+{
+    if (!isCallable(target))
+        return false;
+    JFunc *f = static_cast<JFunc *>(op(target));
+    if (f->kind == FK_BOUND)
+        return instanceOf(v, f->target);
+    if (!isObj(v))
+        return false;
+    V p = getProp(target, A.prototype);
+    if (!isObj(p))
+        throwType("Function has non-object prototype '" + toUtf8V(p) + "' in instanceof check");
+    Obj *po = op(p);
+    for (Obj *o = protoOf(op(v)); o; o = protoOf(o))
+        if (o == po)
+            return true;
+    return false;
+}
+
+Obj *protoFromCtor(V newTarget, Obj *fallback)
+{
+    if (isObj(newTarget))
+    {
+        V p = getProp(newTarget, A.prototype);
+        if (isObj(p))
+            return op(p);
+    }
+    return fallback;
+}
+
+// a short rendering for error messages
+namespace
+{
+
+// a property's value if it is plain data somewhere on the chain
+V dataProp(Obj *o, V key)
+{
+    for (int depth = 0; o && depth < 1000; ++depth)
+    {
+        if (o->cls == C_PROXY)
+            return Undefined;
+        if (o->flags & OF_LAZYFN)
+            materializeFn(static_cast<JFunc *>(o));
+        uint8_t fl = 0;
+        int idx = shapeFind(o->shape, key, &fl);
+        if (idx >= 0)
+            return (fl & PF_ACCESSOR) ? Undefined : o->slots[idx];
+        o = o->proto;
+    }
+    return Undefined;
+}
+
+const char *classTag(Obj *o)
+{
+    switch (o->cls)
+    {
+    case C_ARRAY: return "Array";
+    case C_FUNCTION: return "Function";
+    case C_ERROR: return "Error";
+    case C_BOOLEAN: return "Boolean";
+    case C_NUMBER: return "Number";
+    case C_STRING: return "String";
+    case C_DATE: return "Date";
+    case C_REGEXP: return "RegExp";
+    case C_ARGUMENTS: return "Arguments";
+    default: return "Object";
+    }
+}
+
+} // namespace
+
+// what Node's ERR_INVALID_ARG_TYPE says it received
+std::string receivedText(V v)
+{
+    if (v == Undefined)
+        return "undefined";
+    if (v == Null)
+        return "null";
+    if (isObj(v))
+    {
+        Obj *o = op(v);
+        if (isCallable(v))
+        {
+            V nm = getProp(v, A.name);
+            if (isStr(nm) && sp_(nm)->len)
+                return "function " + toUtf8(sp_(nm));
+            return "type function (" + inspectBrief(v) + ")";
+        }
+        V ctor = dataProp(o, A.constructor);
+        if (isObj(ctor) && isCallable(ctor))
+        {
+            V cn = dataProp(op(ctor), A.name);
+            if (isStr(cn) && sp_(cn)->len)
+                return "an instance of " + toUtf8(sp_(cn));
+        }
+        return "[Object: null prototype] {}";
+    }
+    std::string text;
+    if (isStr(v))
+    {
+        std::string body = toUtf8(sp_(v));
+        char q = body.find('\'') == std::string::npos ? '\'' : body.find('"') == std::string::npos ? '"' : '`';
+        text = std::string(1, q) + body + std::string(1, q);
+    }
+    else if (isBig(v))
+        text = toUtf8V(v) + "n";
+    else if (isSym(v))
+        text = keyText(v);
+    else
+        text = isNum(v) && numOf(v) == 0 && 1 / numOf(v) < 0 ? std::string("-0") : toUtf8V(v);
+    if (text.size() > 28)
+        text = text.substr(0, 25) + "...";
+    return "type " + toUtf8(sp_(typeOf(v))) + " (" + text + ")";
+}
+
+void errNotDefined(V name)
+{
+    throwError(E_REFERENCE, toUtf8(sp_(name)) + " is not defined");
+}
+
+void errReadNullish(V base, V key)
+{
+    if (key == WK.iterator)
+        throwType(defaultCallSite(base) + " is not iterable (cannot read property Symbol(Symbol.iterator))");
+    std::string ks = isSym(key) ? keyText(key) : isObj(key) ? std::string("#<Object>") : toUtf8V(key);
+    throwType("Cannot read properties of " + std::string(base == Null ? "null" : "undefined") + " (reading '" + ks + "')");
+}
+
+void errSetNullish(V base, V key)
+{
+    std::string ks = isSym(key) ? keyText(key) : isObj(key) ? std::string("#<Object>") : toUtf8V(key);
+    throwType("Cannot set properties of " + std::string(base == Null ? "null" : "undefined") + " (setting '" + ks + "')");
+}
+
+void errInOperator(V a, V b)
+{
+    throwType("Cannot use 'in' operator to search for '" + (isSym(a) ? keyText(a) : toUtf8V(a)) + "' in " + (isStr(b) ? toUtf8(sp_(b)) : toUtf8V(b)));
+}
+
+void errNotCallable(V fn)
+{
+    throwType(inspectBrief(fn) + " is not a function");
+}
+
+void errNotConstructor(V fn)
+{
+    throwType(inspectBrief(fn) + " is not a constructor");
+}
+
+void errNotIterable(V v)
+{
+    throwType(defaultCallSite(v) + " is not iterable (cannot read property Symbol(Symbol.iterator))");
+}
+
+void errIteratorResult(V r)
+{
+    throwType("Iterator result " + toUtf8V(r) + " is not an object");
+}
+
+std::string defaultCallSite(V v)
+{
+    std::string type = toUtf8(sp_(typeOf(v)));
+    if (isStr(v))
+        return type + " \"" + toUtf8(sp_(v)) + "\"";
+    if (v == Null || isBool(v) || isNum(v))
+        return type + " " + toUtf8V(v);
+    return type;
+}
+
+std::string inspectBrief(V v)
+{
+    if (isStr(v))
+        return toUtf8(sp_(v));
+    if (isObj(v))
+    {
+        Obj *o = op(v);
+        if (isCallable(v) && o->cls != C_PROXY)
+        {
+            JFunc *f = static_cast<JFunc *>(o);
+            if (f->kind != FK_NATIVE && f->kind != FK_BOUND && f->node && f->node->src && f->node->srcEnd > f->node->srcStart)
+                return toUtf8(newStrUnits(f->node->src + f->node->srcStart, f->node->srcEnd - f->node->srcStart));
+            return "function " + toUtf8V(getProp(v, A.name)) + "() { [native code] }";
+        }
+        V toStr = dataProp(o, A.toString);
+        V errorToStr = dataProp(PR.errorTypes[E_ERROR], A.toString);
+        if (o->cls == C_ERROR || toStr == errorToStr)
+        {
+            V nm = dataProp(o, A.name);
+            V msg = dataProp(o, A.message);
+            std::string ns = isStr(nm) ? toUtf8(sp_(nm)) : std::string("Error");
+            std::string ms = isStr(msg) ? toUtf8(sp_(msg)) : std::string();
+            return ns.empty() ? ms : ms.empty() ? ns : ns + ": " + ms;
+        }
+        if (toStr == dataProp(PR.object, A.toString) && toStr != Undefined)
+        {
+            V ctor = dataProp(o, A.constructor);
+            if (isObj(ctor) && isCallable(ctor))
+            {
+                V cn = dataProp(op(ctor), A.name);
+                if (isStr(cn) && sp_(cn)->len)
+                    return "#<" + toUtf8(sp_(cn)) + ">";
+            }
+        }
+        V tag = dataProp(o, WK.toStringTag);
+        return "[object " + (isStr(tag) ? toUtf8(sp_(tag)) : std::string(classTag(o))) + "]";
+    }
+    if (isSym(v))
+        return keyText(v);
+    return toUtf8V(v);
+}
+
+std::string ctorNameOf(Obj *o)
+{
+    for (Obj *p = o; p; p = p->cls == C_PROXY ? nullptr : p->proto)
+    {
+        uint8_t f;
+        V cur;
+        if (p->cls != C_PROXY && getOwnSlot(p, A.constructor, &cur, &f) && !(f & PF_ACCESSOR) && isCallable(cur))
+        {
+            V n = getProp(cur, A.name);
+            if (isStr(n) && sp_(n)->len)
+                return toUtf8(sp_(n));
+        }
+    }
+    return "Object";
+}
+
+} // namespace js

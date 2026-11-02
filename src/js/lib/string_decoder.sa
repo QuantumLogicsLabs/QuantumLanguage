@@ -1,0 +1,7 @@
+'use strict';
+class StringDecoder {
+  constructor(enc = 'utf8') { this.encoding = enc; }
+  write(b) { return Buffer.from(b).toString(this.encoding); }
+  end(b) { return b ? this.write(b) : ''; }
+}
+module.exports = { StringDecoder };

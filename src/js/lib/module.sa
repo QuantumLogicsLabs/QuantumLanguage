@@ -1,0 +1,9 @@
+'use strict';
+// The module module.
+const builtinModules = ['assert', 'buffer', 'child_process', 'cluster', 'console', 'constants', 'crypto', 'dgram', 'dns', 'domain', 'events', 'fs', 'http', 'http2', 'https', 'inspector', 'module', 'net', 'os', 'path', 'perf_hooks', 'process', 'punycode', 'querystring', 'readline', 'repl', 'stream', 'string_decoder', 'timers', 'tls', 'tty', 'url', 'util', 'v8', 'vm', 'worker_threads', 'zlib'];
+function Module(id) { this.id = id; this.exports = {}; }
+Module.builtinModules = builtinModules;
+Module.isBuiltin = (n) => builtinModules.includes(String(n).replace(/^node:/, ''));
+Module.createRequire = () => require;
+Module.Module = Module;
+module.exports = Module;

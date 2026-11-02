@@ -1,0 +1,469 @@
+// quantum: cpp
+// JavaScript front-end: the code around the generated Unicode tables. The
+// tables are text, read the first time they are needed.
+#include "JsUnicode.h.sa"
+#include <cstdint>
+#include <cstring>
+#include <unordered_map>
+
+namespace js
+{
+
+namespace
+{
+
+int digit36(char c)
+{
+    return c >= 'a' ? c - 'a' + 10 : c - '0';
+}
+
+int readNum(const char *&p)
+{
+    int v = 0;
+    while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z'))
+        v = v * 36 + digit36(*p++);
+    return v;
+}
+
+void readSeq(const char *&p, std::vector<int> &out)
+{
+    while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z'))
+    {
+        out.push_back(readNum(p));
+        if (*p == '.')
+            ++p;
+    }
+}
+
+const char *findTable(const std::string &key)
+{
+    for (int i = 0; i < kUniEntryCount; ++i)
+        if (key == kUniEntries[i].name)
+            return kUniTables[kUniEntries[i].table];
+    return nullptr;
+}
+
+std::unordered_map<std::string, std::vector<int> *> *g_ranges = nullptr;
+
+// the ones asked about most, kept at hand: the map below is a slow way to get there
+const std::vector<int> *rangesFor(const std::string &key)
+{
+    if (!g_ranges)
+        g_ranges = new std::unordered_map<std::string, std::vector<int> *>();
+    auto it = g_ranges->find(key);
+    if (it != g_ranges->end())
+        return it->second;
+    const char *text = findTable(key);
+    if (!text)
+        return nullptr;
+    std::vector<int> *r = new std::vector<int>();
+    int at = 0;
+    const char *p = text;
+    while (*p)
+    {
+        int lo = at + readNum(p);
+        ++p; // ,
+        int hi = lo + readNum(p);
+        if (*p == ' ')
+            ++p;
+        r->push_back(lo);
+        r->push_back(hi);
+        at = hi;
+    }
+    (*g_ranges)[key] = r;
+    return r;
+}
+
+std::unordered_map<int, std::vector<int>> *g_upper = nullptr;
+std::unordered_map<int, std::vector<int>> *g_lower = nullptr;
+
+void loadCase()
+{
+    if (g_upper)
+        return;
+    g_upper = new std::unordered_map<int, std::vector<int>>();
+    g_lower = new std::unordered_map<int, std::vector<int>>();
+    const char *p = kUniCase;
+    while (*p)
+    {
+        int c = readNum(p);
+        ++p;
+        std::vector<int> u, l;
+        readSeq(p, u);
+        ++p;
+        readSeq(p, l);
+        if (*p == ';')
+            ++p;
+        if (!u.empty())
+            (*g_upper)[c] = u;
+        if (!l.empty())
+            (*g_lower)[c] = l;
+    }
+}
+
+struct CaseClasses
+{
+    std::unordered_map<int, int> root;
+    std::unordered_map<int, std::vector<int> *> members;
+};
+
+CaseClasses *g_iClasses = nullptr;
+CaseClasses *g_uClasses = nullptr;
+
+CaseClasses *loadClasses(const char *text)
+{
+    CaseClasses *cc = new CaseClasses();
+    const char *p = text;
+    while (*p)
+    {
+        std::vector<int> *group = new std::vector<int>();
+        readSeq(p, *group);
+        if (*p == ';')
+            ++p;
+        for (int m : *group)
+        {
+            cc->root[m] = (*group)[0];
+            cc->members[m] = group;
+        }
+    }
+    return cc;
+}
+
+CaseClasses *classesFor(bool unicodeMode)
+{
+    if (unicodeMode)
+    {
+        if (!g_uClasses)
+            g_uClasses = loadClasses(kUniUClasses);
+        return g_uClasses;
+    }
+    if (!g_iClasses)
+        g_iClasses = loadClasses(kUniIClasses);
+    return g_iClasses;
+}
+
+struct NormEntry
+{
+    std::vector<int> canonical, compat;
+};
+
+std::unordered_map<int, NormEntry> *g_norm = nullptr;
+std::unordered_map<int, int> *g_ccc = nullptr;
+std::unordered_map<long long, int> *g_composites = nullptr;
+
+long long compKey(int a, int b)
+{
+    return ((long long)a << 32) | b;
+}
+
+void loadNorm()
+{
+    if (g_norm)
+        return;
+    g_norm = new std::unordered_map<int, NormEntry>();
+    g_ccc = new std::unordered_map<int, int>();
+    g_composites = new std::unordered_map<long long, int>();
+    const char *p = kUniNorm;
+    while (*p)
+    {
+        int c = readNum(p);
+        ++p;
+        NormEntry e;
+        readSeq(p, e.canonical);
+        ++p;
+        readSeq(p, e.compat);
+        if (*p == ';')
+            ++p;
+        (*g_norm)[c] = e;
+    }
+    p = kUniCcc;
+    while (*p)
+    {
+        int c = readNum(p);
+        ++p;
+        (*g_ccc)[c] = readNum(p);
+        if (*p == ';')
+            ++p;
+    }
+    p = kUniComp;
+    while (*p)
+    {
+        std::vector<int> t;
+        readSeq(p, t);
+        if (*p == ';')
+            ++p;
+        (*g_composites)[compKey(t[0], t[1])] = t[2];
+    }
+}
+
+const int kSBase = 0xAC00, kLBase = 0x1100, kVBase = 0x1161, kTBase = 0x11A7, kLCount = 19, kVCount = 21, kTCount = 28;
+const int kNCount = kVCount * kTCount, kSCount = kLCount * kNCount;
+
+void decompose(int c, bool compat, std::vector<int> &out)
+{
+    if (c >= kSBase && c < kSBase + kSCount)
+    {
+        int s = c - kSBase;
+        out.push_back(kLBase + s / kNCount);
+        out.push_back(kVBase + (s % kNCount) / kTCount);
+        if (s % kTCount)
+            out.push_back(kTBase + s % kTCount);
+        return;
+    }
+    if (c < 0x80)
+    {
+        out.push_back(c);
+        return;
+    }
+    auto it = g_norm->find(c);
+    if (it == g_norm->end())
+    {
+        out.push_back(c);
+        return;
+    }
+    const NormEntry &e = it->second;
+    if (compat && !e.compat.empty())
+        out.insert(out.end(), e.compat.begin(), e.compat.end());
+    else if (!e.canonical.empty())
+        out.insert(out.end(), e.canonical.begin(), e.canonical.end());
+    else
+        out.push_back(c);
+}
+
+int cccOf(int c)
+{
+    if (c < 0x300)
+        return 0;
+    auto it = g_ccc->find(c);
+    return it == g_ccc->end() ? 0 : it->second;
+}
+
+} // namespace
+
+const std::vector<int> *uniProperty(const std::string &spelling)
+{
+    size_t eq = spelling.find('=');
+    if (eq == std::string::npos)
+    {
+        const std::vector<int> *r = rangesFor("gc:" + spelling);
+        return r ? r : rangesFor("b:" + spelling);
+    }
+    std::string k = spelling.substr(0, eq), v = spelling.substr(eq + 1);
+    if (k == "General_Category" || k == "gc")
+        return rangesFor("gc:" + v);
+    if (k == "Script" || k == "sc")
+        return rangesFor("sc:" + v);
+    if (k == "Script_Extensions" || k == "scx")
+        return rangesFor("scx:" + v);
+    return nullptr;
+}
+
+bool uniRangesHas(const std::vector<int> &ranges, int c)
+{
+    const int *r = ranges.data();
+    int lo = 0, hi = (int)(ranges.size() / 2) - 1;
+    while (lo <= hi)
+    {
+        int mid = (lo + hi) / 2;
+        if (c < r[mid * 2])
+            hi = mid - 1;
+        else if (c > r[mid * 2 + 1])
+            lo = mid + 1;
+        else
+            return true;
+    }
+    return false;
+}
+
+bool uniIdStart(int c)
+{
+    return uniRangesHas(*rangesFor("b:ID_Start"), c);
+}
+
+bool uniIdContinue(int c)
+{
+    return uniRangesHas(*rangesFor("b:ID_Continue"), c);
+}
+
+void uniUpper(int c, std::vector<int> &out)
+{
+    if (c < 128)
+    {
+        out.push_back(c >= 'a' && c <= 'z' ? c - 32 : c);
+        return;
+    }
+    loadCase();
+    auto it = g_upper->find(c);
+    if (it == g_upper->end())
+        out.push_back(c);
+    else
+        out.insert(out.end(), it->second.begin(), it->second.end());
+}
+
+void uniLower(int c, std::vector<int> &out)
+{
+    if (c < 128)
+    {
+        out.push_back(c >= 'A' && c <= 'Z' ? c + 32 : c);
+        return;
+    }
+    loadCase();
+    auto it = g_lower->find(c);
+    if (it == g_lower->end())
+        out.push_back(c);
+    else
+        out.insert(out.end(), it->second.begin(), it->second.end());
+}
+
+int uniSimpleUpper(int c)
+{
+    if (c < 128)
+        return c >= 'a' && c <= 'z' ? c - 32 : c;
+    loadCase();
+    auto it = g_upper->find(c);
+    return it == g_upper->end() || it->second.size() != 1 ? c : it->second[0];
+}
+
+int uniSimpleLower(int c)
+{
+    if (c < 128)
+        return c >= 'A' && c <= 'Z' ? c + 32 : c;
+    loadCase();
+    auto it = g_lower->find(c);
+    return it == g_lower->end() || it->second.size() != 1 ? c : it->second[0];
+}
+
+bool uniCased(int c)
+{
+    return uniRangesHas(*rangesFor("b:Cased"), c);
+}
+
+bool uniCaseIgnorable(int c)
+{
+    return uniRangesHas(*rangesFor("b:Case_Ignorable"), c);
+}
+
+int uniCaseRoot(int c, bool unicodeMode)
+{
+    if (c < 128)
+        return c >= 'a' && c <= 'z' ? c - 32 : c;
+    CaseClasses *cc = classesFor(unicodeMode);
+    auto it = cc->root.find(c);
+    return it == cc->root.end() ? c : it->second;
+}
+
+const std::vector<int> *uniCaseClass(int c, bool unicodeMode)
+{
+    CaseClasses *cc = classesFor(unicodeMode);
+    auto it = cc->members.find(c);
+    return it == cc->members.end() ? nullptr : it->second;
+}
+
+void uniNormalize(const std::vector<int> &in, int form, std::vector<int> &out)
+{
+    loadNorm();
+    bool compat = form >= 2;
+    bool compose = form == 0 || form == 2;
+    std::vector<int> d;
+    d.reserve(in.size());
+    for (int c : in)
+        decompose(c, compat, d);
+    // canonical order: marks sorted by class, stable
+    size_t n = d.size();
+    for (size_t i = 1; i < n; ++i)
+    {
+        int cc = cccOf(d[i]);
+        if (!cc)
+            continue;
+        int x = d[i];
+        size_t j = i;
+        while (j > 0)
+        {
+            int prev = cccOf(d[j - 1]);
+            if (prev <= cc)
+                break;
+            d[j] = d[j - 1];
+            --j;
+        }
+        d[j] = x;
+    }
+    if (!compose)
+    {
+        out = d;
+        return;
+    }
+    out.clear();
+    int starter = -1; // where the current starter is in out
+    int lastCcc = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        int c = d[i];
+        int cc = cccOf(c);
+        if (starter >= 0)
+        {
+            int s = out[(size_t)starter];
+            bool blocked = (int)out.size() - 1 != starter && (lastCcc >= cc);
+            if (!blocked)
+            {
+                // Hangul composes by arithmetic
+                if (s >= kLBase && s < kLBase + kLCount && c >= kVBase && c < kVBase + kVCount)
+                {
+                    out[(size_t)starter] = kSBase + ((s - kLBase) * kVCount + (c - kVBase)) * kTCount;
+                    continue;
+                }
+                if (s >= kSBase && s < kSBase + kSCount && (s - kSBase) % kTCount == 0 && c > kTBase && c < kTBase + kTCount)
+                {
+                    out[(size_t)starter] = s + (c - kTBase);
+                    continue;
+                }
+                auto composed = g_composites->find(compKey(s, c));
+                if (composed != g_composites->end())
+                {
+                    out[(size_t)starter] = composed->second;
+                    continue;
+                }
+            }
+        }
+        if (cc == 0)
+        {
+            starter = (int)out.size();
+            lastCcc = 0;
+        }
+        else
+            lastCcc = cc;
+        out.push_back(c);
+    }
+}
+
+int uniBase(int c)
+{
+    if (c < 0xC0)
+        return c;
+    loadNorm();
+    auto it = g_norm->find(c);
+    if (it == g_norm->end() || it->second.canonical.empty())
+        return c;
+    return it->second.canonical[0];
+}
+
+int uniCollationGroup(int c)
+{
+    const std::vector<int> *z = rangesFor("gc:Z");
+    const std::vector<int> *p = rangesFor("gc:P");
+    const std::vector<int> *s = rangesFor("gc:S");
+    const std::vector<int> *sc = rangesFor("gc:Sc");
+    const std::vector<int> *n = rangesFor("gc:N");
+    if (uniRangesHas(*z, c))
+        return 0;
+    if (uniRangesHas(*p, c))
+        return 1;
+    if (uniRangesHas(*sc, c))
+        return 3;
+    if (uniRangesHas(*s, c))
+        return 2;
+    if (uniRangesHas(*n, c))
+        return 4;
+    return 5;
+}
+
+} // namespace js

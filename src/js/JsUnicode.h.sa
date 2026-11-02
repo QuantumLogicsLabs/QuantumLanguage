@@ -1,0 +1,53 @@
+// quantum: cpp
+#pragma once
+// JavaScript front-end: Unicode properties, case mapping and normalization.
+// The tables are generated (src/tools/gen_js_unicode.py).
+#include <string>
+#include <vector>
+
+namespace js
+{
+
+struct UniEntry
+{
+    const char *name;
+    int table;
+};
+
+extern const char *const kUniTables[];
+extern const UniEntry kUniEntries[];
+extern const int kUniEntryCount;
+extern const char *const kUniCase;
+extern const char *const kUniNorm;
+extern const char *const kUniComp;
+extern const char *const kUniCcc;
+extern const char *const kUniIClasses;
+extern const char *const kUniUClasses;
+
+// A property as \p{...} spells it: sorted lo, hi pairs; nullptr if there is none
+const std::vector<int> *uniProperty(const std::string &spelling);
+bool uniRangesHas(const std::vector<int> &ranges, int c);
+bool uniIdStart(int c);
+bool uniIdContinue(int c);
+
+// Full case mapping of one code point (c itself when it has none)
+void uniUpper(int c, std::vector<int> &out);
+void uniLower(int c, std::vector<int> &out);
+// The single code point it maps to, or itself when the mapping is longer
+int uniSimpleUpper(int c);
+int uniSimpleLower(int c);
+bool uniCased(int c);
+bool uniCaseIgnorable(int c);
+
+// What /i treats alike: a representative, and the whole class (nullptr: alone)
+int uniCaseRoot(int c, bool unicodeMode);
+const std::vector<int> *uniCaseClass(int c, bool unicodeMode);
+
+// form: 0 NFC, 1 NFD, 2 NFKC, 3 NFKD
+void uniNormalize(const std::vector<int> &in, int form, std::vector<int> &out);
+// The first code point of c's canonical decomposition
+int uniBase(int c);
+// General category group, for collation: 0 separator, 1 punctuation, 2 symbol, 3 currency, 4 number, 5 letter or anything else
+int uniCollationGroup(int c);
+
+} // namespace js

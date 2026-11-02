@@ -1,0 +1,326 @@
+'use strict';
+// URL and URLSearchParams.
+const inspectCustom = Symbol.for('nodejs.util.inspect.custom');
+const special = { 'http:': '80', 'https:': '443', 'ftp:': '21', 'ws:': '80', 'wss:': '443', 'file:': '' };
+
+function encodeWith(s, keep) {
+  let out = '';
+  for (const c of String(s)) {
+    if (/[A-Za-z0-9]/.test(c) || keep.includes(c)) out += c;
+    else out += encodeURIComponent(c).replace(/[!'()*~]/g, (x) => '%' + x.charCodeAt(0).toString(16).toUpperCase());
+  }
+  return out;
+}
+
+const formEncode = (s) => encodeWith(s, "*-._ ").replace(/ /g, '+');
+const formDecode = (s) => {
+  const t = s.replace(/\+/g, ' ');
+  try { return decodeURIComponent(t); } catch { return t; }
+};
+
+class URLSearchParams {
+  #list = [];
+  #url = null;
+  constructor(init) {
+    if (init === undefined || init === null) return;
+    if (typeof init === 'object' || typeof init === 'function') {
+      const it = init[Symbol.iterator];
+      if (it !== undefined) {
+        for (const pair of init) {
+          const p = Array.from(pair);
+          if (p.length !== 2) {
+            throw internal.nodeError(TypeError, 'ERR_INVALID_TUPLE', 'Each query pair must be an iterable [name, value] tuple');
+          }
+          this.#list.push([String(p[0]), String(p[1])]);
+        }
+      } else for (const k of Reflect.ownKeys(init)) {
+        if (typeof k === 'string' && Object.getOwnPropertyDescriptor(init, k)?.enumerable) this.#list.push([k, String(init[k])]);
+      }
+      return;
+    }
+    this.__parse(String(init));
+  }
+  __parse(s) {
+    this.#list = [];
+    if (s[0] === '?') s = s.slice(1);
+    for (const part of s.split('&')) {
+      if (!part) continue;
+      const i = part.indexOf('=');
+      if (i < 0) this.#list.push([formDecode(part), '']);
+      else this.#list.push([formDecode(part.slice(0, i)), formDecode(part.slice(i + 1))]);
+    }
+  }
+  __bind(url) { this.#url = url; }
+  #changed() {
+    if (this.#url) this.#url.__setSearch(this.toString());
+  }
+  get size() { return this.#list.length; }
+  append(k, v) { this.#list.push([String(k), String(v)]); this.#changed(); }
+  delete(k, v) {
+    k = String(k);
+    this.#list = this.#list.filter((p) => !(p[0] === k && (v === undefined || p[1] === String(v))));
+    this.#changed();
+  }
+  get(k) {
+    k = String(k);
+    const p = this.#list.find((x) => x[0] === k);
+    return p ? p[1] : null;
+  }
+  getAll(k) {
+    k = String(k);
+    return this.#list.filter((x) => x[0] === k).map((x) => x[1]);
+  }
+  has(k, v) {
+    k = String(k);
+    return this.#list.some((x) => x[0] === k && (v === undefined || x[1] === String(v)));
+  }
+  set(k, v) {
+    k = String(k);
+    v = String(v);
+    const i = this.#list.findIndex((x) => x[0] === k);
+    if (i < 0) this.#list.push([k, v]);
+    else {
+      this.#list[i][1] = v;
+      this.#list = this.#list.filter((x, j) => j <= i || x[0] !== k);
+    }
+    this.#changed();
+  }
+  sort() {
+    this.#list = this.#list.map((p, i) => [p, i]).sort((a, b) => (a[0][0] < b[0][0] ? -1 : a[0][0] > b[0][0] ? 1 : a[1] - b[1])).map((x) => x[0]);
+    this.#changed();
+  }
+  forEach(f, thisArg) {
+    for (const [k, v] of this.#list) f.call(thisArg, v, k, this);
+  }
+  *entries() { for (const p of this.#list) yield [p[0], p[1]]; }
+  *keys() { for (const p of this.#list) yield p[0]; }
+  *values() { for (const p of this.#list) yield p[1]; }
+  [Symbol.iterator]() { return this.entries(); }
+  toString() {
+    return this.#list.map(([k, v]) => `${formEncode(k)}=${formEncode(v)}`).join('&');
+  }
+  get [Symbol.toStringTag]() { return 'URLSearchParams'; }
+  [inspectCustom](depth, opts, inspect) {
+    if (!this.#list.length) return 'URLSearchParams {}';
+    return `URLSearchParams { ${this.#list.map(([k, v]) => `${inspect(k)} => ${inspect(v)}`).join(', ')} }`;
+  }
+}
+for (const k of ['__parse', '__bind']) Object.defineProperty(URLSearchParams.prototype, k, { enumerable: false });
+
+function invalid(input, base) {
+  const e = internal.nodeError(TypeError, 'ERR_INVALID_URL', 'Invalid URL');
+  e.input = input;
+  if (base !== undefined) e.base = base;
+  return e;
+}
+
+function normalizePath(path) {
+  const out = [];
+  const parts = path.split('/');
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i];
+    const lower = p.toLowerCase();
+    if (p === '..' || lower === '.%2e' || lower === '%2e.' || lower === '%2e%2e') {
+      out.pop();
+      if (i === parts.length - 1) out.push('');
+    } else if (p === '.' || lower === '%2e') {
+      if (i === parts.length - 1) out.push('');
+    } else out.push(p);
+  }
+  return '/' + out.join('/');
+}
+
+class URL {
+  #protocol = ''; #username = ''; #password = ''; #hostname = ''; #port = ''; #pathname = ''; #search = ''; #hash = ''; #opaque = false;
+  #params;
+  constructor(input, base) {
+    if (arguments.length === 0) {
+      throw internal.nodeError(TypeError, 'ERR_MISSING_ARGS', 'The "url" argument must be specified');
+    }
+    input = String(input).trim();
+    let baseUrl = null;
+    if (base !== undefined) baseUrl = base instanceof URL ? base : new URL(base);
+    const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(input);
+    if (m) this.#parseAbsolute(input, m[0].toLowerCase(), base);
+    else if (baseUrl) this.#parseRelative(input, baseUrl);
+    else throw invalid(input, base);
+    this.#params = new URLSearchParams(this.#search);
+    this.#params.__bind(this);
+  }
+  #parseAbsolute(input, proto, base) {
+    this.#protocol = proto;
+    let rest = input.slice(proto.length);
+    const hashAt = rest.indexOf('#');
+    if (hashAt >= 0) {
+      this.#hash = rest.length - hashAt > 1 ? encodeFragment(rest.slice(hashAt)) : '';
+      rest = rest.slice(0, hashAt);
+    }
+    const qAt = rest.indexOf('?');
+    if (qAt >= 0) {
+      this.#search = rest.length - qAt > 1 ? encodeQuery(rest.slice(qAt)) : '';
+      rest = rest.slice(0, qAt);
+    }
+    const isSpecial = proto in special;
+    if (isSpecial) rest = rest.replace(/\\/g, '/');
+    if (rest.startsWith('//') || isSpecial) {
+      rest = rest.replace(/^\/*/, (s) => (isSpecial ? '' : s.slice(2)));
+      let slash = rest.indexOf('/');
+      if (slash < 0) slash = rest.length;
+      let auth = rest.slice(0, slash);
+      const path = rest.slice(slash);
+      const at = auth.lastIndexOf('@');
+      if (at >= 0) {
+        const cred = auth.slice(0, at);
+        auth = auth.slice(at + 1);
+        const c = cred.indexOf(':');
+        this.#username = encodeUser(c < 0 ? cred : cred.slice(0, c));
+        this.#password = c < 0 ? '' : encodeUser(cred.slice(c + 1));
+      }
+      const pm = /:(\d*)$/.exec(auth);
+      if (pm) {
+        auth = auth.slice(0, pm.index);
+        this.#port = pm[1] === special[proto] ? '' : pm[1];
+        if (pm[1] && Number(pm[1]) > 65535) throw invalid(input, base);
+      }
+      if (/[\s<>^|%]/.test(auth) || auth.includes(':') && auth[0] !== '[') throw invalid(input, base);
+      if (isSpecial && proto !== 'file:' && !auth) throw invalid(input, base);
+      this.#hostname = isSpecial ? auth.toLowerCase() : auth;
+      this.#pathname = normalizePath(encodePath(path || (isSpecial ? '/' : '')) || '/');
+      if (!path && !isSpecial) this.#pathname = '';
+    } else if (rest[0] === '/') {
+      this.#pathname = normalizePath(encodePath(rest));
+    } else {
+      this.#opaque = true;
+      this.#pathname = rest;
+    }
+  }
+  #parseRelative(input, b) {
+    this.#protocol = b.protocol;
+    this.#username = b.username;
+    this.#password = b.password;
+    this.#hostname = b.hostname;
+    this.#port = b.port;
+    let rest = input;
+    const hashAt = rest.indexOf('#');
+    if (hashAt >= 0) {
+      this.#hash = rest.length - hashAt > 1 ? encodeFragment(rest.slice(hashAt)) : '';
+      rest = rest.slice(0, hashAt);
+    }
+    const qAt = rest.indexOf('?');
+    let hasQuery = false;
+    if (qAt >= 0) {
+      this.#search = rest.length - qAt > 1 ? encodeQuery(rest.slice(qAt)) : '';
+      hasQuery = true;
+      rest = rest.slice(0, qAt);
+    }
+    if (rest.startsWith('//')) {
+      const parsed = new URL(b.protocol + rest);
+      this.#hostname = parsed.hostname;
+      this.#port = parsed.port;
+      this.#username = parsed.username;
+      this.#password = parsed.password;
+      this.#pathname = parsed.pathname;
+      return;
+    }
+    if (!rest) {
+      this.#pathname = b.pathname;
+      if (!hasQuery) this.#search = b.search;
+      return;
+    }
+    if (rest[0] === '/') this.#pathname = normalizePath(encodePath(rest));
+    else {
+      const dir = b.pathname.slice(0, b.pathname.lastIndexOf('/') + 1);
+      this.#pathname = normalizePath(encodePath(dir + rest));
+    }
+  }
+  __setSearch(s) { this.#search = s ? '?' + s : ''; }
+  get protocol() { return this.#protocol; }
+  set protocol(v) { this.#protocol = String(v).replace(/:?$/, ':'); }
+  get username() { return this.#username; }
+  set username(v) { this.#username = encodeUser(v); }
+  get password() { return this.#password; }
+  set password(v) { this.#password = encodeUser(v); }
+  get hostname() { return this.#hostname; }
+  set hostname(v) { this.#hostname = String(v); }
+  get port() { return this.#port; }
+  set port(v) { const s = String(v); this.#port = s === special[this.#protocol] ? '' : s; }
+  get host() { return this.#hostname + (this.#port ? ':' + this.#port : ''); }
+  set host(v) {
+    const m = /^(.*?)(?::(\d+))?$/.exec(String(v));
+    this.#hostname = m[1];
+    if (m[2]) this.port = m[2];
+  }
+  get pathname() { return this.#pathname; }
+  set pathname(v) {
+    let s = encodePath(String(v));
+    if (s[0] !== '/') s = '/' + s;
+    this.#pathname = normalizePath(s);
+  }
+  get search() { return this.#search; }
+  set search(v) {
+    const s = String(v);
+    this.#search = s ? encodeQuery(s[0] === '?' ? s : '?' + s) : '';
+    if (this.#search === '?') this.#search = '';
+    this.#params.__parse(this.#search);
+  }
+  get hash() { return this.#hash; }
+  set hash(v) {
+    const s = String(v);
+    this.#hash = s ? encodeFragment(s[0] === '#' ? s : '#' + s) : '';
+  }
+  get searchParams() { return this.#params; }
+  get origin() {
+    return this.#protocol in special && this.#protocol !== 'file:' ? `${this.#protocol}//${this.host}` : 'null';
+  }
+  get href() {
+    let auth = '';
+    if (this.#username || this.#password) auth = this.#username + (this.#password ? ':' + this.#password : '') + '@';
+    const slashes = this.#hostname || this.#protocol in special ? '//' : '';
+    return this.#protocol + slashes + auth + this.host + this.#pathname + this.#search + this.#hash;
+  }
+  set href(v) {
+    const u = new URL(v);
+    this.#protocol = u.protocol;
+    this.#username = u.username;
+    this.#password = u.password;
+    this.#hostname = u.hostname;
+    this.#port = u.port;
+    this.#pathname = u.pathname;
+    this.#search = u.search;
+    this.#hash = u.hash;
+    this.#params.__parse(this.#search);
+  }
+  toString() { return this.href; }
+  toJSON() { return this.href; }
+  static canParse(u, b) {
+    try { new URL(u, b); return true; } catch { return false; }
+  }
+  [inspectCustom](depth, opts, inspect) {
+    if (typeof depth === 'number' && depth < 0) return this;
+    const o = { href: this.href, origin: this.origin, protocol: this.protocol, username: this.username, password: this.password, host: this.host, hostname: this.hostname, port: this.port, pathname: this.pathname, search: this.search, searchParams: this.searchParams, hash: this.hash };
+    return `URL ${inspect(o, opts)}`;
+  }
+}
+Object.defineProperty(URL.prototype, '__setSearch', { enumerable: false });
+for (const k of ['href', 'origin', 'protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'searchParams', 'hash'])
+  Object.defineProperty(URL.prototype, k, { enumerable: true });
+
+const encodePath = (s) => encodeWith(s, "/%-._~!$&'()*+,;=:@[]|^`");
+const encodeQuery = (s) => encodeWith(s, "?%-._~!$&()*+,;=:@/[]\\^`{|}");
+const encodeFragment = (s) => encodeWith(s, "#%-._~!$&'()*+,;=:@/?[]\\^{|}");
+const encodeUser = (s) => encodeWith(s, "%-._~!$&'()*+,");
+
+internal.installGlobal('URL', URL);
+internal.installGlobal('URLSearchParams', URLSearchParams);
+
+module.exports = {
+  URL,
+  URLSearchParams,
+  parse(s) {
+    const u = new URL(s);
+    return { href: u.href, protocol: u.protocol, host: u.host, hostname: u.hostname, port: u.port || null, pathname: u.pathname, search: u.search || null, query: u.search ? u.search.slice(1) : null, hash: u.hash || null, auth: u.username ? u.username + (u.password ? ':' + u.password : '') : null, slashes: true, path: u.pathname + u.search };
+  },
+  format: (u) => (typeof u === 'string' ? u : u.href ?? String(u)),
+  fileURLToPath: (u) => decodeURIComponent(new URL(u).pathname.replace(/^\/([a-zA-Z]:)/, '$1')).replace(/\//g, '\\'),
+  pathToFileURL: (p) => new URL('file:///' + String(p).replace(/\\/g, '/').replace(/^\//, '')),
+};

@@ -1,0 +1,166 @@
+'use strict';
+// console's less common methods.
+const util = require('util');
+const out = (s) => console.log(s);
+let indent = '';
+const counts = new Map();
+const timers = new Map();
+
+function width(s) {
+  return util.getStringWidth(s);
+}
+
+// console.table's drawing (the layout of Node's lib/internal/cli_table.js)
+const tableChars = { middleMiddle: '─', rowMiddle: '┼', topRight: '┐', topLeft: '┌', leftMiddle: '├', topMiddle: '┬', bottomRight: '┘', bottomLeft: '└', bottomMiddle: '┴', rightMiddle: '┤', left: '│ ', right: ' │', middle: ' │ ' };
+
+function renderRow(row, columnWidths) {
+  let text = tableChars.left;
+  for (let i = 0; i < row.length; i++) {
+    const cell = row[i];
+    const len = width(cell);
+    const needed = (columnWidths[i] - len) / 2;
+    text += cell + ' '.repeat(needed * 2);
+    if (i !== row.length - 1) text += tableChars.middle;
+  }
+  return text + tableChars.right;
+}
+
+function drawTable(head, columns) {
+  const rows = [];
+  const columnWidths = head.map((h) => width(h));
+  const longest = Math.max(...columns.map((a) => a.length));
+  for (let i = 0; i < head.length; i++) {
+    const column = columns[i];
+    for (let j = 0; j < longest; j++) {
+      if (rows[j] === undefined) rows[j] = [];
+      const value = (rows[j][i] = Object.hasOwn(column, j) ? column[j] : '');
+      const w = columnWidths[i] || 0;
+      const counted = width(value);
+      columnWidths[i] = Math.max(w, counted);
+    }
+  }
+  const divider = columnWidths.map((i) => tableChars.middleMiddle.repeat(i + 2));
+  let result = tableChars.topLeft + divider.join(tableChars.topMiddle) + tableChars.topRight + '\n' + renderRow(head, columnWidths) + '\n' + tableChars.leftMiddle + divider.join(tableChars.rowMiddle) + tableChars.rightMiddle + '\n';
+  for (const row of rows) result += renderRow(row, columnWidths) + '\n';
+  return result + tableChars.bottomLeft + divider.join(tableChars.bottomMiddle) + tableChars.bottomRight;
+}
+
+const iterKey = '(iteration index)', keyKey = 'Key', valuesKey = 'Values', indexKey = '(index)';
+
+function table(data, properties) {
+  if (data === null || typeof data !== 'object') return console.log(data);
+  const fmt = (v) => {
+    const opt = { depth: v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 2 ? -1 : 0, maxArrayLength: 3, breakLength: Infinity };
+    return util.inspect(v, opt);
+  };
+  const final = (k, v) => console.log(drawTable(k, v));
+  const isMap = data instanceof Map, isSet = data instanceof Set;
+  const mapIter = util.types.isMapIterator(data), setIter = util.types.isSetIterator(data);
+  if (isMap || mapIter) {
+    const keys = [], values = [];
+    let length = 0;
+    for (const [k, v] of isMap ? data : util.previewEntriesPairs(data)) {
+      keys.push(fmt(k));
+      values.push(fmt(v));
+      length++;
+    }
+    return final([iterKey, keyKey, valuesKey], [Array.from({ length }, (_, i) => String(i)), keys, values]);
+  }
+  if (isSet || setIter) {
+    const values = [];
+    let length = 0;
+    for (const v of data) {
+      values.push(fmt(v));
+      length++;
+    }
+    return final([iterKey, valuesKey], [Array.from({ length }, (_, i) => String(i)), values]);
+  }
+  const map = Object.create(null);
+  let hasPrimitives = false;
+  const valuesKeyArray = [];
+  const indexKeyArray = Object.keys(data);
+  for (let i = 0; i < indexKeyArray.length; i++) {
+    const item = data[indexKeyArray[i]];
+    const primitive = item === null || (typeof item !== 'function' && typeof item !== 'object');
+    if (properties === undefined && primitive) {
+      hasPrimitives = true;
+      valuesKeyArray[i] = fmt(item);
+    } else {
+      const keys = properties || Object.keys(item);
+      for (const key of keys) {
+        map[key] ??= [];
+        if ((primitive && properties) || !Object.hasOwn(item, key)) map[key][i] = '';
+        else map[key][i] = fmt(item[key]);
+      }
+    }
+  }
+  const keys = Object.keys(map);
+  const values = Object.values(map);
+  if (hasPrimitives) {
+    keys.push(valuesKey);
+    values.push(valuesKeyArray);
+  }
+  keys.unshift(indexKey);
+  values.unshift(indexKeyArray);
+  return final(keys, values);
+}
+
+function setIndent(s) {
+  indent = s;
+  internal.setGroupIndent(s);
+}
+
+module.exports = {
+  table,
+  group(...label) {
+    if (label.length) console.log(...label);
+    setIndent(indent + '  ');
+  },
+  groupCollapsed(...label) {
+    if (label.length) console.log(...label);
+    setIndent(indent + '  ');
+  },
+  groupEnd() {
+    setIndent(indent.slice(0, -2));
+  },
+  dir(obj, options) {
+    out(util.inspect(obj, { customInspect: false, ...options }));
+  },
+  dirxml(...args) {
+    console.log(...args);
+  },
+  count(label = 'default') {
+    label = `${label}`;
+    const n = (counts.get(label) ?? 0) + 1;
+    counts.set(label, n);
+    console.log(`${label}: ${n}`);
+  },
+  countReset(label = 'default') {
+    counts.delete(`${label}`);
+  },
+  assert(cond, ...args) {
+    if (cond) return;
+    if (typeof args[0] === 'string') args[0] = `Assertion failed: ${args[0]}`;
+    else args.unshift('Assertion failed');
+    console.warn(...args);
+  },
+  time(label = 'default') {
+    timers.set(`${label}`, internal.now());
+  },
+  timeEnd(label = 'default') {
+    const t = timers.get(`${label}`);
+    if (t === undefined) return;
+    timers.delete(`${label}`);
+    console.log(`${label}: ${(internal.now() - t).toFixed(3)}ms`);
+  },
+  timeLog(label = 'default', ...data) {
+    const t = timers.get(`${label}`);
+    if (t === undefined) return;
+    console.log(`${label}: ${(internal.now() - t).toFixed(3)}ms`, ...data);
+  },
+  trace(...args) {
+    const err = { name: 'Trace', message: util.format(...args) };
+    Error.captureStackTrace(err);
+    console.error(err.stack);
+  },
+};

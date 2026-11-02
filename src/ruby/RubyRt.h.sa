@@ -328,6 +328,10 @@ struct StopEx // internal: ends a native iteration early
 {
     uint64_t tag;
 };
+struct KillEx // Thread#kill: nothing rescues it, ensure clauses still run
+{
+    int unused;
+};
 
 enum Unwind : uint8_t
 {

@@ -1,0 +1,2042 @@
+// quantum: cpp
+// JavaScript front-end: generators, async functions, promises and the event
+// loop. A generator or async function runs on a fiber of its own, with its own
+// native stack and value stack; suspending is a stack switch. Promise jobs
+// follow the spec's steps so that their order comes out exactly the same.
+// Time is virtual: nothing ever sleeps, timers just run in order of their due.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <chrono>
+#include <algorithm>
+#include <cstdlib>
+
+// A compiler older than these intrinsics (the seed, on the way to building
+// the real one) never runs this code
+#ifndef __QUANTUM_EH_TOP__
+#define __eh_top() ((int64_t)0)
+#define __eh_top_set(x) ((void)(x))
+#endif
+
+namespace __dll_kernel32
+{
+void *ConvertThreadToFiber(void *param);
+void *CreateFiberEx(size_t commit, size_t reserve, unsigned long flags, void (*start)(void *), void *param);
+void SwitchToFiber(void *fiber);
+} // namespace __dll_kernel32
+
+namespace js
+{
+
+void reportUncaught(V err); // JsNode.sa
+void reportUnhandledRejection(V reason, V promise);
+bool hasUnhandledRejectionHandler();
+
+namespace
+{
+
+const int kCoValueSlots = 1 << 16;
+const size_t kCoStackReserve = (size_t)16 << 20;
+const size_t kCoStackCommit = (size_t)64 << 10;
+
+enum CoKind : uint8_t
+{
+    CK_GENERATOR,
+    CK_ASYNC,
+    CK_ASYNCGEN
+};
+
+enum ResumeMode : uint8_t
+{
+    RM_NEXT,
+    RM_THROW,
+    RM_RETURN
+};
+
+struct FiberBox
+{
+    void *fiber;
+    V *values;
+    char *limit;
+};
+
+struct AgRequest
+{
+    uint8_t mode;
+    V val;
+    V promise;
+};
+
+struct Co : Obj
+{
+    uint8_t kind;
+    bool started, finished, running;
+    uint8_t mode;
+    V transfer;
+    V yielded;
+    bool threw;
+    V result;
+    bool exited;
+    int exitCode;
+    JFunc *fn;
+    Frame *frame;
+    FiberBox *box;
+    void *caller;
+    // what the resumer had
+    V *savedSp, *savedSpEnd;
+    Frame *savedFrame;
+    char *savedLimit;
+    int64_t savedEh;
+    JFunc *savedCallee;
+    V savedNt;
+    // async functions
+    V promise;
+    // async generators
+    std::vector<AgRequest> *queue;
+    bool agSuspendedYield;
+    bool agAwaitingReturn;
+};
+
+void *g_mainFiber = nullptr;
+void *g_curFiber = nullptr;
+std::vector<FiberBox *> g_freeBoxes;
+Co *g_startCo = nullptr;
+Co *g_curCo = nullptr;
+
+void fiberEntry(void *param);
+
+FiberBox *takeBox()
+{
+    if (!g_freeBoxes.empty())
+    {
+        FiberBox *b = g_freeBoxes.back();
+        g_freeBoxes.pop_back();
+        return b;
+    }
+    FiberBox *b = new FiberBox();
+    b->values = static_cast<V *>(zalloc((size_t)kCoValueSlots * sizeof(V)));
+    b->limit = nullptr;
+    b->fiber = __dll_kernel32::CreateFiberEx(kCoStackCommit, kCoStackReserve, 0, fiberEntry, b);
+    if (!b->fiber)
+        throwRange("Out of stacks for generators");
+    return b;
+}
+
+void coRunBody(Co *c)
+{
+    Frame *f = c->frame;
+    V r = Undefined;
+    bool threw = false;
+    JsState st0;
+    try
+    {
+        if (c->mode == RM_THROW)
+            throw JsThrow{c->transfer};
+        if (c->mode == RM_RETURN)
+            throw GenReturn{c->transfer};
+        r = runFunctionBody(f->node->body, f);
+    }
+    catch (JsThrow &t)
+    {
+        st0.restore();
+        threw = true;
+        r = t.val;
+    }
+    catch (GenReturn &g)
+    {
+        st0.restore();
+        r = g.val;
+    }
+    catch (JsExit &e)
+    {
+        st0.restore();
+        c->exited = true;
+        c->exitCode = e.code;
+    }
+    g_comp = CO_NONE;
+    c->threw = threw;
+    c->result = r;
+    c->finished = true;
+    c->running = false;
+}
+
+void fiberEntry(void *param)
+{
+    FiberBox *box = static_cast<FiberBox *>(param);
+    char here;
+    box->limit = &here - (kCoStackReserve - ((size_t)1 << 20));
+    for (;;)
+    {
+        Co *c = g_startCo;
+        __eh_top_set(0);
+        g_stackLimit = box->limit;
+        coRunBody(c);
+        // the stack goes back to the pool before anything else can want one
+        g_freeBoxes.push_back(box);
+        void *back = c->caller;
+        g_curFiber = back;
+        __dll_kernel32::SwitchToFiber(back);
+    }
+}
+
+// hands control to the coroutine; returns when it yields, awaits or ends
+void coSwitchIn(Co *c, uint8_t mode, V val)
+{
+    if (!g_mainFiber)
+    {
+        g_mainFiber = __dll_kernel32::ConvertThreadToFiber(nullptr);
+        g_curFiber = g_mainFiber;
+    }
+    c->mode = mode;
+    c->transfer = val;
+    c->running = true;
+    c->caller = g_curFiber;
+    c->savedSp = g_sp;
+    c->savedSpEnd = g_spEnd;
+    c->savedFrame = g_frame;
+    c->savedLimit = g_stackLimit;
+    c->savedEh = __eh_top();
+    c->savedCallee = g_nativeCallee;
+    c->savedNt = g_nativeNewTarget;
+    Co *prevCo = g_curCo;
+    g_curCo = c;
+    c->frame->prev = g_frame;
+    bool first = !c->started;
+    if (first)
+    {
+        c->started = true;
+        c->box = takeBox();
+        g_startCo = c;
+        g_sp = c->box->values;
+        g_spEnd = c->box->values + kCoValueSlots - 64;
+        if (c->box->limit)
+            g_stackLimit = c->box->limit;
+    }
+    g_frame = c->frame;
+    void *target = c->box->fiber;
+    g_curFiber = target;
+    __dll_kernel32::SwitchToFiber(target);
+    // back here
+    __eh_top_set(c->savedEh);
+    g_sp = c->savedSp;
+    g_spEnd = c->savedSpEnd;
+    g_frame = c->savedFrame;
+    g_stackLimit = c->savedLimit;
+    g_nativeCallee = c->savedCallee;
+    g_nativeNewTarget = c->savedNt;
+    g_curCo = prevCo;
+    if (c->exited)
+        throw JsExit{c->exitCode};
+}
+
+// from inside: back to whoever resumed this coroutine
+void coSwitchOut(Co *c)
+{
+    V *mySp = g_sp;
+    V *mySpEnd = g_spEnd;
+    char *myLimit = g_stackLimit;
+    int64_t myEh = __eh_top();
+    Frame *myFrame = g_frame;
+    JFunc *myCallee = g_nativeCallee;
+    V myNt = g_nativeNewTarget;
+    c->running = false;
+    void *back = c->caller;
+    g_curFiber = back;
+    __dll_kernel32::SwitchToFiber(back);
+    // resumed
+    __eh_top_set(myEh);
+    g_sp = mySp;
+    g_spEnd = mySpEnd;
+    g_stackLimit = myLimit;
+    g_frame = myFrame;
+    g_nativeCallee = myCallee;
+    g_nativeNewTarget = myNt;
+}
+
+Co *newCo(uint8_t kind, JFunc *fn, V thisV, V *args, int argc)
+{
+    Co *c = static_cast<Co *>(allocObj(sizeof(Co), C_OBJECT, nullptr));
+    c->kind = kind;
+    c->fn = fn;
+    c->transfer = Undefined;
+    c->yielded = Undefined;
+    c->result = Undefined;
+    c->promise = Undefined;
+    FuncNode *node = fn->node;
+    Frame *f = NEW(Frame);
+    f->fn = fn;
+    f->node = node;
+    f->env = fn->env;
+    f->newTarget = Undefined;
+    f->co = c;
+    f->isNative = false;
+    f->prev = g_frame;
+    if (fn->kind == FK_ARROW || node->isArrow)
+    {
+        f->receiver = thisV;
+        f->thisV = fn->thisV;
+        f->newTarget = fn->newTarget;
+    }
+    else if (node->strict)
+        f->thisV = thisV;
+    else if (isNullish(thisV))
+        f->thisV = objv(g_global);
+    else
+        f->thisV = isObj(thisV) ? thisV : toObject(thisV);
+    // arguments outlive the call that passed them
+    V *mem = static_cast<V *>(bump(sizeof(V) * (size_t)(argc + 1)));
+    for (int i = 0; i < argc; ++i)
+        mem[i] = args[i];
+    f->args = mem;
+    f->argc = argc;
+    f->locals = static_cast<V *>(bump(sizeof(V) * (size_t)(node->nLocals + 1)));
+    c->frame = f;
+    return c;
+}
+
+// run parameter binding on the caller's stack: errors there happen at the call
+void bindParams(Co *c)
+{
+    Frame *f = c->frame;
+    Frame *saved = g_frame;
+    g_frame = f;
+    JsState st1;
+    try
+    {
+        setupCall(f, f->node, c->fn);
+    }
+    catch (...)
+    {
+        st1.restore();
+        g_frame = saved;
+        throw;
+    }
+    g_frame = saved;
+}
+
+// ── generators ───────────────────────────────────────────────────────────
+
+struct JGen : Obj
+{
+    Co *co;
+};
+
+V genResume(V thisV, uint8_t mode, V val, const char *name)
+{
+    if (!isObj(thisV) || op(thisV)->cls != C_GENERATOR)
+        throwType(std::string("Method [Generator].prototype.") + name + " called on incompatible receiver " + inspectBrief(thisV));
+    Co *c = static_cast<JGen *>(op(thisV))->co;
+    if (c->running)
+        throwType("Generator is already running");
+    if (c->finished)
+    {
+        if (mode == RM_THROW)
+            throw JsThrow{val};
+        return iterResult(mode == RM_RETURN ? val : Undefined, true);
+    }
+    if (!c->started && mode != RM_NEXT)
+    {
+        c->finished = true;
+        if (mode == RM_THROW)
+            throw JsThrow{val};
+        return iterResult(val, true);
+    }
+    coSwitchIn(c, mode, val);
+    if (c->finished)
+    {
+        if (c->threw)
+            throw JsThrow{c->result};
+        return iterResult(c->result, true);
+    }
+    return iterResult(c->yielded, false);
+}
+
+V genNext(V thisV, V *args, int argc) { return genResume(thisV, RM_NEXT, argOr(args, argc, 0), "next"); }
+V genReturn(V thisV, V *args, int argc) { return genResume(thisV, RM_RETURN, argOr(args, argc, 0), "return"); }
+V genThrow(V thisV, V *args, int argc) { return genResume(thisV, RM_THROW, argOr(args, argc, 0), "throw"); }
+
+// after a suspension: what the resumer asked for
+V coAfterResume(Co *c)
+{
+    if (c->mode == RM_THROW)
+        throw JsThrow{c->transfer};
+    if (c->mode == RM_RETURN)
+        throw GenReturn{c->transfer};
+    return c->transfer;
+}
+
+// ── promises ─────────────────────────────────────────────────────────────
+
+struct Reaction
+{
+    V onOk, onBad;
+    V capPromise, capResolve, capReject; // capResolve 0: capPromise is ours, resolved directly
+};
+
+struct JPromise : Obj
+{
+    uint8_t state; // 0 pending, 1 fulfilled, 2 rejected
+    bool handled;
+    V value;
+    std::vector<Reaction> *reactions;
+};
+
+enum JobKind : uint8_t
+{
+    JOB_REACTION,
+    JOB_THENABLE,
+    JOB_CALLBACK
+};
+
+struct Job
+{
+    uint8_t kind;
+    bool rejected;
+    V a, b, c;
+    V capPromise, capResolve, capReject;
+};
+
+std::vector<Job> *g_jobs = nullptr;
+size_t g_jobHead = 0;
+std::vector<V> *g_pendingRejections = nullptr;
+
+void enqueue(const Job &j)
+{
+    g_jobs->push_back(j);
+}
+
+#define IS_PROMISE(v) (isObj(v) && op(v)->cls == C_PROMISE)
+#define PROM(v) (static_cast<JPromise *>(op(v)))
+
+V allocPromise(Obj *proto)
+{
+    JPromise *p = static_cast<JPromise *>(allocObj(sizeof(JPromise), C_PROMISE, proto));
+    p->value = Undefined;
+    return objv(p);
+}
+
+void settle(V pv, uint8_t state, V val)
+{
+    JPromise *p = PROM(pv);
+    if (p->state)
+        return;
+    p->state = state;
+    p->value = val;
+    std::vector<Reaction> *rs = p->reactions;
+    p->reactions = nullptr;
+    if (state == 2 && !p->handled)
+        g_pendingRejections->push_back(pv);
+    if (!rs)
+        return;
+    for (const Reaction &r : *rs)
+    {
+        Job j;
+        j.kind = JOB_REACTION;
+        j.rejected = state == 2;
+        j.a = state == 2 ? r.onBad : r.onOk;
+        j.b = val;
+        j.c = Undefined;
+        j.capPromise = r.capPromise;
+        j.capResolve = r.capResolve;
+        j.capReject = r.capReject;
+        enqueue(j);
+    }
+}
+
+} // namespace
+
+V newPromise()
+{
+    return allocPromise(PR.promise);
+}
+
+void promiseReject(V p, V reason)
+{
+    settle(p, 2, reason);
+}
+
+// the resolve function's steps
+void promiseResolve(V p, V val)
+{
+    if (PROM(p)->state)
+        return;
+    if (val == p)
+    {
+        settle(p, 2, makeError(E_TYPE, "Chaining cycle detected for promise #<Promise>"));
+        return;
+    }
+    if (!isObj(val))
+    {
+        settle(p, 1, val);
+        return;
+    }
+    V then;
+    JsState st2;
+    try
+    {
+        then = getProp(val, A.then);
+    }
+    catch (JsThrow &t)
+    {
+        st2.restore();
+        settle(p, 2, t.val);
+        return;
+    }
+    if (!isCallable(then))
+    {
+        settle(p, 1, val);
+        return;
+    }
+    Job j;
+    j.kind = JOB_THENABLE;
+    j.rejected = false;
+    j.a = p;
+    j.b = val;
+    j.c = then;
+    j.capPromise = 0;
+    j.capResolve = 0;
+    j.capReject = 0;
+    enqueue(j);
+}
+
+namespace
+{
+
+// the two functions a promise's executor gets
+V resolvingCall(V, V *args, int argc)
+{
+    JFunc *self = g_nativeCallee;
+    V flag = self->data2;
+    JArray *fl = static_cast<JArray *>(op(flag));
+    if (fl->el[0] == True)
+        return Undefined;
+    fl->el[0] = True;
+    V p = self->data;
+    if (self->natLen == 1 && self->target == True)
+        settle(p, 2, argOr(args, argc, 0));
+    else
+        promiseResolve(p, argOr(args, argc, 0));
+    return Undefined;
+}
+
+void resolvingFunctions(V p, V *resolve, V *reject)
+{
+    V f = False;
+    V flag = objv(newArrayFrom(&f, 1));
+    JFunc *a = newClosure("", resolvingCall, 1, p, flag);
+    JFunc *b = newClosure("", resolvingCall, 1, p, flag);
+    b->target = True;
+    *resolve = objv(a);
+    *reject = objv(b);
+}
+
+V promiseCtor(V, V *args, int argc)
+{
+    if (g_nativeNewTarget == Undefined)
+        throwType("Promise constructor cannot be invoked without 'new'");
+    V ex = argOr(args, argc, 0);
+    if (!isCallable(ex))
+        throwType("Promise resolver " + inspectBrief(ex) + " is not a function");
+    V p = allocPromise(protoFromCtor(g_nativeNewTarget, PR.promise));
+    V res, rej;
+    resolvingFunctions(p, &res, &rej);
+    bool threw = false;
+    V exc = Undefined;
+    JsState st3;
+    try
+    {
+        call2(ex, Undefined, res, rej);
+    }
+    catch (JsThrow &t)
+    {
+        st3.restore();
+        threw = true;
+        exc = t.val;
+    }
+    if (threw)
+        call1(rej, Undefined, exc);
+    return p;
+}
+
+struct Capability
+{
+    V promise, resolve, reject;
+};
+
+V capExecutor(V, V *args, int argc)
+{
+    V holder = NATIVE_DATA();
+    JArray *h = static_cast<JArray *>(op(holder));
+    if (h->el[0] != Undefined || h->el[1] != Undefined)
+        throwType("Promise executor has already been invoked with non-undefined arguments");
+    h->el[0] = argOr(args, argc, 0);
+    h->el[1] = argOr(args, argc, 1);
+    return Undefined;
+}
+
+Capability newCapability(V ctorC)
+{
+    Capability cap;
+    if (ctorC == PR.ctorPromise)
+    {
+        cap.promise = newPromise();
+        cap.resolve = 0;
+        cap.reject = 0;
+        return cap;
+    }
+    if (!isCtor(ctorC))
+        throwType("Promise resolve or reject function is not callable");
+    V init[2] = {Undefined, Undefined};
+    V holder = objv(newArrayFrom(init, 2));
+    V ex = objv(newClosure("", capExecutor, 2, holder));
+    V p = construct(ctorC, &ex, 1, ctorC);
+    JArray *h = static_cast<JArray *>(op(holder));
+    if (!isCallable(h->el[0]) || !isCallable(h->el[1]))
+        throwType("Promise resolve or reject function is not callable");
+    cap.promise = p;
+    cap.resolve = h->el[0];
+    cap.reject = h->el[1];
+    return cap;
+}
+
+void capResolve(const Capability &c, V v)
+{
+    if (c.resolve)
+        call1(c.resolve, Undefined, v);
+    else
+        promiseResolve(c.promise, v);
+}
+
+void capReject(const Capability &c, V v)
+{
+    if (c.reject)
+        call1(c.reject, Undefined, v);
+    else
+        settle(c.promise, 2, v);
+}
+
+V capFnResolve(const Capability &c)
+{
+    if (c.resolve)
+        return c.resolve;
+    V a, b;
+    resolvingFunctions(c.promise, &a, &b);
+    return a;
+}
+
+} // namespace
+
+// PerformPromiseThen; result 0: nobody awaits the outcome
+void promiseThen(V pv, V onOk, V onBad, V result)
+{
+    JPromise *p = PROM(pv);
+    Reaction r;
+    r.onOk = onOk;
+    r.onBad = onBad;
+    r.capPromise = result;
+    r.capResolve = 0;
+    r.capReject = 0;
+    if (p->state == 0)
+    {
+        if (!p->reactions)
+            p->reactions = new std::vector<Reaction>();
+        p->reactions->push_back(r);
+    }
+    else
+    {
+        Job j;
+        j.kind = JOB_REACTION;
+        j.rejected = p->state == 2;
+        j.a = p->state == 2 ? onBad : onOk;
+        j.b = p->value;
+        j.c = Undefined;
+        j.capPromise = result;
+        j.capResolve = 0;
+        j.capReject = 0;
+        enqueue(j);
+    }
+    p->handled = true;
+}
+
+namespace
+{
+
+void promiseThenCap(V pv, V onOk, V onBad, const Capability &cap)
+{
+    JPromise *p = PROM(pv);
+    Reaction r;
+    r.onOk = onOk;
+    r.onBad = onBad;
+    r.capPromise = cap.promise;
+    r.capResolve = cap.resolve;
+    r.capReject = cap.reject;
+    if (p->state == 0)
+    {
+        if (!p->reactions)
+            p->reactions = new std::vector<Reaction>();
+        p->reactions->push_back(r);
+    }
+    else
+    {
+        Job j;
+        j.kind = JOB_REACTION;
+        j.rejected = p->state == 2;
+        j.a = p->state == 2 ? onBad : onOk;
+        j.b = p->value;
+        j.c = Undefined;
+        j.capPromise = cap.promise;
+        j.capResolve = cap.resolve;
+        j.capReject = cap.reject;
+        enqueue(j);
+    }
+    p->handled = true;
+}
+
+V speciesCtor(V obj, V dflt)
+{
+    V c = getProp(obj, A.constructor);
+    if (c == Undefined)
+        return dflt;
+    if (!isObj(c))
+        throwType("The .constructor property is not an object");
+    V s = getProp(c, WK.species);
+    if (isNullish(s))
+        return dflt;
+    if (isCtor(s))
+        return s;
+    throwType("object.constructor[Symbol.species] is not a constructor");
+}
+
+V pThen(V thisV, V *args, int argc)
+{
+    if (!IS_PROMISE(thisV))
+        throwType("Method Promise.prototype.then called on incompatible receiver " + inspectBrief(thisV));
+    V c = speciesCtor(thisV, PR.ctorPromise);
+    Capability cap = newCapability(c);
+    V ok = argOr(args, argc, 0), bad = argOr(args, argc, 1);
+    promiseThenCap(thisV, isCallable(ok) ? ok : Undefined, isCallable(bad) ? bad : Undefined, cap);
+    return cap.promise;
+}
+
+V pCatch(V thisV, V *args, int argc)
+{
+    V a[2] = {Undefined, argOr(args, argc, 0)};
+    return invoke(thisV, A.then, a, 2);
+}
+
+// Promise.resolve's steps
+V promiseResolveWith(V ctorC, V x)
+{
+    if (IS_PROMISE(x))
+    {
+        V xc = getProp(x, A.constructor);
+        if (xc == ctorC)
+            return x;
+    }
+    Capability cap = newCapability(ctorC);
+    capResolve(cap, x);
+    return cap.promise;
+}
+
+V valueThunk(V, V *, int) { return NATIVE_DATA(); }
+V throwerThunk(V, V *, int) { throw JsThrow{NATIVE_DATA()}; }
+
+V finallyStep(V, V *args, int argc)
+{
+    // data: onFinally; data2: constructor; target: True when rejecting
+    JFunc *self = g_nativeCallee;
+    V r = call0(self->data, Undefined);
+    V p = promiseResolveWith(self->data2, r);
+    V val = argOr(args, argc, 0);
+    bool rejecting = self->target == True;
+    V thunk = objv(newClosure("", rejecting ? throwerThunk : valueThunk, 0, val));
+    return invoke(p, A.then, &thunk, 1);
+}
+
+V pFinally(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("Promise.prototype.finally called on a non-object");
+    V f = argOr(args, argc, 0);
+    V c = speciesCtor(thisV, PR.ctorPromise);
+    V a[2];
+    if (!isCallable(f))
+    {
+        a[0] = f;
+        a[1] = f;
+    }
+    else
+    {
+        JFunc *ok = newClosure("", finallyStep, 1, f, c);
+        JFunc *bad = newClosure("", finallyStep, 1, f, c);
+        bad->target = True;
+        a[0] = objv(ok);
+        a[1] = objv(bad);
+    }
+    return invoke(thisV, A.then, a, 2);
+}
+
+V pResolveStatic(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("PromiseResolve called on non-object");
+    return promiseResolveWith(thisV, argOr(args, argc, 0));
+}
+
+V pRejectStatic(V thisV, V *args, int argc)
+{
+    Capability cap = newCapability(thisV);
+    capReject(cap, argOr(args, argc, 0));
+    return cap.promise;
+}
+
+V pWithResolvers(V thisV, V *, int)
+{
+    V res, rej, pr;
+    if (thisV == PR.ctorPromise)
+    {
+        pr = newPromise();
+        resolvingFunctions(pr, &res, &rej);
+    }
+    else
+    {
+        Capability c = newCapability(thisV);
+        pr = c.promise;
+        res = c.resolve;
+        rej = c.reject;
+    }
+    Obj *o = newObject();
+    defineOwn(o, atomOf("promise"), pr, PF_DEFAULT);
+    defineOwn(o, atomOf("resolve"), res, PF_DEFAULT);
+    defineOwn(o, atomOf("reject"), rej, PF_DEFAULT);
+    return objv(o);
+}
+
+// shared bookkeeping of the combinators: values array, remaining count, capability
+struct CombState : Obj
+{
+    JArray *values;
+    int64_t remaining;
+    V capPromise, capResolve, capReject;
+    uint8_t mode; // 0 all, 1 allSettled, 2 any
+};
+
+Capability capOf(CombState *s)
+{
+    Capability c;
+    c.promise = s->capPromise;
+    c.resolve = s->capResolve;
+    c.reject = s->capReject;
+    return c;
+}
+
+void combFinish(CombState *s)
+{
+    Capability c = capOf(s);
+    if (s->mode == 2)
+    {
+        V err = makeError(E_AGGREGATE, "All promises were rejected");
+        defineOwn(op(err), A.errors, objv(s->values), PF_W | PF_C);
+        capReject(c, err);
+    }
+    else
+        capResolve(c, objv(s->values));
+}
+
+V combElement(V, V *args, int argc)
+{
+    // data: state; data2: [index, kind 0 plain/1 fulfilled/2 rejected, shared called flag]
+    JFunc *self = g_nativeCallee;
+    JArray *info = static_cast<JArray *>(op(self->data2));
+    JArray *called = static_cast<JArray *>(op(info->el[2]));
+    if (called->el[0] == True)
+        return Undefined;
+    called->el[0] = True;
+    CombState *s = static_cast<CombState *>(op(self->data));
+    int idx = (int)numOf(info->el[0]);
+    int kind = (int)numOf(info->el[1]);
+    V x = argOr(args, argc, 0);
+    if (kind)
+    {
+        Obj *o = newObject();
+        defineOwn(o, atomOf("status"), kind == 1 ? atomOf("fulfilled") : atomOf("rejected"), PF_DEFAULT);
+        defineOwn(o, kind == 1 ? A.value : atomOf("reason"), x, PF_DEFAULT);
+        x = objv(o);
+    }
+    s->values->el[idx] = x;
+    if (--s->remaining == 0)
+        combFinish(s);
+    return Undefined;
+}
+
+V makeElement(CombState *s, int idx, int kind, V called)
+{
+    V info[3] = {num((double)idx), num((double)kind), called};
+    return objv(newClosure("", combElement, 1, objv(s), objv(newArrayFrom(info, 3))));
+}
+
+V combinator(V ctorC, V iterable, uint8_t mode)
+{
+    Capability cap = newCapability(ctorC);
+    bool failed = false;
+    V exc = Undefined;
+    JsState st4;
+    try
+    {
+        V resolver = getProp(ctorC, atomOf("resolve"));
+        if (!isCallable(resolver))
+            throwType("Promise resolve or reject function is not callable");
+        CombState *s = static_cast<CombState *>(allocObj(sizeof(CombState), C_OBJECT, nullptr));
+        s->values = newArray();
+        s->remaining = 1;
+        s->capPromise = cap.promise;
+        s->capResolve = cap.resolve;
+        s->capReject = cap.reject;
+        s->mode = mode;
+        Iter it;
+        iterOpen(it, iterable);
+        V x;
+        int idx = 0;
+        while (iterStep(it, &x))
+        {
+            arrayPush(s->values, Undefined);
+            V next = call1(resolver, ctorC, x);
+            V f = False;
+            V called = objv(newArrayFrom(&f, 1));
+            V a[2];
+            if (mode == 0)
+            {
+                a[0] = makeElement(s, idx, 0, called);
+                V res, rej = cap.reject;
+                if (!cap.reject)
+                {
+                    V tmp;
+                    resolvingFunctions(cap.promise, &tmp, &res);
+                    rej = res;
+                }
+                a[1] = rej;
+            }
+            else if (mode == 1)
+            {
+                a[0] = makeElement(s, idx, 1, called);
+                a[1] = makeElement(s, idx, 2, called);
+            }
+            else
+            {
+                V res = capFnResolve(cap);
+                a[0] = res;
+                a[1] = makeElement(s, idx, 0, called);
+            }
+            ++s->remaining;
+            invoke(next, A.then, a, 2);
+            ++idx;
+        }
+        if (--s->remaining == 0)
+            combFinish(s);
+    }
+    catch (JsThrow &t)
+    {
+        st4.restore();
+        failed = true;
+        exc = t.val;
+    }
+    if (failed)
+        capReject(cap, exc);
+    return cap.promise;
+}
+
+V pAll(V thisV, V *args, int argc) { return combinator(thisV, argOr(args, argc, 0), 0); }
+V pAllSettled(V thisV, V *args, int argc) { return combinator(thisV, argOr(args, argc, 0), 1); }
+V pAny(V thisV, V *args, int argc) { return combinator(thisV, argOr(args, argc, 0), 2); }
+
+V pRace(V thisV, V *args, int argc)
+{
+    Capability cap = newCapability(thisV);
+    bool failed = false;
+    V exc = Undefined;
+    JsState st5;
+    try
+    {
+        V resolver = getProp(thisV, atomOf("resolve"));
+        if (!isCallable(resolver))
+            throwType("Promise resolve or reject function is not callable");
+        V res = cap.resolve, rej = cap.reject;
+        if (!res)
+            resolvingFunctions(cap.promise, &res, &rej);
+        Iter it;
+        iterOpen(it, argOr(args, argc, 0));
+        V x;
+        while (iterStep(it, &x))
+        {
+            V next = call1(resolver, thisV, x);
+            V a[2] = {res, rej};
+            invoke(next, A.then, a, 2);
+        }
+    }
+    catch (JsThrow &t)
+    {
+        st5.restore();
+        failed = true;
+        exc = t.val;
+    }
+    if (failed)
+        capReject(cap, exc);
+    return cap.promise;
+}
+
+V selfSpecies(V thisV, V *, int)
+{
+    return thisV;
+}
+
+void runJob(const Job &j)
+{
+    switch (j.kind)
+    {
+    case JOB_CALLBACK:
+    {
+        V a[2] = {j.b, j.c};
+        call(j.a, Undefined, a, j.b == Hole ? 0 : 2);
+        return;
+    }
+    case JOB_THENABLE:
+    {
+        V res, rej;
+        resolvingFunctions(j.a, &res, &rej);
+        bool threw = false;
+        V exc = Undefined;
+        JsState st6;
+        try
+        {
+            call2(j.c, j.b, res, rej);
+        }
+        catch (JsThrow &t)
+        {
+            st6.restore();
+            threw = true;
+            exc = t.val;
+        }
+        if (threw)
+            call1(rej, Undefined, exc);
+        return;
+    }
+    default:
+    {
+        V out = Undefined;
+        bool threw = false;
+        if (j.a == Undefined)
+        {
+            threw = j.rejected;
+            out = j.b;
+        }
+        else
+        {
+            JsState st7;
+            try
+            {
+                out = call1(j.a, Undefined, j.b);
+            }
+            catch (JsThrow &t)
+            {
+                st7.restore();
+                threw = true;
+                out = t.val;
+            }
+        }
+        if (!j.capPromise)
+            return;
+        Capability cap;
+        cap.promise = j.capPromise;
+        cap.resolve = j.capResolve;
+        cap.reject = j.capReject;
+        if (threw)
+            capReject(cap, out);
+        else
+            capResolve(cap, out);
+    }
+    }
+}
+
+} // namespace
+
+V promiseResolved(V v)
+{
+    return promiseResolveWith(PR.ctorPromise, v);
+}
+
+void enqueueJob(V fn, V a, V b)
+{
+    Job j;
+    j.kind = JOB_CALLBACK;
+    j.rejected = false;
+    j.a = fn;
+    j.b = a;
+    j.c = b;
+    j.capPromise = 0;
+    j.capResolve = 0;
+    j.capReject = 0;
+    enqueue(j);
+}
+
+void drainMicrotasks()
+{
+    for (;;)
+    {
+        if (g_jobHead >= g_jobs->size())
+        {
+            g_jobs->clear();
+            g_jobHead = 0;
+            return;
+        }
+        Job j = (*g_jobs)[g_jobHead++];
+        runJob(j);
+    }
+}
+
+// ── await and async functions ────────────────────────────────────────────
+
+namespace
+{
+
+V awaitContinue(V, V *args, int argc)
+{
+    // data: the coroutine; data2: True to throw instead
+    JFunc *self = g_nativeCallee;
+    Co *c = static_cast<Co *>(op(self->data));
+    uint8_t mode = self->data2 == True ? RM_THROW : RM_NEXT;
+    coSwitchIn(c, mode, argOr(args, argc, 0));
+    // an async function that ended settles its promise from its own side
+    return Undefined;
+}
+
+void finishAsync(Co *c);
+void agDrain(Co *c);
+
+// after any resumption from outside: did the body end?
+void afterSwitch(Co *c)
+{
+    if (!c->finished)
+        return;
+    if (c->kind == CK_ASYNC)
+        finishAsync(c);
+    else if (c->kind == CK_ASYNCGEN)
+        agDrain(c);
+}
+
+V awaitContinueA(V thisV, V *args, int argc)
+{
+    awaitContinue(thisV, args, argc);
+    JFunc *self = g_nativeCallee;
+    Co *c = static_cast<Co *>(op(self->data));
+    afterSwitch(c);
+    return Undefined;
+}
+
+void finishAsync(Co *c)
+{
+    if (c->threw)
+        settle(c->promise, 2, c->result);
+    else
+        promiseResolve(c->promise, c->result);
+}
+
+} // namespace
+
+V doAwait(V val, Frame *f)
+{
+    Co *c = static_cast<Co *>(f->co);
+    if (!c)
+        throwError(E_SYNTAX, "await is only valid in async functions");
+    V p;
+    p = promiseResolveWith(PR.ctorPromise, val);
+    JFunc *ok = newClosure("", awaitContinueA, 1, objv(c), False);
+    JFunc *bad = newClosure("", awaitContinueA, 1, objv(c), True);
+    promiseThen(p, objv(ok), objv(bad), 0);
+    coSwitchOut(c);
+    if (c->mode == RM_THROW)
+        throw JsThrow{c->transfer};
+    return c->transfer;
+}
+
+V asyncStart(JFunc *fn, V thisV, V *args, int argc)
+{
+    Co *c = newCo(CK_ASYNC, fn, thisV, args, argc);
+    c->promise = newPromise();
+    V p = c->promise;
+    bool threw = false;
+    V exc = Undefined;
+    JsState st8;
+    try
+    {
+        bindParams(c);
+    }
+    catch (JsThrow &t)
+    {
+        st8.restore();
+        threw = true;
+        exc = t.val;
+    }
+    if (threw)
+    {
+        settle(p, 2, exc);
+        return p;
+    }
+    coSwitchIn(c, RM_NEXT, Undefined);
+    afterSwitch(c);
+    return p;
+}
+
+V generatorStart(JFunc *fn, V thisV, V *args, int argc)
+{
+    Co *c = newCo(CK_GENERATOR, fn, thisV, args, argc);
+    bindParams(c);
+    V protoV = getProp(objv(fn), A.prototype);
+    Obj *proto = isObj(protoV) ? op(protoV) : PR.generator;
+    JGen *g = static_cast<JGen *>(allocObj(sizeof(JGen), C_GENERATOR, proto));
+    g->co = c;
+    return objv(g);
+}
+
+// ── async generators ─────────────────────────────────────────────────────
+
+namespace
+{
+
+struct JAsyncGen : Obj
+{
+    Co *co;
+};
+
+void agResumeNext(Co *c);
+
+V agAfterReturnAwait(V, V *args, int argc)
+{
+    // a return request on a finished generator: its value was awaited
+    JFunc *self = g_nativeCallee;
+    Co *c = static_cast<Co *>(op(self->data));
+    c->agAwaitingReturn = false;
+    AgRequest r = c->queue->front();
+    c->queue->erase(c->queue->begin());
+    if (self->data2 == True)
+        settle(r.promise, 2, argOr(args, argc, 0));
+    else
+        promiseResolve(r.promise, iterResult(argOr(args, argc, 0), true));
+    agResumeNext(c);
+    return Undefined;
+}
+
+void agResumeNext(Co *c)
+{
+    while (!c->queue->empty() && !c->running && !c->agAwaitingReturn)
+    {
+        AgRequest r = c->queue->front();
+        if (!c->started && r.mode != RM_NEXT)
+            c->finished = true;
+        if (c->finished)
+        {
+            if (r.mode == RM_NEXT)
+            {
+                c->queue->erase(c->queue->begin());
+                promiseResolve(r.promise, iterResult(Undefined, true));
+                continue;
+            }
+            if (r.mode == RM_THROW)
+            {
+                c->queue->erase(c->queue->begin());
+                settle(r.promise, 2, r.val);
+                continue;
+            }
+            // return: await the value first
+            c->agAwaitingReturn = true;
+            V p;
+            bool threw = false;
+            V exc = Undefined;
+            JsState st9;
+            try
+            {
+                p = promiseResolveWith(PR.ctorPromise, r.val);
+            }
+            catch (JsThrow &t)
+            {
+                st9.restore();
+                threw = true;
+                exc = t.val;
+            }
+            if (threw)
+            {
+                c->agAwaitingReturn = false;
+                c->queue->erase(c->queue->begin());
+                settle(r.promise, 2, exc);
+                continue;
+            }
+            JFunc *ok = newClosure("", agAfterReturnAwait, 1, objv(c), False);
+            JFunc *bad = newClosure("", agAfterReturnAwait, 1, objv(c), True);
+            promiseThen(p, objv(ok), objv(bad), 0);
+            return;
+        }
+        coSwitchIn(c, r.mode, r.val);
+        afterSwitch(c);
+        return;
+    }
+}
+
+// the body ended: settle the request it was serving, then the rest
+void agDrain(Co *c)
+{
+    if (!c->queue->empty())
+    {
+        AgRequest r = c->queue->front();
+        c->queue->erase(c->queue->begin());
+        if (c->threw)
+            settle(r.promise, 2, c->result);
+        else
+            promiseResolve(r.promise, iterResult(c->result, true));
+    }
+    agResumeNext(c);
+}
+
+V agEnqueue(V thisV, uint8_t mode, V val, const char *name)
+{
+    V p = newPromise();
+    if (!isObj(thisV) || op(thisV)->cls != C_ASYNCGENERATOR)
+    {
+        settle(p, 2, makeError(E_TYPE, std::string(name) + " method called on incompatible receiver " + inspectBrief(thisV)));
+        return p;
+    }
+    Co *c = static_cast<JAsyncGen *>(op(thisV))->co;
+    AgRequest r;
+    r.mode = mode;
+    r.val = val;
+    r.promise = p;
+    c->queue->push_back(r);
+    if (!c->running && c->queue->size() == 1)
+        agResumeNext(c);
+    return p;
+}
+
+V agNext(V thisV, V *args, int argc) { return agEnqueue(thisV, RM_NEXT, argOr(args, argc, 0), "next"); }
+V agReturn(V thisV, V *args, int argc) { return agEnqueue(thisV, RM_RETURN, argOr(args, argc, 0), "return"); }
+V agThrow(V thisV, V *args, int argc) { return agEnqueue(thisV, RM_THROW, argOr(args, argc, 0), "throw"); }
+
+} // namespace
+
+V asyncGenStart(JFunc *fn, V thisV, V *args, int argc)
+{
+    Co *c = newCo(CK_ASYNCGEN, fn, thisV, args, argc);
+    c->queue = new std::vector<AgRequest>();
+    bindParams(c);
+    V protoV = getProp(objv(fn), A.prototype);
+    Obj *proto = isObj(protoV) ? op(protoV) : PR.asyncGenerator;
+    JAsyncGen *g = static_cast<JAsyncGen *>(allocObj(sizeof(JAsyncGen), C_ASYNCGENERATOR, proto));
+    g->co = c;
+    return objv(g);
+}
+
+// a `yield` in a generator of either kind
+V doYield(V val, Frame *f)
+{
+    Co *c = static_cast<Co *>(f->co);
+    if (c->kind == CK_GENERATOR)
+    {
+        c->yielded = val;
+        coSwitchOut(c);
+        return coAfterResume(c);
+    }
+    // async: the value is awaited, then given to the request being served
+    V v = doAwait(val, f);
+    AgRequest r = c->queue->front();
+    c->queue->erase(c->queue->begin());
+    promiseResolve(r.promise, iterResult(v, false));
+    // another request may be waiting already
+    if (!c->queue->empty())
+    {
+        AgRequest n = c->queue->front();
+        c->mode = n.mode;
+        c->transfer = n.val;
+    }
+    else
+        coSwitchOut(c);
+    if (c->mode == RM_THROW)
+        throw JsThrow{c->transfer};
+    if (c->mode == RM_RETURN)
+    {
+        // `return v` awaits v first
+        V rv = doAwait(c->transfer, f);
+        throw GenReturn{rv};
+    }
+    return c->transfer;
+}
+
+V doYieldStar(V iterable, Frame *f)
+{
+    Co *c = static_cast<Co *>(f->co);
+    bool isAsync = c->kind == CK_ASYNCGEN;
+    V iter;
+    bool syncIter = true;
+    if (isAsync)
+    {
+        V m = getProp(iterable, WK.asyncIterator);
+        if (!isNullish(m))
+        {
+            iter = call(m, iterable, nullptr, 0);
+            syncIter = false;
+        }
+    }
+    if (syncIter)
+    {
+        V m = getProp(iterable, WK.iterator);
+        if (!isCallable(m))
+            throwType(iterable == Undefined ? std::string("yield* (intermediate value) is not iterable") : defaultCallSite(iterable) + " is not iterable (cannot read property Symbol(Symbol.iterator))");
+        iter = call(m, iterable, nullptr, 0);
+    }
+    if (!isObj(iter))
+        throwType("Result of the Symbol.iterator method is not an object");
+    V next = getProp(iter, A.next);
+    V received = Undefined;
+    uint8_t mode = RM_NEXT;
+    for (;;)
+    {
+        V r;
+        if (mode == RM_NEXT)
+            r = call1(next, iter, received);
+        else if (mode == RM_THROW)
+        {
+            V m = getProp(iter, A.throw_);
+            if (isNullish(m))
+            {
+                V cl = getProp(iter, A.ret);
+                if (!isNullish(cl))
+                    call0(cl, iter);
+                throwType("The iterator does not provide a 'throw' method");
+            }
+            r = call1(m, iter, received);
+        }
+        else
+        {
+            V m = getProp(iter, A.ret);
+            if (isNullish(m))
+                throw GenReturn{received};
+            r = call1(m, iter, received);
+        }
+        if (isAsync && !syncIter)
+            r = doAwait(r, f);
+        if (!isObj(r))
+            throwType("Iterator result " + toUtf8V(r) + " is not an object");
+        if (truthy(getProp(r, A.done)))
+        {
+            V value = getProp(r, A.value);
+            if (mode == RM_RETURN)
+                throw GenReturn{value};
+            return value;
+        }
+        V value = getProp(r, A.value);
+        // hand it out as a yield would; note how the consumer came back
+        bool threw = false;
+        bool ret = false;
+        V got = Undefined;
+        JsState st10;
+        try
+        {
+            got = doYield(value, f);
+        }
+        catch (JsThrow &t)
+        {
+            st10.restore();
+            threw = true;
+            got = t.val;
+        }
+        catch (GenReturn &g)
+        {
+            st10.restore();
+            ret = true;
+            got = g.val;
+        }
+        received = got;
+        mode = threw ? RM_THROW : ret ? RM_RETURN : RM_NEXT;
+    }
+}
+
+// for await (... of ...)
+void forAwaitLoop(Node *n, V iterable, Frame *f)
+{
+    V m = getProp(iterable, WK.asyncIterator);
+    bool syncIter = isNullish(m);
+    V iter;
+    if (syncIter)
+    {
+        V sm = getProp(iterable, WK.iterator);
+        if (!isCallable(sm))
+            throwType(nodeToCallText(n->b) + " is not async iterable");
+        iter = call(sm, iterable, nullptr, 0);
+    }
+    else
+        iter = call(m, iterable, nullptr, 0);
+    if (!isObj(iter))
+        throwType("Result of the Symbol.asyncIterator method is not an object");
+    V next = getProp(iter, A.next);
+    Env *savedEnv = f->env;
+    Scope *s = n->scope;
+    for (;;)
+    {
+        V r = call0(next, iter);
+        if (!syncIter)
+            r = doAwait(r, f);
+        if (!isObj(r))
+            throwType("Iterator result " + toUtf8V(r) + " is not an object");
+        bool stepDone = truthy(getProp(r, A.done));
+        V v = getProp(r, A.value);
+        if (syncIter)
+        {
+            bool rejected = false;
+            V reason = Undefined;
+            JsState stStep;
+            try
+            {
+                v = doAwait(v, f);
+            }
+            catch (JsThrow &t)
+            {
+                stStep.restore();
+                rejected = true;
+                reason = t.val;
+            }
+            doAwait(Undefined, f);
+            if (rejected)
+                throw JsThrow{reason};
+        }
+        if (stepDone)
+            break;
+        bool threw = false;
+        V exc = Undefined;
+        JsState st11;
+        try
+        {
+            if (s && !s->plain)
+                enterScopeSlow(s, f);
+            if (n->a->k == N_VAR)
+                assignNode(n->a->items[0]->a, v, f, true);
+            else
+                assignNode(n->a, v, f, false);
+            execNode(n->d, f);
+        }
+        catch (JsThrow &t)
+        {
+            st11.restore();
+            threw = true;
+            exc = t.val;
+        }
+        f->env = savedEnv;
+        if (threw)
+        {
+            V cl = getProp(iter, A.ret);
+            if (!isNullish(cl))
+            {
+                bool again = false;
+                JsState st12;
+                try
+                {
+                    V cr = call0(cl, iter);
+                    if (!syncIter)
+                        doAwait(cr, f);
+                }
+                catch (JsThrow &)
+                {
+                    st12.restore();
+                    again = true;
+                }
+                (void)again;
+            }
+            throw JsThrow{exc};
+        }
+        bool stop = false;
+        if (g_comp)
+        {
+            if (g_comp == CO_BREAK && (!g_compLabel || g_compLabel == n->val))
+            {
+                g_comp = CO_NONE;
+                g_compLabel = 0;
+                stop = true;
+            }
+            else if (g_comp == CO_CONTINUE && (!g_compLabel || g_compLabel == n->val))
+            {
+                g_comp = CO_NONE;
+                g_compLabel = 0;
+            }
+            else
+                stop = true;
+        }
+        if (stop)
+        {
+            uint8_t c = g_comp;
+            V l = g_compLabel, rv = g_retVal;
+            g_comp = CO_NONE;
+            V cl = getProp(iter, A.ret);
+            if (!isNullish(cl))
+            {
+                V cr = call0(cl, iter);
+                if (!syncIter)
+                    doAwait(cr, f);
+            }
+            g_comp = c;
+            g_compLabel = l;
+            g_retVal = rv;
+            break;
+        }
+    }
+    f->env = savedEnv;
+}
+
+// ── the event loop ───────────────────────────────────────────────────────
+
+namespace
+{
+
+struct Timer
+{
+    double due;
+    uint64_t seq;
+    int id;
+    V fn;
+    V *args;
+    int argc;
+    double interval; // < 0: once
+    bool refd;
+    bool cancelled;
+    V handle;
+    bool fired;
+};
+
+std::vector<Timer *> g_timers;
+std::vector<Timer *> g_immediates;
+std::vector<V> *g_ticks = nullptr;
+size_t g_tickHead = 0;
+double g_now = 0;
+uint64_t g_seq = 0;
+int g_timerId = 1;
+Obj *g_timeoutProto = nullptr;
+Obj *g_immediateProto = nullptr;
+
+Timer *timerOf(V handle)
+{
+    if (isObj(handle) && (op(handle)->proto == g_timeoutProto || op(handle)->proto == g_immediateProto))
+    {
+        V p = getV(handle, "__timer");
+        if (isNum(p))
+            return reinterpret_cast<Timer *>((uintptr_t)numOf(p));
+    }
+    return nullptr;
+}
+
+V makeHandle(Timer *t, Obj *proto)
+{
+    Obj *o = newObjectProto(proto);
+    defineOwn(o, atomOf("__timer"), num((double)(uintptr_t)t), PF_W);
+    t->handle = objv(o);
+    return t->handle;
+}
+
+void insertTimer(Timer *t)
+{
+    auto it = std::upper_bound(g_timers.begin(), g_timers.end(), t, [](Timer *a, Timer *b) {
+        return a->due < b->due || (a->due == b->due && a->seq < b->seq);
+    });
+    g_timers.insert(it, t);
+}
+
+V timerCommon(V *args, int argc, bool repeat)
+{
+    V fn = argOr(args, argc, 0);
+    if (!isCallable(fn))
+    {
+        V e = makeError(E_TYPE, "The \"callback\" argument must be of type function. Received " + receivedText(fn));
+        makeNodeError(e, "ERR_INVALID_ARG_TYPE");
+        throw JsThrow{e};
+    }
+    double delay = toNumber(argOr(args, argc, 1));
+    if (!(delay >= 1 && delay <= 2147483647.0))
+        delay = 1;
+    delay = std::floor(delay);
+    Timer *t = new Timer();
+    t->due = g_now + delay;
+    t->seq = ++g_seq;
+    t->id = g_timerId++;
+    t->fn = fn;
+    int extra = argc > 2 ? argc - 2 : 0;
+    t->args = static_cast<V *>(bump(sizeof(V) * (size_t)(extra + 1)));
+    for (int i = 0; i < extra; ++i)
+        t->args[i] = args[i + 2];
+    t->argc = extra;
+    t->interval = repeat ? delay : -1;
+    t->refd = true;
+    t->cancelled = false;
+    t->fired = false;
+    insertTimer(t);
+    return makeHandle(t, g_timeoutProto);
+}
+
+V gSetTimeout(V, V *args, int argc) { return timerCommon(args, argc, false); }
+V gSetInterval(V, V *args, int argc) { return timerCommon(args, argc, true); }
+
+V gClearTimer(V, V *args, int argc)
+{
+    V h = argOr(args, argc, 0);
+    Timer *t = timerOf(h);
+    if (!t && (isNum(h) || isStr(h)))
+    {
+        int id = (int)toNumber(h);
+        for (Timer *x : g_timers)
+            if (x->id == id)
+                t = x;
+    }
+    if (t)
+        t->cancelled = true;
+    return Undefined;
+}
+
+V gSetImmediate(V, V *args, int argc)
+{
+    V fn = argOr(args, argc, 0);
+    if (!isCallable(fn))
+    {
+        V e = makeError(E_TYPE, "The \"callback\" argument must be of type function. Received " + receivedText(fn));
+        makeNodeError(e, "ERR_INVALID_ARG_TYPE");
+        throw JsThrow{e};
+    }
+    Timer *t = new Timer();
+    t->fn = fn;
+    int extra = argc > 1 ? argc - 1 : 0;
+    t->args = static_cast<V *>(bump(sizeof(V) * (size_t)(extra + 1)));
+    for (int i = 0; i < extra; ++i)
+        t->args[i] = args[i + 1];
+    t->argc = extra;
+    t->refd = true;
+    t->cancelled = false;
+    t->interval = -1;
+    g_immediates.push_back(t);
+    return makeHandle(t, g_immediateProto);
+}
+
+V gQueueMicrotask(V, V *args, int argc)
+{
+    V fn = argOr(args, argc, 0);
+    if (!isCallable(fn))
+    {
+        V e = makeError(E_TYPE, "The \"callback\" argument must be of type function. Received " + receivedText(fn));
+        makeNodeError(e, "ERR_INVALID_ARG_TYPE");
+        throw JsThrow{e};
+    }
+    enqueueJob(fn, Hole, Undefined);
+    return Undefined;
+}
+
+V tRef(V thisV, V *, int)
+{
+    Timer *t = timerOf(thisV);
+    if (t)
+        t->refd = true;
+    return thisV;
+}
+
+V tUnref(V thisV, V *, int)
+{
+    Timer *t = timerOf(thisV);
+    if (t)
+        t->refd = false;
+    return thisV;
+}
+
+V tHasRef(V thisV, V *, int)
+{
+    Timer *t = timerOf(thisV);
+    return boolv(t && t->refd);
+}
+
+V tRefresh(V thisV, V *, int)
+{
+    Timer *t = timerOf(thisV);
+    if (t && !t->cancelled)
+    {
+        auto it = std::find(g_timers.begin(), g_timers.end(), t);
+        if (it != g_timers.end())
+            g_timers.erase(it);
+        t->due = g_now + (t->interval >= 0 ? t->interval : 1);
+        t->seq = ++g_seq;
+        insertTimer(t);
+    }
+    return thisV;
+}
+
+V tClose(V thisV, V *, int)
+{
+    Timer *t = timerOf(thisV);
+    if (t)
+        t->cancelled = true;
+    return thisV;
+}
+
+V tToPrimitive(V thisV, V *, int)
+{
+    Timer *t = timerOf(thisV);
+    return num(t ? (double)t->id : 0);
+}
+
+// a tick queued by process.nextTick
+V nativeNextTick(V, V *args, int argc)
+{
+    V fn = argOr(args, argc, 0);
+    if (!isCallable(fn))
+    {
+        V e = makeError(E_TYPE, "The \"callback\" argument must be of type function. Received " + receivedText(fn));
+        makeNodeError(e, "ERR_INVALID_ARG_TYPE");
+        throw JsThrow{e};
+    }
+    g_ticks->push_back(fn);
+    g_ticks->push_back(argc > 1 ? objv(newArrayFrom(args + 1, argc - 1)) : Undefined);
+    return Undefined;
+}
+
+// a callback from the loop: what it throws is an uncaught exception
+void runGuarded(V fn, V thisV, V *args, int argc)
+{
+    bool threw = false;
+    V exc = Undefined;
+    JsState st13;
+    try
+    {
+        call(fn, thisV, args, argc);
+    }
+    catch (JsThrow &t)
+    {
+        st13.restore();
+        threw = true;
+        exc = t.val;
+    }
+    if (threw)
+        reportUncaught(exc);
+}
+
+void processRejections()
+{
+    if (g_pendingRejections->empty())
+        return;
+    std::vector<V> list = *g_pendingRejections;
+    g_pendingRejections->clear();
+    for (V p : list)
+        if (!PROM(p)->handled)
+            reportUnhandledRejection(PROM(p)->value, p);
+}
+
+} // namespace
+
+// everything queued for "right now": ticks, then promise jobs, until both are empty
+void nodeDrainTicks()
+{
+    for (;;)
+    {
+        // promise jobs run under the tick processor only when it had ticks to run
+        g_hostContext = g_tickHead < g_ticks->size() ? HOST_TICKCB : g_hostContext == HOST_TICKCB ? HOST_TICK : HOST_NONE;
+        while (g_tickHead < g_ticks->size())
+        {
+            V fn = (*g_ticks)[g_tickHead];
+            V a = (*g_ticks)[g_tickHead + 1];
+            g_tickHead += 2;
+            if (a == Undefined)
+                runGuarded(fn, Undefined, nullptr, 0);
+            else
+            {
+                JArray *arr = static_cast<JArray *>(op(a));
+                runGuarded(fn, Undefined, arr->el, (int)arr->used);
+            }
+            // promise jobs get their turn between ticks only once the queue is empty
+        }
+        g_ticks->clear();
+        g_tickHead = 0;
+        if (g_hostContext == HOST_TICKCB)
+            g_hostContext = HOST_TICK;
+        bool threw = false;
+        V exc = Undefined;
+        JsState st14;
+        try
+        {
+            drainMicrotasks();
+        }
+        catch (JsThrow &t)
+        {
+            st14.restore();
+            threw = true;
+            exc = t.val;
+        }
+        if (threw)
+        {
+            reportUncaught(exc);
+            continue;
+        }
+        if (g_ticks->empty())
+        {
+            processRejections();
+            if (g_ticks->empty() && g_jobHead >= g_jobs->size())
+                return;
+        }
+    }
+}
+
+void runEventLoop()
+{
+    nodeDrainTicks();
+    bool firstPass = true;
+    for (;;)
+    {
+        // timers that are due; the clock moves when nothing else is left to do
+        bool anyRef = false;
+        for (Timer *t : g_timers)
+            if (t->refd && !t->cancelled)
+                anyRef = true;
+        for (Timer *t : g_immediates)
+            if (t->refd && !t->cancelled)
+                anyRef = true;
+        if (!anyRef)
+            return;
+        // the process has been up for at least a millisecond on the first pass
+        if (firstPass)
+        {
+            g_now += 1;
+            firstPass = false;
+        }
+        if (g_immediates.empty() && !g_timers.empty() && g_timers[0]->due > g_now)
+        {
+            // past cancelled ones and unref'd ones with nothing else alive
+            g_now = g_timers[0]->due;
+        }
+        double horizon = g_now;
+        while (!g_timers.empty() && g_timers[0]->due <= horizon)
+        {
+            Timer *t = g_timers[0];
+            g_timers.erase(g_timers.begin());
+            if (t->cancelled)
+                continue;
+            t->fired = true;
+            g_hostContext = HOST_TIMER;
+            g_hostCallback = isObj(t->fn) ? static_cast<JFunc *>(op(t->fn)) : nullptr;
+            g_hostBase = g_frame;
+            runGuarded(t->fn, t->handle, t->args, t->argc);
+            g_hostCallback = nullptr;
+            g_hostContext = HOST_NONE;
+            nodeDrainTicks();
+            if (t->interval >= 0 && !t->cancelled)
+            {
+                t->due = g_now + t->interval;
+                t->seq = ++g_seq;
+                insertTimer(t);
+            }
+        }
+        std::vector<Timer *> imm;
+        imm.swap(g_immediates);
+        for (Timer *t : imm)
+        {
+            if (t->cancelled)
+                continue;
+            g_hostContext = HOST_IMMEDIATE;
+            g_hostCallback = isObj(t->fn) ? static_cast<JFunc *>(op(t->fn)) : nullptr;
+            g_hostBase = g_frame;
+            runGuarded(t->fn, t->handle, t->args, t->argc);
+            g_hostCallback = nullptr;
+            g_hostContext = HOST_NONE;
+            nodeDrainTicks();
+        }
+    }
+}
+
+V g_nextTickFn = 0;
+
+// Timers run on virtual time, which only moves when the loop skips ahead, so
+// that their order does not depend on how fast the program runs. A program
+// that looks at the clock sees real time pass too: what passed since it last
+// looked joins the virtual time.
+double virtualNow()
+{
+    static bool started = false;
+    static long long last = 0;
+    auto since = std::chrono::steady_clock::now().time_since_epoch();
+    long long t = (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(since).count();
+    if (started)
+        g_now += (double)(t - last) / 1000000.0;
+    started = true;
+    last = t;
+    return g_now;
+}
+
+V promiseStateOf(V p, V *value)
+{
+    if (!IS_PROMISE(p))
+        return Undefined;
+    *value = PROM(p)->value;
+    return num((double)PROM(p)->state);
+}
+
+void initAsyncBuiltins()
+{
+    g_jobs = new std::vector<Job>();
+    g_pendingRejections = new std::vector<V>();
+    g_ticks = new std::vector<V>();
+    // generators
+    Obj *g = PR.generator;
+    defFn(g, "next", genNext, 1);
+    defFn(g, "return", genReturn, 1);
+    defFn(g, "throw", genThrow, 1);
+    defineOwn(g, WK.toStringTag, atomOf("Generator"), PF_C);
+    defineOwn(PR.generatorFunction, A.prototype, objv(g), PF_C);
+    defineOwn(g, A.constructor, objv(PR.generatorFunction), PF_C);
+    defineOwn(PR.generatorFunction, WK.toStringTag, atomOf("GeneratorFunction"), PF_C);
+    defineOwn(PR.asyncFunction, WK.toStringTag, atomOf("AsyncFunction"), PF_C);
+    Obj *ag = PR.asyncGenerator;
+    defFn(ag, "next", agNext, 1);
+    defFn(ag, "return", agReturn, 1);
+    defFn(ag, "throw", agThrow, 1);
+    defineOwn(ag, WK.toStringTag, atomOf("AsyncGenerator"), PF_C);
+    defineOwn(PR.asyncGenFunction, A.prototype, objv(ag), PF_C);
+    defineOwn(ag, A.constructor, objv(PR.asyncGenFunction), PF_C);
+    defineOwn(PR.asyncGenFunction, WK.toStringTag, atomOf("AsyncGeneratorFunction"), PF_C);
+    defFnSym(PR.asyncIterator, WK.asyncIterator, "[Symbol.asyncIterator]", selfSpecies, 0);
+    // promises
+    JFunc *c = defCtor("Promise", promiseCtor, 1, PR.promise);
+    PR.ctorPromise = objv(c);
+    defFn(c, "resolve", pResolveStatic, 1);
+    defFn(c, "reject", pRejectStatic, 1);
+    defFn(c, "all", pAll, 1);
+    defFn(c, "allSettled", pAllSettled, 1);
+    defFn(c, "any", pAny, 1);
+    defFn(c, "race", pRace, 1);
+    defGetterSym(c, WK.species, "[Symbol.species]", selfSpecies);
+    Obj *p = PR.promise;
+    defFn(p, "then", pThen, 2);
+    defFn(p, "catch", pCatch, 1);
+    defFn(p, "finally", pFinally, 1);
+    defineOwn(p, WK.toStringTag, atomOf("Promise"), PF_C);
+    // timers
+    Obj *gl = g_global;
+    g_timeoutProto = newObject();
+    defFn(g_timeoutProto, "ref", tRef, 0);
+    defFn(g_timeoutProto, "unref", tUnref, 0);
+    defFn(g_timeoutProto, "hasRef", tHasRef, 0);
+    defFn(g_timeoutProto, "refresh", tRefresh, 0);
+    defFn(g_timeoutProto, "close", tClose, 0);
+    defFnSym(g_timeoutProto, WK.toPrimitive, "[Symbol.toPrimitive]", tToPrimitive, 0);
+    g_immediateProto = newObject();
+    defFn(g_immediateProto, "ref", tRef, 0);
+    defFn(g_immediateProto, "unref", tUnref, 0);
+    defFn(g_immediateProto, "hasRef", tHasRef, 0);
+    JFunc *tc = newNative("Timeout", gClearTimer, 0);
+    defineOwn(g_timeoutProto, A.constructor, objv(tc), PF_W | PF_C);
+    JFunc *ic = newNative("Immediate", gClearTimer, 0);
+    defineOwn(g_immediateProto, A.constructor, objv(ic), PF_W | PF_C);
+    defFn(gl, "setTimeout", gSetTimeout, 2);
+    defFn(gl, "setInterval", gSetInterval, 2);
+    defFn(gl, "setImmediate", gSetImmediate, 1);
+    defFn(gl, "clearTimeout", gClearTimer, 1);
+    defFn(gl, "clearInterval", gClearTimer, 1);
+    defFn(gl, "clearImmediate", gClearTimer, 1);
+    defFn(gl, "queueMicrotask", gQueueMicrotask, 1);
+    g_nextTickFn = objv(newNative("nextTick", nativeNextTick, 1));
+}
+
+} // namespace js

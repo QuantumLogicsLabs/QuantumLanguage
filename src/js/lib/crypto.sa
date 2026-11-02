@@ -1,0 +1,289 @@
+'use strict';
+// Hashes in crypto: md5, sha1, sha256, sha512, and HMAC over them.
+const rl = (x, n) => (x << n) | (x >>> (32 - n));
+const rr = (x, n) => (x >>> n) | (x << (32 - n));
+
+function md5(bytes) {
+  const K = [];
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) >>> 0;
+  const S = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+  const m = [...bytes];
+  const len = m.length;
+  m.push(0x80);
+  while (m.length % 64 !== 56) m.push(0);
+  const bits = len * 8;
+  for (let i = 0; i < 8; i++) m.push(i < 4 ? (bits >>> (i * 8)) & 255 : Math.floor(bits / 4294967296 / 2 ** ((i - 4) * 8)) & 255);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  for (let o = 0; o < m.length; o += 64) {
+    const w = [];
+    for (let i = 0; i < 16; i++) w[i] = m[o + i * 4] | (m[o + i * 4 + 1] << 8) | (m[o + i * 4 + 2] << 16) | (m[o + i * 4 + 3] << 24);
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+      else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+      F = (F + A + K[i] + w[g]) | 0;
+      A = D;
+      D = C;
+      C = B;
+      B = (B + rl(F, S[(i >> 4) * 4 + (i % 4)])) | 0;
+    }
+    a0 = (a0 + A) | 0;
+    b0 = (b0 + B) | 0;
+    c0 = (c0 + C) | 0;
+    d0 = (d0 + D) | 0;
+  }
+  const out = [];
+  for (const v of [a0, b0, c0, d0]) for (let i = 0; i < 4; i++) out.push((v >>> (i * 8)) & 255);
+  return out;
+}
+
+function padBE(bytes, block, lenBytes) {
+  const m = [...bytes];
+  const len = m.length;
+  m.push(0x80);
+  while (m.length % block !== block - lenBytes) m.push(0);
+  const hi = Math.floor(len / 536870912), lo = (len * 8) >>> 0;
+  for (let i = 0; i < lenBytes - 8; i++) m.push(0);
+  for (let i = 3; i >= 0; i--) m.push((hi >>> (i * 8)) & 255);
+  for (let i = 3; i >= 0; i--) m.push((lo >>> (i * 8)) & 255);
+  return m;
+}
+
+function sha1(bytes) {
+  const m = padBE(bytes, 64, 8);
+  let h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+  for (let o = 0; o < m.length; o += 64) {
+    const w = [];
+    for (let t = 0; t < 80; t++) w[t] = t < 16 ? (m[o + t * 4] << 24) | (m[o + t * 4 + 1] << 16) | (m[o + t * 4 + 2] << 8) | m[o + t * 4 + 3] : rl(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+    let [a, b, c, d, e] = h;
+    for (let t = 0; t < 80; t++) {
+      const f = t < 20 ? (b & c) | (~b & d) : t < 40 ? b ^ c ^ d : t < 60 ? (b & c) | (b & d) | (c & d) : b ^ c ^ d;
+      const k = t < 20 ? 0x5a827999 : t < 40 ? 0x6ed9eba1 : t < 60 ? 0x8f1bbcdc : 0xca62c1d6;
+      const tmp = (rl(a, 5) + f + e + k + w[t]) | 0;
+      e = d;
+      d = c;
+      c = rl(b, 30);
+      b = a;
+      a = tmp;
+    }
+    h = [h[0] + a | 0, h[1] + b | 0, h[2] + c | 0, h[3] + d | 0, h[4] + e | 0];
+  }
+  return h.flatMap((v) => [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
+}
+
+function primes(n) {
+  const out = [];
+  for (let c = 2; out.length < n; c++) {
+    let p = true;
+    for (let i = 2; i * i <= c; i++) if (c % i === 0) { p = false; break; }
+    if (p) out.push(c);
+  }
+  return out;
+}
+
+let K256 = null;
+function sha256(bytes) {
+  K256 ??= primes(64).map((p) => Math.floor((Math.cbrt(p) % 1) * 4294967296) >>> 0);
+  const m = padBE(bytes, 64, 8);
+  let h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  for (let o = 0; o < m.length; o += 64) {
+    const w = [];
+    for (let t = 0; t < 64; t++) {
+      if (t < 16) w[t] = (m[o + t * 4] << 24) | (m[o + t * 4 + 1] << 16) | (m[o + t * 4 + 2] << 8) | m[o + t * 4 + 3];
+      else {
+        const s0 = rr(w[t - 15], 7) ^ rr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+        const s1 = rr(w[t - 2], 17) ^ rr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
+      }
+    }
+    let [a, b, c, d, e, f, g, i] = h;
+    for (let t = 0; t < 64; t++) {
+      const t1 = (i + (rr(e, 6) ^ rr(e, 11) ^ rr(e, 25)) + ((e & f) ^ (~e & g)) + K256[t] + w[t]) | 0;
+      const t2 = ((rr(a, 2) ^ rr(a, 13) ^ rr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      i = g;
+      g = f;
+      f = e;
+      e = (d + t1) | 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) | 0;
+    }
+    h = [h[0] + a | 0, h[1] + b | 0, h[2] + c | 0, h[3] + d | 0, h[4] + e | 0, h[5] + f | 0, h[6] + g | 0, h[7] + i | 0];
+  }
+  return h.flatMap((v) => [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
+}
+
+function fracRoot(p, root) {
+  // the first 64 bits of the fractional part of p's root, exactly
+  const s = 2n ** (64n * BigInt(root));
+  const n = BigInt(p) * s;
+  let lo = 0n, hi = BigInt(p) * 2n ** 64n;
+  while (lo < hi) {
+    const mid = (lo + hi + 1n) >> 1n;
+    if (mid ** BigInt(root) <= n) lo = mid;
+    else hi = mid - 1n;
+  }
+  return lo & (2n ** 64n - 1n);
+}
+
+let K512 = null, H512 = null;
+function sha512(bytes) {
+  const MASK = 2n ** 64n - 1n;
+  const R = (x, n) => ((x >> n) | (x << (64n - n))) & MASK;
+  if (!K512) {
+    const ps = primes(80);
+    K512 = ps.map((p) => fracRoot(p, 3));
+    H512 = ps.slice(0, 8).map((p) => fracRoot(p, 2));
+  }
+  const m = padBE(bytes, 128, 16);
+  let h = H512.slice();
+  for (let o = 0; o < m.length; o += 128) {
+    const w = [];
+    for (let t = 0; t < 80; t++) {
+      if (t < 16) {
+        let v = 0n;
+        for (let k = 0; k < 8; k++) v = (v << 8n) | BigInt(m[o + t * 8 + k]);
+        w[t] = v;
+      } else {
+        const s0 = R(w[t - 15], 1n) ^ R(w[t - 15], 8n) ^ (w[t - 15] >> 7n);
+        const s1 = R(w[t - 2], 19n) ^ R(w[t - 2], 61n) ^ (w[t - 2] >> 6n);
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) & MASK;
+      }
+    }
+    let [a, b, c, d, e, f, g, i] = h;
+    for (let t = 0; t < 80; t++) {
+      const t1 = (i + (R(e, 14n) ^ R(e, 18n) ^ R(e, 41n)) + ((e & f) ^ (~e & g & MASK)) + K512[t] + w[t]) & MASK;
+      const t2 = ((R(a, 28n) ^ R(a, 34n) ^ R(a, 39n)) + ((a & b) ^ (a & c) ^ (b & c))) & MASK;
+      i = g;
+      g = f;
+      f = e;
+      e = (d + t1) & MASK;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) & MASK;
+    }
+    h = [a, b, c, d, e, f, g, i].map((v, x) => (v + h[x]) & MASK);
+  }
+  return h.flatMap((v) => {
+    const out = [];
+    for (let k = 7n; k >= 0n; k--) out.push(Number((v >> (k * 8n)) & 255n));
+    return out;
+  });
+}
+
+const ALGS = { md5: [md5, 64], sha1: [sha1, 64], sha256: [sha256, 64], sha512: [sha512, 128] };
+
+function toBytes(data, enc) {
+  if (typeof data === 'string') return Array.from(Buffer.from(data, enc));
+  if (ArrayBuffer.isView(data)) return Array.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  throw internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ${internal.received(data)}`);
+}
+
+function algorithm(name) {
+  const a = ALGS[String(name).toLowerCase().replace('-', '')];
+  if (!a) {
+    throw internal.nodeError(Error, 'ERR_CRYPTO_INVALID_DIGEST', 'Digest method not supported');
+  }
+  return a;
+}
+
+function output(bytes, enc) {
+  const b = Buffer.from(bytes);
+  return enc && enc !== 'buffer' ? b.toString(enc) : b;
+}
+
+class Hash {
+  #fn; #data = []; #done = false;
+  constructor(name) { this.#fn = algorithm(name)[0]; }
+  update(d, enc) {
+    if (this.#done) {
+      throw internal.nodeError(Error, 'ERR_CRYPTO_HASH_FINALIZED', 'Digest already called');
+    }
+    this.#data.push(...toBytes(d, enc));
+    return this;
+  }
+  digest(enc) {
+    if (this.#done) {
+      throw internal.nodeError(Error, 'ERR_CRYPTO_HASH_FINALIZED', 'Digest already called');
+    }
+    this.#done = true;
+    return output(this.#fn(this.#data), enc);
+  }
+  copy() {
+    const h = new Hash('md5');
+    h.#fn = this.#fn;
+    h.#data = this.#data.slice();
+    return h;
+  }
+}
+
+class Hmac {
+  #fn; #inner; #outer; #data = [];
+  constructor(name, key) {
+    const [fn, block] = algorithm(name);
+    this.#fn = fn;
+    let k = toBytes(key);
+    if (k.length > block) k = fn(k);
+    k = k.concat(new Array(block - k.length).fill(0));
+    this.#inner = k.map((b) => b ^ 0x36);
+    this.#outer = k.map((b) => b ^ 0x5c);
+  }
+  update(d, enc) {
+    this.#data.push(...toBytes(d, enc));
+    return this;
+  }
+  digest(enc) {
+    const first = this.#fn(this.#inner.concat(this.#data));
+    return output(this.#fn(this.#outer.concat(first)), enc);
+  }
+}
+
+let seed = (internal.now() * 1000) >>> 0 || 1;
+function randByte() {
+  seed ^= seed << 13;
+  seed ^= seed >>> 17;
+  seed ^= seed << 5;
+  return seed & 255;
+}
+
+const cryptoApi = {
+  createHash: (n) => new Hash(n),
+  createHmac: (n, k) => new Hmac(n, k),
+  getHashes: () => Object.keys(ALGS),
+  randomBytes(n) {
+    const b = Buffer.alloc(n);
+    for (let i = 0; i < n; i++) b[i] = randByte();
+    return b;
+  },
+  randomInt(a, b) {
+    if (b === undefined) { b = a; a = 0; }
+    return a + Math.floor(Math.random() * (b - a));
+  },
+  randomUUID() {
+    const b = Array.from({ length: 16 }, randByte);
+    b[6] = (b[6] & 15) | 64;
+    b[8] = (b[8] & 63) | 128;
+    const h = b.map((x) => x.toString(16).padStart(2, '0')).join('');
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  },
+  timingSafeEqual: (a, b) => Buffer.compare(a, b) === 0,
+};
+
+const webcrypto = {
+  getRandomValues(a) {
+    const b = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+    for (let i = 0; i < b.length; i++) b[i] = randByte();
+    return a;
+  },
+  randomUUID: cryptoApi.randomUUID,
+  subtle: {},
+  [Symbol.toStringTag]: 'Crypto',
+};
+cryptoApi.webcrypto = webcrypto;
+internal.installGlobal('crypto', webcrypto);
+module.exports = cryptoApi;

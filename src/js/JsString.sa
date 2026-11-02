@@ -1,0 +1,1097 @@
+// quantum: cpp
+// JavaScript front-end: String. Everything works on UTF-16 code units; case
+// mapping, normalization and locale comparison cover the alphabets programs
+// use, not all of Unicode.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <algorithm>
+#include <cmath>
+
+namespace js
+{
+
+namespace
+{
+
+struct StringIter : Obj
+{
+    JStr *s;
+    int pos;
+};
+
+JStr *thisStr(V v, const char *method)
+{
+    if (isStr(v))
+        return flat_(sp_(v));
+    if (isNullish(v))
+        throwType(std::string("String.prototype.") + method + " called on null or undefined");
+    return flat_(toStr(v));
+}
+
+bool isSpaceUnit(int c)
+{
+    return c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0xFEFF || c == 0x2028 || c == 0x2029 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+int clampArg(V v, int len, int dflt)
+{
+    if (v == Undefined)
+        return dflt;
+    double d = toIntegerOrInf(v);
+    if (d < 0)
+        return 0;
+    return d > len ? len : (int)d;
+}
+
+int relArg(V v, int len, int dflt)
+{
+    if (v == Undefined)
+        return dflt;
+    double d = toIntegerOrInf(v);
+    if (d < 0)
+    {
+        d += len;
+        return d < 0 ? 0 : (int)d;
+    }
+    return d > len ? len : (int)d;
+}
+
+// ── case ─────────────────────────────────────────────────────────────────
+
+int upperUnit(int c)
+{
+    return uniSimpleUpper(c);
+}
+
+int lowerUnit(int c)
+{
+    return uniSimpleLower(c);
+}
+
+// the code point at i and how many units it takes
+int cpAt(JStr *s, int i, int *width)
+{
+    int c = unitAt(s, i);
+    *width = 1;
+    if (c >= 0xD800 && c < 0xDC00 && i + 1 < s->len)
+    {
+        int d = unitAt(s, i + 1);
+        if (d >= 0xDC00 && d < 0xE000)
+        {
+            *width = 2;
+            return 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+        }
+    }
+    return c;
+}
+
+void pushCp(std::vector<uint16_t> &u, int c)
+{
+    if (c >= 0x10000)
+    {
+        c -= 0x10000;
+        u.push_back((uint16_t)(0xD800 + (c >> 10)));
+        u.push_back((uint16_t)(0xDC00 + (c & 0x3FF)));
+    }
+    else
+        u.push_back((uint16_t)c);
+}
+
+// Σ is final after a cased letter and not before one, looking past marks
+bool sigmaIsFinal(JStr *s, int at)
+{
+    bool before = false;
+    for (int i = at - 1; i >= 0; --i)
+    {
+        int c = unitAt(s, i);
+        if (c >= 0xDC00 && c < 0xE000 && i > 0)
+        {
+            int w;
+            c = cpAt(s, i - 1, &w);
+            if (w == 2)
+                --i;
+        }
+        if (uniCaseIgnorable(c))
+            continue;
+        before = uniCased(c);
+        break;
+    }
+    if (!before)
+        return false;
+    for (int i = at + 1; i < s->len;)
+    {
+        int w;
+        int c = cpAt(s, i, &w);
+        i += w;
+        if (uniCaseIgnorable(c))
+            continue;
+        return !uniCased(c);
+    }
+    return true;
+}
+
+V sToUpper(V thisV, V *, int)
+{
+    JStr *s = thisStr(thisV, "toUpperCase");
+    std::vector<uint16_t> u;
+    u.reserve((size_t)s->len);
+    std::vector<int> mapped;
+    for (int i = 0; i < s->len;)
+    {
+        int w;
+        int c = cpAt(s, i, &w);
+        i += w;
+        if (c < 128)
+        {
+            u.push_back((uint16_t)(c >= 'a' && c <= 'z' ? c - 32 : c));
+            continue;
+        }
+        mapped.clear();
+        uniUpper(c, mapped);
+        for (int m : mapped)
+            pushCp(u, m);
+    }
+    return strv(newStrFromUnitsVec(u));
+}
+
+V sToLower(V thisV, V *, int)
+{
+    JStr *s = thisStr(thisV, "toLowerCase");
+    std::vector<uint16_t> u;
+    u.reserve((size_t)s->len);
+    std::vector<int> mapped;
+    for (int i = 0; i < s->len;)
+    {
+        int w;
+        int c = cpAt(s, i, &w);
+        if (c < 128)
+        {
+            u.push_back((uint16_t)(c >= 'A' && c <= 'Z' ? c + 32 : c));
+            i += w;
+            continue;
+        }
+        if (c == 0x3A3)
+        {
+            u.push_back(sigmaIsFinal(s, i) ? 0x3C2 : 0x3C3);
+            i += w;
+            continue;
+        }
+        i += w;
+        mapped.clear();
+        uniLower(c, mapped);
+        for (int m : mapped)
+            pushCp(u, m);
+    }
+    return strv(newStrFromUnitsVec(u));
+}
+
+// ── normalization ────────────────────────────────────────────────────────
+
+V sNormalize(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "normalize");
+    V formV = argOr(args, argc, 0);
+    std::string form = formV == Undefined ? "NFC" : toUtf8V(formV);
+    int which = form == "NFC" ? 0 : form == "NFD" ? 1 : form == "NFKC" ? 2 : form == "NFKD" ? 3 : -1;
+    if (which < 0)
+        throwRange("The normalization form should be one of NFC, NFD, NFKC, NFKD.");
+    bool ascii = true;
+    for (int i = 0; i < s->len && ascii; ++i)
+        ascii = unitAt(s, i) < 128;
+    if (ascii)
+        return strv(s);
+    std::vector<int> in, out;
+    in.reserve((size_t)s->len);
+    for (int i = 0; i < s->len;)
+    {
+        int w;
+        in.push_back(cpAt(s, i, &w));
+        i += w;
+    }
+    uniNormalize(in, which, out);
+    std::vector<uint16_t> u;
+    u.reserve(out.size());
+    for (int c : out)
+        pushCp(u, c);
+    return strv(newStrFromUnitsVec(u));
+}
+
+// ── comparing as a locale does ───────────────────────────────────────────
+
+// the base letter under an accent
+int baseLetter(int c)
+{
+    return uniBase(c);
+}
+
+// order among kinds of character: spaces, punctuation, symbols, digits, letters
+int primaryKey(int c)
+{
+    int b = baseLetter(c);
+    if (b == '_' || b == '-' || b == ',' || b == ';' || b == ':' || b == '!' || b == '?' || b == '.' || b == '\'' || b == '"' || b == '(' || b == ')' || b == '[' || b == ']' || b == '{' || b == '}' || b == '@' || b == '*' || b == '/' || b == '\\' || b == '&' || b == '#' || b == '%')
+    {
+        static const char *order = "_-,;:!?.'\"()[]{}@*/\\&#%";
+        return 100 + (int)(std::strchr(order, b) - order);
+    }
+    if (b == '`' || b == '^' || b == '+' || b == '<' || b == '=' || b == '>' || b == '|' || b == '~' || b == '$')
+    {
+        static const char *order = "`^+<=>|~$";
+        return 200 + (int)(std::strchr(order, b) - order);
+    }
+    if (b == ' ' || (b >= 9 && b <= 13))
+        return 50 + (b == ' ' ? 10 : b - 9);
+    if (b >= '0' && b <= '9')
+        return 300 + (b - '0');
+    int l = lowerUnit(b);
+    if (l >= 'a' && l <= 'z')
+        return 400 + (l - 'a');
+    // half of a surrogate pair: mostly emoji, which are symbols
+    if (b >= 0xD800 && b < 0xE000)
+        return 260;
+    if (b >= 128)
+    {
+        int group = uniCollationGroup(b);
+        if (group == 0)
+            return 70;
+        if (group == 1)
+            return 150;
+        if (group == 2)
+            return 250;
+        if (group == 3)
+            return 280;
+        if (group == 4)
+            return 340;
+    }
+    return 1000 + l;
+}
+
+int localeCompareStr(JStr *a, JStr *b, int sensitivity, bool numeric)
+{
+    // sensitivity: 0 base, 1 accent, 2 case, 3 variant
+    a = flat_(a);
+    b = flat_(b);
+    int i = 0, j = 0;
+    int accentDiff = 0, caseDiff = 0;
+    while (i < a->len && j < b->len)
+    {
+        int x = unitAt(a, i), y = unitAt(b, j);
+        if (numeric && x >= '0' && x <= '9' && y >= '0' && y <= '9')
+        {
+            int si = i, sj = j;
+            while (si < a->len && unitAt(a, si) == '0')
+                ++si;
+            while (sj < b->len && unitAt(b, sj) == '0')
+                ++sj;
+            int ei = si, ej = sj;
+            while (ei < a->len && unitAt(a, ei) >= '0' && unitAt(a, ei) <= '9')
+                ++ei;
+            while (ej < b->len && unitAt(b, ej) >= '0' && unitAt(b, ej) <= '9')
+                ++ej;
+            if (ei - si != ej - sj)
+                return ei - si < ej - sj ? -1 : 1;
+            for (int k = 0; k < ei - si; ++k)
+            {
+                int p = unitAt(a, si + k), q = unitAt(b, sj + k);
+                if (p != q)
+                    return p < q ? -1 : 1;
+            }
+            i = ei;
+            j = ej;
+            continue;
+        }
+        // a separate combining mark counts as an accent on what came before
+        if (x >= 0x300 && x < 0x370 && !(y >= 0x300 && y < 0x370))
+        {
+            if (!accentDiff)
+                accentDiff = 1;
+            ++i;
+            continue;
+        }
+        if (y >= 0x300 && y < 0x370 && !(x >= 0x300 && x < 0x370))
+        {
+            if (!accentDiff)
+                accentDiff = -1;
+            ++j;
+            continue;
+        }
+        int px = primaryKey(x), py = primaryKey(y);
+        if (px != py)
+            return px < py ? -1 : 1;
+        int bx = baseLetter(x), by = baseLetter(y);
+        if (!accentDiff && (x != bx) != (y != by))
+            accentDiff = x != bx ? 1 : -1;
+        if (!accentDiff && x != bx && y != by && lowerUnit(x) != lowerUnit(y))
+            accentDiff = lowerUnit(x) < lowerUnit(y) ? -1 : 1;
+        if (!caseDiff && bx != by)
+            caseDiff = lowerUnit(bx) == bx ? -1 : 1;
+        ++i;
+        ++j;
+    }
+    while (i < a->len && unitAt(a, i) >= 0x300 && unitAt(a, i) < 0x370)
+    {
+        if (!accentDiff)
+            accentDiff = 1;
+        ++i;
+    }
+    while (j < b->len && unitAt(b, j) >= 0x300 && unitAt(b, j) < 0x370)
+    {
+        if (!accentDiff)
+            accentDiff = -1;
+        ++j;
+    }
+    if (i < a->len)
+        return 1;
+    if (j < b->len)
+        return -1;
+    if (accentDiff && (sensitivity == 1 || sensitivity == 3))
+        return accentDiff;
+    if (caseDiff && sensitivity >= 2)
+        return caseDiff;
+    return 0;
+}
+
+V sLocaleCompare(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "localeCompare");
+    JStr *t = toStr(argOr(args, argc, 0));
+    int sens = 3;
+    bool numeric = false;
+    V opts = argOr(args, argc, 2);
+    if (isObj(opts))
+    {
+        V sv = getV(opts, "sensitivity");
+        if (isStr(sv))
+        {
+            std::string x = toUtf8(sp_(sv));
+            sens = x == "base" ? 0 : x == "accent" ? 1 : x == "case" ? 2 : 3;
+        }
+        numeric = truthy(getV(opts, "numeric"));
+    }
+    return num((double)localeCompareStr(s, t, sens, numeric));
+}
+
+// ── basics ───────────────────────────────────────────────────────────────
+
+V stringCtor(V, V *args, int argc)
+{
+    V v;
+    if (argc == 0)
+        v = A.empty;
+    else if (isSym(args[0]) && g_nativeNewTarget == Undefined)
+        v = str(keyText(args[0]));
+    else
+        v = toStringV(args[0]);
+    if (g_nativeNewTarget == Undefined)
+        return v;
+    JPrim *p = static_cast<JPrim *>(allocObj(sizeof(JPrim), C_STRING, protoFromCtor(g_nativeNewTarget, PR.string)));
+    p->val = strv(flat_(sp_(v)));
+    return objv(p);
+}
+
+V sFromCharCode(V, V *args, int argc)
+{
+    if (argc == 1)
+        return strv(charStr((int)(uint16_t)toInt32(args[0])));
+    std::vector<uint16_t> u;
+    for (int i = 0; i < argc; ++i)
+        u.push_back((uint16_t)toInt32(args[i]));
+    return strv(newStrFromUnitsVec(u));
+}
+
+V sFromCodePoint(V, V *args, int argc)
+{
+    std::vector<uint16_t> u;
+    for (int i = 0; i < argc; ++i)
+    {
+        double d = toNumber(args[i]);
+        if (d != std::floor(d) || d < 0 || d > 0x10FFFF)
+            throwRange("Invalid code point " + toUtf8V(args[i]));
+        uint32_t cp = (uint32_t)d;
+        if (cp >= 0x10000)
+        {
+            cp -= 0x10000;
+            u.push_back((uint16_t)(0xD800 + (cp >> 10)));
+            u.push_back((uint16_t)(0xDC00 + (cp & 0x3FF)));
+        }
+        else
+            u.push_back((uint16_t)cp);
+    }
+    return strv(newStrFromUnitsVec(u));
+}
+
+V sRaw(V, V *args, int argc)
+{
+    V cooked = toObject(argOr(args, argc, 0));
+    V raw = toObject(getProp(cooked, A.raw));
+    int64_t n = toLength(getProp(raw, A.length));
+    JStr *out = sp_(A.empty);
+    for (int64_t i = 0; i < n; ++i)
+    {
+        out = concatStr(out, toStr(getIdx(raw, (double)i)));
+        if (i + 1 < n && i + 1 < argc)
+            out = concatStr(out, toStr(args[i + 1]));
+    }
+    return strv(out);
+}
+
+V sValueOf(V thisV, V *, int)
+{
+    if (isStr(thisV))
+        return thisV;
+    if (isObj(thisV) && op(thisV)->cls == C_STRING)
+        return static_cast<JPrim *>(op(thisV))->val;
+    throwType("String.prototype.valueOf requires that 'this' be a String");
+}
+
+V sCharAt(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "charAt");
+    double d = toIntegerOrInf(argOr(args, argc, 0));
+    if (d < 0 || d >= s->len)
+        return A.empty;
+    return strv(charStr(unitAt(s, (int)d)));
+}
+
+V sCharCodeAt(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "charCodeAt");
+    double d = argc && isNum(args[0]) ? numOf(args[0]) : toIntegerOrInf(argOr(args, argc, 0));
+    if (d != d)
+        d = 0;
+    d = std::trunc(d);
+    if (d < 0 || d >= s->len)
+        return num(0.0 / 0.0);
+    double r = (double)unitAt(s, (int)d);
+    return BITS(r);
+}
+
+V sCodePointAt(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "codePointAt");
+    double d = toIntegerOrInf(argOr(args, argc, 0));
+    if (d < 0 || d >= s->len)
+        return Undefined;
+    int i = (int)d;
+    int c = unitAt(s, i);
+    if (c >= 0xD800 && c < 0xDC00 && i + 1 < s->len)
+    {
+        int e = unitAt(s, i + 1);
+        if (e >= 0xDC00 && e < 0xE000)
+            return num((double)(0x10000 + ((c - 0xD800) << 10) + (e - 0xDC00)));
+    }
+    return num((double)c);
+}
+
+V sAt(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "at");
+    double d = toIntegerOrInf(argOr(args, argc, 0));
+    double at = d < 0 ? s->len + d : d;
+    if (at < 0 || at >= s->len)
+        return Undefined;
+    return strv(charStr(unitAt(s, (int)at)));
+}
+
+V sConcat(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "concat");
+    for (int i = 0; i < argc; ++i)
+        s = concatStr(s, toStr(args[i]));
+    return strv(s);
+}
+
+JStr *searchArg(V v, const char *method)
+{
+    if (isObj(v))
+    {
+        V m = getProp(v, WK.match);
+        if (m != Undefined ? truthy(m) : isRegExp(v))
+            throwType(std::string("First argument to String.prototype.") + method + " must not be a regular expression");
+    }
+    return toStr(v);
+}
+
+V sIncludes(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "includes");
+    JStr *t = searchArg(argOr(args, argc, 0), "includes");
+    return boolv(indexOfStr(s, t, clampArg(argOr(args, argc, 1), s->len, 0)) >= 0);
+}
+
+V sStartsWith(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "startsWith");
+    JStr *t = flat_(searchArg(argOr(args, argc, 0), "startsWith"));
+    int p = clampArg(argOr(args, argc, 1), s->len, 0);
+    if (p + t->len > s->len)
+        return False;
+    for (int i = 0; i < t->len; ++i)
+        if (unitAt(s, p + i) != unitAt(t, i))
+            return False;
+    return True;
+}
+
+V sEndsWith(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "endsWith");
+    JStr *t = flat_(searchArg(argOr(args, argc, 0), "endsWith"));
+    int e = clampArg(argOr(args, argc, 1), s->len, s->len);
+    int p = e - t->len;
+    if (p < 0)
+        return False;
+    for (int i = 0; i < t->len; ++i)
+        if (unitAt(s, p + i) != unitAt(t, i))
+            return False;
+    return True;
+}
+
+V sIndexOf(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "indexOf");
+    JStr *t = toStr(argOr(args, argc, 0));
+    return num((double)indexOfStr(s, t, clampArg(argOr(args, argc, 1), s->len, 0)));
+}
+
+V sLastIndexOf(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "lastIndexOf");
+    JStr *t = flat_(toStr(argOr(args, argc, 0)));
+    double d = toNumber(argOr(args, argc, 1));
+    int start = d != d ? s->len : d < 0 ? 0 : d > s->len ? s->len : (int)d;
+    if (start > s->len - t->len)
+        start = s->len - t->len;
+    for (int i = start; i >= 0; --i)
+    {
+        int j = 0;
+        while (j < t->len && unitAt(s, i + j) == unitAt(t, j))
+            ++j;
+        if (j == t->len)
+            return num((double)i);
+    }
+    return num(-1);
+}
+
+V sSlice(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "slice");
+    int a = relArg(argOr(args, argc, 0), s->len, 0);
+    int b = relArg(argOr(args, argc, 1), s->len, s->len);
+    return strv(substr(s, a, b));
+}
+
+V sSubstring(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "substring");
+    int a = clampArg(argOr(args, argc, 0), s->len, 0);
+    int b = clampArg(argOr(args, argc, 1), s->len, s->len);
+    if (a > b)
+        std::swap(a, b);
+    return strv(substr(s, a, b));
+}
+
+V sSubstr(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "substr");
+    int a = relArg(argOr(args, argc, 0), s->len, 0);
+    double l = argOr(args, argc, 1) == Undefined ? s->len : toIntegerOrInf(args[1]);
+    double e = a + l;
+    if (e > s->len)
+        e = s->len;
+    return strv(substr(s, a, (int)e));
+}
+
+V trimLike(V thisV, bool start, bool end, const char *name)
+{
+    JStr *s = thisStr(thisV, name);
+    int a = 0, b = s->len;
+    if (start)
+        while (a < b && isSpaceUnit(unitAt(s, a)))
+            ++a;
+    if (end)
+        while (b > a && isSpaceUnit(unitAt(s, b - 1)))
+            --b;
+    return strv(substr(s, a, b));
+}
+
+V sTrim(V thisV, V *, int) { return trimLike(thisV, true, true, "trim"); }
+V sTrimStart(V thisV, V *, int) { return trimLike(thisV, true, false, "trimStart"); }
+V sTrimEnd(V thisV, V *, int) { return trimLike(thisV, false, true, "trimEnd"); }
+
+V padLike(V thisV, V *args, int argc, bool atStart)
+{
+    JStr *s = thisStr(thisV, atStart ? "padStart" : "padEnd");
+    int64_t target = toLength(argOr(args, argc, 0));
+    if (target <= s->len)
+        return strv(s);
+    V fv = argOr(args, argc, 1);
+    JStr *fill = flat_(fv == Undefined ? newStrAscii(" ") : toStr(fv));
+    if (!fill->len)
+        return strv(s);
+    int need = (int)(target - s->len);
+    std::vector<uint16_t> u;
+    u.reserve((size_t)need);
+    for (int i = 0; i < need; ++i)
+        u.push_back((uint16_t)unitAt(fill, i % fill->len));
+    JStr *p = newStrFromUnitsVec(u);
+    return strv(atStart ? concatStr(p, s) : concatStr(s, p));
+}
+
+V sPadStart(V thisV, V *args, int argc) { return padLike(thisV, args, argc, true); }
+V sPadEnd(V thisV, V *args, int argc) { return padLike(thisV, args, argc, false); }
+
+V sRepeat(V thisV, V *args, int argc)
+{
+    JStr *s = thisStr(thisV, "repeat");
+    double d = toIntegerOrInf(argOr(args, argc, 0));
+    if (d < 0 || d - d != 0)
+        throwRange("Invalid count value: " + toUtf8V(argOr(args, argc, 0)));
+    if (d == 0 || !s->len)
+        return A.empty;
+    if (d * s->len > 536870888.0)
+        throwRange("Invalid string length");
+    int n = (int)d;
+    int total = n * s->len;
+    JStr *r = NEW(JStr);
+    r->len = total;
+    r->flat = 1;
+    if (s->wide)
+    {
+        uint16_t *m = static_cast<uint16_t *>(bump((size_t)total * 2 + 2));
+        for (int i = 0; i < n; ++i)
+            std::memcpy(m + i * s->len, s->w, (size_t)s->len * 2);
+        r->w = m;
+        r->wide = 1;
+    }
+    else
+    {
+        uint8_t *m = static_cast<uint8_t *>(bump((size_t)total + 1));
+        for (int i = 0; i < n; ++i)
+            std::memcpy(m + i * s->len, s->a, (size_t)s->len);
+        r->a = m;
+    }
+    return strv(r);
+}
+
+V sSplit(V thisV, V *args, int argc)
+{
+    if (isNullish(thisV))
+        throwType("String.prototype.split called on null or undefined");
+    V sep = argOr(args, argc, 0);
+    V limV = argOr(args, argc, 1);
+    if (!isNullish(sep) && isObj(sep))
+    {
+        V m = getProp(sep, WK.split);
+        if (!isNullish(m))
+        {
+            V a[2] = {thisV, limV};
+            return call(m, sep, a, 2);
+        }
+    }
+    JStr *s = flat_(toStr(thisV));
+    uint32_t lim = limV == Undefined ? 4294967295u : toUint32(limV);
+    JArray *out = newArray();
+    if (lim == 0)
+        return objv(out);
+    if (sep == Undefined)
+    {
+        arrayPush(out, strv(s));
+        return objv(out);
+    }
+    JStr *t = flat_(toStr(sep));
+    if (!t->len)
+    {
+        for (int i = 0; i < s->len && (uint32_t)i < lim; ++i)
+            arrayPush(out, strv(charStr(unitAt(s, i))));
+        return objv(out);
+    }
+    if (!s->len)
+    {
+        arrayPush(out, strv(s));
+        return objv(out);
+    }
+    int p = 0;
+    for (;;)
+    {
+        int q = indexOfStr(s, t, p);
+        if (q < 0)
+            break;
+        arrayPush(out, strv(substr(s, p, q)));
+        if (out->len >= lim)
+            return objv(out);
+        p = q + t->len;
+    }
+    arrayPush(out, strv(substr(s, p, s->len)));
+    return objv(out);
+}
+
+// a method that hands over to a regular expression's Symbol method
+V delegate(V thisV, V *args, int argc, V sym, const char *name, const char *flags)
+{
+    if (isNullish(thisV))
+        throwType(std::string("String.prototype.") + name + " called on null or undefined");
+    V pat = argOr(args, argc, 0);
+    if (!isNullish(pat) && isObj(pat))
+    {
+        V m = getProp(pat, sym);
+        if (!isNullish(m))
+        {
+            V a = thisV;
+            return call(m, pat, &a, 1);
+        }
+    }
+    V s = toStringV(thisV);
+    V re = regexpNew(pat == Undefined ? (flags ? A.empty : strA("(?:)")) : toStringV(pat), flags ? strA(flags) : A.empty);
+    return invoke(re, sym, &s, 1);
+}
+
+V sMatch(V thisV, V *args, int argc) { return delegate(thisV, args, argc, WK.match, "match", nullptr); }
+V sSearch(V thisV, V *args, int argc) { return delegate(thisV, args, argc, WK.search, "search", nullptr); }
+
+V sMatchAll(V thisV, V *args, int argc)
+{
+    V pat = argOr(args, argc, 0);
+    if (isObj(pat) && isRegExp(pat))
+    {
+        V f = getProp(pat, A.flags);
+        if (toUtf8V(f).find('g') == std::string::npos)
+            throwType("String.prototype.matchAll called with a non-global RegExp argument");
+    }
+    return delegate(thisV, args, argc, WK.matchAll, "matchAll", "g");
+}
+
+// $ patterns in a replacement string
+JStr *expand(JStr *rep, JStr *subject, int pos, JStr *matched, const std::vector<V> &caps, V named)
+{
+    rep = flat_(rep);
+    bool any = false;
+    for (int i = 0; i < rep->len; ++i)
+        if (unitAt(rep, i) == '$')
+        {
+            any = true;
+            break;
+        }
+    if (!any)
+        return rep;
+    std::vector<uint16_t> u;
+    subject = flat_(subject);
+    matched = flat_(matched);
+    auto addStr = [&](JStr *x) {
+        x = flat_(x);
+        for (int k = 0; k < x->len; ++k)
+            u.push_back((uint16_t)unitAt(x, k));
+    };
+    int m = (int)caps.size();
+    for (int i = 0; i < rep->len; ++i)
+    {
+        int c = unitAt(rep, i);
+        if (c != '$' || i + 1 >= rep->len)
+        {
+            u.push_back((uint16_t)c);
+            continue;
+        }
+        int d = unitAt(rep, i + 1);
+        if (d == '$')
+        {
+            u.push_back('$');
+            ++i;
+        }
+        else if (d == '&')
+        {
+            addStr(matched);
+            ++i;
+        }
+        else if (d == '`')
+        {
+            addStr(substr(subject, 0, pos));
+            ++i;
+        }
+        else if (d == '\'')
+        {
+            int e = pos + matched->len;
+            if (e < subject->len)
+                addStr(substr(subject, e, subject->len));
+            ++i;
+        }
+        else if (d >= '0' && d <= '9')
+        {
+            int n = d - '0';
+            int used = 1;
+            if (i + 2 < rep->len)
+            {
+                int e = unitAt(rep, i + 2);
+                if (e >= '0' && e <= '9' && n * 10 + (e - '0') >= 1 && n * 10 + (e - '0') <= m)
+                {
+                    n = n * 10 + (e - '0');
+                    used = 2;
+                }
+            }
+            if (n >= 1 && n <= m)
+            {
+                V cap = caps[(size_t)n - 1];
+                if (cap != Undefined)
+                    addStr(toStr(cap));
+                i += used;
+            }
+            else
+                u.push_back('$');
+        }
+        else if (d == '<' && named != Undefined)
+        {
+            int e = i + 2;
+            while (e < rep->len && unitAt(rep, e) != '>')
+                ++e;
+            if (e >= rep->len)
+                u.push_back('$');
+            else
+            {
+                V key = atomStr(substr(rep, i + 2, e));
+                V v = getProp(named, key);
+                if (v != Undefined)
+                    addStr(toStr(v));
+                i = e;
+            }
+        }
+        else
+            u.push_back('$');
+    }
+    return newStrFromUnitsVec(u);
+}
+
+V replaceLike(V thisV, V *args, int argc, bool all)
+{
+    if (isNullish(thisV))
+        throwType(std::string("String.prototype.") + (all ? "replaceAll" : "replace") + " called on null or undefined");
+    V pat = argOr(args, argc, 0);
+    V rep = argOr(args, argc, 1);
+    if (!isNullish(pat) && isObj(pat))
+    {
+        if (all && isRegExp(pat))
+        {
+            if (toUtf8V(getProp(pat, A.flags)).find('g') == std::string::npos)
+                throwType("String.prototype.replaceAll called with a non-global RegExp argument");
+        }
+        V m = getProp(pat, WK.replace);
+        if (!isNullish(m))
+        {
+            V a[2] = {thisV, rep};
+            return call(m, pat, a, 2);
+        }
+    }
+    JStr *s = flat_(toStr(thisV));
+    JStr *t = flat_(toStr(pat));
+    bool fn = isCallable(rep);
+    JStr *rs = fn ? nullptr : toStr(rep);
+    std::vector<int> positions;
+    int adv = t->len ? t->len : 1;
+    int p = indexOfStr(s, t, 0);
+    while (p >= 0)
+    {
+        positions.push_back(p);
+        if (!all)
+            break;
+        if (p + adv > s->len)
+            break;
+        p = indexOfStr(s, t, p + adv);
+    }
+    if (positions.empty())
+        return strv(s);
+    JStr *out = sp_(A.empty);
+    int end = 0;
+    std::vector<V> noCaps;
+    for (int at : positions)
+    {
+        out = concatStr(out, substr(s, end, at));
+        JStr *r;
+        if (fn)
+        {
+            V a[3] = {strv(t), num((double)at), strv(s)};
+            r = toStr(call(rep, Undefined, a, 3));
+        }
+        else
+            r = expand(rs, s, at, t, noCaps, Undefined);
+        out = concatStr(out, r);
+        end = at + t->len;
+    }
+    out = concatStr(out, substr(s, end, s->len));
+    return strv(out);
+}
+
+V sReplace(V thisV, V *args, int argc) { return replaceLike(thisV, args, argc, false); }
+V sReplaceAll(V thisV, V *args, int argc) { return replaceLike(thisV, args, argc, true); }
+
+V sIsWellFormed(V thisV, V *, int)
+{
+    JStr *s = thisStr(thisV, "isWellFormed");
+    for (int i = 0; i < s->len; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c >= 0xD800 && c < 0xDC00)
+        {
+            if (i + 1 >= s->len || unitAt(s, i + 1) < 0xDC00 || unitAt(s, i + 1) >= 0xE000)
+                return False;
+            ++i;
+        }
+        else if (c >= 0xDC00 && c < 0xE000)
+            return False;
+    }
+    return True;
+}
+
+V sToWellFormed(V thisV, V *, int)
+{
+    JStr *s = thisStr(thisV, "toWellFormed");
+    std::vector<uint16_t> u;
+    for (int i = 0; i < s->len; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < s->len && unitAt(s, i + 1) >= 0xDC00 && unitAt(s, i + 1) < 0xE000)
+        {
+            u.push_back((uint16_t)c);
+            u.push_back((uint16_t)unitAt(s, ++i));
+        }
+        else if (c >= 0xD800 && c < 0xE000)
+            u.push_back(0xFFFD);
+        else
+            u.push_back((uint16_t)c);
+    }
+    return strv(newStrFromUnitsVec(u));
+}
+
+V sIterator(V thisV, V *, int)
+{
+    JStr *s = thisStr(thisV, "[Symbol.iterator]");
+    StringIter *it = static_cast<StringIter *>(allocObj(sizeof(StringIter), C_STRINGITER, PR.stringIter));
+    it->s = s;
+    return objv(it);
+}
+
+V stringIterNext(V thisV, V *, int)
+{
+    if (!isObj(thisV) || op(thisV)->cls != C_STRINGITER)
+        throwType("next method called on incompatible receiver " + inspectBrief(thisV));
+    StringIter *it = static_cast<StringIter *>(op(thisV));
+    JStr *s = it->s;
+    if (it->pos >= s->len)
+        return iterResult(Undefined, true);
+    int i = it->pos;
+    int c = unitAt(s, i);
+    if (c >= 0xD800 && c < 0xDC00 && i + 1 < s->len)
+    {
+        int e = unitAt(s, i + 1);
+        if (e >= 0xDC00 && e < 0xE000)
+        {
+            it->pos = i + 2;
+            return iterResult(strv(substr(s, i, i + 2)), false);
+        }
+    }
+    it->pos = i + 1;
+    return iterResult(strv(charStr(c)), false);
+}
+
+} // namespace
+
+JStr *expandReplacement(JStr *rep, JStr *subject, int pos, JStr *matched, const std::vector<V> &caps, V named)
+{
+    return expand(rep, subject, pos, matched, caps, named);
+}
+
+static V htmlWrap(V thisV, V *args, int argc, const char *method, const char *tag, const char *attr)
+{
+    if (isNullish(thisV))
+        throwType(std::string("String.prototype.") + method + " called on null or undefined");
+    std::string out = std::string("<") + tag;
+    if (attr)
+    {
+        std::string value = toUtf8V(argOr(args, argc, 0));
+        out += std::string(" ") + attr + "=\"";
+        for (char ch : value)
+        {
+            if (ch == '"')
+                out += "&quot;";
+            else
+                out += ch;
+        }
+        out += "\"";
+    }
+    out += ">" + toUtf8V(thisV) + "</" + tag + ">";
+    return str(out);
+}
+
+static V strHtml_anchor(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "anchor", "a", "name"); }
+static V strHtml_big(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "big", "big", nullptr); }
+static V strHtml_blink(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "blink", "blink", nullptr); }
+static V strHtml_bold(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "bold", "b", nullptr); }
+static V strHtml_fixed(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "fixed", "tt", nullptr); }
+static V strHtml_fontcolor(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "fontcolor", "font", "color"); }
+static V strHtml_fontsize(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "fontsize", "font", "size"); }
+static V strHtml_italics(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "italics", "i", nullptr); }
+static V strHtml_link(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "link", "a", "href"); }
+static V strHtml_small(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "small", "small", nullptr); }
+static V strHtml_strike(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "strike", "strike", nullptr); }
+static V strHtml_sub(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "sub", "sub", nullptr); }
+static V strHtml_sup(V thisV, V *args, int argc) { return htmlWrap(thisV, args, argc, "sup", "sup", nullptr); }
+
+void initStringBuiltins()
+{
+    JFunc *c = defCtor("String", stringCtor, 1, PR.string);
+    defFn(c, "fromCharCode", sFromCharCode, 1);
+    defFn(c, "fromCodePoint", sFromCodePoint, 1);
+    defFn(c, "raw", sRaw, 1);
+    Obj *p = PR.string;
+    defFn(p, "anchor", strHtml_anchor, 1);
+    defFn(p, "big", strHtml_big, 0);
+    defFn(p, "blink", strHtml_blink, 0);
+    defFn(p, "bold", strHtml_bold, 0);
+    defFn(p, "fixed", strHtml_fixed, 0);
+    defFn(p, "fontcolor", strHtml_fontcolor, 1);
+    defFn(p, "fontsize", strHtml_fontsize, 1);
+    defFn(p, "italics", strHtml_italics, 0);
+    defFn(p, "link", strHtml_link, 1);
+    defFn(p, "small", strHtml_small, 0);
+    defFn(p, "strike", strHtml_strike, 0);
+    defFn(p, "sub", strHtml_sub, 0);
+    defFn(p, "sup", strHtml_sup, 0);
+    defFn(p, "at", sAt, 1);
+    defFn(p, "charAt", sCharAt, 1);
+    defFn(p, "charCodeAt", sCharCodeAt, 1);
+    defFn(p, "codePointAt", sCodePointAt, 1);
+    defFn(p, "concat", sConcat, 1);
+    defFn(p, "endsWith", sEndsWith, 1);
+    defFn(p, "includes", sIncludes, 1);
+    defFn(p, "indexOf", sIndexOf, 1);
+    defFn(p, "isWellFormed", sIsWellFormed, 0);
+    defFn(p, "lastIndexOf", sLastIndexOf, 1);
+    defFn(p, "localeCompare", sLocaleCompare, 1);
+    defFn(p, "match", sMatch, 1);
+    defFn(p, "matchAll", sMatchAll, 1);
+    defFn(p, "normalize", sNormalize, 0);
+    defFn(p, "padEnd", sPadEnd, 1);
+    defFn(p, "padStart", sPadStart, 1);
+    defFn(p, "repeat", sRepeat, 1);
+    defFn(p, "replace", sReplace, 2);
+    defFn(p, "replaceAll", sReplaceAll, 2);
+    defFn(p, "search", sSearch, 1);
+    defFn(p, "slice", sSlice, 2);
+    defFn(p, "split", sSplit, 2);
+    defFn(p, "startsWith", sStartsWith, 1);
+    defFn(p, "substr", sSubstr, 2);
+    defFn(p, "substring", sSubstring, 2);
+    defFn(p, "toLowerCase", sToLower, 0);
+    defFn(p, "toUpperCase", sToUpper, 0);
+    defFn(p, "toLocaleLowerCase", sToLower, 0);
+    defFn(p, "toLocaleUpperCase", sToUpper, 0);
+    defFn(p, "toString", sValueOf, 0);
+    defFn(p, "toWellFormed", sToWellFormed, 0);
+    defFn(p, "trim", sTrim, 0);
+    defFn(p, "trimEnd", sTrimEnd, 0);
+    defFn(p, "trimStart", sTrimStart, 0);
+    defineOwn(p, atomOf("trimLeft"), getProp(objv(p), atomOf("trimStart")), PF_W | PF_C);
+    defineOwn(p, atomOf("trimRight"), getProp(objv(p), atomOf("trimEnd")), PF_W | PF_C);
+    defFn(p, "valueOf", sValueOf, 0);
+    defFnSym(p, WK.iterator, "[Symbol.iterator]", sIterator, 0);
+    defFn(PR.stringIter, "next", stringIterNext, 0);
+    defineOwn(PR.stringIter, WK.toStringTag, atomOf("String Iterator"), PF_C);
+}
+
+} // namespace js

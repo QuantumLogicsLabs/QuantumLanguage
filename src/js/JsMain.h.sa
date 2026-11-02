@@ -1,0 +1,30 @@
+// quantum: cpp
+#pragma once
+// JavaScript front-end: what the rest of the compiler sees of it.
+#include <string>
+
+namespace js
+{
+
+// A syntax error while parsing
+struct ParseError
+{
+    std::string message;
+    int line, col;
+};
+
+// An uncaught exception, for the caller to report
+struct RunFailure
+{
+    bool failed = false;
+    std::string kind, message;
+    int line = 0;
+};
+
+// Runs a JavaScript program to its end; the result is the exit status
+int runProgram(const std::string &source, const std::string &path, RunFailure &failure);
+
+// Whether this front-end can parse the source (`why`: the syntax error if not)
+bool canRun(const std::string &source, const std::string &path, std::string &why);
+
+} // namespace js

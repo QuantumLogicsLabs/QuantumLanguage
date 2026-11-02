@@ -1,0 +1,114 @@
+// quantum: cpp
+#pragma once
+// JavaScript front-end: declarations shared between the runtime's own files.
+#include "JsRt.h.sa"
+
+#include <string>
+#include <vector>
+
+namespace js
+{
+
+struct JArgs : JArray
+{
+    Env *env;
+    int *map; // parameter index -> environment slot, or -1
+    int nMap;
+};
+
+struct KeyTable;
+
+int shapeFind(Shape *s, V key, uint8_t *flags);
+void addProp(Obj *o, V key, V val, uint8_t flags);
+void arraySetIndex(JArray *a, uint32_t i, V val);
+void arraySetLength(JArray *a, V val);
+std::string keyText(V key);
+std::string ctorNameOf(Obj *o);
+bool ordinaryHasInstance(V target, V v);
+V PR_hasInstanceDefault();
+extern void (*g_strTooLong)();
+
+// proxies (JsReflect.sa)
+V proxyGet(Obj *o, V key, V receiver);
+bool proxySet(Obj *o, V key, V val, V receiver);
+bool proxyHas(Obj *o, V key);
+bool proxyDelete(Obj *o, V key);
+void proxyOwnKeys(Obj *o, std::vector<V> &out, bool strings, bool symbols, bool onlyEnumerable);
+Obj *proxyGetProto(Obj *o);
+bool proxySetProto(Obj *o, Obj *proto);
+bool proxyIsExtensible(Obj *o);
+bool proxyPreventExt(Obj *o);
+bool proxyGetOwnDesc(Obj *o, V key, V *val, V *getter, V *setter, uint8_t *flags);
+bool proxyDefine(Obj *o, V key, V desc, bool throwing);
+V proxyCall(JFunc *f, V thisV, V *args, int argc);
+V proxyConstruct(JFunc *f, V *args, int argc, V newTarget);
+
+// typed arrays (JsBinary.sa)
+int typedGetKey(Obj *o, V key, V *out); // 1 found, 0 out of range, -1 not numeric
+int typedGetIndex(Obj *o, double d, V *out);
+int typedSetIndex(Obj *o, double d, V val);
+int typedSetKey(Obj *o, V key, V val);  // >= 0 handled, -1 not numeric
+int64_t typedLength(Obj *o);
+
+// map and set storage (JsCollections.sa)
+struct MapData;
+V mapGetRaw(Obj *m, V key, bool *found);
+
+// the interpreter's helpers shared with builtins
+V iterResult(V value, bool done);
+V makeBoundFunction(V target, V thisV, V *args, int argc);
+V functionToString(V fn);
+std::string stringifyForMessage(V v);
+Frame *currentJsFrame();
+
+// promise jobs and timers
+void nodeDrainTicks();
+int timerAdd(V fn, double delay, V *args, int argc, bool repeat);
+
+// stack traces
+std::string callSiteLine(Frame *f);
+V stackFrames(V skipUntil, int limit);
+
+std::string defaultCallSite(V v);
+[[noreturn]] void errNotDefined(V name);
+[[noreturn]] void errReadNullish(V base, V key);
+[[noreturn]] void errSetNullish(V base, V key);
+[[noreturn]] void errInOperator(V a, V b);
+[[noreturn]] void errNotCallable(V fn);
+[[noreturn]] void errNotConstructor(V fn);
+[[noreturn]] void errNotIterable(V v);
+[[noreturn]] void errIteratorResult(V r);
+std::string receivedText(V v);
+void requireIterable(V v, Node *src);
+
+// arrays and iterators
+V atomKeyOf(int64_t i);
+V makeArrayIterator(V target, int kind);
+void initLookupCache();
+void mapPreview(Obj *m, JArray *out, bool *keyed);
+void iterPreview(Obj *it, JArray *out, bool *keyed);
+double virtualNow();
+extern V g_nextTickFn;
+Obj *typedArrayHolder();
+
+// the interpreter (JsEval.sa)
+extern V g_evalFn;
+extern V g_arrayValuesFn;
+extern V g_arrayIterNext;
+void assignNode(Node *t, V val, Frame *f, bool init);
+void enterScopeSlow(Scope *s, Frame *f);
+void setupCall(Frame *f, FuncNode *node, JFunc *fn);
+V runFunctionBody(Node *body, Frame *f);
+void initFields(JFunc *F, V self);
+std::string keyText2(V key);
+std::string inspectForExtends(V v);
+V runModuleFunction(FuncNode *node, V thisV, V *args, int argc);
+void forAwaitLoop(Node *n, V iterable, Frame *f);
+V throwerFn();
+
+// a native function with captured values
+JFunc *newClosure(const char *name, NativeFn fn, int length, V data, V data2 = Undefined);
+#define NATIVE_DATA() (g_nativeCallee->data)
+#define NATIVE_DATA2() (g_nativeCallee->data2)
+
+} // namespace js

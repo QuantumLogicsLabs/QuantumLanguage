@@ -1,0 +1,25 @@
+'use strict';
+// The os module: this machine, as far as programs usually ask.
+module.exports = {
+  EOL: '\r\n',
+  platform: () => 'win32',
+  type: () => 'Windows_NT',
+  arch: () => 'x64',
+  machine: () => 'x86_64',
+  release: () => '10.0.19045',
+  version: () => 'Windows 10 Pro',
+  hostname: () => internal.getEnv('COMPUTERNAME') ?? 'localhost',
+  homedir: () => internal.getEnv('USERPROFILE') ?? 'C:\\',
+  tmpdir: () => internal.getEnv('TEMP') ?? 'C:\\Temp',
+  endianness: () => 'LE',
+  uptime: () => 1000,
+  loadavg: () => [0, 0, 0],
+  totalmem: () => 8589934592,
+  freemem: () => 4294967296,
+  cpus: () => [{ model: 'cpu', speed: 2000, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }],
+  availableParallelism: () => 1,
+  networkInterfaces: () => ({}),
+  userInfo: () => ({ username: internal.getEnv('USERNAME') ?? 'user', uid: -1, gid: -1, shell: null, homedir: internal.getEnv('USERPROFILE') ?? 'C:\\' }),
+  constants: { signals: {}, errno: {} },
+  devNull: '\\\\.\\nul',
+};

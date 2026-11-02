@@ -1,0 +1,21 @@
+'use strict';
+const esc = (s) => encodeURIComponent(s).replace(/%20/g, '%20');
+module.exports = {
+  parse(s, sep = '&', eq = '=') {
+    const o = Object.create(null);
+    for (const part of String(s).split(sep)) {
+      if (!part) continue;
+      const i = part.indexOf(eq);
+      const k = decodeURIComponent((i < 0 ? part : part.slice(0, i)).replace(/\+/g, ' '));
+      const v = i < 0 ? '' : decodeURIComponent(part.slice(i + eq.length).replace(/\+/g, ' '));
+      if (k in o) o[k] = [].concat(o[k], v);
+      else o[k] = v;
+    }
+    return o;
+  },
+  stringify(o, sep = '&', eq = '=') {
+    return Object.entries(o ?? {}).flatMap(([k, v]) => [].concat(v).map((x) => esc(k) + eq + esc(String(x)))).join(sep);
+  },
+  escape: esc,
+  unescape: decodeURIComponent,
+};

@@ -659,7 +659,7 @@ class Gen
     std::vector<cpp::ExprP> keepExprs_;
     std::vector<BindP> keepBinds_; // likewise bindings (memo keys)
     std::vector<int> flagSlots_;   // the current function's temporaries' "constructed" flags
-    bool frameObjects_ = false;    // the current function keeps objects in its frame
+    std::vector<std::pair<int, int>> frameObjects_; // the current function's object slots: offset, size
     // translation units: anonymous namespaces and namespace-scope statics of a
     // .sa/.cpp file live in a hidden scope __tuN:: that only its TU sees
     int curTu_ = 0;
@@ -3445,7 +3445,7 @@ void Gen::function(Method &m)
     a.jmp(setupLabel);
     a.bind(setupDone);
     flagSlots_.clear();
-    frameObjects_ = false;
+    frameObjects_.clear();
     if (m.decl)
         for (size_t i = 0; i < m.params.size(); ++i)
         {
@@ -3483,19 +3483,39 @@ void Gen::function(Method &m)
             a.storeInd(RAX, RDX);
         }
     }
-    if (frameObjects_)
+    // A frame with objects in it starts zeroed, as code has come to rely on. The
+    // JavaScript interpreter's hot functions keep a few strings for their error
+    // paths in large frames, and this runs on every call: there, only the objects.
+    bool objectsOnly = m.name.rfind("js::", 0) == 0;
+    if (!frameObjects_.empty() && !objectsOnly)
     {
-        // all of it zeroed (rep stosq over [rbp - frame, rbp))
         a.movImm(RCX, frameSize / 8);
         a.lea(RDI, -frameSize);
         a.movImm(RAX, 0);
         a.byte(0xF3);
         a.byte(0x48);
-        a.byte(0xAB);
+        a.byte(0xAB); // rep stosq
     }
-    else if (!flagSlots_.empty())
+    else
     {
-        a.movImm(RAX, 0);
+        if (!frameObjects_.empty() || !flagSlots_.empty())
+            a.movImm(RAX, 0);
+        for (const auto &slot : frameObjects_)
+        {
+            if (slot.first < -frameSize)
+                continue; // from a trial that was rolled back: past the end of the frame
+            if (slot.second <= 128)
+            {
+                for (int k = 0; k < slot.second; k += 8)
+                    a.store(slot.first + k, RAX);
+                continue;
+            }
+            a.movImm(RCX, slot.second / 8);
+            a.lea(RDI, slot.first);
+            a.byte(0xF3);
+            a.byte(0x48);
+            a.byte(0xAB); // rep stosq
+        }
         for (int f : flagSlots_)
             a.store(f, RAX);
     }
@@ -3922,7 +3942,7 @@ int Gen::newSlot(const NT &t)
     while (el->cat == C_ARRAY)
         el = el->elem;
     if (el->cat == C_CLASS)
-        frameObjects_ = true; // an object may be destroyed without having been built: the frame starts zeroed
+        frameObjects_.push_back({nextOff_, alignUp(sizeOf(t), 8)}); // may be destroyed without having been built: starts zeroed
     return nextOff_;
 }
 
@@ -4976,6 +4996,20 @@ void Gen::bindRef(const NT &ref, const cpp::ExprP &e, int line)
         if (to->cat == C_CLASS && to->cls->needsDtor)
             addTemp(slot, to->cls);
         a.lea(RAX, slot);
+        return;
+    }
+    if (e->k == cpp::EK::Cond && to->cat != C_CLASS)
+    {
+        // c ? x : y binds to whichever it picks, not to a copy of it
+        int other = a.newLabel(), end = a.newLabel();
+        truth(expr(asCondition(e->kids[0])));
+        a.test(RAX, RAX);
+        a.jcc(CC_E, other);
+        bindRef(ref, e->kids[1], line);
+        a.jmp(end);
+        a.bind(other);
+        bindRef(ref, e->kids[2], line);
+        a.bind(end);
         return;
     }
     NT t = rawType(e); // a call returning a reference is an lvalue

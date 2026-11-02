@@ -1,0 +1,1710 @@
+// quantum: cpp
+// JavaScript front-end: Map, Set, the weak collections, JSON and Reflect/Proxy.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <algorithm>
+#include <cmath>
+
+namespace js
+{
+
+// ── ordered hash tables ──────────────────────────────────────────────────
+
+struct JMap : Obj
+{
+    V *keys;
+    V *vals;
+    uint32_t used;   // entries, with deleted ones
+    uint32_t live;
+    uint32_t cap;
+    int32_t *index;  // open addressing over entries: -1 empty, -2 deleted
+    uint32_t idxCap;
+    uint32_t epoch;  // clear() moves iterators back to the start
+};
+
+struct MapIter : Obj
+{
+    JMap *m;
+    uint32_t pos;
+    uint32_t epoch;
+    uint8_t kind; // 0 keys, 1 values, 2 entries
+    bool done;
+};
+
+namespace
+{
+
+uint32_t hashValue(V v)
+{
+    if (isNum(v))
+    {
+        double d = numOf(v);
+        if (d == 0)
+            return 0x51ed27;
+        if (d != d)
+            return 0x7ff8;
+        uint64_t b = v;
+        return (uint32_t)(b ^ (b >> 32)) * 2654435761u;
+    }
+    if (isStr(v))
+        return hashStr(sp_(v));
+    if (isBig(v))
+    {
+        JBig *b = bigp(v);
+        return b->n ? b->d[0] * 2654435761u : 0;
+    }
+    return (uint32_t)((v >> 4) ^ (v >> 20)) * 2654435761u;
+}
+
+void mapInit(JMap *m)
+{
+    m->cap = 8;
+    m->keys = static_cast<V *>(bump(sizeof(V) * 8));
+    m->vals = static_cast<V *>(bump(sizeof(V) * 8));
+    m->idxCap = 16;
+    m->index = static_cast<int32_t *>(bump(sizeof(int32_t) * 16));
+    for (uint32_t i = 0; i < 16; ++i)
+        m->index[i] = -1;
+}
+
+int mapFind(JMap *m, V key)
+{
+    uint32_t mask = m->idxCap - 1;
+    uint32_t h = hashValue(key) & mask;
+    for (;;)
+    {
+        int32_t e = m->index[h];
+        if (e == -1)
+            return -1;
+        if (e >= 0 && sameValueZero(m->keys[e], key))
+            return e;
+        h = (h + 1) & mask;
+    }
+}
+
+void mapReindex(JMap *m, uint32_t idxCap)
+{
+    m->idxCap = idxCap;
+    m->index = static_cast<int32_t *>(bump(sizeof(int32_t) * idxCap));
+    for (uint32_t i = 0; i < idxCap; ++i)
+        m->index[i] = -1;
+    uint32_t mask = idxCap - 1;
+    for (uint32_t e = 0; e < m->used; ++e)
+    {
+        if (m->keys[e] == Hole)
+            continue;
+        uint32_t h = hashValue(m->keys[e]) & mask;
+        while (m->index[h] != -1)
+            h = (h + 1) & mask;
+        m->index[h] = (int32_t)e;
+    }
+}
+
+void mapSet(JMap *m, V key, V val)
+{
+    if (isNum(key) && numOf(key) == 0)
+        key = num(0); // -0 is stored as +0
+    int e = mapFind(m, key);
+    if (e >= 0)
+    {
+        m->vals[e] = val;
+        return;
+    }
+    if (m->used >= m->cap)
+    {
+        uint32_t cap = m->cap * 2;
+        V *nk = static_cast<V *>(bump(sizeof(V) * cap));
+        V *nv = static_cast<V *>(bump(sizeof(V) * cap));
+        std::memcpy(nk, m->keys, sizeof(V) * m->used);
+        std::memcpy(nv, m->vals, sizeof(V) * m->used);
+        m->keys = nk;
+        m->vals = nv;
+        m->cap = cap;
+    }
+    if ((m->used + 1) * 2 > m->idxCap)
+        mapReindex(m, m->idxCap * 2);
+    uint32_t mask = m->idxCap - 1;
+    uint32_t h = hashValue(key) & mask;
+    while (m->index[h] >= 0)
+        h = (h + 1) & mask;
+    uint32_t i = m->used++;
+    m->keys[i] = key;
+    m->vals[i] = val;
+    m->index[h] = (int32_t)i;
+    m->live++;
+}
+
+bool mapDelete(JMap *m, V key)
+{
+    uint32_t mask = m->idxCap - 1;
+    uint32_t h = hashValue(key) & mask;
+    for (;;)
+    {
+        int32_t e = m->index[h];
+        if (e == -1)
+            return false;
+        if (e >= 0 && sameValueZero(m->keys[e], key))
+        {
+            m->index[h] = -2;
+            m->keys[e] = Hole;
+            m->vals[e] = Undefined;
+            m->live--;
+            return true;
+        }
+        h = (h + 1) & mask;
+    }
+}
+
+void mapClear(JMap *m)
+{
+    for (uint32_t i = 0; i < m->used; ++i)
+    {
+        m->keys[i] = Hole;
+        m->vals[i] = Undefined;
+    }
+    for (uint32_t i = 0; i < m->idxCap; ++i)
+        m->index[i] = -1;
+    m->live = 0;
+    m->epoch++;
+    m->used = 0;
+}
+
+JMap *thisMap(V v, uint8_t cls, const char *name)
+{
+    if (!isObj(v) || op(v)->cls != cls)
+    {
+        const char *t = cls == C_MAP ? "Map" : cls == C_SET ? "Set" : cls == C_WEAKMAP ? "WeakMap" : "WeakSet";
+        throwType(std::string("Method ") + t + ".prototype." + name + " called on incompatible receiver " + inspectBrief(v));
+    }
+    return static_cast<JMap *>(op(v));
+}
+
+V newCollection(uint8_t cls, Obj *dflt, const char *name)
+{
+    if (g_nativeNewTarget == Undefined)
+        throwType(std::string("Constructor ") + name + " requires 'new'");
+    JMap *m = static_cast<JMap *>(allocObj(sizeof(JMap), cls, protoFromCtor(g_nativeNewTarget, dflt)));
+    mapInit(m);
+    return objv(m);
+}
+
+// Map
+V mapCtor(V, V *args, int argc)
+{
+    V self = newCollection(C_MAP, PR.map, "Map");
+    V items = argOr(args, argc, 0);
+    if (isNullish(items))
+        return self;
+    V adder = getProp(self, A.set);
+    if (!isCallable(adder))
+        throwType("'" + inspectBrief(adder) + "' returned for property 'set' of object '#<Map>' is not a function");
+    Iter it;
+    iterOpen(it, items);
+    V e;
+    while (iterStep(it, &e))
+    {
+        if (!isObj(e))
+            throwType("Iterator value " + inspectBrief(e) + " is not an entry object");
+        call2(adder, self, getIdx(e, 0), getIdx(e, 1));
+    }
+    return self;
+}
+
+V mapGet(V thisV, V *args, int argc)
+{
+    JMap *m = thisMap(thisV, C_MAP, "get");
+    int e = mapFind(m, argOr(args, argc, 0));
+    return e >= 0 ? m->vals[e] : Undefined;
+}
+
+V mapSetFn(V thisV, V *args, int argc)
+{
+    mapSet(thisMap(thisV, C_MAP, "set"), argOr(args, argc, 0), argOr(args, argc, 1));
+    return thisV;
+}
+
+V mapHas(V thisV, V *args, int argc)
+{
+    return boolv(mapFind(thisMap(thisV, C_MAP, "has"), argOr(args, argc, 0)) >= 0);
+}
+
+V mapDeleteFn(V thisV, V *args, int argc)
+{
+    return boolv(mapDelete(thisMap(thisV, C_MAP, "delete"), argOr(args, argc, 0)));
+}
+
+V mapClearFn(V thisV, V *, int)
+{
+    mapClear(thisMap(thisV, C_MAP, "clear"));
+    return Undefined;
+}
+
+V mapSize(V thisV, V *, int)
+{
+    return num((double)thisMap(thisV, C_MAP, "size")->live);
+}
+
+V mapForEach(V thisV, V *args, int argc)
+{
+    JMap *m = thisMap(thisV, C_MAP, "forEach");
+    V f = argOr(args, argc, 0);
+    if (!isCallable(f))
+        throwType(inspectBrief(f) + " is not a function");
+    V ta = argOr(args, argc, 1);
+    V a[3];
+    for (uint32_t i = 0; i < m->used; ++i)
+    {
+        if (m->keys[i] == Hole)
+            continue;
+        a[0] = m->vals[i];
+        a[1] = m->keys[i];
+        a[2] = thisV;
+        call(f, ta, a, 3);
+    }
+    return Undefined;
+}
+
+V makeMapIter(V self, JMap *m, uint8_t kind, uint8_t cls, Obj *proto)
+{
+    (void)self;
+    MapIter *it = static_cast<MapIter *>(allocObj(sizeof(MapIter), cls, proto));
+    it->m = m;
+    it->kind = kind;
+    it->epoch = m->epoch;
+    return objv(it);
+}
+
+V mapKeys(V thisV, V *, int) { return makeMapIter(thisV, thisMap(thisV, C_MAP, "keys"), 0, C_MAPITER, PR.mapIter); }
+V mapValues(V thisV, V *, int) { return makeMapIter(thisV, thisMap(thisV, C_MAP, "values"), 1, C_MAPITER, PR.mapIter); }
+V mapEntries(V thisV, V *, int) { return makeMapIter(thisV, thisMap(thisV, C_MAP, "entries"), 2, C_MAPITER, PR.mapIter); }
+
+V iterNextCommon(V thisV, uint8_t cls)
+{
+    if (!isObj(thisV) || op(thisV)->cls != cls)
+        throwType("next method called on incompatible receiver " + inspectBrief(thisV));
+    MapIter *it = static_cast<MapIter *>(op(thisV));
+    if (it->done)
+        return iterResult(Undefined, true);
+    JMap *m = it->m;
+    if (it->epoch != m->epoch)
+    {
+        it->epoch = m->epoch;
+        it->pos = 0;
+    }
+    while (it->pos < m->used && m->keys[it->pos] == Hole)
+        it->pos++;
+    if (it->pos >= m->used)
+    {
+        it->done = true;
+        return iterResult(Undefined, true);
+    }
+    uint32_t i = it->pos++;
+    V k = m->keys[i];
+    V v = cls == C_SETITER ? k : m->vals[i];
+    if (it->kind == 0)
+        return iterResult(k, false);
+    if (it->kind == 1)
+        return iterResult(v, false);
+    V pair[2] = {k, v};
+    return iterResult(objv(newArrayFrom(pair, 2)), false);
+}
+
+V mapIterNext(V thisV, V *, int) { return iterNextCommon(thisV, C_MAPITER); }
+V setIterNext(V thisV, V *, int) { return iterNextCommon(thisV, C_SETITER); }
+
+V mapGroupBy(V, V *args, int argc)
+{
+    JMap *m = static_cast<JMap *>(allocObj(sizeof(JMap), C_MAP, PR.map));
+    mapInit(m);
+    V fn = argOr(args, argc, 1);
+    Iter it;
+    iterOpen(it, argOr(args, argc, 0));
+    V e;
+    double i = 0;
+    while (iterStep(it, &e))
+    {
+        V k = call2(fn, Undefined, e, num(i++));
+        int idx = mapFind(m, k);
+        JArray *a;
+        if (idx >= 0)
+            a = static_cast<JArray *>(op(m->vals[idx]));
+        else
+        {
+            a = newArray();
+            mapSet(m, k, objv(a));
+        }
+        arrayPush(a, e);
+    }
+    return objv(m);
+}
+
+V selfGetter(V thisV, V *, int)
+{
+    return thisV;
+}
+
+// Set
+V setCtor(V, V *args, int argc)
+{
+    V self = newCollection(C_SET, PR.set, "Set");
+    V items = argOr(args, argc, 0);
+    if (isNullish(items))
+        return self;
+    V adder = getProp(self, A.add);
+    Iter it;
+    iterOpen(it, items);
+    V e;
+    while (iterStep(it, &e))
+        call1(adder, self, e);
+    return self;
+}
+
+V setAdd(V thisV, V *args, int argc)
+{
+    V k = argOr(args, argc, 0);
+    mapSet(thisMap(thisV, C_SET, "add"), k, k);
+    return thisV;
+}
+
+V setHas(V thisV, V *args, int argc)
+{
+    return boolv(mapFind(thisMap(thisV, C_SET, "has"), argOr(args, argc, 0)) >= 0);
+}
+
+V setDelete(V thisV, V *args, int argc)
+{
+    return boolv(mapDelete(thisMap(thisV, C_SET, "delete"), argOr(args, argc, 0)));
+}
+
+V setClear(V thisV, V *, int)
+{
+    mapClear(thisMap(thisV, C_SET, "clear"));
+    return Undefined;
+}
+
+V setSize(V thisV, V *, int)
+{
+    return num((double)thisMap(thisV, C_SET, "size")->live);
+}
+
+V setForEach(V thisV, V *args, int argc)
+{
+    JMap *m = thisMap(thisV, C_SET, "forEach");
+    V f = argOr(args, argc, 0);
+    if (!isCallable(f))
+        throwType(inspectBrief(f) + " is not a function");
+    V ta = argOr(args, argc, 1);
+    V a[3];
+    for (uint32_t i = 0; i < m->used; ++i)
+    {
+        if (m->keys[i] == Hole)
+            continue;
+        a[0] = m->keys[i];
+        a[1] = m->keys[i];
+        a[2] = thisV;
+        call(f, ta, a, 3);
+    }
+    return Undefined;
+}
+
+V setValues(V thisV, V *, int) { return makeMapIter(thisV, thisMap(thisV, C_SET, "values"), 1, C_SETITER, PR.setIter); }
+V setEntries(V thisV, V *, int) { return makeMapIter(thisV, thisMap(thisV, C_SET, "entries"), 2, C_SETITER, PR.setIter); }
+
+// WeakMap, WeakSet: nothing is ever collected here anyway
+void weakKey(V k, const char *what)
+{
+    if (!isObj(k) && !(isSym(k) && !symp(k)->registered))
+        throwType(std::string("Invalid value used ") + what);
+}
+
+V weakMapCtor(V, V *args, int argc)
+{
+    V self = newCollection(C_WEAKMAP, PR.weakmap, "WeakMap");
+    V items = argOr(args, argc, 0);
+    if (isNullish(items))
+        return self;
+    V adder = getProp(self, A.set);
+    Iter it;
+    iterOpen(it, items);
+    V e;
+    while (iterStep(it, &e))
+    {
+        if (!isObj(e))
+            throwType("Iterator value " + inspectBrief(e) + " is not an entry object");
+        call2(adder, self, getIdx(e, 0), getIdx(e, 1));
+    }
+    return self;
+}
+
+V wmGet(V thisV, V *args, int argc)
+{
+    JMap *m = thisMap(thisV, C_WEAKMAP, "get");
+    int e = mapFind(m, argOr(args, argc, 0));
+    return e >= 0 ? m->vals[e] : Undefined;
+}
+
+V wmSet(V thisV, V *args, int argc)
+{
+    JMap *m = thisMap(thisV, C_WEAKMAP, "set");
+    weakKey(argOr(args, argc, 0), "as weak map key");
+    mapSet(m, args[0], argOr(args, argc, 1));
+    return thisV;
+}
+
+V wmHas(V thisV, V *args, int argc)
+{
+    return boolv(mapFind(thisMap(thisV, C_WEAKMAP, "has"), argOr(args, argc, 0)) >= 0);
+}
+
+V wmDelete(V thisV, V *args, int argc)
+{
+    return boolv(mapDelete(thisMap(thisV, C_WEAKMAP, "delete"), argOr(args, argc, 0)));
+}
+
+V weakSetCtor(V, V *args, int argc)
+{
+    V self = newCollection(C_WEAKSET, PR.weakset, "WeakSet");
+    V items = argOr(args, argc, 0);
+    if (isNullish(items))
+        return self;
+    V adder = getProp(self, A.add);
+    Iter it;
+    iterOpen(it, items);
+    V e;
+    while (iterStep(it, &e))
+        call1(adder, self, e);
+    return self;
+}
+
+V wsAdd(V thisV, V *args, int argc)
+{
+    JMap *m = thisMap(thisV, C_WEAKSET, "add");
+    weakKey(argOr(args, argc, 0), "in weak set");
+    mapSet(m, args[0], True);
+    return thisV;
+}
+
+V wsHas(V thisV, V *args, int argc)
+{
+    return boolv(mapFind(thisMap(thisV, C_WEAKSET, "has"), argOr(args, argc, 0)) >= 0);
+}
+
+V wsDelete(V thisV, V *args, int argc)
+{
+    return boolv(mapDelete(thisMap(thisV, C_WEAKSET, "delete"), argOr(args, argc, 0)));
+}
+
+V weakRefCtor(V, V *args, int argc)
+{
+    if (g_nativeNewTarget == Undefined)
+        throwType("Constructor WeakRef requires 'new'");
+    V t = argOr(args, argc, 0);
+    if (!isObj(t) && !isSym(t))
+        throwType("WeakRef: invalid target");
+    JPrim *p = static_cast<JPrim *>(allocObj(sizeof(JPrim), C_WEAKREF, protoFromCtor(g_nativeNewTarget, PR.weakref)));
+    p->val = t;
+    return objv(p);
+}
+
+V wrDeref(V thisV, V *, int)
+{
+    if (!isObj(thisV) || op(thisV)->cls != C_WEAKREF)
+        throwType("Method WeakRef.prototype.deref called on incompatible receiver " + inspectBrief(thisV));
+    return static_cast<JPrim *>(op(thisV))->val;
+}
+
+V finRegCtor(V thisV, V *, int)
+{
+    (void)thisV;
+    return objv(newObjectProto(protoFromCtor(g_nativeNewTarget, PR.object)));
+}
+
+V noopFn(V, V *, int)
+{
+    return Undefined;
+}
+
+// ── JSON ─────────────────────────────────────────────────────────────────
+
+struct JsonParser
+{
+    JStr *s;
+    int i = 0;
+
+    [[noreturn]] void bad()
+    {
+        if (i >= s->len)
+            throwError(E_SYNTAX, "Unexpected end of JSON input");
+        int c = unitAt(s, i);
+        if (c == '-' || (c >= '0' && c <= '9'))
+            throwError(E_SYNTAX, "Unexpected number in JSON at position " + std::to_string(i));
+        if (c == '"')
+            throwError(E_SYNTAX, "Unexpected string in JSON at position " + std::to_string(i));
+        std::string text = toUtf8(s);
+        if (text == "NaN" || text == "Infinity" || text == "undefined" || text == "[object Object]")
+            throwError(E_SYNTAX, "\"" + text + "\" is not valid JSON");
+        std::vector<uint16_t> one(1, (uint16_t)c);
+        std::string token = "Unexpected token '" + toUtf8(newStrFromUnitsVec(one)) + "', ";
+        // V8 quotes a little of the source around the mistake
+        const int context = 10;
+        if (s->len < context * 2 + 1)
+            throwError(E_SYNTAX, token + "\"" + text + "\" is not valid JSON");
+        if (i < context)
+            throwError(E_SYNTAX, token + "\"" + toUtf8(substr(s, 0, i + context)) + "\"... is not valid JSON");
+        if (i < s->len - context)
+            throwError(E_SYNTAX, token + "...\"" + toUtf8(substr(s, i - context, i + context)) + "\"... is not valid JSON");
+        throwError(E_SYNTAX, token + "...\"" + toUtf8(substr(s, i - context, s->len)) + "\" is not valid JSON");
+    }
+
+    void ws()
+    {
+        while (i < s->len)
+        {
+            int c = unitAt(s, i);
+            if (c == ' ' || c == '\n' || c == '\r' || c == '\t')
+                ++i;
+            else
+                break;
+        }
+    }
+
+    V value()
+    {
+        ws();
+        if (i >= s->len)
+            bad();
+        int c = unitAt(s, i);
+        if (c == '{')
+            return object();
+        if (c == '[')
+            return array();
+        if (c == '"')
+            return strv(string());
+        if (c == 't' && word("true"))
+            return True;
+        if (c == 'f' && word("false"))
+            return False;
+        if (c == 'n' && word("null"))
+            return Null;
+        if (c == '-' || (c >= '0' && c <= '9'))
+            return number();
+        bad();
+    }
+
+    bool word(const char *w)
+    {
+        int n = (int)std::strlen(w);
+        for (int k = 0; k < n; ++k)
+        {
+            if (i + k >= s->len)
+            {
+                i += k;
+                bad();
+            }
+            if (unitAt(s, i + k) != w[k])
+            {
+                i += k;
+                bad();
+            }
+        }
+        i += n;
+        return true;
+    }
+
+    V number()
+    {
+        int b = i;
+        if (unitAt(s, i) == '-')
+        {
+            ++i;
+            if (i >= s->len || unitAt(s, i) < '0' || unitAt(s, i) > '9')
+                throwError(E_SYNTAX, "No number after minus sign in JSON at position " + std::to_string(i));
+        }
+        if (unitAt(s, i) == '0')
+        {
+            ++i;
+            if (i < s->len && unitAt(s, i) >= '0' && unitAt(s, i) <= '9')
+                bad();
+        }
+        else
+            while (i < s->len && unitAt(s, i) >= '0' && unitAt(s, i) <= '9')
+                ++i;
+        if (i < s->len && unitAt(s, i) == '.')
+        {
+            ++i;
+            if (i >= s->len || unitAt(s, i) < '0' || unitAt(s, i) > '9')
+                throwError(E_SYNTAX, "Unterminated fractional number in JSON at position " + std::to_string(i));
+            while (i < s->len && unitAt(s, i) >= '0' && unitAt(s, i) <= '9')
+                ++i;
+        }
+        if (i < s->len && (unitAt(s, i) == 'e' || unitAt(s, i) == 'E'))
+        {
+            ++i;
+            if (i < s->len && (unitAt(s, i) == '+' || unitAt(s, i) == '-'))
+                ++i;
+            if (i >= s->len || unitAt(s, i) < '0' || unitAt(s, i) > '9')
+                throwError(E_SYNTAX, "Exponent part is missing a number in JSON at position " + std::to_string(i));
+            while (i < s->len && unitAt(s, i) >= '0' && unitAt(s, i) <= '9')
+                ++i;
+        }
+        std::string t;
+        for (int k = b; k < i; ++k)
+            t += (char)unitAt(s, k);
+        return num(std::strtod(t.c_str(), nullptr));
+    }
+
+    JStr *string()
+    {
+        ++i;
+        int b = i;
+        bool simple = true;
+        while (i < s->len)
+        {
+            int c = unitAt(s, i);
+            if (c == '"')
+                break;
+            if (c == '\\')
+            {
+                simple = false;
+                break;
+            }
+            if (c < 0x20)
+                badCtl();
+            ++i;
+        }
+        if (i >= s->len)
+            throwError(E_SYNTAX, "Unterminated string in JSON at position " + std::to_string(i));
+        if (simple)
+        {
+            JStr *r = substr(s, b, i);
+            ++i;
+            return r;
+        }
+        std::vector<uint16_t> u;
+        for (int k = b; k < i; ++k)
+            u.push_back((uint16_t)unitAt(s, k));
+        for (;;)
+        {
+            if (i >= s->len)
+                throwError(E_SYNTAX, "Unterminated string in JSON at position " + std::to_string(i));
+            int c = unitAt(s, i);
+            if (c == '"')
+            {
+                ++i;
+                break;
+            }
+            if (c < 0x20)
+                badCtl();
+            if (c != '\\')
+            {
+                u.push_back((uint16_t)c);
+                ++i;
+                continue;
+            }
+            ++i;
+            if (i >= s->len)
+                throwError(E_SYNTAX, "Unterminated string in JSON at position " + std::to_string(i));
+            int e = unitAt(s, i++);
+            switch (e)
+            {
+            case '"': u.push_back('"'); break;
+            case '\\': u.push_back('\\'); break;
+            case '/': u.push_back('/'); break;
+            case 'b': u.push_back('\b'); break;
+            case 'f': u.push_back('\f'); break;
+            case 'n': u.push_back('\n'); break;
+            case 'r': u.push_back('\r'); break;
+            case 't': u.push_back('\t'); break;
+            case 'u':
+            {
+                int v = 0;
+                for (int k = 0; k < 4; ++k)
+                {
+                    int h = i < s->len ? unitAt(s, i) : -1;
+                    int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+                    if (d < 0)
+                        throwError(E_SYNTAX, "Bad Unicode escape in JSON at position " + std::to_string(i));
+                    v = v * 16 + d;
+                    ++i;
+                }
+                u.push_back((uint16_t)v);
+                break;
+            }
+            default:
+                --i;
+                throwError(E_SYNTAX, "Bad escaped character in JSON at position " + std::to_string(i));
+            }
+        }
+        return newStrFromUnitsVec(u);
+    }
+
+    [[noreturn]] void badCtl()
+    {
+        throwError(E_SYNTAX, "Bad control character in string literal in JSON at position " + std::to_string(i));
+    }
+
+    V array()
+    {
+        ++i;
+        JArray *a = newArray();
+        ws();
+        if (i < s->len && unitAt(s, i) == ']')
+        {
+            ++i;
+            return objv(a);
+        }
+        for (;;)
+        {
+            arrayPush(a, value());
+            ws();
+            int c = i < s->len ? unitAt(s, i) : -1;
+            if (c == ',')
+            {
+                ++i;
+                continue;
+            }
+            if (c == ']')
+            {
+                ++i;
+                return objv(a);
+            }
+            throwError(E_SYNTAX, "Expected ',' or ']' after array element in JSON at position " + std::to_string(i));
+        }
+    }
+
+    V object()
+    {
+        ++i;
+        Obj *o = newObject();
+        ws();
+        if (i < s->len && unitAt(s, i) == '}')
+        {
+            ++i;
+            return objv(o);
+        }
+        bool first = true;
+        for (;;)
+        {
+            ws();
+            if (i >= s->len || unitAt(s, i) != '"')
+                throwError(E_SYNTAX, (first ? std::string("Expected property name or '}' in JSON at position ") : std::string("Expected double-quoted property name in JSON at position ")) + std::to_string(i));
+            first = false;
+            V key = atomStr(string());
+            ws();
+            if (i >= s->len || unitAt(s, i) != ':')
+                throwError(E_SYNTAX, "Expected ':' after property name in JSON at position " + std::to_string(i));
+            ++i;
+            V v = value();
+            defineOwn(o, key, v, PF_DEFAULT);
+            ws();
+            int c = i < s->len ? unitAt(s, i) : -1;
+            if (c == ',')
+            {
+                ++i;
+                continue;
+            }
+            if (c == '}')
+            {
+                ++i;
+                return objv(o);
+            }
+            throwError(E_SYNTAX, "Expected ',' or '}' after property value in JSON at position " + std::to_string(i));
+        }
+    }
+};
+
+V revive(V holder, V key, V reviver)
+{
+    V val = getProp(holder, key);
+    if (isObj(val))
+    {
+        if (op(val)->cls == C_ARRAY)
+        {
+            int64_t n = toLength(getProp(val, A.length));
+            for (int64_t i = 0; i < n; ++i)
+            {
+                V k = atomKeyOf(i);
+                V nv = revive(val, k, reviver);
+                if (nv == Undefined)
+                    deleteProp(op(val), k);
+                else
+                    defineOwn(op(val), k, nv, PF_DEFAULT);
+            }
+        }
+        else
+        {
+            std::vector<V> keys;
+            ownKeys(op(val), keys, true, false, true);
+            for (V k : keys)
+            {
+                V nv = revive(val, k, reviver);
+                if (nv == Undefined)
+                    deleteProp(op(val), k);
+                else
+                    defineOwn(op(val), k, nv, PF_DEFAULT);
+            }
+        }
+    }
+    V a[2] = {key, val};
+    return call(reviver, holder, a, 2);
+}
+
+V jsonParse(V, V *args, int argc)
+{
+    JsonParser p;
+    p.s = flat_(toStr(argOr(args, argc, 0)));
+    V v = p.value();
+    p.ws();
+    if (p.i < p.s->len)
+        throwError(E_SYNTAX, "Unexpected non-whitespace character after JSON at position " + std::to_string(p.i));
+    V reviver = argOr(args, argc, 1);
+    if (isCallable(reviver))
+    {
+        Obj *root = newObject();
+        defineOwn(root, A.empty, v, PF_DEFAULT);
+        return revive(objv(root), A.empty, reviver);
+    }
+    return v;
+}
+
+void quoteInto(JStr *s, std::string &out)
+{
+    s = flat_(s);
+    out += '"';
+    static const char *hex = "0123456789abcdef";
+    int n = s->len;
+    for (int i = 0; i < n; ++i)
+    {
+        int c = unitAt(s, i);
+        switch (c)
+        {
+        case '"': out += "\\\""; continue;
+        case '\\': out += "\\\\"; continue;
+        case '\b': out += "\\b"; continue;
+        case '\f': out += "\\f"; continue;
+        case '\n': out += "\\n"; continue;
+        case '\r': out += "\\r"; continue;
+        case '\t': out += "\\t"; continue;
+        default: break;
+        }
+        if (c < 0x20)
+        {
+            out += "\\u00";
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+        else if (c < 0x80)
+            out += (char)c;
+        else if (c >= 0xD800 && c < 0xDC00 && i + 1 < n && unitAt(s, i + 1) >= 0xDC00 && unitAt(s, i + 1) < 0xE000)
+        {
+            uint16_t pair[2] = {(uint16_t)c, (uint16_t)unitAt(s, i + 1)};
+            out += toUtf8(newStrUnits(pair, 2));
+            ++i;
+        }
+        else if (c >= 0xD800 && c < 0xE000)
+        {
+            out += "\\u";
+            out += hex[(c >> 12) & 15];
+            out += hex[(c >> 8) & 15];
+            out += hex[(c >> 4) & 15];
+            out += hex[c & 15];
+        }
+        else
+        {
+            uint16_t one = (uint16_t)c;
+            out += toUtf8(newStrUnits(&one, 1));
+        }
+    }
+    out += '"';
+}
+
+struct Stringifier
+{
+    V replacer = Undefined;
+    bool hasList = false;
+    std::vector<V> list;
+    std::string gap;
+    std::vector<V> stack;
+    std::vector<std::string> keyLabels;
+    std::string currentLabel;
+    std::string out;
+
+    std::string keyLabel(size_t at)
+    {
+        return keyLabels[at];
+    }
+
+    [[noreturn]] void circular(V v)
+    {
+        // V8 draws the path back around
+        size_t start = 0;
+        while (v != stack[start])
+            ++start;
+        std::string msg = "Converting circular structure to JSON\n    --> starting at object with constructor '" + ctorNameOf(op(v)) + "'";
+        size_t count = stack.size() - start - 1;
+        for (size_t k = 0; k < count; ++k)
+        {
+            if (count > 3 && k == 2)
+            {
+                msg += "\n    |     ...";
+                k = count - 1;
+            }
+            size_t at = start + 1 + k;
+            msg += "\n    |     " + keyLabel(at) + " -> object with constructor '" + ctorNameOf(op(static_cast<V>(stack[at]))) + "'";
+        }
+        msg += "\n    --- " + currentLabel + " closes the circle";
+        throwType(msg);
+    }
+
+    // false: leave the property out
+    bool serialize(V holder, V key, const std::string &indent)
+    {
+        V val = getProp(holder, key);
+        if (isObj(val) || isBig(val))
+        {
+            V tj = getProp(val, A.toJSON);
+            if (isCallable(tj))
+            {
+                V k = key;
+                val = call(tj, val, &k, 1);
+            }
+        }
+        if (replacer != Undefined)
+        {
+            V a[2] = {key, val};
+            val = call(replacer, holder, a, 2);
+        }
+        if (isObj(val) && !isCallable(val))
+        {
+            if (isObj(holder) && op(holder)->cls == C_ARRAY)
+                currentLabel = "index " + toUtf8V(key);
+            else
+                currentLabel = "property '" + (isSym(key) ? keyText(key) : toUtf8V(key)) + "'";
+        }
+        return writeValue(val, indent);
+    }
+
+    bool writeValue(V val, const std::string &indent)
+    {
+        if (isObj(val))
+        {
+            Obj *o = op(val);
+            if (o->cls == C_NUMBER)
+                val = num(toNumber(val));
+            else if (o->cls == C_STRING)
+                val = toStringV(val);
+            else if (o->cls == C_BOOLEAN)
+                val = static_cast<JPrim *>(o)->val;
+            else if (o->cls == C_BIGINT)
+                val = static_cast<JPrim *>(o)->val;
+        }
+        if (val == Null)
+        {
+            out += "null";
+            return true;
+        }
+        if (val == True)
+        {
+            out += "true";
+            return true;
+        }
+        if (val == False)
+        {
+            out += "false";
+            return true;
+        }
+        if (isStr(val))
+        {
+            quoteInto(sp_(val), out);
+            return true;
+        }
+        if (isNum(val))
+        {
+            double d = numOf(val);
+            out += d - d == 0 ? numberToStd(d) : "null";
+            return true;
+        }
+        if (isBig(val))
+            throwType("Do not know how to serialize a BigInt");
+        if (isObj(val) && !isCallable(val))
+        {
+            for (V s : stack)
+                if (s == val)
+                    circular(val);
+            char probe;
+            if (&probe < g_stackLimit)
+                throwRange("Maximum call stack size exceeded");
+            stack.push_back(val);
+            keyLabels.push_back(currentLabel);
+            V isA = val;
+            bool arr = op(val)->cls == C_ARRAY;
+            if (op(val)->cls == C_PROXY)
+            {
+                V t = static_cast<JFunc *>(op(val))->data;
+                arr = isObj(t) && op(t)->cls == C_ARRAY;
+            }
+            (void)isA;
+            if (arr)
+                writeArray(val, indent);
+            else
+                writeObject(val, indent);
+            stack.pop_back();
+            keyLabels.pop_back();
+            return true;
+        }
+        return false;
+    }
+
+    void writeArray(V val, const std::string &indent)
+    {
+        std::string inner = indent + gap;
+        int64_t n = toLength(getProp(val, A.length));
+        if (!n)
+        {
+            out += "[]";
+            return;
+        }
+        out += '[';
+        for (int64_t i = 0; i < n; ++i)
+        {
+            if (i)
+                out += ',';
+            if (!gap.empty())
+            {
+                out += '\n';
+                out += inner;
+            }
+            if (!serialize(val, atomKeyOf(i), inner))
+                out += "null";
+        }
+        if (!gap.empty())
+        {
+            out += '\n';
+            out += indent;
+        }
+        out += ']';
+    }
+
+    void writeObject(V val, const std::string &indent)
+    {
+        std::string inner = indent + gap;
+        std::vector<V> keys;
+        if (hasList)
+            keys = list;
+        else
+        {
+            std::vector<V> all;
+            ownKeys(op(val), all, true, false, false);
+            for (V k : all)
+            {
+                V v0, g0, s0;
+                uint8_t fl = 0;
+                if (getOwnDesc(op(val), k, &v0, &g0, &s0, &fl) && (fl & PF_E))
+                    keys.push_back(k);
+            }
+        }
+        out += '{';
+        bool any = false;
+        for (V k : keys)
+        {
+            size_t mark = out.size();
+            if (any)
+                out += ',';
+            if (!gap.empty())
+            {
+                out += '\n';
+                out += inner;
+            }
+            quoteInto(sp_(k), out);
+            out += gap.empty() ? ":" : ": ";
+            if (serialize(val, k, inner))
+                any = true;
+            else
+                out.resize(mark);
+        }
+        if (any && !gap.empty())
+        {
+            out += '\n';
+            out += indent;
+        }
+        out += '}';
+    }
+};
+
+V jsonStringify(V, V *args, int argc)
+{
+    Stringifier st;
+    V rep = argOr(args, argc, 1);
+    if (isCallable(rep))
+        st.replacer = rep;
+    else if (isObj(rep) && op(rep)->cls == C_ARRAY)
+    {
+        st.hasList = true;
+        int64_t n = toLength(getProp(rep, A.length));
+        for (int64_t i = 0; i < n; ++i)
+        {
+            V e = getIdx(rep, (double)i);
+            V k = 0;
+            if (isStr(e) || isNum(e))
+                k = toKey(e);
+            else if (isObj(e) && (op(e)->cls == C_STRING || op(e)->cls == C_NUMBER))
+                k = toKey(toStringV(e));
+            if (k && std::find(st.list.begin(), st.list.end(), k) == st.list.end())
+                st.list.push_back(k);
+        }
+    }
+    V sp = argOr(args, argc, 2);
+    if (isObj(sp))
+    {
+        if (op(sp)->cls == C_NUMBER)
+            sp = num(toNumber(sp));
+        else if (op(sp)->cls == C_STRING)
+            sp = toStringV(sp);
+    }
+    if (isNum(sp))
+    {
+        double d = toIntegerOrInf(sp);
+        d = d > 10 ? 10 : d;
+        if (d >= 1)
+            st.gap = std::string((size_t)d, ' ');
+    }
+    else if (isStr(sp))
+    {
+        JStr *g = flat_(sp_(sp));
+        st.gap = toUtf8(substr(g, 0, g->len > 10 ? 10 : g->len));
+    }
+    Obj *root = newObject();
+    defineOwn(root, A.empty, argOr(args, argc, 0), PF_DEFAULT);
+    if (!st.serialize(objv(root), A.empty, ""))
+        return Undefined;
+    return str(st.out);
+}
+
+// ── Reflect ──────────────────────────────────────────────────────────────
+
+Obj *reflectTarget(V *args, int argc, const char *name)
+{
+    V t = argOr(args, argc, 0);
+    if (!isObj(t))
+        throwType(std::string("Reflect.") + name + " called on non-object");
+    return op(t);
+}
+
+V rApply(V, V *args, int argc)
+{
+    V f = argOr(args, argc, 0);
+    if (!isCallable(f))
+        throwType("Function.prototype.apply was called on " + inspectBrief(f) + ", which is " + (f == Null ? std::string("null") : toUtf8(sp_(typeOf(f))) == "object" ? std::string("an object") : "a " + toUtf8(sp_(typeOf(f)))) + " and not a function");
+    V list = argOr(args, argc, 2);
+    if (!isObj(list))
+        throwType("CreateListFromArrayLike called on non-object");
+    int64_t n = toLength(getProp(list, A.length));
+    V *mem = static_cast<V *>(bump(sizeof(V) * (size_t)(n + 1)));
+    for (int64_t i = 0; i < n; ++i)
+        mem[i] = getIdx(list, (double)i);
+    return call(f, argOr(args, argc, 1), mem, (int)n);
+}
+
+V rConstruct(V, V *args, int argc)
+{
+    V f = argOr(args, argc, 0);
+    if (!isCtor(f))
+        throwType(inspectBrief(f) + " is not a constructor");
+    V nt = argc > 2 ? args[2] : f;
+    if (!isCtor(nt))
+        throwType(inspectBrief(nt) + " is not a constructor");
+    V list = argOr(args, argc, 1);
+    if (!isObj(list))
+        throwType("CreateListFromArrayLike called on non-object");
+    int64_t n = toLength(getProp(list, A.length));
+    V *mem = static_cast<V *>(bump(sizeof(V) * (size_t)(n + 1)));
+    for (int64_t i = 0; i < n; ++i)
+        mem[i] = getIdx(list, (double)i);
+    return construct(f, mem, (int)n, nt);
+}
+
+V rGet(V, V *args, int argc)
+{
+    Obj *o = reflectTarget(args, argc, "get");
+    return getPropObj(o, toKey(argOr(args, argc, 1)), argc > 2 ? args[2] : objv(o));
+}
+
+V rSet(V, V *args, int argc)
+{
+    Obj *o = reflectTarget(args, argc, "set");
+    return boolv(setPropObj(o, toKey(argOr(args, argc, 1)), argOr(args, argc, 2), argc > 3 ? args[3] : objv(o)));
+}
+
+V rHas(V, V *args, int argc)
+{
+    return boolv(hasProp(reflectTarget(args, argc, "has"), toKey(argOr(args, argc, 1))));
+}
+
+V rDelete(V, V *args, int argc)
+{
+    return boolv(deleteProp(reflectTarget(args, argc, "deleteProperty"), toKey(argOr(args, argc, 1))));
+}
+
+V rOwnKeys(V, V *args, int argc)
+{
+    std::vector<V> keys;
+    ownKeys(reflectTarget(args, argc, "ownKeys"), keys, true, true, false);
+    JArray *a = newArray((uint32_t)keys.size());
+    for (V k : keys)
+        arrayPush(a, k);
+    return objv(a);
+}
+
+V rGetProto(V, V *args, int argc)
+{
+    Obj *p = protoOf(reflectTarget(args, argc, "getPrototypeOf"));
+    return p ? objv(p) : Null;
+}
+
+V rSetProto(V, V *args, int argc)
+{
+    Obj *o = reflectTarget(args, argc, "setPrototypeOf");
+    V p = argOr(args, argc, 1);
+    if (!isObj(p) && p != Null)
+        throwType("Object prototype may only be an Object or null: " + inspectBrief(p));
+    return boolv(setProtoOf(o, p == Null ? nullptr : op(p)));
+}
+
+V rIsExtensible(V, V *args, int argc)
+{
+    return boolv(isExtensible(reflectTarget(args, argc, "isExtensible")));
+}
+
+V rPreventExt(V, V *args, int argc)
+{
+    return boolv(preventExt(reflectTarget(args, argc, "preventExtensions")));
+}
+
+V rDefine(V, V *args, int argc)
+{
+    Obj *o = reflectTarget(args, argc, "defineProperty");
+    return boolv(defineFromDesc(o, toKey(argOr(args, argc, 1)), argOr(args, argc, 2), false));
+}
+
+V rGetOwnDesc(V, V *args, int argc)
+{
+    Obj *o = reflectTarget(args, argc, "getOwnPropertyDescriptor");
+    V val = Undefined, g = Undefined, s = Undefined;
+    uint8_t fl = 0;
+    if (!getOwnDesc(o, toKey(argOr(args, argc, 1)), &val, &g, &s, &fl))
+        return Undefined;
+    return descToObject(val, g, s, fl);
+}
+
+// ── Proxy ────────────────────────────────────────────────────────────────
+
+V proxyTrap(Obj *o, const char *name, V *handlerOut)
+{
+    JFunc *p = static_cast<JFunc *>(o);
+    if (p->data == Null)
+        throwType(std::string("Cannot perform '") + name + "' on a proxy that has been revoked");
+    *handlerOut = p->data2;
+    V trap = getProp(p->data2, atomOf(name));
+    if (isNullish(trap))
+        return Undefined;
+    if (!isCallable(trap))
+        throwType("'" + inspectBrief(trap) + "' returned for property '" + name + "' of object '#<Object>' is not a function");
+    return trap;
+}
+
+V proxyCtor(V, V *args, int argc)
+{
+    if (g_nativeNewTarget == Undefined)
+        throwType("Constructor Proxy requires 'new'");
+    V t = argOr(args, argc, 0), h = argOr(args, argc, 1);
+    if (!isObj(t) || !isObj(h))
+        throwType("Cannot create proxy with a non-object as target or handler");
+    JFunc *p = static_cast<JFunc *>(allocObj(sizeof(JFunc), C_PROXY, nullptr));
+    p->kind = FK_PROXY;
+    p->data = t;
+    p->data2 = h;
+    p->flags = (uint8_t)(op(t)->flags & (OF_CALLABLE | OF_CTOR));
+    p->thisV = Undefined;
+    p->newTarget = Undefined;
+    p->home = Undefined;
+    p->target = Undefined;
+    return objv(p);
+}
+
+V revokeFn(V, V *, int)
+{
+    V p = NATIVE_DATA();
+    if (isObj(p))
+    {
+        static_cast<JFunc *>(op(p))->data = Null;
+        static_cast<JFunc *>(op(p))->data2 = Null;
+        g_nativeCallee->data = Null;
+    }
+    return Undefined;
+}
+
+V proxyRevocable(V, V *args, int argc)
+{
+    V saved = g_nativeNewTarget;
+    g_nativeNewTarget = True;
+    V p = proxyCtor(Undefined, args, argc);
+    g_nativeNewTarget = saved;
+    Obj *r = newObject();
+    defineOwn(r, atomOf("proxy"), p, PF_DEFAULT);
+    defineOwn(r, atomOf("revoke"), objv(newClosure("", revokeFn, 0, p)), PF_DEFAULT);
+    return objv(r);
+}
+
+Obj *proxyTarget(Obj *o)
+{
+    return op(static_cast<JFunc *>(o)->data);
+}
+
+} // namespace
+
+V proxyGet(Obj *o, V key, V receiver)
+{
+    V h;
+    V trap = proxyTrap(o, "get", &h);
+    if (trap == Undefined)
+        return getPropObj(proxyTarget(o), key, receiver);
+    V a[3] = {objv(proxyTarget(o)), key, receiver};
+    V r = call(trap, h, a, 3);
+    V v, g, s;
+    uint8_t f = 0;
+    if (getOwnDesc(proxyTarget(o), key, &v, &g, &s, &f) && !(f & PF_C))
+    {
+        if (!(f & PF_ACCESSOR) && !(f & PF_W) && !sameValue(v, r))
+            throwType("'get' on proxy: property '" + keyText(key) + "' is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value (expected '" + inspectBrief(v) + "' but got '" + inspectBrief(r) + "')");
+    }
+    return r;
+}
+
+bool proxySet(Obj *o, V key, V val, V receiver)
+{
+    V h;
+    V trap = proxyTrap(o, "set", &h);
+    if (trap == Undefined)
+        return setPropObj(proxyTarget(o), key, val, receiver);
+    V a[4] = {objv(proxyTarget(o)), key, val, receiver};
+    return truthy(call(trap, h, a, 4));
+}
+
+bool proxyHas(Obj *o, V key)
+{
+    V h;
+    V trap = proxyTrap(o, "has", &h);
+    if (trap == Undefined)
+        return hasProp(proxyTarget(o), key);
+    V a[2] = {objv(proxyTarget(o)), key};
+    return truthy(call(trap, h, a, 2));
+}
+
+bool proxyDelete(Obj *o, V key)
+{
+    V h;
+    V trap = proxyTrap(o, "deleteProperty", &h);
+    if (trap == Undefined)
+        return deleteProp(proxyTarget(o), key);
+    V a[2] = {objv(proxyTarget(o)), key};
+    return truthy(call(trap, h, a, 2));
+}
+
+void proxyOwnKeys(Obj *o, std::vector<V> &out, bool strings, bool symbols, bool onlyEnumerable)
+{
+    V h;
+    V trap = proxyTrap(o, "ownKeys", &h);
+    std::vector<V> keys;
+    if (trap == Undefined)
+        ownKeys(proxyTarget(o), keys, true, true, false);
+    else
+    {
+        V a = objv(proxyTarget(o));
+        V r = call(trap, h, &a, 1);
+        if (!isObj(r))
+            throwType("CreateListFromArrayLike called on non-object");
+        int64_t n = toLength(getProp(r, A.length));
+        for (int64_t i = 0; i < n; ++i)
+        {
+            V k = getIdx(r, (double)i);
+            if (!isStr(k) && !isSym(k))
+                throwType(inspectBrief(k) + " is not a valid property name");
+            keys.push_back(toKey(k));
+        }
+    }
+    for (V k : keys)
+    {
+        if (isStr(k) ? !strings : !symbols)
+            continue;
+        if (onlyEnumerable)
+        {
+            V v, g, s;
+            uint8_t f = 0;
+            if (!proxyGetOwnDesc(o, k, &v, &g, &s, &f) || !(f & PF_E))
+                continue;
+        }
+        out.push_back(k);
+    }
+}
+
+Obj *proxyGetProto(Obj *o)
+{
+    V h;
+    V trap = proxyTrap(o, "getPrototypeOf", &h);
+    if (trap == Undefined)
+        return protoOf(proxyTarget(o));
+    V a = objv(proxyTarget(o));
+    V r = call(trap, h, &a, 1);
+    if (!isObj(r) && r != Null)
+        throwType("'getPrototypeOf' on proxy: trap returned neither object nor null");
+    return r == Null ? nullptr : op(r);
+}
+
+bool proxySetProto(Obj *o, Obj *proto)
+{
+    V h;
+    V trap = proxyTrap(o, "setPrototypeOf", &h);
+    if (trap == Undefined)
+        return setProtoOf(proxyTarget(o), proto);
+    V a[2] = {objv(proxyTarget(o)), proto ? objv(proto) : Null};
+    return truthy(call(trap, h, a, 2));
+}
+
+bool proxyIsExtensible(Obj *o)
+{
+    V h;
+    V trap = proxyTrap(o, "isExtensible", &h);
+    if (trap == Undefined)
+        return isExtensible(proxyTarget(o));
+    V a = objv(proxyTarget(o));
+    return truthy(call(trap, h, &a, 1));
+}
+
+bool proxyPreventExt(Obj *o)
+{
+    V h;
+    V trap = proxyTrap(o, "preventExtensions", &h);
+    if (trap == Undefined)
+        return preventExt(proxyTarget(o));
+    V a = objv(proxyTarget(o));
+    return truthy(call(trap, h, &a, 1));
+}
+
+bool proxyGetOwnDesc(Obj *o, V key, V *val, V *getter, V *setter, uint8_t *flags)
+{
+    V h;
+    V trap = proxyTrap(o, "getOwnPropertyDescriptor", &h);
+    if (trap == Undefined)
+        return getOwnDesc(proxyTarget(o), key, val, getter, setter, flags);
+    V a[2] = {objv(proxyTarget(o)), key};
+    V r = call(trap, h, a, 2);
+    if (r == Undefined)
+        return false;
+    if (!isObj(r))
+        throwType("'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined for property '" + keyText(key) + "'");
+    uint8_t f = 0;
+    if (truthy(getProp(r, A.enumerable)))
+        f |= PF_E;
+    if (truthy(getProp(r, A.configurable)))
+        f |= PF_C;
+    if (hasProp(op(r), A.get) || hasProp(op(r), A.set))
+    {
+        f |= PF_ACCESSOR;
+        *getter = getProp(r, A.get);
+        *setter = getProp(r, A.set);
+        *val = Undefined;
+    }
+    else
+    {
+        if (truthy(getProp(r, A.writable)))
+            f |= PF_W;
+        *val = getProp(r, A.value);
+        *getter = Hole;
+        *setter = Hole;
+    }
+    *flags = f;
+    return true;
+}
+
+bool proxyDefine(Obj *o, V key, V desc, bool throwing)
+{
+    V h;
+    V trap = proxyTrap(o, "defineProperty", &h);
+    if (trap == Undefined)
+        return defineFromDesc(proxyTarget(o), key, desc, throwing);
+    V a[3] = {objv(proxyTarget(o)), key, desc};
+    bool ok = truthy(call(trap, h, a, 3));
+    if (!ok && throwing)
+        throwType("'defineProperty' on proxy: trap returned falsish for property '" + keyText(key) + "'");
+    return ok;
+}
+
+V proxyCall(JFunc *f, V thisV, V *args, int argc)
+{
+    V h;
+    V trap = proxyTrap(f, "apply", &h);
+    if (trap == Undefined)
+        return call(f->data, thisV, args, argc);
+    V a[3] = {f->data, thisV, objv(newArrayFrom(args, argc))};
+    return call(trap, h, a, 3);
+}
+
+V proxyConstruct(JFunc *f, V *args, int argc, V newTarget)
+{
+    V h;
+    V trap = proxyTrap(f, "construct", &h);
+    if (trap == Undefined)
+        return construct(f->data, args, argc, newTarget);
+    V a[3] = {f->data, objv(newArrayFrom(args, argc)), newTarget};
+    V r = call(trap, h, a, 3);
+    if (!isObj(r))
+        throwType("proxy [[Construct]] must return an object");
+    return r;
+}
+
+void mapPreview(Obj *m, JArray *out, bool *keyed)
+{
+    JMap *jm = static_cast<JMap *>(m);
+    bool isMapLike = m->cls == C_MAP || m->cls == C_WEAKMAP;
+    *keyed = isMapLike;
+    for (uint32_t i = 0; i < jm->used; ++i)
+    {
+        if (jm->keys[i] == Hole)
+            continue;
+        arrayPush(out, jm->keys[i]);
+        if (isMapLike)
+            arrayPush(out, jm->vals[i]);
+    }
+}
+
+void iterPreview(Obj *it, JArray *out, bool *keyed)
+{
+    MapIter *mi = static_cast<MapIter *>(it);
+    JMap *m = mi->m;
+    bool setLike = it->cls == C_SETITER;
+    *keyed = mi->kind == 2;
+    if (mi->done)
+        return;
+    for (uint32_t i = mi->pos; i < m->used; ++i)
+    {
+        if (m->keys[i] == Hole)
+            continue;
+        V k = m->keys[i];
+        V v = setLike ? k : m->vals[i];
+        if (mi->kind == 0)
+            arrayPush(out, k);
+        else if (mi->kind == 1)
+            arrayPush(out, v);
+        else
+        {
+            arrayPush(out, k);
+            arrayPush(out, v);
+        }
+    }
+}
+
+V mapGetRaw(Obj *m, V key, bool *found)
+{
+    JMap *jm = static_cast<JMap *>(m);
+    int e = mapFind(jm, key);
+    *found = e >= 0;
+    return e >= 0 ? jm->vals[e] : Undefined;
+}
+
+void initCollectionBuiltins()
+{
+    JFunc *mc = defCtor("Map", mapCtor, 0, PR.map);
+    PR.ctorMap = objv(mc);
+    defGetterSym(mc, WK.species, "[Symbol.species]", selfGetter);
+    Obj *m = PR.map;
+    defFn(m, "get", mapGet, 1);
+    defFn(m, "set", mapSetFn, 2);
+    defFn(m, "has", mapHas, 1);
+    defFn(m, "delete", mapDeleteFn, 1);
+    defFn(m, "clear", mapClearFn, 0);
+    defFn(m, "entries", mapEntries, 0);
+    defFn(m, "forEach", mapForEach, 1);
+    defFn(m, "keys", mapKeys, 0);
+    defGetter(m, "size", mapSize);
+    defFn(m, "values", mapValues, 0);
+    defineOwn(m, WK.toStringTag, atomOf("Map"), PF_C);
+    defineOwn(m, WK.iterator, getProp(objv(m), atomOf("entries")), PF_W | PF_C);
+    defFn(PR.mapIter, "next", mapIterNext, 0);
+    defineOwn(PR.mapIter, WK.toStringTag, atomOf("Map Iterator"), PF_C);
+
+    JFunc *sc = defCtor("Set", setCtor, 0, PR.set);
+    PR.ctorSet = objv(sc);
+    defGetterSym(sc, WK.species, "[Symbol.species]", selfGetter);
+    Obj *s = PR.set;
+    defFn(s, "has", setHas, 1);
+    defFn(s, "add", setAdd, 1);
+    defFn(s, "delete", setDelete, 1);
+    defFn(s, "clear", setClear, 0);
+    defFn(s, "entries", setEntries, 0);
+    defFn(s, "forEach", setForEach, 1);
+    defGetter(s, "size", setSize);
+    defFn(s, "values", setValues, 0);
+    V vals = getProp(objv(s), atomOf("values"));
+    defineOwn(s, A.keys, vals, PF_W | PF_C);
+    defineOwn(s, WK.toStringTag, atomOf("Set"), PF_C);
+    defineOwn(s, WK.iterator, vals, PF_W | PF_C);
+    defFn(PR.setIter, "next", setIterNext, 0);
+    defineOwn(PR.setIter, WK.toStringTag, atomOf("Set Iterator"), PF_C);
+
+    defCtor("WeakMap", weakMapCtor, 0, PR.weakmap);
+    defFn(PR.weakmap, "get", wmGet, 1);
+    defFn(PR.weakmap, "set", wmSet, 2);
+    defFn(PR.weakmap, "has", wmHas, 1);
+    defFn(PR.weakmap, "delete", wmDelete, 1);
+    defineOwn(PR.weakmap, WK.toStringTag, atomOf("WeakMap"), PF_C);
+    defCtor("WeakSet", weakSetCtor, 0, PR.weakset);
+    defFn(PR.weakset, "add", wsAdd, 1);
+    defFn(PR.weakset, "has", wsHas, 1);
+    defFn(PR.weakset, "delete", wsDelete, 1);
+    defineOwn(PR.weakset, WK.toStringTag, atomOf("WeakSet"), PF_C);
+    defCtor("WeakRef", weakRefCtor, 1, PR.weakref);
+    defFn(PR.weakref, "deref", wrDeref, 0);
+    defineOwn(PR.weakref, WK.toStringTag, atomOf("WeakRef"), PF_C);
+    Obj *fr = newObject();
+    defCtor("FinalizationRegistry", finRegCtor, 1, fr);
+    defFn(fr, "register", noopFn, 2);
+    defFn(fr, "unregister", noopFn, 1);
+    defineOwn(fr, WK.toStringTag, atomOf("FinalizationRegistry"), PF_C);
+}
+
+void initJsonBuiltins()
+{
+    Obj *j = newObject();
+    defineOwn(g_global, atomOf("JSON"), objv(j), PF_W | PF_C);
+    defFn(j, "parse", jsonParse, 2);
+    defFn(j, "stringify", jsonStringify, 3);
+    defineOwn(j, WK.toStringTag, atomOf("JSON"), PF_C);
+}
+
+void initReflectBuiltins()
+{
+    Obj *r = newObject();
+    defineOwn(g_global, atomOf("Reflect"), objv(r), PF_W | PF_C);
+    defFn(r, "apply", rApply, 3);
+    defFn(r, "construct", rConstruct, 2);
+    defFn(r, "defineProperty", rDefine, 3);
+    defFn(r, "deleteProperty", rDelete, 2);
+    defFn(r, "get", rGet, 2);
+    defFn(r, "getOwnPropertyDescriptor", rGetOwnDesc, 2);
+    defFn(r, "getPrototypeOf", rGetProto, 1);
+    defFn(r, "has", rHas, 2);
+    defFn(r, "isExtensible", rIsExtensible, 1);
+    defFn(r, "ownKeys", rOwnKeys, 1);
+    defFn(r, "preventExtensions", rPreventExt, 1);
+    defFn(r, "set", rSet, 3);
+    defFn(r, "setPrototypeOf", rSetProto, 2);
+    defineOwn(r, WK.toStringTag, atomOf("Reflect"), PF_C);
+    JFunc *pc = newNative("Proxy", proxyCtor, 2);
+    pc->flags |= OF_CTOR;
+    materializeFn(pc);
+    defineOwn(g_global, atomOf("Proxy"), objv(pc), PF_W | PF_C);
+    defFn(pc, "revocable", proxyRevocable, 2);
+}
+
+} // namespace js
