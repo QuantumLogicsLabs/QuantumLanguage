@@ -486,7 +486,6 @@ class Thread
     end
   end
 
-  def self.exit = current.exit
   def self.kill(t) = t.kill
   def self.handle_interrupt(*) = yield
   def self.pending_interrupt? = false
@@ -3256,6 +3255,9 @@ end
 Thread = __thread_class
 
 class Thread
+  # here, not in core_ext: Kernel#exit would hide it from a method-missing load
+  def self.exit = current.kill
+
   class Mutex
     def initialize
       @owner = nil

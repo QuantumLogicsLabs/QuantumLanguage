@@ -7,6 +7,8 @@
 //     (the Java library: the .sa files in src/java's folders, not the
 //     front-end's own files directly in src/java)
 //   src/dialect/javastyle/*.sa -> JavaStyleData.sa  javastyle::librarySources()
+//   src/js/lib/*.sa -> JsLibData.sa  js::jsLibrarySources()
+//     (the JavaScript library: these .sa files hold JavaScript source)
 //   src/ruby/lib/*.sa -> RubyLibData.sa  ruby::librarySources()
 //     (the Ruby library: these .sa files hold Ruby source)
 // Run from compiler/:  quantum src/tools/embed.sa   (or qrun)
@@ -128,6 +130,12 @@ int main()
         items.push_back({f, readText("src/ruby/lib/" + f)});
     changed += writeIfChanged("src/generated/RubyLibData.sa",
                               generate("src/ruby/lib", "ruby", "librarySources", items, "QRUBYLIB"));
+
+    items.clear();
+    for (const std::string &f : listFiles("src/js/lib", ".sa"))
+        items.push_back({f, readText("src/js/lib/" + f)});
+    changed += writeIfChanged("src/generated/JsLibData.sa",
+                              generate("src/js/lib", "js", "jsLibrarySources", items, "QJSLIB"));
 
     std::cout << "embed: " << changed << " file(s) updated in src/generated\n";
     return 0;

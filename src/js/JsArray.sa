@@ -1,0 +1,1347 @@
+// quantum: cpp
+// JavaScript front-end: Array and its iterator. Arrays get direct paths; any
+// other array-like goes through ordinary property access, as the spec has it.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <algorithm>
+#include <cmath>
+
+namespace js
+{
+
+static V arrayThis(V thisV, const char *method)
+{
+    if (isNullish(thisV))
+        throwType(std::string(method) + " called on null or undefined");
+    return toObject(thisV);
+}
+
+namespace
+{
+
+struct ArrayIter : Obj
+{
+    V target;
+    uint32_t idx;
+    uint8_t kind; // 0 keys, 1 values, 2 entries
+    bool finished;
+};
+
+#define IS_ARR(v) (isObj(v) && op(v)->cls == C_ARRAY)
+#define ARR(v) (static_cast<JArray *>(op(v)))
+
+int64_t lenOf(V o)
+{
+    if (IS_ARR(o))
+        return ARR(o)->len;
+    return toLength(getProp(o, A.length));
+}
+
+V elemAt(V o, int64_t i)
+{
+    if (IS_ARR(o))
+    {
+        JArray *a = ARR(o);
+        if (i < (int64_t)a->used)
+        {
+            V v = a->el[i];
+            if (v != Hole)
+                return v;
+        }
+        else if (!a->proto)
+            return Undefined;
+    }
+    return getProp(o, atomKeyOf(i));
+}
+
+bool hasElem(V o, int64_t i)
+{
+    if (IS_ARR(o))
+    {
+        JArray *a = ARR(o);
+        if (i < (int64_t)a->used && a->el[i] != Hole)
+            return true;
+    }
+    return hasProp(op(o), atomKeyOf(i));
+}
+
+void setElem(V o, int64_t i, V v)
+{
+    if (IS_ARR(o) && !(op(o)->flags & (OF_FROZEN | OF_NONEXT)))
+    {
+        arraySetIndex(ARR(o), (uint32_t)i, v);
+        return;
+    }
+    putProp(o, atomKeyOf(i), v, true);
+}
+
+void delElem(V o, int64_t i)
+{
+    if (!deleteProp(op(o), atomKeyOf(i)))
+        throwType("Cannot delete property '" + std::to_string(i) + "' of " + inspectBrief(o));
+}
+
+void setLen(V o, int64_t n)
+{
+    putProp(o, A.length, num((double)n), true);
+}
+
+// a position argument: negative counts from the end, then clamped
+int64_t relIndex(V v, int64_t len, int64_t dflt)
+{
+    if (v == Undefined)
+        return dflt;
+    double d = toIntegerOrInf(v);
+    if (d < 0)
+    {
+        d += (double)len;
+        return d < 0 ? 0 : (int64_t)d;
+    }
+    return d > (double)len ? len : (int64_t)d;
+}
+
+V needFn(V *args, int argc, int i)
+{
+    V f = argOr(args, argc, i);
+    if (!isCallable(f))
+        throwType(inspectBrief(f) + " is not a function");
+    return f;
+}
+
+// the constructor to make a derived array with (ArraySpeciesCreate)
+V speciesCreate(V self, int64_t n)
+{
+    if (IS_ARR(self))
+    {
+        V c = getProp(self, A.constructor);
+        if (c == PR.ctorArray)
+        {
+            // the species getter on Array itself gives Array back
+            JArray *a = newArray(n > 0 && n < (1 << 24) ? (uint32_t)n : 0);
+            a->len = (uint32_t)n;
+            return objv(a);
+        }
+        if (isObj(c))
+        {
+            V s = getProp(c, WK.species);
+            c = s == Null ? Undefined : s;
+        }
+        if (c == Undefined || c == PR.ctorArray)
+        {
+            JArray *a = newArray(n > 0 && n < (1 << 24) ? (uint32_t)n : 0);
+            a->len = (uint32_t)n;
+            return objv(a);
+        }
+        if (!isCtor(c))
+            throwType("object.constructor[Symbol.species] is not a constructor");
+        V len = num((double)n);
+        return construct(c, &len, 1, c);
+    }
+    JArray *a = newArray(n > 0 && n < (1 << 24) ? (uint32_t)n : 0);
+    a->len = (uint32_t)n;
+    return objv(a);
+}
+
+void createData(V o, int64_t i, V v)
+{
+    if (IS_ARR(o))
+    {
+        JArray *a = ARR(o);
+        if ((uint64_t)i == a->used)
+        {
+            arrayEnsure(a, a->used + 1);
+            a->el[a->used++] = v;
+            if (a->len < a->used)
+                a->len = a->used;
+            return;
+        }
+        arraySetIndex(a, (uint32_t)i, v);
+        return;
+    }
+    defineOwn(op(o), atomKeyOf(i), v, PF_DEFAULT);
+}
+
+V arrayCtor(V, V *args, int argc)
+{
+    Obj *proto = g_nativeNewTarget != Undefined ? protoFromCtor(g_nativeNewTarget, PR.array) : PR.array;
+    JArray *a;
+    if (argc == 1 && isNum(args[0]))
+    {
+        double d = numOf(args[0]);
+        uint32_t n = (uint32_t)d;
+        if ((double)n != d)
+            throwRange("Invalid array length");
+        a = newArray();
+        a->len = n;
+    }
+    else
+    {
+        a = newArrayFrom(args, argc);
+    }
+    a->proto = proto;
+    return objv(a);
+}
+
+V arrayIsArray(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isObj(v))
+        return False;
+    Obj *o = op(v);
+    while (o->cls == C_PROXY)
+    {
+        V t = static_cast<JFunc *>(o)->data;
+        if (!isObj(t))
+            throwType("Cannot perform 'IsArray' on a proxy that has been revoked");
+        o = op(t);
+    }
+    return boolv(o->cls == C_ARRAY);
+}
+
+V arrayOf(V thisV, V *args, int argc)
+{
+    if (isCtor(thisV) && thisV != PR.ctorArray)
+    {
+        V n = num((double)argc);
+        V r = construct(thisV, &n, 1, thisV);
+        for (int i = 0; i < argc; ++i)
+            defineOwn(op(r), atomKeyOf(i), args[i], PF_DEFAULT);
+        setLen(r, argc);
+        return r;
+    }
+    return objv(newArrayFrom(args, argc));
+}
+
+V arrayFrom(V thisV, V *args, int argc)
+{
+    V items = argOr(args, argc, 0);
+    V mapFn = argOr(args, argc, 1);
+    V thisArg = argOr(args, argc, 2);
+    if (mapFn != Undefined && !isCallable(mapFn))
+        throwType(inspectBrief(mapFn) + " is not a function");
+    if (isNullish(items))
+        throwType(toUtf8V(items) + " is not iterable");
+    bool custom = isCtor(thisV) && thisV != PR.ctorArray;
+    V m = getProp(items, WK.iterator);
+    V out = custom ? Undefined : objv(newArray());
+    if (!isNullish(m))
+    {
+        if (!isCallable(m))
+            throwType(inspectBrief(m) + " is not a function");
+        if (custom)
+            out = construct(thisV, nullptr, 0, thisV);
+        Iter it;
+        iterOpen(it, items);
+        V x;
+        int64_t i = 0;
+        while (iterStep(it, &x))
+        {
+            V v = mapFn != Undefined ? call2(mapFn, thisArg, x, num((double)i)) : x;
+            createData(out, i, v);
+            ++i;
+        }
+        setLen(out, i);
+        return out;
+    }
+    V like = toObject(items);
+    int64_t n = lenOf(like);
+    if (custom)
+    {
+        V len = num((double)n);
+        out = construct(thisV, &len, 1, thisV);
+    }
+    for (int64_t i = 0; i < n; ++i)
+    {
+        V x = elemAt(like, i);
+        V v = mapFn != Undefined ? call2(mapFn, thisArg, x, num((double)i)) : x;
+        createData(out, i, v);
+    }
+    setLen(out, n);
+    return out;
+}
+
+V speciesGetter(V thisV, V *, int)
+{
+    return thisV;
+}
+
+// ── mutators ─────────────────────────────────────────────────────────────
+
+void checkFrozenArr(V o)
+{
+    if (IS_ARR(o) && (op(o)->flags & OF_NONEXT))
+    {
+        if (op(o)->flags & OF_FROZEN)
+            throwType("Cannot add property " + std::to_string(ARR(o)->len) + ", object is not extensible");
+        throwType("Cannot add property " + std::to_string(ARR(o)->len) + ", object is not extensible");
+    }
+}
+
+V aPush(V thisV, V *args, int argc)
+{
+    if (IS_ARR(thisV) && !(op(thisV)->flags & OF_NONEXT))
+    {
+        JArray *a = ARR(thisV);
+        for (int i = 0; i < argc; ++i)
+            arrayPush(a, args[i]);
+        return num((double)a->len);
+    }
+    checkFrozenArr(thisV);
+    V o = toObject(thisV);
+    int64_t n = lenOf(o);
+    for (int i = 0; i < argc; ++i)
+        putProp(o, atomKeyOf(n + i), args[i], true);
+    setLen(o, n + argc);
+    return num((double)(n + argc));
+}
+
+V aPop(V thisV, V *, int)
+{
+    V o = arrayThis(thisV, "Array.prototype.pop");
+    if (IS_ARR(o) && !(op(o)->flags & (OF_FROZEN | OF_SEALED)))
+    {
+        JArray *a = ARR(o);
+        if (!a->len)
+            return Undefined;
+        uint32_t last = a->len - 1;
+        V v = last < a->used ? a->el[last] : Hole;
+        if (v == Hole)
+            v = getProp(o, atomKeyOf(last));
+        a->len = last;
+        if (a->used > last)
+            a->used = last;
+        return v;
+    }
+    int64_t n = lenOf(o);
+    if (!n)
+    {
+        setLen(o, 0);
+        return Undefined;
+    }
+    V v = getProp(o, atomKeyOf(n - 1));
+    delElem(o, n - 1);
+    setLen(o, n - 1);
+    return v;
+}
+
+V aShift(V thisV, V *, int)
+{
+    V o = arrayThis(thisV, "Array.prototype.shift");
+    if (IS_ARR(o) && !(op(o)->flags & (OF_FROZEN | OF_SEALED)))
+    {
+        JArray *a = ARR(o);
+        if (!a->len)
+            return Undefined;
+        V v = a->used ? a->el[0] : Hole;
+        if (v == Hole)
+            v = getProp(o, atomKeyOf(0));
+        // moving the base pointer makes queues cheap
+        if (a->used)
+        {
+            a->el += 1;
+            a->used -= 1;
+            a->elCap -= 1;
+        }
+        a->len -= 1;
+        return v;
+    }
+    int64_t n = lenOf(o);
+    if (!n)
+    {
+        setLen(o, 0);
+        return Undefined;
+    }
+    V first = getProp(o, atomKeyOf(0));
+    for (int64_t i = 1; i < n; ++i)
+    {
+        if (hasElem(o, i))
+            putProp(o, atomKeyOf(i - 1), getProp(o, atomKeyOf(i)), true);
+        else
+            delElem(o, i - 1);
+    }
+    delElem(o, n - 1);
+    setLen(o, n - 1);
+    return first;
+}
+
+V aUnshift(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.unshift");
+    if (IS_ARR(o) && !(op(o)->flags & OF_NONEXT))
+    {
+        JArray *a = ARR(o);
+        if (a->used < a->len)
+        {
+            arrayEnsure(a, a->len);
+            for (uint32_t i = a->used; i < a->len; ++i)
+                a->el[i] = Hole;
+            a->used = a->len;
+        }
+        arrayEnsure(a, a->used + (uint32_t)argc);
+        std::memmove(a->el + argc, a->el, sizeof(V) * a->used);
+        for (int i = 0; i < argc; ++i)
+            a->el[i] = args[i];
+        a->used += (uint32_t)argc;
+        a->len = a->used;
+        return num((double)a->len);
+    }
+    checkFrozenArr(o);
+    int64_t n = lenOf(o);
+    for (int64_t i = n - 1; i >= 0; --i)
+    {
+        if (hasElem(o, i))
+            putProp(o, atomKeyOf(i + argc), getProp(o, atomKeyOf(i)), true);
+        else
+            delElem(o, i + argc);
+    }
+    for (int i = 0; i < argc; ++i)
+        putProp(o, atomKeyOf(i), args[i], true);
+    setLen(o, n + argc);
+    return num((double)(n + argc));
+}
+
+V aSplice(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.splice");
+    int64_t n = lenOf(o);
+    int64_t start = relIndex(argOr(args, argc, 0), n, 0);
+    int64_t del;
+    if (argc == 0)
+        del = 0;
+    else if (argc == 1)
+        del = n - start;
+    else
+    {
+        double d = toIntegerOrInf(args[1]);
+        del = d < 0 ? 0 : d > (double)(n - start) ? n - start : (int64_t)d;
+    }
+    int ins = argc > 2 ? argc - 2 : 0;
+    V removed = speciesCreate(o, del);
+    for (int64_t i = 0; i < del; ++i)
+        if (hasElem(o, start + i))
+            createData(removed, i, elemAt(o, start + i));
+    if (!IS_ARR(removed) || ARR(removed)->len != del)
+        setLen(removed, del);
+    if (IS_ARR(o) && !(op(o)->flags & (OF_FROZEN | OF_SEALED | OF_NONEXT)))
+    {
+        JArray *a = ARR(o);
+        if (a->used < a->len)
+        {
+            arrayEnsure(a, a->len);
+            for (uint32_t i = a->used; i < a->len; ++i)
+                a->el[i] = Hole;
+            a->used = a->len;
+        }
+        int64_t nl = n - del + ins;
+        if (nl > (int64_t)a->elCap)
+            arrayEnsure(a, (uint32_t)nl);
+        std::memmove(a->el + start + ins, a->el + start + del, sizeof(V) * (size_t)(n - start - del));
+        for (int i = 0; i < ins; ++i)
+            a->el[start + i] = args[2 + i];
+        a->used = (uint32_t)nl;
+        a->len = (uint32_t)nl;
+        return removed;
+    }
+    if (IS_ARR(o) && (op(o)->flags & OF_FROZEN))
+        throwType("Cannot add/remove sealed array elements");
+    if (ins < del)
+    {
+        for (int64_t k = start; k < n - del; ++k)
+        {
+            if (hasElem(o, k + del))
+                putProp(o, atomKeyOf(k + ins), getProp(o, atomKeyOf(k + del)), true);
+            else
+                delElem(o, k + ins);
+        }
+        for (int64_t k = n; k > n - del + ins; --k)
+            delElem(o, k - 1);
+    }
+    else if (ins > del)
+    {
+        for (int64_t k = n - del; k > start; --k)
+        {
+            if (hasElem(o, k + del - 1))
+                putProp(o, atomKeyOf(k + ins - 1), getProp(o, atomKeyOf(k + del - 1)), true);
+            else
+                delElem(o, k + ins - 1);
+        }
+    }
+    for (int i = 0; i < ins; ++i)
+        putProp(o, atomKeyOf(start + i), args[2 + i], true);
+    setLen(o, n - del + ins);
+    return removed;
+}
+
+V aReverse(V thisV, V *, int)
+{
+    V o = arrayThis(thisV, "Array.prototype.reverse");
+    int64_t n = lenOf(o);
+    if (IS_ARR(o) && ARR(o)->used == n && !(op(o)->flags & OF_FROZEN))
+    {
+        JArray *a = ARR(o);
+        std::reverse(a->el, a->el + n);
+        return o;
+    }
+    for (int64_t l = 0, h = n - 1; l < h; ++l, --h)
+    {
+        bool hl = hasElem(o, l), hh = hasElem(o, h);
+        V vl = hl ? elemAt(o, l) : Undefined;
+        V vh = hh ? elemAt(o, h) : Undefined;
+        if (hh)
+            putProp(o, atomKeyOf(l), vh, true);
+        else if (hl)
+            delElem(o, l);
+        if (hl)
+            putProp(o, atomKeyOf(h), vl, true);
+        else if (hh)
+            delElem(o, h);
+    }
+    return o;
+}
+
+V aFill(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.fill");
+    int64_t n = lenOf(o);
+    V v = argOr(args, argc, 0);
+    int64_t s = relIndex(argOr(args, argc, 1), n, 0);
+    int64_t e = relIndex(argOr(args, argc, 2), n, n);
+    if (IS_ARR(o) && (op(o)->flags & OF_FROZEN) && s < e)
+        throwType("Cannot modify frozen array elements");
+    for (int64_t i = s; i < e; ++i)
+        setElem(o, i, v);
+    return o;
+}
+
+V aCopyWithin(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.copyWithin");
+    int64_t n = lenOf(o);
+    int64_t to = relIndex(argOr(args, argc, 0), n, 0);
+    int64_t from = relIndex(argOr(args, argc, 1), n, 0);
+    int64_t fin = relIndex(argOr(args, argc, 2), n, n);
+    int64_t count = std::min(fin - from, n - to);
+    int dir = 1;
+    if (from < to && to < from + count)
+    {
+        dir = -1;
+        from += count - 1;
+        to += count - 1;
+    }
+    for (; count > 0; --count)
+    {
+        if (hasElem(o, from))
+            setElem(o, to, elemAt(o, from));
+        else
+            delElem(o, to);
+        from += dir;
+        to += dir;
+    }
+    return o;
+}
+
+// ── sorting ──────────────────────────────────────────────────────────────
+
+struct SortCtx
+{
+    V fn;
+};
+
+int sortCompare(SortCtx &c, V a, V b)
+{
+    if (a == Undefined)
+        return b == Undefined ? 0 : 1;
+    if (b == Undefined)
+        return -1;
+    if (c.fn != Undefined)
+    {
+        V r = call2(c.fn, Undefined, a, b);
+        double d = isNum(r) ? D(r) : toNumber(r);
+        return d < 0 ? -1 : d > 0 ? 1 : 0;
+    }
+    if (isNum(a) && isNum(b))
+    {
+        // as strings, but small integers need no allocation for the common case
+        return compareStr(toStr(a), toStr(b));
+    }
+    return compareStr(toStr(a), toStr(b));
+}
+
+// V8's TimSort, without galloping: the same runs and insertions, so that even an
+// inconsistent comparator gives the same order in arrays of fewer than 64
+int countRun(SortCtx &c, V *a, int low, int high)
+{
+    if (low + 1 == high)
+        return 1;
+    int run = 2;
+    bool desc = sortCompare(c, a[low + 1], a[low]) < 0;
+    V prev = a[low + 1];
+    for (int i = low + 2; i < high; ++i)
+    {
+        V cur = a[i];
+        int order = sortCompare(c, cur, prev);
+        if (desc ? order >= 0 : order < 0)
+            break;
+        prev = cur;
+        ++run;
+    }
+    if (desc)
+    {
+        int l = low, h = low + run - 1;
+        while (l < h)
+        {
+            V t = a[l];
+            a[l] = a[h];
+            a[h] = t;
+            ++l;
+            --h;
+        }
+    }
+    return run;
+}
+
+void binaryInsertion(SortCtx &c, V *a, int low, int start, int high)
+{
+    for (int i = start == low ? start + 1 : start; i < high; ++i)
+    {
+        int left = low, right = i;
+        V pivot = a[i];
+        while (left < right)
+        {
+            int mid = left + ((right - left) >> 1);
+            if (sortCompare(c, pivot, a[mid]) < 0)
+                right = mid;
+            else
+                left = mid + 1;
+        }
+        for (int k = i; k > left; --k)
+            a[k] = a[k - 1];
+        a[left] = pivot;
+    }
+}
+
+struct SortRun
+{
+    int base, len;
+};
+
+void mergeRuns(SortCtx &c, V *a, std::vector<V> &tmp, std::vector<SortRun> &runs, int at)
+{
+    int base = runs[at].base, n1 = runs[at].len, n2 = runs[at + 1].len;
+    for (int i = 0; i < n1; ++i)
+        tmp[i] = a[base + i];
+    int i = 0, j = base + n1, k = base, end = base + n1 + n2;
+    while (i < n1 && j < end)
+        a[k++] = sortCompare(c, a[j], tmp[i]) < 0 ? a[j++] : tmp[i++];
+    while (i < n1)
+        a[k++] = tmp[i++];
+    runs[at].len = n1 + n2;
+    runs.erase(runs.begin() + at + 1);
+}
+
+void mergeSort(SortCtx &c, std::vector<V> &v)
+{
+    int n = (int)v.size();
+    if (n < 2)
+        return;
+    V *a = v.data();
+    int minRun = n, odd = 0;
+    while (minRun >= 64)
+    {
+        odd |= minRun & 1;
+        minRun >>= 1;
+    }
+    minRun += odd;
+    std::vector<V> tmp(n);
+    std::vector<SortRun> runs;
+    int low = 0, remaining = n;
+    while (remaining > 0)
+    {
+        int run = countRun(c, a, low, low + remaining);
+        if (run < minRun)
+        {
+            int forced = minRun < remaining ? minRun : remaining;
+            binaryInsertion(c, a, low, low + run, low + forced);
+            run = forced;
+        }
+        SortRun r;
+        r.base = low;
+        r.len = run;
+        runs.push_back(r);
+        for (;;)
+        {
+            int sz = (int)runs.size();
+            if (sz < 2)
+                break;
+            int m = sz - 2;
+            bool broken = (m + 1 >= 2 && runs[m - 1].len <= runs[m].len + runs[m + 1].len) ||
+                          (m >= 2 && runs[m - 2].len <= runs[m - 1].len + runs[m].len);
+            if (broken)
+            {
+                if (runs[m - 1].len < runs[m + 1].len)
+                    --m;
+                mergeRuns(c, a, tmp, runs, m);
+            }
+            else if (runs[m].len <= runs[m + 1].len)
+                mergeRuns(c, a, tmp, runs, m);
+            else
+                break;
+        }
+        low += run;
+        remaining -= run;
+    }
+    while (runs.size() > 1)
+    {
+        int m = (int)runs.size() - 2;
+        if (m > 0 && runs[m - 1].len < runs[m + 1].len)
+            --m;
+        mergeRuns(c, a, tmp, runs, m);
+    }
+}
+
+void sortValues(std::vector<V> &vals, V fn)
+{
+    SortCtx c{fn};
+    // undefined always sorts last, without asking the comparator
+    size_t undef = 0;
+    std::vector<V> rest;
+    rest.reserve(vals.size());
+    for (V v : vals)
+    {
+        if (v == Undefined)
+            ++undef;
+        else
+            rest.push_back(v);
+    }
+    mergeSort(c, rest);
+    vals.clear();
+    for (V v : rest)
+        vals.push_back(v);
+    for (size_t i = 0; i < undef; ++i)
+        vals.push_back(Undefined);
+}
+
+V aSort(V thisV, V *args, int argc)
+{
+    V fn = argOr(args, argc, 0);
+    if (fn != Undefined && !isCallable(fn))
+        throwType("The comparison function must be either a function or undefined");
+    V o = toObject(thisV);
+    int64_t n = lenOf(o);
+    std::vector<V> vals;
+    int64_t holes = 0;
+    for (int64_t i = 0; i < n; ++i)
+    {
+        if (hasElem(o, i))
+            vals.push_back(elemAt(o, i));
+        else
+            ++holes;
+    }
+    sortValues(vals, fn);
+    int64_t i = 0;
+    for (V v : vals)
+        setElem(o, i++, v);
+    for (; i < n; ++i)
+        if (hasElem(o, i))
+            delElem(o, i);
+    return o;
+}
+
+V aToSorted(V thisV, V *args, int argc)
+{
+    V fn = argOr(args, argc, 0);
+    if (fn != Undefined && !isCallable(fn))
+        throwType("The comparison function must be either a function or undefined");
+    V o = toObject(thisV);
+    int64_t n = lenOf(o);
+    std::vector<V> vals;
+    for (int64_t i = 0; i < n; ++i)
+        vals.push_back(elemAt(o, i));
+    sortValues(vals, fn);
+    return objv(newArrayFrom(vals.data(), (int)vals.size()));
+}
+
+V aToReversed(V thisV, V *, int)
+{
+    V o = arrayThis(thisV, "Array.prototype.toReversed");
+    int64_t n = lenOf(o);
+    JArray *r = newArray((uint32_t)n);
+    for (int64_t i = n - 1; i >= 0; --i)
+        arrayPush(r, elemAt(o, i));
+    return objv(r);
+}
+
+V aWith(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.with");
+    int64_t n = lenOf(o);
+    double d = toIntegerOrInf(argOr(args, argc, 0));
+    double at = d < 0 ? (double)n + d : d;
+    if (at < 0 || at >= (double)n)
+        throwRange("Invalid index : " + numberToStd(d));
+    JArray *r = newArray((uint32_t)n);
+    for (int64_t i = 0; i < n; ++i)
+        arrayPush(r, i == (int64_t)at ? argOr(args, argc, 1) : elemAt(o, i));
+    return objv(r);
+}
+
+V aToSpliced(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.toSpliced");
+    int64_t n = lenOf(o);
+    int64_t start = relIndex(argOr(args, argc, 0), n, 0);
+    int64_t del = argc == 0 ? 0 : argc == 1 ? n - start : (int64_t)std::min(std::max(toIntegerOrInf(args[1]), 0.0), (double)(n - start));
+    JArray *r = newArray();
+    for (int64_t i = 0; i < start; ++i)
+        arrayPush(r, elemAt(o, i));
+    for (int i = 2; i < argc; ++i)
+        arrayPush(r, args[i]);
+    for (int64_t i = start + del; i < n; ++i)
+        arrayPush(r, elemAt(o, i));
+    return objv(r);
+}
+
+// ── non-mutating ─────────────────────────────────────────────────────────
+
+V aSlice(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.slice");
+    int64_t n = lenOf(o);
+    int64_t s = relIndex(argOr(args, argc, 0), n, 0);
+    int64_t e = relIndex(argOr(args, argc, 1), n, n);
+    int64_t count = e > s ? e - s : 0;
+    V r = speciesCreate(o, count);
+    int64_t k = 0;
+    for (int64_t i = s; i < e; ++i, ++k)
+        if (hasElem(o, i))
+            createData(r, k, elemAt(o, i));
+    if (!IS_ARR(r) || (int64_t)ARR(r)->len != k)
+        setLen(r, k);
+    return r;
+}
+
+bool spreadable(V v)
+{
+    if (!isObj(v))
+        return false;
+    V s = getProp(v, WK.isConcatSpreadable);
+    if (s != Undefined)
+        return truthy(s);
+    return truthy(arrayIsArray(Undefined, &v, 1));
+}
+
+V aConcat(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.concat");
+    V r = speciesCreate(o, 0);
+    int64_t k = 0;
+    for (int i = -1; i < argc; ++i)
+    {
+        V e = i < 0 ? o : args[i];
+        if (spreadable(e))
+        {
+            int64_t n = lenOf(e);
+            for (int64_t j = 0; j < n; ++j, ++k)
+                if (hasElem(e, j))
+                    createData(r, k, elemAt(e, j));
+        }
+        else
+            createData(r, k++, e);
+    }
+    setLen(r, k);
+    return r;
+}
+
+V aJoin(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.join");
+    static std::vector<V> *active = nullptr;
+    if (!active)
+        active = new std::vector<V>();
+    for (V x : *active)
+        if (x == o)
+            return A.empty;
+    active->push_back(o);
+    V sepV = argOr(args, argc, 0);
+    JStr *sep = sepV == Undefined ? newStrAscii(",") : toStr(sepV);
+    int64_t n = lenOf(o);
+    JStr *out = sp_(A.empty);
+    JsState st0;
+    try
+    {
+        for (int64_t i = 0; i < n; ++i)
+        {
+            if (i)
+                out = concatStr(out, sep);
+            V v = elemAt(o, i);
+            if (!isNullish(v))
+                out = concatStr(out, toStr(v));
+        }
+    }
+    catch (JsThrow &)
+    {
+        st0.restore();
+        active->pop_back();
+        throw;
+    }
+    active->pop_back();
+    return strv(out);
+}
+
+V aToString(V thisV, V *, int)
+{
+    V o = arrayThis(thisV, "Array.prototype.toString");
+    V j = getProp(o, A.join);
+    if (isCallable(j))
+        return call(j, o, nullptr, 0);
+    return invoke(objv(PR.object), A.toString, nullptr, 0);
+}
+
+V aToLocale(V thisV, V *, int)
+{
+    V o = arrayThis(thisV, "Array.prototype.toLocaleString");
+    int64_t n = lenOf(o);
+    JStr *out = sp_(A.empty);
+    for (int64_t i = 0; i < n; ++i)
+    {
+        if (i)
+            out = concatStr(out, newStrAscii(","));
+        V v = elemAt(o, i);
+        if (!isNullish(v))
+            out = concatStr(out, toStr(invoke(v, atomOf("toLocaleString"), nullptr, 0)));
+    }
+    return strv(out);
+}
+
+V aIndexOf(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.indexOf");
+    int64_t n = lenOf(o);
+    V t = argOr(args, argc, 0);
+    int64_t s = relIndex(argOr(args, argc, 1), n, 0);
+    for (int64_t i = s; i < n; ++i)
+        if (hasElem(o, i) && strictEq(elemAt(o, i), t))
+            return num((double)i);
+    return num(-1);
+}
+
+V aLastIndexOf(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.lastIndexOf");
+    int64_t n = lenOf(o);
+    V t = argOr(args, argc, 0);
+    int64_t s = n - 1;
+    if (argc > 1)
+    {
+        double d = toIntegerOrInf(args[1]);
+        s = d >= 0 ? (d < (double)n - 1 ? (int64_t)d : n - 1) : (int64_t)((double)n + d);
+    }
+    for (int64_t i = s; i >= 0; --i)
+        if (hasElem(o, i) && strictEq(elemAt(o, i), t))
+            return num((double)i);
+    return num(-1);
+}
+
+V aIncludes(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.includes");
+    int64_t n = lenOf(o);
+    V t = argOr(args, argc, 0);
+    int64_t s = relIndex(argOr(args, argc, 1), n, 0);
+    for (int64_t i = s; i < n; ++i)
+        if (sameValueZero(elemAt(o, i), t))
+            return True;
+    return False;
+}
+
+V aAt(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.at");
+    int64_t n = lenOf(o);
+    double d = toIntegerOrInf(argOr(args, argc, 0));
+    double at = d < 0 ? (double)n + d : d;
+    if (at < 0 || at >= (double)n)
+        return Undefined;
+    return elemAt(o, (int64_t)at);
+}
+
+// ── callbacks ────────────────────────────────────────────────────────────
+
+V aForEach(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.forEach");
+    int64_t n = lenOf(o);
+    V f = needFn(args, argc, 0);
+    V ta = argOr(args, argc, 1);
+    V a[3];
+    for (int64_t i = 0; i < n; ++i)
+        if (hasElem(o, i))
+        {
+            a[0] = elemAt(o, i);
+            a[1] = num((double)i);
+            a[2] = o;
+            call(f, ta, a, 3);
+        }
+    return Undefined;
+}
+
+V aMap(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.map");
+    int64_t n = lenOf(o);
+    V f = needFn(args, argc, 0);
+    V ta = argOr(args, argc, 1);
+    V r = speciesCreate(o, n);
+    V a[3];
+    for (int64_t i = 0; i < n; ++i)
+        if (hasElem(o, i))
+        {
+            a[0] = elemAt(o, i);
+            a[1] = num((double)i);
+            a[2] = o;
+            V v = call(f, ta, a, 3);
+            if (IS_ARR(r))
+            {
+                JArray *ra = ARR(r);
+                if ((uint64_t)i == ra->used)
+                {
+                    arrayEnsure(ra, ra->used + 1);
+                    ra->el[ra->used++] = v;
+                }
+                else
+                    arraySetIndex(ra, (uint32_t)i, v);
+            }
+            else
+                createData(r, i, v);
+        }
+    return r;
+}
+
+V aFilter(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.filter");
+    int64_t n = lenOf(o);
+    V f = needFn(args, argc, 0);
+    V ta = argOr(args, argc, 1);
+    V r = speciesCreate(o, 0);
+    int64_t k = 0;
+    V a[3];
+    for (int64_t i = 0; i < n; ++i)
+        if (hasElem(o, i))
+        {
+            V x = elemAt(o, i);
+            a[0] = x;
+            a[1] = num((double)i);
+            a[2] = o;
+            if (truthy(call(f, ta, a, 3)))
+                createData(r, k++, x);
+        }
+    return r;
+}
+
+V findLike(V thisV, V *args, int argc, bool fromEnd, bool wantIndex)
+{
+    V o = toObject(thisV);
+    int64_t n = lenOf(o);
+    V f = needFn(args, argc, 0);
+    V ta = argOr(args, argc, 1);
+    V a[3];
+    for (int64_t k = 0; k < n; ++k)
+    {
+        int64_t i = fromEnd ? n - 1 - k : k;
+        V x = elemAt(o, i);
+        a[0] = x;
+        a[1] = num((double)i);
+        a[2] = o;
+        if (truthy(call(f, ta, a, 3)))
+            return wantIndex ? num((double)i) : x;
+    }
+    return wantIndex ? num(-1) : Undefined;
+}
+
+V aFind(V thisV, V *args, int argc) { return findLike(thisV, args, argc, false, false); }
+V aFindIndex(V thisV, V *args, int argc) { return findLike(thisV, args, argc, false, true); }
+V aFindLast(V thisV, V *args, int argc) { return findLike(thisV, args, argc, true, false); }
+V aFindLastIndex(V thisV, V *args, int argc) { return findLike(thisV, args, argc, true, true); }
+
+V aSome(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.some");
+    int64_t n = lenOf(o);
+    V f = needFn(args, argc, 0);
+    V ta = argOr(args, argc, 1);
+    V a[3];
+    for (int64_t i = 0; i < n; ++i)
+        if (hasElem(o, i))
+        {
+            a[0] = elemAt(o, i);
+            a[1] = num((double)i);
+            a[2] = o;
+            if (truthy(call(f, ta, a, 3)))
+                return True;
+        }
+    return False;
+}
+
+V aEvery(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.every");
+    int64_t n = lenOf(o);
+    V f = needFn(args, argc, 0);
+    V ta = argOr(args, argc, 1);
+    V a[3];
+    for (int64_t i = 0; i < n; ++i)
+        if (hasElem(o, i))
+        {
+            a[0] = elemAt(o, i);
+            a[1] = num((double)i);
+            a[2] = o;
+            if (!truthy(call(f, ta, a, 3)))
+                return False;
+        }
+    return True;
+}
+
+V aReduce(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.reduce");
+    int64_t n = lenOf(o);
+    V f = needFn(args, argc, 0);
+    int64_t i = 0;
+    V acc;
+    if (argc > 1)
+        acc = args[1];
+    else
+    {
+        while (i < n && !hasElem(o, i))
+            ++i;
+        if (i >= n)
+            throwType("Reduce of empty array with no initial value");
+        acc = elemAt(o, i++);
+    }
+    V a[4];
+    for (; i < n; ++i)
+        if (hasElem(o, i))
+        {
+            a[0] = acc;
+            a[1] = elemAt(o, i);
+            a[2] = num((double)i);
+            a[3] = o;
+            acc = call(f, Undefined, a, 4);
+        }
+    return acc;
+}
+
+V aReduceRight(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.reduceRight");
+    int64_t n = lenOf(o);
+    V f = needFn(args, argc, 0);
+    int64_t i = n - 1;
+    V acc;
+    if (argc > 1)
+        acc = args[1];
+    else
+    {
+        while (i >= 0 && !hasElem(o, i))
+            --i;
+        if (i < 0)
+            throwType("Reduce of empty array with no initial value");
+        acc = elemAt(o, i--);
+    }
+    V a[4];
+    for (; i >= 0; --i)
+        if (hasElem(o, i))
+        {
+            a[0] = acc;
+            a[1] = elemAt(o, i);
+            a[2] = num((double)i);
+            a[3] = o;
+            acc = call(f, Undefined, a, 4);
+        }
+    return acc;
+}
+
+int64_t flattenInto(V target, V src, int64_t n, int64_t at, double depth, V mapFn, V ta)
+{
+    V a[3];
+    for (int64_t i = 0; i < n; ++i)
+    {
+        if (!hasElem(src, i))
+            continue;
+        V x = elemAt(src, i);
+        if (mapFn != Undefined)
+        {
+            a[0] = x;
+            a[1] = num((double)i);
+            a[2] = src;
+            x = call(mapFn, ta, a, 3);
+        }
+        if (depth > 0 && truthy(arrayIsArray(Undefined, &x, 1)))
+            at = flattenInto(target, x, lenOf(x), at, depth - 1, Undefined, Undefined);
+        else
+            createData(target, at++, x);
+    }
+    return at;
+}
+
+V aFlat(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.flat");
+    double depth = argOr(args, argc, 0) == Undefined ? 1 : toIntegerOrInf(args[0]);
+    V r = speciesCreate(o, 0);
+    int64_t k = flattenInto(r, o, lenOf(o), 0, depth, Undefined, Undefined);
+    setLen(r, k);
+    return r;
+}
+
+V aFlatMap(V thisV, V *args, int argc)
+{
+    V o = arrayThis(thisV, "Array.prototype.flatMap");
+    V f = argOr(args, argc, 0);
+    if (!isCallable(f))
+        throwType("flatMap mapper function is not callable");
+    V r = speciesCreate(o, 0);
+    int64_t k = flattenInto(r, o, lenOf(o), 0, 1, f, argOr(args, argc, 1));
+    setLen(r, k);
+    return r;
+}
+
+// ── iterators ────────────────────────────────────────────────────────────
+
+V makeArrayIter(V target, uint8_t kind)
+{
+    ArrayIter *it = static_cast<ArrayIter *>(allocObj(sizeof(ArrayIter), C_ARRAYITER, PR.arrayIter));
+    it->target = target;
+    it->kind = kind;
+    return objv(it);
+}
+
+V aValues(V thisV, V *, int)
+{
+    return makeArrayIter(toObject(thisV), 1);
+}
+
+V aKeys(V thisV, V *, int)
+{
+    return makeArrayIter(toObject(thisV), 0);
+}
+
+V aEntries(V thisV, V *, int)
+{
+    return makeArrayIter(toObject(thisV), 2);
+}
+
+V arrayIterNext(V thisV, V *, int)
+{
+    if (!isObj(thisV) || op(thisV)->cls != C_ARRAYITER)
+        throwType("next method called on incompatible receiver " + inspectBrief(thisV));
+    ArrayIter *it = static_cast<ArrayIter *>(op(thisV));
+    if (it->finished)
+        return iterResult(Undefined, true);
+    int64_t n;
+    V tgt = it->target;
+    if (op(tgt)->cls == C_TYPEDARRAY)
+        n = typedLength(op(tgt));
+    else
+        n = lenOf(tgt);
+    uint32_t i = it->idx;
+    if ((int64_t)i >= n)
+    {
+        it->finished = true;
+        return iterResult(Undefined, true);
+    }
+    it->idx = i + 1;
+    if (it->kind == 0)
+        return iterResult(num((double)i), false);
+    V v = elemAt(tgt, i);
+    if (it->kind == 1)
+        return iterResult(v, false);
+    V pair[2] = {num((double)i), v};
+    return iterResult(objv(newArrayFrom(pair, 2)), false);
+}
+
+V iterSelf(V thisV, V *, int)
+{
+    return thisV;
+}
+
+} // namespace
+
+V atomKeyOf(int64_t i)
+{
+    if (i >= 0 && i < 4294967295LL)
+        return atomIndex((uint32_t)i);
+    return atomStr(fromUtf8(std::to_string(i)));
+}
+
+V makeArrayIterator(V target, int kind)
+{
+    return makeArrayIter(target, (uint8_t)kind);
+}
+
+void initArrayBuiltins()
+{
+    JFunc *c = defCtor("Array", arrayCtor, 1, PR.array);
+    PR.ctorArray = objv(c);
+    defFn(c, "isArray", arrayIsArray, 1);
+    defFn(c, "of", arrayOf, 0);
+    defFn(c, "from", arrayFrom, 1);
+    defGetterSym(c, WK.species, "[Symbol.species]", speciesGetter);
+    Obj *p = PR.array;
+    defFn(p, "at", aAt, 1);
+    defFn(p, "concat", aConcat, 1);
+    defFn(p, "copyWithin", aCopyWithin, 2);
+    defFn(p, "fill", aFill, 1);
+    defFn(p, "find", aFind, 1);
+    defFn(p, "findIndex", aFindIndex, 1);
+    defFn(p, "findLast", aFindLast, 1);
+    defFn(p, "findLastIndex", aFindLastIndex, 1);
+    defFn(p, "lastIndexOf", aLastIndexOf, 1);
+    defFn(p, "pop", aPop, 0);
+    defFn(p, "push", aPush, 1);
+    defFn(p, "reverse", aReverse, 0);
+    defFn(p, "shift", aShift, 0);
+    defFn(p, "unshift", aUnshift, 1);
+    defFn(p, "slice", aSlice, 2);
+    defFn(p, "sort", aSort, 1);
+    defFn(p, "splice", aSplice, 2);
+    defFn(p, "includes", aIncludes, 1);
+    defFn(p, "indexOf", aIndexOf, 1);
+    defFn(p, "join", aJoin, 1);
+    defFn(p, "keys", aKeys, 0);
+    defFn(p, "entries", aEntries, 0);
+    JFunc *values = newNative("values", aValues, 0);
+    g_arrayValuesFn = objv(values);
+    defineOwn(p, atomOf("values"), g_arrayValuesFn, PF_W | PF_C);
+    defFn(p, "forEach", aForEach, 1);
+    defFn(p, "filter", aFilter, 1);
+    defFn(p, "flat", aFlat, 0);
+    defFn(p, "flatMap", aFlatMap, 1);
+    defFn(p, "map", aMap, 1);
+    defFn(p, "every", aEvery, 1);
+    defFn(p, "some", aSome, 1);
+    defFn(p, "reduce", aReduce, 1);
+    defFn(p, "reduceRight", aReduceRight, 1);
+    defFn(p, "toLocaleString", aToLocale, 0);
+    defFn(p, "toReversed", aToReversed, 0);
+    defFn(p, "toSorted", aToSorted, 1);
+    defFn(p, "toSpliced", aToSpliced, 2);
+    defFn(p, "with", aWith, 2);
+    defFn(p, "toString", aToString, 0);
+    defineOwn(p, WK.iterator, g_arrayValuesFn, PF_W | PF_C);
+    Obj *un = newObjectProto(nullptr);
+    static const char *unames[] = {"at", "copyWithin", "entries", "fill", "find", "findIndex", "findLast", "findLastIndex", "flat", "flatMap", "includes", "keys", "toReversed", "toSorted", "toSpliced", "values"};
+    for (const char *u : unames)
+        defineOwn(un, atomOf(u), True, PF_DEFAULT);
+    defineOwn(p, WK.unscopables, objv(un), PF_C);
+
+    defFnSym(PR.iterator, WK.iterator, "[Symbol.iterator]", iterSelf, 0);
+    JFunc *nx = newNative("next", arrayIterNext, 0);
+    g_arrayIterNext = objv(nx);
+    defineOwn(PR.arrayIter, A.next, g_arrayIterNext, PF_W | PF_C);
+    defineOwn(PR.arrayIter, WK.toStringTag, atomOf("Array Iterator"), PF_C);
+}
+
+} // namespace js

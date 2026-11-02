@@ -1,0 +1,92 @@
+'use strict';
+// structuredClone.
+function dataCloneError(what) {
+  const { DOMException } = require('eventtarget');
+  return new DOMException(`${what} could not be cloned.`, 'DataCloneError');
+}
+
+function cloneValue(v, seen) {
+  if (typeof v === 'function') throw dataCloneError(String(v));
+  if (typeof v === 'symbol') throw dataCloneError(String(v));
+  if (v === null || typeof v !== 'object') return v;
+  if (seen.has(v)) return seen.get(v);
+  const c = internal.classOf(v);
+  let out;
+  switch (c) {
+    case 9: // Date
+      out = new Date(v.getTime());
+      seen.set(v, out);
+      return out;
+    case 10: // RegExp
+      out = new RegExp(v.source, v.flags);
+      seen.set(v, out);
+      return out;
+    case 4:
+      out = Object(Boolean.prototype.valueOf.call(v));
+      seen.set(v, out);
+      return out;
+    case 5:
+      out = Object(Number.prototype.valueOf.call(v));
+      seen.set(v, out);
+      return out;
+    case 6:
+      out = Object(String.prototype.valueOf.call(v));
+      seen.set(v, out);
+      return out;
+    case 8:
+      out = Object(BigInt.prototype.valueOf.call(v));
+      seen.set(v, out);
+      return out;
+    case 11: // Map
+      out = new Map();
+      seen.set(v, out);
+      for (const [k, x] of Map.prototype.entries.call(v)) out.set(cloneValue(k, seen), cloneValue(x, seen));
+      return out;
+    case 12: // Set
+      out = new Set();
+      seen.set(v, out);
+      for (const x of Set.prototype.values.call(v)) out.add(cloneValue(x, seen));
+      return out;
+    case 21: // ArrayBuffer
+      out = v.slice(0);
+      seen.set(v, out);
+      return out;
+    case 22: { // typed array
+      const buf = cloneValue(v.buffer, seen);
+      out = new (internal.typed[v[Symbol.toStringTag]])(buf, v.byteOffset, v.length);
+      seen.set(v, out);
+      return out;
+    }
+    case 3: { // Error
+      const name = ['Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError'].includes(v.name) ? v.name : 'Error';
+      out = new globalThis[name](v.message);
+      seen.set(v, out);
+      if ('stack' in v) Object.defineProperty(out, 'stack', { value: v.stack, writable: true, configurable: true });
+      if ('cause' in v) Object.defineProperty(out, 'cause', { value: cloneValue(v.cause, seen), writable: true, configurable: true });
+      return out;
+    }
+    case 1: // Array
+      out = new Array(v.length);
+      seen.set(v, out);
+      for (const k of Object.keys(v)) out[k] = cloneValue(v[k], seen);
+      return out;
+    case 0:
+    case 16:
+      out = {};
+      seen.set(v, out);
+      for (const k of Object.keys(v)) out[k] = cloneValue(v[k], seen);
+      return out;
+    default:
+      throw dataCloneError(`#<${internal.getConstructorName(v) || 'Object'}>`);
+  }
+}
+
+function structuredClone(value, options) {
+  if (arguments.length === 0) {
+    throw internal.nodeError(TypeError, 'ERR_MISSING_ARGS', 'The value argument must be specified');
+  }
+  return cloneValue(value, new Map());
+}
+
+internal.installGlobal('structuredClone', structuredClone);
+module.exports = { structuredClone };

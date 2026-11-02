@@ -2716,6 +2716,10 @@ V Interp::evalBegin(BeginNode *n, Frame *f)
             thrown = 5;
             exTag = e.tag;
         }
+        catch (KillEx &)
+        {
+            thrown = 6;
+        }
         // Ruby code never runs inside a catch block: another thread of
         // control could run and throw there
         if (thrown)
@@ -2733,6 +2737,7 @@ V Interp::evalBegin(BeginNode *n, Frame *f)
             case 2: throw BreakEx{exTag, ex1};
             case 3: throw ReturnEx{exTag, ex1};
             case 4: throw ThrowEx{ex1, ex2};
+            case 6: throw KillEx{0};
             default: throw StopEx{exTag};
             }
         }

@@ -377,6 +377,27 @@ print(dog.fetch("ball")) # Rex fetches the ball
 
 ---
 
+## JavaScript
+
+A `.js` file runs on the JavaScript front-end in `src/js`: a complete engine, not a translation.
+Programs behave as they do under Node.js 20 (the reference it is tested against), in CommonJS form:
+`require`, `module`, `exports`, `__filename` and `__dirname` are there, and so are ES2023 syntax
+and built-ins, promises and the event loop, `process`, `console`, `Buffer`, `URL`, `Intl`, typed
+arrays and the modules `assert`, `buffer`, `crypto` (hashes), `events`, `fs` (whole files), `os`,
+`path`, `perf_hooks`, `querystring`, `readline`, `stream`, `string_decoder`, `timers`, `tty`, `url`,
+`util`, `vm` and `worker_threads` (main thread only). A file the front-end cannot parse falls back
+to the older JavaScript dialect of the common syntax.
+
+Timers run on virtual time: waiting costs nothing, and their order does not depend on how fast the
+program runs. A program that reads the clock still sees real time pass.
+
+Not there: `import`/`export` modules, networking (`http`, `net`, `fetch`), `child_process`, `zlib`,
+real worker threads, resizable `ArrayBuffer`s, and time-zone history (a date's local time uses the
+machine's current offset). `Intl` knows English and German names and common number punctuation.
+There is no garbage collector: memory goes back when the program ends.
+
+---
+
 ## Java Style
 
 A `.sa` file may contain Java code next to Python, JavaScript, C++ and Ruby. It is recognised by

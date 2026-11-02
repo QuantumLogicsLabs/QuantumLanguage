@@ -1,0 +1,929 @@
+// quantum: cpp
+// JavaScript front-end: the host. console, modules, the bridge the JavaScript
+// library (src/js/lib) stands on, and running a program from start to exit.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+#include "JsMain.h.sa"
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+
+namespace fs = std::filesystem;
+
+namespace js
+{
+
+std::string g_out;
+std::string g_scriptPath;
+std::vector<std::pair<std::string, std::string>> jsLibrarySources();
+
+V promiseStateOf(V p, V *value);
+uint8_t *bufferBytes(V buffer, int64_t *size);
+
+namespace
+{
+
+Obj *g_internal = nullptr;
+std::unordered_map<std::string, V> *g_modules = nullptr;
+V g_process = Undefined;
+V g_formatFn = Undefined;
+std::string g_groupIndent;
+V g_requireFn = Undefined;
+int g_exitCode = 0;
+bool g_exiting = false;
+
+// a global that a library provides, the first time anyone asks
+struct LazyGlobal
+{
+    const char *name;
+    const char *lib;
+};
+
+const LazyGlobal g_lazyGlobals[] = {
+    {"Int8Array", "typedarray"}, {"Uint8Array", "typedarray"}, {"Uint8ClampedArray", "typedarray"}, {"Int16Array", "typedarray"}, {"Uint16Array", "typedarray"},
+    {"Int32Array", "typedarray"}, {"Uint32Array", "typedarray"}, {"Float32Array", "typedarray"}, {"Float64Array", "typedarray"}, {"BigInt64Array", "typedarray"},
+    {"BigUint64Array", "typedarray"}, {"DOMException", "eventtarget"}, {"CustomEvent", "eventtarget"}, {"crypto", "crypto"},
+    {"process", "process"}, {"Buffer", "buffer"}, {"atob", "buffer"}, {"btoa", "buffer"}, {"URL", "url"}, {"URLSearchParams", "url"},
+    {"TextEncoder", "encoding"}, {"TextDecoder", "encoding"}, {"AbortController", "eventtarget"}, {"AbortSignal", "eventtarget"},
+    {"Event", "eventtarget"}, {"EventTarget", "eventtarget"}, {"Intl", "intl"}, {"structuredClone", "clone"}, {"DataView", "typedarray"},
+    {"Atomics", "typedarray"}, {"SharedArrayBuffer", "typedarray"}, {"performance", "perf_hooks"}, {"fetch", "process"},
+};
+
+} // namespace
+
+void writeOut(const std::string &s)
+{
+    g_out += s;
+    if (g_out.size() >= 65536)
+        flushOut();
+}
+
+void flushOut()
+{
+    if (!g_out.empty())
+    {
+        fwrite(g_out.data(), 1, g_out.size(), stdout);
+        g_out.clear();
+    }
+    fflush(stdout);
+}
+
+void writeErr(const std::string &s)
+{
+    flushOut();
+    fwrite(s.data(), 1, s.size(), stderr);
+    fflush(stderr);
+}
+
+namespace
+{
+
+// ── loading library files ────────────────────────────────────────────────
+
+const std::string *librarySource(const std::string &name)
+{
+    static std::unordered_map<std::string, std::string> *table = nullptr;
+    if (!table)
+    {
+        table = new std::unordered_map<std::string, std::string>();
+        for (auto &kv : jsLibrarySources())
+            (*table)[kv.first] = kv.second;
+    }
+    std::string file = name;
+    for (char &c : file)
+        if (c == '/')
+            c = '_';
+    auto it = table->find(file + ".sa");
+    return it == table->end() ? nullptr : &it->second;
+}
+
+V runLibrary(const std::string &name, const std::string &source)
+{
+    static const std::vector<std::string> params = {"exports", "require", "module", "internal"};
+    FuncNode *node = nullptr;
+    std::string why;
+    bool failed = false;
+    JsState st0;
+    try
+    {
+        node = parseProgramSource(source, "node:" + name, nullptr, false, true, &params);
+    }
+    catch (ParseError &e)
+    {
+        st0.restore();
+        failed = true;
+        why = "in library " + name + " line " + std::to_string(e.line) + ": " + e.message;
+    }
+    if (failed)
+        throwError(E_SYNTAX, why);
+    Obj *mod = newObject();
+    Obj *exportsObj = newObject();
+    defineOwn(mod, atomOf("exports"), objv(exportsObj), PF_DEFAULT);
+    (*g_modules)[name] = objv(mod);
+    V args[4] = {objv(exportsObj), g_requireFn, objv(mod), objv(g_internal)};
+    runModuleFunction(node, objv(exportsObj), args, 4);
+    return objv(mod);
+}
+
+std::string stripNodePrefix(const std::string &s)
+{
+    return s.rfind("node:", 0) == 0 ? s.substr(5) : s;
+}
+
+V loadUserFile(const std::string &path)
+{
+    std::string key = "file:" + path;
+    auto it = g_modules->find(key);
+    if (it != g_modules->end())
+        return getProp(it->second, atomOf("exports"));
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return 0;
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string src = ss.str();
+    Obj *mod = newObject();
+    Obj *exportsObj = newObject();
+    defineOwn(mod, atomOf("exports"), objv(exportsObj), PF_DEFAULT);
+    defineOwn(mod, atomOf("id"), str(path), PF_DEFAULT);
+    defineOwn(mod, atomOf("filename"), str(path), PF_DEFAULT);
+    defineOwn(mod, atomOf("loaded"), False, PF_DEFAULT);
+    (*g_modules)[key] = objv(mod);
+    if (path.size() > 5 && path.compare(path.size() - 5, 5, ".json") == 0)
+    {
+        V text = str(src);
+        V json = getProp(objv(g_global), atomOf("JSON"));
+        V parsed = invoke(json, atomOf("parse"), &text, 1);
+        defineOwn(mod, atomOf("exports"), parsed, PF_DEFAULT);
+        return parsed;
+    }
+    static const std::vector<std::string> params = {"exports", "require", "module", "__filename", "__dirname"};
+    FuncNode *node = nullptr;
+    bool failed = false;
+    std::string why;
+    JsState st1;
+    try
+    {
+        node = parseProgramSource(src, path, nullptr, false, true, &params);
+    }
+    catch (ParseError &e)
+    {
+        st1.restore();
+        failed = true;
+        why = e.message;
+    }
+    if (failed)
+        throwError(E_SYNTAX, why);
+    fs::path p(path);
+    V args[5] = {objv(exportsObj), g_requireFn, objv(mod), str(path), str(p.parent_path().string())};
+    runModuleFunction(node, objv(exportsObj), args, 5);
+    return getProp(objv(mod), atomOf("exports"));
+}
+
+V requireFnImpl(V, V *args, int argc)
+{
+    V nameV = argOr(args, argc, 0);
+    if (!isStr(nameV))
+    {
+        V e = makeError(E_TYPE, "The \"id\" argument must be of type string. Received " + receivedText(nameV));
+        makeNodeError(e, "ERR_INVALID_ARG_TYPE");
+        throw JsThrow{e};
+    }
+    std::string name = toUtf8(sp_(nameV));
+    if (name.rfind("./", 0) == 0 || name.rfind("../", 0) == 0 || name.rfind("/", 0) == 0 || (name.size() > 1 && name[1] == ':'))
+    {
+        fs::path base = fs::path(g_scriptPath).parent_path();
+        fs::path p = name[0] == '.' ? base / name : fs::path(name);
+        for (const char *ext : {"", ".js", ".json", "/index.js"})
+        {
+            std::string candidate = p.string() + ext;
+            std::error_code ec;
+            if (fs::is_regular_file(fs::path(candidate), ec))
+                return loadUserFile(candidate);
+        }
+    }
+    else
+    {
+        V m = requireModule(stripNodePrefix(name));
+        if (m)
+            return m;
+    }
+    V e = makeError(E_ERROR, "Cannot find module '" + name + "'\nRequire stack:\n- " + g_scriptPath);
+    defineOwn(op(e), A.code, atomOf("MODULE_NOT_FOUND"), PF_DEFAULT);
+    throw JsThrow{e};
+}
+
+V requireResolve(V, V *args, int argc)
+{
+    return argOr(args, argc, 0);
+}
+
+// ── console ──────────────────────────────────────────────────────────────
+
+void loadFormatter()
+{
+    if (g_formatFn == Undefined)
+    {
+        V util = requireModule("util_inspect");
+        g_formatFn = getProp(util, atomOf("format"));
+    }
+}
+
+void emitLine(const std::string &text, bool toErr)
+{
+    std::string line = text;
+    if (!g_groupIndent.empty())
+    {
+        std::string o = g_groupIndent;
+        for (char c : line)
+        {
+            o += c;
+            if (c == '\n')
+                o += g_groupIndent;
+        }
+        line = o;
+    }
+    line += '\n';
+    if (toErr)
+        writeErr(line);
+    else
+        writeOut(line);
+}
+
+void consoleWrite(V *args, int argc, bool toErr)
+{
+    // plain values need no formatting machinery
+    bool simple = true;
+    for (int i = 0; i < argc && simple; ++i)
+    {
+        V v = args[i];
+        if (isStr(v))
+        {
+            if (i == 0 && argc > 1)
+            {
+                JStr *s = flat_(sp_(v));
+                for (int k = 0; k < s->len; ++k)
+                    if (unitAt(s, k) == '%')
+                    {
+                        simple = false;
+                        break;
+                    }
+            }
+        }
+        else if (!(isNum(v) || v == Undefined || v == Null || isBool(v) || isBig(v)))
+            simple = false;
+    }
+    std::string out;
+    if (simple)
+    {
+        for (int i = 0; i < argc; ++i)
+        {
+            if (i)
+                out += ' ';
+            V v = args[i];
+            if (isStr(v))
+                out += toUtf8(sp_(v));
+            else if (isNum(v))
+            {
+                double d = numOf(v);
+                if (d == 0 && std::signbit(d))
+                    out += "-0";
+                else
+                    out += numberToStd(d);
+            }
+            else if (isBig(v))
+                out += bigToStr(bigp(v)) + "n";
+            else
+                out += toUtf8V(v);
+        }
+    }
+    else
+    {
+        loadFormatter();
+        V r = call(g_formatFn, Undefined, args, argc);
+        out = toUtf8V(r);
+    }
+    emitLine(out, toErr);
+}
+
+V cLog(V, V *args, int argc)
+{
+    consoleWrite(args, argc, false);
+    return Undefined;
+}
+
+V cErr(V, V *args, int argc)
+{
+    consoleWrite(args, argc, true);
+    return Undefined;
+}
+
+// console.table and the rest: in the library, loaded on first use
+V cLazy(V thisV, V *args, int argc)
+{
+    V lib = requireModule("console");
+    return invoke(lib, NATIVE_DATA(), args, argc);
+    (void)thisV;
+}
+
+// ── the bridge ───────────────────────────────────────────────────────────
+
+V inSetGroupIndent(V, V *args, int argc)
+{
+    g_groupIndent = toUtf8V(argOr(args, argc, 0));
+    return Undefined;
+}
+
+V inWriteOut(V, V *args, int argc)
+{
+    writeOut(toUtf8V(argOr(args, argc, 0)));
+    return Undefined;
+}
+
+V inWriteErr(V, V *args, int argc)
+{
+    writeErr(toUtf8V(argOr(args, argc, 0)));
+    return Undefined;
+}
+
+V inOwnNonIndex(V, V *args, int argc)
+{
+    V o = argOr(args, argc, 0);
+    double filter = toNumber(argOr(args, argc, 1));
+    JArray *out = newArray();
+    if (!isObj(o))
+        return objv(out);
+    std::vector<V> keys;
+    ownKeys(op(o), keys, true, true, false);
+    for (V k : keys)
+    {
+        if (isStr(k) && sp_(k)->isIdx)
+            continue;
+        if (filter != 0)
+        {
+            V val, g, s;
+            uint8_t fl = 0;
+            if (!getOwnDesc(op(o), k, &val, &g, &s, &fl) || !(fl & PF_E))
+                continue;
+        }
+        arrayPush(out, k);
+    }
+    return objv(out);
+}
+
+V inPromiseDetails(V, V *args, int argc)
+{
+    V val = Undefined;
+    V state = promiseStateOf(argOr(args, argc, 0), &val);
+    if (state == Undefined)
+        return Undefined;
+    V pair[2] = {state, val};
+    return objv(newArrayFrom(pair, 2));
+}
+
+V inProxyDetails(V, V *args, int argc)
+{
+    V p = argOr(args, argc, 0);
+    if (!isObj(p) || op(p)->cls != C_PROXY)
+        return Undefined;
+    JFunc *f = static_cast<JFunc *>(op(p));
+    if (argc > 1 && args[1] == False)
+        return f->data;
+    V pair[2] = {f->data, f->data2};
+    return objv(newArrayFrom(pair, 2));
+}
+
+V inClassOf(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isObj(v))
+        return num(-1);
+    return num((double)op(v)->cls);
+}
+
+V inFnKind(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isCallable(v))
+        return num(-1);
+    return num((double)static_cast<JFunc *>(op(v))->kind);
+}
+
+// the entries behind a weak collection or an iterator, without disturbing it
+V inPreviewEntries(V, V *args, int argc)
+{
+    V o = argOr(args, argc, 0);
+    bool wantFlag = argc > 1 && truthy(args[1]);
+    JArray *out = newArray();
+    bool keyed = false;
+    if (isObj(o))
+    {
+        uint8_t cls = op(o)->cls;
+        if (cls == C_WEAKMAP || cls == C_WEAKSET || cls == C_MAP || cls == C_SET)
+            mapPreview(op(o), out, &keyed);
+        else if (cls == C_MAPITER || cls == C_SETITER)
+            iterPreview(op(o), out, &keyed);
+    }
+    if (wantFlag)
+    {
+        V pair[2] = {objv(out), boolv(keyed)};
+        return objv(newArrayFrom(pair, 2));
+    }
+    return objv(out);
+}
+
+V inCtorName(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isObj(v))
+        return A.empty;
+    return str(ctorNameOf(op(v)));
+}
+
+V inExit(V, V *args, int argc)
+{
+    int code = (int)toNumber(argOr(args, argc, 0));
+    throw JsExit{code};
+}
+
+V inSetProcess(V, V *args, int argc)
+{
+    g_process = argOr(args, argc, 0);
+    return Undefined;
+}
+
+V inCwd(V, V *, int)
+{
+    std::error_code ec;
+    return str(fs::current_path(ec).string());
+}
+
+V inGetEnv(V, V *args, int argc)
+{
+    const char *e = std::getenv(toUtf8V(argOr(args, argc, 0)).c_str());
+    return e ? str(e) : Undefined;
+}
+
+V inScriptPath(V, V *, int)
+{
+    return str(g_scriptPath);
+}
+
+V inReadFile(V, V *args, int argc)
+{
+    std::string path = toUtf8V(argOr(args, argc, 0));
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return Null;
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return str(ss.str());
+}
+
+V inReadStdin(V, V *, int)
+{
+    std::stringstream ss;
+    ss << std::cin.rdbuf();
+    return str(ss.str());
+}
+
+V inWriteFile(V, V *args, int argc)
+{
+    std::string path = toUtf8V(argOr(args, argc, 0));
+    std::string data = toUtf8V(argOr(args, argc, 1));
+    bool append = truthy(argOr(args, argc, 2));
+    std::ofstream out(path, append ? (std::ios::binary | std::ios::app) : (std::ios::binary | std::ios::trunc));
+    if (!out)
+        return False;
+    out << data;
+    return True;
+}
+
+V inFileExists(V, V *args, int argc)
+{
+    std::error_code ec;
+    return boolv(fs::exists(fs::path(toUtf8V(argOr(args, argc, 0))), ec));
+}
+
+V inNow(V, V *, int)
+{
+    return num(virtualNow());
+}
+
+V inUtf8Encode(V, V *args, int argc)
+{
+    std::string s = toUtf8V(argOr(args, argc, 0));
+    JArray *a = newArray((uint32_t)s.size());
+    for (unsigned char c : s)
+        arrayPush(a, num((double)c));
+    return objv(a);
+}
+
+V inUtf8Decode(V, V *args, int argc)
+{
+    V list = argOr(args, argc, 0);
+    int64_t n = toLength(getProp(list, A.length));
+    std::string s;
+    s.reserve((size_t)n);
+    for (int64_t i = 0; i < n; ++i)
+        s += (char)toInt32(getIdx(list, (double)i));
+    return str(s);
+}
+
+// a global replaced keeps whether it is enumerable
+void setGlobalKeeping(V key, V val)
+{
+    uint8_t fl = 0;
+    int idx = shapeFind(g_global->shape, key, &fl);
+    defineOwn(g_global, key, val, idx >= 0 && (fl & PF_E) ? PF_DEFAULT : PF_W | PF_C);
+}
+
+V inNodeError(V, V *args, int argc)
+{
+    V base = argOr(args, argc, 0);
+    V msg = argOr(args, argc, 2);
+    V e = construct(base, &msg, 1, base);
+    return makeNodeError(e, toUtf8V(argOr(args, argc, 1)));
+}
+
+V inReceived(V, V *args, int argc)
+{
+    return str(receivedText(argOr(args, argc, 0)));
+}
+
+V inInstallGlobalName(V, V *args, int argc)
+{
+    setGlobalKeeping(toKey(argOr(args, argc, 0)), argOr(args, argc, 1));
+    return Undefined;
+}
+
+V inNextTick(V, V *args, int argc)
+{
+    V tick = g_nextTickFn;
+    return call(tick, Undefined, args, argc);
+}
+
+V inFormatDouble(V, V *args, int argc)
+{
+    return str(numberToStd(toNumber(argOr(args, argc, 0))));
+}
+
+} // namespace
+
+// a library module's exports; 0 when there is no such library
+V requireModule(const std::string &name)
+{
+    auto it = g_modules->find(name);
+    if (it != g_modules->end())
+        return getProp(it->second, atomOf("exports"));
+    const std::string *src = librarySource(name);
+    if (!src)
+        return 0;
+    V mod = runLibrary(name, *src);
+    return getProp(mod, atomOf("exports"));
+}
+
+void loadLib(const std::string &name)
+{
+    requireModule(name);
+}
+
+bool autoloadGlobal(V name)
+{
+    if (!isStr(name))
+        return false;
+    for (const LazyGlobal &g : g_lazyGlobals)
+    {
+        if (atomOf(g.name) != name)
+            continue;
+        requireModule(g.lib);
+        uint8_t fl = 0;
+        int idx = shapeFind(g_global->shape, name, &fl);
+        return idx >= 0 && !(fl & PF_ACCESSOR);
+    }
+    return false;
+}
+
+namespace
+{
+
+V lazyGlobalGet(V, V *, int)
+{
+    V name = NATIVE_DATA();
+    for (const LazyGlobal &g : g_lazyGlobals)
+    {
+        if (atomOf(g.name) != name)
+            continue;
+        requireModule(g.lib);
+        uint8_t fl = 0;
+        int idx = shapeFind(g_global->shape, name, &fl);
+        if (idx < 0 || (fl & PF_ACCESSOR))
+            return Undefined;
+        return g_global->slots[idx];
+    }
+    return Undefined;
+}
+
+V lazyGlobalSet(V, V *args, int argc)
+{
+    setGlobalKeeping(NATIVE_DATA(), argOr(args, argc, 0));
+    return Undefined;
+}
+
+// the globals a program sees listed, in Node's order
+void orderEnumerableGlobals()
+{
+    static const char *const names[] = {"global", "clearImmediate", "setImmediate", "clearInterval", "clearTimeout", "setInterval", "setTimeout", "queueMicrotask", "structuredClone", "atob", "btoa", "performance", "fetch", "crypto"};
+    for (const char *n : names)
+    {
+        V key = atomOf(n);
+        V val, g, s;
+        uint8_t fl = 0;
+        if (!getOwnDesc(g_global, key, &val, &g, &s, &fl))
+            continue;
+        deleteProp(g_global, key);
+        if (fl & PF_ACCESSOR)
+            defineAccessor(g_global, key, g, s, PF_E | PF_C);
+        else
+            defineOwn(g_global, key, val, PF_DEFAULT);
+    }
+}
+
+} // namespace
+
+void initNodeBuiltins()
+{
+    g_modules = new std::unordered_map<std::string, V>();
+    for (const LazyGlobal &g : g_lazyGlobals)
+    {
+        V name = atomOf(g.name);
+        V getter = objv(newClosure(g.name, lazyGlobalGet, 0, name));
+        V setter = objv(newClosure(g.name, lazyGlobalSet, 1, name));
+        defineAccessor(g_global, name, getter, setter, PF_C);
+    }
+    JFunc *req = newNative("require", requireFnImpl, 1);
+    defFn(req, "resolve", requireResolve, 1);
+    g_requireFn = objv(req);
+    Obj *c = newObject();
+    defineOwn(g_global, atomOf("console"), objv(c), PF_W | PF_C);
+    defFn(c, "log", cLog, 0);
+    defFn(c, "info", cLog, 0);
+    defFn(c, "debug", cLog, 0);
+    defFn(c, "error", cErr, 0);
+    defFn(c, "warn", cErr, 0);
+    for (const char *n : {"table", "group", "groupCollapsed", "groupEnd", "dir", "dirxml", "count", "countReset", "assert", "time", "timeEnd", "timeLog", "trace"})
+    {
+        JFunc *f = newClosure(n, cLazy, 0, atomOf(n));
+        defineOwn(c, atomOf(n), objv(f), PF_DEFAULT);
+    }
+    Obj *in = newObject();
+    g_internal = in;
+    defFn(in, "setGroupIndent", inSetGroupIndent, 1);
+    defFn(in, "writeOut", inWriteOut, 1);
+    defFn(in, "writeErr", inWriteErr, 1);
+    defFn(in, "getOwnNonIndexProperties", inOwnNonIndex, 2);
+    defFn(in, "getPromiseDetails", inPromiseDetails, 1);
+    defFn(in, "getProxyDetails", inProxyDetails, 2);
+    defFn(in, "classOf", inClassOf, 1);
+    defFn(in, "fnKind", inFnKind, 1);
+    defFn(in, "previewEntries", inPreviewEntries, 2);
+    defFn(in, "getConstructorName", inCtorName, 1);
+    defFn(in, "exit", inExit, 1);
+    defFn(in, "setProcess", inSetProcess, 1);
+    defFn(in, "cwd", inCwd, 0);
+    defFn(in, "getEnv", inGetEnv, 1);
+    defFn(in, "scriptPath", inScriptPath, 0);
+    defFn(in, "readFile", inReadFile, 1);
+    defFn(in, "readStdin", inReadStdin, 0);
+    defFn(in, "writeFile", inWriteFile, 3);
+    defFn(in, "fileExists", inFileExists, 1);
+    defFn(in, "now", inNow, 0);
+    defFn(in, "utf8Encode", inUtf8Encode, 1);
+    defFn(in, "utf8Decode", inUtf8Decode, 1);
+    defFn(in, "installGlobal", inInstallGlobalName, 2);
+    defFn(in, "received", inReceived, 1);
+    defFn(in, "nodeError", inNodeError, 3);
+    defFn(in, "nextTick", inNextTick, 1);
+    defFn(in, "formatDouble", inFormatDouble, 1);
+    defVal(in, "typed", objv(typedArrayHolder()), PF_DEFAULT);    orderEnumerableGlobals();
+}
+
+// ── uncaught errors ──────────────────────────────────────────────────────
+
+namespace
+{
+
+std::string errorText(V err)
+{
+    if (isObj(err))
+    {
+        bool threw = false;
+        V st = Undefined;
+        JsState st2;
+        try
+        {
+            st = getProp(err, A.stack);
+        }
+        catch (JsThrow &)
+        {
+            st2.restore();
+            threw = true;
+        }
+        if (!threw && isStr(st))
+            return toUtf8(sp_(st));
+        bool threw2 = false;
+        std::string s;
+        JsState st3;
+        try
+        {
+            loadFormatter();
+            V r = call1(g_formatFn, Undefined, err);
+            s = toUtf8V(r);
+        }
+        catch (JsThrow &)
+        {
+            st3.restore();
+            threw2 = true;
+        }
+        if (!threw2)
+            return "Uncaught " + s;
+    }
+    return "Uncaught " + inspectBrief(err);
+}
+
+bool processHasListeners(const char *name)
+{
+    if (g_process == Undefined)
+        return false;
+    V n = strA(name);
+    V c = invoke(g_process, atomOf("listenerCount"), &n, 1);
+    return isNum(c) && numOf(c) > 0;
+}
+
+} // namespace
+
+// the exception nobody caught: a handler may take it; otherwise the process dies
+void reportUncaught(V err)
+{
+    if (processHasListeners("uncaughtException"))
+    {
+        V a[3] = {atomOf("uncaughtException"), err, atomOf("uncaughtException")};
+        invoke(g_process, atomOf("emit"), a, 3);
+        return;
+    }
+    writeErr(errorText(err) + "\n\nNode.js v20.20.2\n");
+    throw JsExit{1};
+}
+
+bool hasUnhandledRejectionHandler()
+{
+    return processHasListeners("unhandledRejection");
+}
+
+void reportUnhandledRejection(V reason, V promise)
+{
+    if (processHasListeners("unhandledRejection"))
+    {
+        V a[3] = {atomOf("unhandledRejection"), reason, promise};
+        invoke(g_process, atomOf("emit"), a, 3);
+        return;
+    }
+    if (isObj(reason) && op(reason)->cls == C_ERROR)
+    {
+        reportUncaught(reason);
+        return;
+    }
+    V e = makeError(E_ERROR, "This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason \"" + inspectBrief(reason) + "\".");
+    makeNodeError(e, "ERR_UNHANDLED_REJECTION");
+    reportUncaught(e);
+}
+
+// ── a program, start to finish ───────────────────────────────────────────
+
+int runProgram(const std::string &source, const std::string &path, RunFailure &failure)
+{
+    static bool ready = false;
+    if (!ready)
+    {
+        initCore();
+        ready = true;
+    }
+    std::error_code ec;
+    fs::path abs = fs::absolute(fs::path(path), ec);
+    g_scriptPath = ec ? path : abs.string();
+    static const std::vector<std::string> params = {"exports", "require", "module", "__filename", "__dirname"};
+    FuncNode *node = nullptr;
+    {
+        bool failed = false;
+        ParseError pe{"", 0, 0};
+        JsState st4;
+        try
+        {
+            node = parseProgramSource(source, g_scriptPath, nullptr, false, true, &params);
+        }
+        catch (ParseError &e)
+        {
+            st4.restore();
+            failed = true;
+            pe = e;
+        }
+        if (failed)
+        {
+            failure.failed = true;
+            failure.kind = "SyntaxError";
+            failure.message = pe.message;
+            failure.line = pe.line;
+            return 1;
+        }
+    }
+    int code = 0;
+    bool exited = false;
+    V uncaught = Hole;
+    Obj *mod = newObject();
+    Obj *exportsObj = newObject();
+    defineOwn(mod, atomOf("id"), strA("."), PF_DEFAULT);
+    defineOwn(mod, atomOf("path"), str(fs::path(g_scriptPath).parent_path().string()), PF_DEFAULT);
+    defineOwn(mod, atomOf("exports"), objv(exportsObj), PF_DEFAULT);
+    defineOwn(mod, atomOf("filename"), str(g_scriptPath), PF_DEFAULT);
+    defineOwn(mod, atomOf("loaded"), False, PF_DEFAULT);
+    defineOwn(mod, atomOf("children"), objv(newArray()), PF_DEFAULT);
+    defineOwn(mod, atomOf("paths"), objv(newArray()), PF_DEFAULT);
+    defineOwn(op(g_requireFn), atomOf("main"), objv(mod), PF_DEFAULT);
+    V args[5] = {objv(exportsObj), g_requireFn, objv(mod), str(g_scriptPath), str(fs::path(g_scriptPath).parent_path().string())};
+    JsState st5;
+    try
+    {
+        JsState st6;
+        try
+        {
+            runModuleFunction(node, objv(exportsObj), args, 5);
+        }
+        catch (JsThrow &t)
+        {
+            st6.restore();
+            uncaught = t.val;
+        }
+        if (uncaught != Hole)
+        {
+            V e = uncaught;
+            uncaught = Hole;
+            reportUncaught(e);
+        }
+        runEventLoop();
+        if (g_process != Undefined)
+        {
+            V ec2 = getProp(g_process, atomOf("exitCode"));
+            if (isNum(ec2))
+                code = (int)numOf(ec2);
+            V a = num((double)code);
+            invoke(g_process, atomOf("__beforeExit"), &a, 1);
+            runEventLoop();
+        }
+    }
+    catch (JsExit &e)
+    {
+        st5.restore();
+        code = e.code;
+        exited = true;
+    }
+    catch (JsThrow &t)
+    {
+        st5.restore();
+        writeErr(errorText(t.val) + "\n");
+        code = 1;
+    }
+    // exit handlers, once; process.exit inside one just ends them
+    if (g_process != Undefined)
+    {
+        JsState st7;
+        try
+        {
+            V ec2 = getProp(g_process, atomOf("exitCode"));
+            if (isNum(ec2) && !exited)
+                code = (int)numOf(ec2);
+            V a = num((double)code);
+            V r = invoke(g_process, atomOf("__runExit"), &a, 1);
+            if (isNum(r))
+                code = (int)numOf(r);
+        }
+        catch (JsExit &e)
+        {
+            st7.restore();
+            code = e.code;
+        }
+        catch (JsThrow &t)
+        {
+            st7.restore();
+            writeErr(errorText(t.val) + "\n");
+            code = 1;
+        }
+    }
+    flushOut();
+    return code;
+}
+
+} // namespace js

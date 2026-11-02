@@ -286,6 +286,17 @@ inline string __sciDigits(double v, int prec, int &exp10)
             continue;
         }
         exp10 = k;
+        // the estimate of k can be one too high when v is just under a power
+        // of ten: then v rounded to this length looks like 1000...
+        if (d[0] == '1' && d.find_first_not_of('0', 1) == string::npos)
+        {
+            string lower = __roundedDigits(v, k - 1 - prec);
+            if ((int)lower.size() == prec + 1)
+            {
+                exp10 = k - 1;
+                return lower;
+            }
+        }
         return d;
     }
     exp10 = k;

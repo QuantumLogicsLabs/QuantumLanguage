@@ -1,0 +1,430 @@
+// assert's error type. The logic is Node.js's own
+// (lib/internal/assert/assertion_error.js, adapted to run here).
+//
+// Copyright Joyent, Inc. and other Node contributors.
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+'use strict';
+
+const ArrayPrototypeJoin = (a, s) => a.join(s);
+const ArrayPrototypePop = (a) => a.pop();
+const ErrorCaptureStackTrace = Error.captureStackTrace;
+const MathMax = Math.max;
+const ObjectAssign = Object.assign;
+const ObjectDefineProperty = Object.defineProperty;
+const ObjectGetPrototypeOf = Object.getPrototypeOf;
+const StringPrototypeEndsWith = (s, e) => s.endsWith(e);
+const StringPrototypeRepeat = (s, n) => s.repeat(n);
+const StringPrototypeSlice = (s, a, b) => s.slice(a, b);
+const StringPrototypeSplit = (s, d) => s.split(d);
+const { inspect } = require('util');
+const removeColors = (s) => s.replace(/\u001b\[\d\d?m/g, '');
+const colors = { blue: '', green: '', white: '', red: '', clear: '', hasColors: false, refresh() {}, shouldColorize: () => false };
+const validateObject = (v, name) => {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+    const e = new TypeError(`The "${name}" argument must be of type object. Received ${internal.received(v)}`);
+    e.code = 'ERR_INVALID_ARG_TYPE';
+    throw e;
+  }
+};
+const isErrorStackTraceLimitWritable = () => true;
+
+const kReadableOperator = {
+  deepStrictEqual: 'Expected values to be strictly deep-equal:',
+  strictEqual: 'Expected values to be strictly equal:',
+  strictEqualObject: 'Expected "actual" to be reference-equal to "expected":',
+  deepEqual: 'Expected values to be loosely deep-equal:',
+  notDeepStrictEqual: 'Expected "actual" not to be strictly deep-equal to:',
+  notStrictEqual: 'Expected "actual" to be strictly unequal to:',
+  notStrictEqualObject:
+    'Expected "actual" not to be reference-equal to "expected":',
+  notDeepEqual: 'Expected "actual" not to be loosely deep-equal to:',
+  notIdentical: 'Values have same structure but are not reference-equal:',
+  notDeepEqualUnequal: 'Expected values not to be loosely deep-equal:',
+};
+
+const kMaxShortLength = 12;
+
+function copyError(source) {
+  const target = ObjectAssign({ __proto__: ObjectGetPrototypeOf(source) }, source);
+  ObjectDefineProperty(target, 'message', { __proto__: null, value: source.message });
+  return target;
+}
+
+function inspectValue(val) {
+  return inspect(
+    val,
+    {
+      compact: false,
+      customInspect: false,
+      depth: 1000,
+      maxArrayLength: Infinity,
+      showHidden: false,
+      showProxy: false,
+      sorted: true,
+      getters: true,
+    },
+  );
+}
+
+function getErrorMessage(operator, message) {
+  return message || kReadableOperator[operator];
+}
+
+function createErrDiff(actual, expected, operator, message = '') {
+  let other = '';
+  let res = '';
+  let end = '';
+  let skipped = false;
+  const actualInspected = inspectValue(actual);
+  const actualLines = StringPrototypeSplit(actualInspected, '\n');
+  const expectedLines = StringPrototypeSplit(inspectValue(expected), '\n');
+
+  let i = 0;
+  let indicator = '';
+
+  if (operator === 'strictEqual' &&
+      ((typeof actual === 'object' && actual !== null &&
+        typeof expected === 'object' && expected !== null) ||
+       (typeof actual === 'function' && typeof expected === 'function'))) {
+    operator = 'strictEqualObject';
+  }
+
+  if (actualLines.length === 1 && expectedLines.length === 1 &&
+    actualLines[0] !== expectedLines[0]) {
+    const c = inspect.defaultOptions.colors;
+    const actualRaw = c ? removeColors(actualLines[0]) : actualLines[0];
+    const expectedRaw = c ? removeColors(expectedLines[0]) : expectedLines[0];
+    const inputLength = actualRaw.length + expectedRaw.length;
+    if (inputLength <= kMaxShortLength) {
+      if ((typeof actual !== 'object' || actual === null) &&
+          (typeof expected !== 'object' || expected === null) &&
+          (actual !== 0 || expected !== 0)) { // -0 === +0
+        return `${getErrorMessage(operator, message)}\n\n` +
+            `${actualLines[0]} !== ${expectedLines[0]}\n`;
+      }
+    } else if (operator !== 'strictEqualObject') {
+      const maxLength = process.stderr.isTTY ? process.stderr.columns : 80;
+      if (inputLength < maxLength) {
+        while (actualRaw[i] === expectedRaw[i]) {
+          i++;
+        }
+        if (i > 2) {
+          indicator = `\n  ${StringPrototypeRepeat(' ', i)}^`;
+          i = 0;
+        }
+      }
+    }
+  }
+
+  let a = actualLines[actualLines.length - 1];
+  let b = expectedLines[expectedLines.length - 1];
+  while (a === b) {
+    if (i++ < 3) {
+      end = `\n  ${a}${end}`;
+    } else {
+      other = a;
+    }
+    ArrayPrototypePop(actualLines);
+    ArrayPrototypePop(expectedLines);
+    if (actualLines.length === 0 || expectedLines.length === 0)
+      break;
+    a = actualLines[actualLines.length - 1];
+    b = expectedLines[expectedLines.length - 1];
+  }
+
+  const maxLines = MathMax(actualLines.length, expectedLines.length);
+  if (maxLines === 0) {
+    const actualLines = StringPrototypeSplit(actualInspected, '\n');
+
+    if (actualLines.length > 50) {
+      actualLines[46] = `${colors.blue}...${colors.white}`;
+      while (actualLines.length > 47) {
+        ArrayPrototypePop(actualLines);
+      }
+    }
+
+    return `${kReadableOperator.notIdentical}\n\n` +
+           `${ArrayPrototypeJoin(actualLines, '\n')}\n`;
+  }
+
+  if (i >= 5) {
+    end = `\n${colors.blue}...${colors.white}${end}`;
+    skipped = true;
+  }
+  if (other !== '') {
+    end = `\n  ${other}${end}`;
+    other = '';
+  }
+
+  let printedLines = 0;
+  let identical = 0;
+  const msg = `${getErrorMessage(operator, message)}\n${colors.green}+ actual${colors.white} ${colors.red}- expected${colors.white}`;
+  const skippedMsg = ` ${colors.blue}...${colors.white} Lines skipped`;
+
+  let lines = actualLines;
+  let plusMinus = `${colors.green}+${colors.white}`;
+  let maxLength = expectedLines.length;
+  if (actualLines.length < maxLines) {
+    lines = expectedLines;
+    plusMinus = `${colors.red}-${colors.white}`;
+    maxLength = actualLines.length;
+  }
+
+  for (i = 0; i < maxLines; i++) {
+    if (maxLength < i + 1) {
+      if (identical > 2) {
+        if (identical > 3) {
+          if (identical > 4) {
+            if (identical === 5) {
+              res += `\n  ${lines[i - 3]}`;
+              printedLines++;
+            } else {
+              res += `\n${colors.blue}...${colors.white}`;
+              skipped = true;
+            }
+          }
+          res += `\n  ${lines[i - 2]}`;
+          printedLines++;
+        }
+        res += `\n  ${lines[i - 1]}`;
+        printedLines++;
+      }
+      identical = 0;
+      if (lines === actualLines) {
+        res += `\n${plusMinus} ${lines[i]}`;
+      } else {
+        other += `\n${plusMinus} ${lines[i]}`;
+      }
+      printedLines++;
+    } else {
+      const expectedLine = expectedLines[i];
+      let actualLine = actualLines[i];
+      let divergingLines =
+        actualLine !== expectedLine &&
+        (!StringPrototypeEndsWith(actualLine, ',') ||
+         StringPrototypeSlice(actualLine, 0, -1) !== expectedLine);
+      if (divergingLines &&
+          StringPrototypeEndsWith(expectedLine, ',') &&
+          StringPrototypeSlice(expectedLine, 0, -1) === actualLine) {
+        divergingLines = false;
+        actualLine += ',';
+      }
+      if (divergingLines) {
+        if (identical > 2) {
+          if (identical > 3) {
+            if (identical > 4) {
+              if (identical === 5) {
+                res += `\n  ${actualLines[i - 3]}`;
+                printedLines++;
+              } else {
+                res += `\n${colors.blue}...${colors.white}`;
+                skipped = true;
+              }
+            }
+            res += `\n  ${actualLines[i - 2]}`;
+            printedLines++;
+          }
+          res += `\n  ${actualLines[i - 1]}`;
+          printedLines++;
+        }
+        identical = 0;
+        res += `\n${colors.green}+${colors.white} ${actualLine}`;
+        other += `\n${colors.red}-${colors.white} ${expectedLine}`;
+        printedLines += 2;
+      } else {
+        res += other;
+        other = '';
+        identical++;
+        if (identical <= 2) {
+          res += `\n  ${actualLine}`;
+          printedLines++;
+        }
+      }
+    }
+    if (printedLines > 50 && i < maxLines - 2) {
+      return `${msg}${skippedMsg}\n${res}\n${colors.blue}...${colors.white}${other}\n` +
+             `${colors.blue}...${colors.white}`;
+    }
+  }
+
+  return `${msg}${skipped ? skippedMsg : ''}\n${res}${other}${end}${indicator}`;
+}
+
+function addEllipsis(string) {
+  const lines = StringPrototypeSplit(string, '\n', 11);
+  if (lines.length > 10) {
+    lines.length = 10;
+    return `${ArrayPrototypeJoin(lines, '\n')}\n...`;
+  } else if (string.length > 512) {
+    return `${StringPrototypeSlice(string, 512)}...`;
+  }
+  return string;
+}
+
+class AssertionError extends Error {
+  constructor(options) {
+    validateObject(options, 'options');
+    const {
+      message,
+      operator,
+      stackStartFn,
+      details,
+      stackStartFunction,
+    } = options;
+    let {
+      actual,
+      expected,
+    } = options;
+
+    const limit = Error.stackTraceLimit;
+    if (isErrorStackTraceLimitWritable()) Error.stackTraceLimit = 0;
+
+    if (message != null) {
+      if (operator === 'deepStrictEqual' || operator === 'strictEqual') {
+        super(createErrDiff(actual, expected, operator, message));
+      } else {
+        super(String(message));
+      }
+    } else {
+      colors.refresh();
+      if (typeof actual === 'object' && actual !== null &&
+          typeof expected === 'object' && expected !== null &&
+          'stack' in actual && actual instanceof Error &&
+          'stack' in expected && expected instanceof Error) {
+        actual = copyError(actual);
+        expected = copyError(expected);
+      }
+
+      if (operator === 'deepStrictEqual' || operator === 'strictEqual') {
+        super(createErrDiff(actual, expected, operator));
+      } else if (operator === 'notDeepStrictEqual' ||
+        operator === 'notStrictEqual') {
+        let base = kReadableOperator[operator];
+        const res = StringPrototypeSplit(inspectValue(actual), '\n');
+
+        if (operator === 'notStrictEqual' &&
+            ((typeof actual === 'object' && actual !== null) ||
+             typeof actual === 'function')) {
+          base = kReadableOperator.notStrictEqualObject;
+        }
+
+        if (res.length > 50) {
+          res[46] = `${colors.blue}...${colors.white}`;
+          while (res.length > 47) {
+            ArrayPrototypePop(res);
+          }
+        }
+
+        if (res.length === 1) {
+          super(`${base}${res[0].length > 5 ? '\n\n' : ' '}${res[0]}`);
+        } else {
+          super(`${base}\n\n${ArrayPrototypeJoin(res, '\n')}\n`);
+        }
+      } else {
+        let res = inspectValue(actual);
+        let other = inspectValue(expected);
+        const knownOperator = kReadableOperator[operator];
+        if (operator === 'notDeepEqual' && res === other) {
+          res = `${knownOperator}\n\n${res}`;
+          if (res.length > 1024) {
+            res = `${StringPrototypeSlice(res, 0, 1021)}...`;
+          }
+          super(res);
+        } else {
+          if (res.length > 512) {
+            res = `${StringPrototypeSlice(res, 0, 509)}...`;
+          }
+          if (other.length > 512) {
+            other = `${StringPrototypeSlice(other, 0, 509)}...`;
+          }
+          if (operator === 'deepEqual') {
+            res = `${knownOperator}\n\n${res}\n\nshould loosely deep-equal\n\n`;
+          } else {
+            const newOp = kReadableOperator[`${operator}Unequal`];
+            if (newOp) {
+              res = `${newOp}\n\n${res}\n\nshould not loosely deep-equal\n\n`;
+            } else {
+              other = ` ${operator} ${other}`;
+            }
+          }
+          super(`${res}${other}`);
+        }
+      }
+    }
+
+    if (isErrorStackTraceLimitWritable()) Error.stackTraceLimit = limit;
+
+    this.generatedMessage = !message;
+    ObjectDefineProperty(this, 'name', {
+      __proto__: null,
+      value: 'AssertionError [ERR_ASSERTION]',
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    this.code = 'ERR_ASSERTION';
+    if (details) {
+      this.actual = undefined;
+      this.expected = undefined;
+      this.operator = undefined;
+      for (let i = 0; i < details.length; i++) {
+        this['message ' + i] = details[i].message;
+        this['actual ' + i] = details[i].actual;
+        this['expected ' + i] = details[i].expected;
+        this['operator ' + i] = details[i].operator;
+        this['stack trace ' + i] = details[i].stack;
+      }
+    } else {
+      this.actual = actual;
+      this.expected = expected;
+      this.operator = operator;
+    }
+    ErrorCaptureStackTrace(this, stackStartFn || stackStartFunction);
+    this.stack; // eslint-disable-line no-unused-expressions
+    this.name = 'AssertionError';
+  }
+
+  toString() {
+    return `${this.name} [${this.code}]: ${this.message}`;
+  }
+
+  [inspect.custom](recurseTimes, ctx) {
+    const tmpActual = this.actual;
+    const tmpExpected = this.expected;
+
+    if (typeof this.actual === 'string') {
+      this.actual = addEllipsis(this.actual);
+    }
+    if (typeof this.expected === 'string') {
+      this.expected = addEllipsis(this.expected);
+    }
+
+    const result = inspect(this, {
+      ...ctx,
+      customInspect: false,
+      depth: 0,
+    });
+
+    this.actual = tmpActual;
+    this.expected = tmpExpected;
+
+    return result;
+  }
+}
+
+
+module.exports = AssertionError;

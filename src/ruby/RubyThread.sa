@@ -74,11 +74,7 @@ struct Co
     bool reportOnException = true;
 };
 
-struct KillEx
-{
-    int unused;
-};
-
+RClass *g_cFatal = nullptr; // `fatal`: has a name but no constant
 std::vector<Co *> g_all;
 Co *g_cur = nullptr, *g_main = nullptr;
 double g_skew = 0;
@@ -214,6 +210,9 @@ void removeCo(Co *c)
         if (g_all[i] == c)
         {
             g_all.erase(g_all.begin() + (long)i);
+            // pick starts after g_next: the one that moved into this slot goes next
+            if (i <= g_next)
+                g_next = g_next > 0 ? g_next - 1 : g_all.size() - 1;
             if (g_next >= g_all.size())
                 g_next = 0;
             return;
@@ -252,7 +251,7 @@ bool blockOn(Interp &I, V cond, double timeout, bool forever)
         // a deadlock: the main thread hears about it
         me->state = S_RUNNABLE;
         me->waitProc = Qnil;
-        V exc = I.makeExc(I.cThreadError, "No live threads left. Deadlock");
+        V exc = I.makeExc(g_cFatal, "No live threads left. Deadlock?");
         if (me == g_main || me->owner == g_main)
             I.raiseExc(exc);
         g_main->pending = exc;
@@ -342,7 +341,7 @@ void coBody(Interp &I, Co *c)
     Co *next = pick(I);
     if (!next)
     {
-        g_main->pending = I.makeExc(I.cThreadError, "No live threads left. Deadlock");
+        g_main->pending = I.makeExc(g_cFatal, "No live threads left. Deadlock?");
         g_main->woken = true;
         next = g_main;
     }
@@ -816,6 +815,8 @@ void Interp::initThread()
     cThread = newClass(cObject, false);
     nameClass(cThread, intern("Thread"), cObject);
     cFiber = defineClass("Fiber", cObject);
+    g_cFatal = newClass(cException, false);
+    nameClass(g_cFatal, intern("fatal"), cObject);
     g_main = new Co();
     g_main->started = true;
     g_main->event = __dll_kernel32::CreateEventA(nullptr, 0, 0, nullptr);

@@ -1,0 +1,1523 @@
+// quantum: cpp
+// JavaScript front-end: Date, and the storage side of typed arrays. The methods
+// of typed arrays that are not about storage live in lib/typedarray.sa.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+
+namespace __dll_kernel32
+{
+unsigned long GetTimeZoneInformation(void *info);
+} // namespace __dll_kernel32
+
+namespace js
+{
+
+namespace
+{
+
+// ── calendar arithmetic ──────────────────────────────────────────────────
+
+const double MS_DAY = 86400000.0;
+
+double daysFromCivil(double y, int m, int d)
+{
+    // m: 0-11; days since 1970-01-01
+    y += std::floor(m / 12.0);
+    m = ((m % 12) + 12) % 12;
+    double yy = m < 2 ? y - 1 : y;
+    double era = std::floor(yy / 400);
+    double yoe = yy - era * 400;
+    int mp = (m + 10) % 12;
+    double doy = std::floor((153.0 * mp + 2) / 5) + d - 1;
+    double doe = yoe * 365 + std::floor(yoe / 4) - std::floor(yoe / 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+void civilFromDays(double z, double *y, int *m, int *d)
+{
+    z += 719468;
+    double era = std::floor(z / 146097);
+    double doe = z - era * 146097;
+    double yoe = std::floor((doe - std::floor(doe / 1460) + std::floor(doe / 36524) - std::floor(doe / 146096)) / 365);
+    double yr = yoe + era * 400;
+    double doy = doe - (365 * yoe + std::floor(yoe / 4) - std::floor(yoe / 100));
+    int mp = (int)std::floor((5 * doy + 2) / 153);
+    *d = (int)(doy - std::floor((153.0 * mp + 2) / 5) + 1);
+    *m = mp < 10 ? mp + 2 : mp - 10;
+    *y = *m < 2 ? yr + 1 : yr;
+}
+
+double makeTime(double y, double mo, double d, double h, double mi, double s, double ms)
+{
+    if (y != y || mo != mo || d != d || h != h || mi != mi || s != s || ms != ms)
+        return 0.0 / 0.0;
+    if (y - y != 0 || mo - mo != 0 || d - d != 0 || h - h != 0 || mi - mi != 0 || s - s != 0 || ms - ms != 0)
+        return 0.0 / 0.0;
+    double ym = std::trunc(y) + std::floor(std::trunc(mo) / 12);
+    int mn = (int)std::fmod(std::fmod(std::trunc(mo), 12) + 12, 12);
+    double day = daysFromCivil(ym, mn, 1) + std::trunc(d) - 1;
+    return day * MS_DAY + std::trunc(h) * 3600000 + std::trunc(mi) * 60000 + std::trunc(s) * 1000 + std::trunc(ms);
+}
+
+double timeClip(double t)
+{
+    if (t != t || std::fabs(t) > 8.64e15)
+        return 0.0 / 0.0;
+    return std::trunc(t) + 0.0;
+}
+
+struct Parts
+{
+    double year;
+    int mon, day, wday, hour, min, sec, ms;
+};
+
+void partsOf(double t, Parts &p)
+{
+    double days = std::floor(t / MS_DAY);
+    double rem = t - days * MS_DAY;
+    civilFromDays(days, &p.year, &p.mon, &p.day);
+    p.wday = (int)std::fmod(std::fmod(days + 4, 7) + 7, 7);
+    p.hour = (int)std::floor(rem / 3600000);
+    rem -= p.hour * 3600000.0;
+    p.min = (int)std::floor(rem / 60000);
+    rem -= p.min * 60000.0;
+    p.sec = (int)std::floor(rem / 1000);
+    p.ms = (int)(rem - p.sec * 1000.0);
+}
+
+// the machine's offset from UTC, in minutes east, and its zone's name
+int g_tzReady = 0;
+int g_tzMinutes = 0;
+std::string g_tzName = "Coordinated Universal Time";
+
+void loadTz()
+{
+    if (g_tzReady)
+        return;
+    g_tzReady = 1;
+    int32_t info[60];
+    unsigned long r = __dll_kernel32::GetTimeZoneInformation(info);
+    int bias = info[0];
+    int stdBias = info[21];
+    int dayBias = info[42];
+    g_tzMinutes = -(bias + (r == 2 ? dayBias : stdBias));
+    const uint16_t *name = reinterpret_cast<const uint16_t *>(&info[r == 2 ? 22 : 1]);
+    int n = 0;
+    while (n < 32 && name[n])
+        ++n;
+    if (n)
+        g_tzName = toUtf8(newStrUnits(name, n));
+}
+
+double toLocal(double t)
+{
+    loadTz();
+    return t + g_tzMinutes * 60000.0;
+}
+
+double toUtc(double t)
+{
+    loadTz();
+    return t - g_tzMinutes * 60000.0;
+}
+
+const char *const DAY_NAMES[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+const char *const MON_NAMES[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+JPrim *thisDate(V v)
+{
+    if (!isObj(v) || op(v)->cls != C_DATE)
+        throwType("this is not a Date object.");
+    return static_cast<JPrim *>(op(v));
+}
+
+std::string yearText(double y)
+{
+    char buf[32];
+    if (y >= 0 && y <= 9999)
+        snprintf(buf, sizeof buf, "%04d", (int)y);
+    else if (y >= 0)
+        snprintf(buf, sizeof buf, "+%06d", (int)y);
+    else
+        snprintf(buf, sizeof buf, "-%06d", (int)-y);
+    return buf;
+}
+
+std::string isoString(double t)
+{
+    Parts p;
+    partsOf(t, p);
+    char buf[64];
+    snprintf(buf, sizeof buf, "-%02d-%02dT%02d:%02d:%02d.%03dZ", p.mon + 1, p.day, p.hour, p.min, p.sec, p.ms);
+    return yearText(p.year) + buf;
+}
+
+std::string datePart(double local)
+{
+    Parts p;
+    partsOf(local, p);
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s %s %02d ", DAY_NAMES[p.wday], MON_NAMES[p.mon], p.day);
+    std::string y = p.year >= 0 ? (p.year <= 9999 ? yearText(p.year) : std::to_string((long long)p.year)) : "-" + std::to_string((long long)-p.year);
+    return buf + y;
+}
+
+std::string timePart(double local)
+{
+    loadTz();
+    Parts p;
+    partsOf(local, p);
+    char buf[64];
+    int off = g_tzMinutes < 0 ? -g_tzMinutes : g_tzMinutes;
+    snprintf(buf, sizeof buf, "%02d:%02d:%02d GMT%c%02d%02d (", p.hour, p.min, p.sec, g_tzMinutes < 0 ? '-' : '+', off / 60, off % 60);
+    return buf + g_tzName + ")";
+}
+
+// ── parsing ──────────────────────────────────────────────────────────────
+
+// V8's fallback grammar: numbers, names and zones in nearly any order
+struct DateWord
+{
+    const char *prefix;
+    int type; // 0 month, 1 am/pm, 2 zone, 3 T
+    int value;
+};
+
+const DateWord g_dateWords[] = {
+    {"jan", 0, 1}, {"feb", 0, 2}, {"mar", 0, 3}, {"apr", 0, 4}, {"may", 0, 5}, {"jun", 0, 6}, {"jul", 0, 7}, {"aug", 0, 8}, {"sep", 0, 9}, {"oct", 0, 10}, {"nov", 0, 11}, {"dec", 0, 12},
+    {"am", 1, 0}, {"pm", 1, 12}, {"ut", 2, 0}, {"utc", 2, 0}, {"z", 2, 0}, {"gmt", 2, 0}, {"cdt", 2, -5}, {"cst", 2, -6}, {"edt", 2, -4}, {"est", 2, -5}, {"mdt", 2, -6}, {"mst", 2, -7}, {"pdt", 2, -7}, {"pst", 2, -8}, {"t", 3, 0},
+};
+
+double parseLegacyDate(const std::string &s)
+{
+    const int kNone = 2147483647;
+    int dayComp[3] = {0, 0, 0}, dayCount = 0, namedMonth = kNone;
+    int timeComp[4] = {0, 0, 0, 0}, timeCount = 0, hourOffset = kNone;
+    int tzSign = kNone, tzHour = kNone, tzMinute = kNone;
+    bool hasReadNumber = false;
+    size_t i = 0, n = s.size();
+    const double nan = 0.0 / 0.0;
+    while (i < n)
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= '0' && c <= '9')
+        {
+            size_t start = i;
+            int value = 0;
+            bool big = false;
+            while (i < n && s[i] >= '0' && s[i] <= '9')
+            {
+                if (value > 214748363)
+                    big = true;
+                else
+                    value = value * 10 + (s[i] - '0');
+                ++i;
+            }
+            if (big)
+                value = kNone - 1;
+            (void)start;
+            hasReadNumber = true;
+            bool timeExpects = (timeCount == 1 && value < 60) || (timeCount == 2 && value < 60) || (timeCount == 3 && value < 1000);
+            if (i < n && s[i] == ':')
+            {
+                ++i;
+                if (i < n && s[i] == ':')
+                    return nan;
+                if (timeCount >= 4)
+                    return nan;
+                timeComp[timeCount++] = value;
+                if (i < n && s[i] == '.')
+                    ++i;
+            }
+            else if (i < n && s[i] == '.' && timeExpects)
+            {
+                ++i;
+                timeComp[timeCount++] = value;
+                if (i >= n || s[i] < '0' || s[i] > '9')
+                    return nan;
+                int ms = 0, digits = 0;
+                while (i < n && s[i] >= '0' && s[i] <= '9')
+                {
+                    if (digits < 3)
+                        ms = ms * 10 + (s[i] - '0');
+                    ++digits;
+                    ++i;
+                }
+                while (digits < 3)
+                {
+                    ms *= 10;
+                    ++digits;
+                }
+                if (timeCount < 4)
+                    timeComp[timeCount++] = ms;
+                while (timeCount < 4)
+                    timeComp[timeCount++] = 0;
+            }
+            else if (tzHour != kNone && tzMinute == kNone && value < 60)
+                tzMinute = value;
+            else if (timeExpects)
+            {
+                timeComp[timeCount++] = value;
+                while (timeCount < 4)
+                    timeComp[timeCount++] = 0;
+                if (i < n)
+                {
+                    char p = s[i];
+                    bool z = p == 'Z' || p == 'z';
+                    if (p != ' ' && p != '\t' && !z && p != '+' && p != '-')
+                        return nan;
+                }
+            }
+            else
+            {
+                if (dayCount == 3)
+                    return nan;
+                dayComp[dayCount++] = value;
+                if (i < n && s[i] == '-')
+                    ++i;
+            }
+            continue;
+        }
+        if (c == ':' || c == '.')
+        {
+            ++i;
+            continue;
+        }
+        if (c == '+' || c == '-')
+        {
+            ++i;
+            bool utc = tzHour == 0 && tzMinute == 0;
+            if (utc || timeCount != 0)
+            {
+                tzSign = c == '+' ? 1 : -1;
+                int value = 0, length = 0;
+                while (i < n && s[i] >= '0' && s[i] <= '9')
+                {
+                    value = value * 10 + (s[i] - '0');
+                    ++length;
+                    ++i;
+                }
+                hasReadNumber = true;
+                if (i < n && s[i] == ':')
+                {
+                    tzHour = value;
+                    tzMinute = kNone;
+                }
+                else if (length == 2 || length == 1)
+                {
+                    tzHour = value;
+                    tzMinute = 0;
+                }
+                else if (length == 4 || length == 3)
+                {
+                    tzHour = value / 100;
+                    tzMinute = value % 100;
+                }
+                else
+                    return nan;
+            }
+            else if (hasReadNumber)
+                return nan;
+            continue;
+        }
+        if (c == ')')
+        {
+            ++i;
+            if (hasReadNumber)
+                return nan;
+            continue;
+        }
+        if (c >= 'A' && c != ' ' && c != 0xA0)
+        {
+            std::string word;
+            while (i < n && (unsigned char)s[i] >= 'A')
+            {
+                char w = s[i];
+                if (word.size() < 3)
+                    word += (char)(w >= 'A' && w <= 'Z' ? w + 32 : w);
+                ++i;
+            }
+            size_t whole = 0;
+            {
+                size_t back = i;
+                while (back > 0 && (unsigned char)s[back - 1] >= 'A')
+                    --back;
+                whole = i - back;
+            }
+            const DateWord *found = nullptr;
+            for (const DateWord &k : g_dateWords)
+                if (word == k.prefix && (whole <= 3 || k.type == 0))
+                    found = &k;
+            if (found && found->type == 1 && timeCount != 0)
+                hourOffset = found->value;
+            else if (found && found->type == 0)
+            {
+                namedMonth = found->value;
+                if (i < n && s[i] == '-')
+                    ++i;
+            }
+            else if (found && found->type == 2 && hasReadNumber)
+            {
+                tzSign = found->value < 0 ? -1 : 1;
+                tzHour = found->value < 0 ? -found->value : found->value;
+                tzMinute = 0;
+            }
+            else
+            {
+                if (hasReadNumber)
+                    return nan;
+                if (i < n && s[i] >= '0' && s[i] <= '9')
+                    return nan;
+            }
+            continue;
+        }
+        if (c == '(')
+        {
+            int depth = 0;
+            while (i < n)
+            {
+                if (s[i] == '(')
+                    ++depth;
+                else if (s[i] == ')')
+                    --depth;
+                ++i;
+                if (depth == 0)
+                    break;
+            }
+            continue;
+        }
+        ++i;
+    }
+    if (dayCount < 1)
+        return nan;
+    int filled = dayCount;
+    while (filled < 3)
+        dayComp[filled++] = 1;
+    int year = 0, month, day;
+    bool firstIsDay = dayComp[0] >= 1 && dayComp[0] <= 31;
+    if (namedMonth == kNone)
+    {
+        if (!firstIsDay)
+        {
+            year = dayComp[0];
+            month = dayComp[1];
+            day = dayComp[2];
+        }
+        else
+        {
+            month = dayComp[0];
+            day = dayComp[1];
+            year = dayComp[2];
+        }
+    }
+    else
+    {
+        month = namedMonth;
+        if (dayCount == 1 && firstIsDay)
+            day = dayComp[0], year = 1;
+        else if (dayCount == 1)
+            year = dayComp[0], day = 1;
+        else if (!firstIsDay)
+        {
+            year = dayComp[0];
+            day = dayComp[1];
+        }
+        else
+        {
+            day = dayComp[0];
+            year = dayComp[1];
+        }
+    }
+    if (year >= 0 && year <= 49)
+        year += 2000;
+    else if (year >= 50 && year <= 99)
+        year += 1900;
+    if (month < 1 || month > 12 || day < 1 || day > 31)
+        return nan;
+    while (timeCount < 4)
+        timeComp[timeCount++] = 0;
+    int hour = timeComp[0];
+    if (hourOffset != kNone)
+    {
+        if (hour < 0 || hour > 12)
+            return nan;
+        hour = hour % 12 + hourOffset;
+    }
+    if (hour > 23 || timeComp[1] > 59 || timeComp[2] > 59 || timeComp[3] > 999)
+    {
+        if (hour != 24 || timeComp[1] != 0 || timeComp[2] != 0 || timeComp[3] != 0)
+            return nan;
+    }
+    double t = makeTime(year, month - 1, day, hour, timeComp[1], timeComp[2], timeComp[3]);
+    if (tzSign != kNone)
+    {
+        int zh = tzHour == kNone ? 0 : tzHour, zm = tzMinute == kNone ? 0 : tzMinute;
+        return t - tzSign * (zh * 3600.0 + zm * 60.0) * 1000.0;
+    }
+    return toUtc(t);
+}
+
+double parseDate(const std::string &s0)
+{
+    std::string s = s0;
+    size_t b = 0;
+    while (b < s.size() && s[b] == ' ')
+        ++b;
+    s = s.substr(b);
+    // ISO: YYYY[-MM[-DD]][THH:MM[:SS[.mmm]]][Z|+HH:MM]
+    {
+        size_t i = 0;
+        int sign = 0;
+        if (i < s.size() && (s[i] == '+' || s[i] == '-'))
+            sign = s[i++] == '-' ? -1 : 1;
+        int want = sign ? 6 : 4;
+        size_t st = i;
+        double y = 0;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9' && (int)(i - st) < want)
+            y = y * 10 + (s[i++] - '0');
+        if ((int)(i - st) == want && (i >= s.size() || s[i] == '-' || s[i] == 'T' || s[i] == 't' || s[i] == ' '))
+        {
+            bool ok = true;
+            int mo = 1, d = 1, h = 0, mi = 0, sec = 0;
+            double ms = 0;
+            bool hasTime = false, hasZone = false;
+            int zone = 0;
+            auto two = [&](int *out) {
+                if (i + 1 < s.size() && s[i] >= '0' && s[i] <= '9' && s[i + 1] >= '0' && s[i + 1] <= '9')
+                {
+                    *out = (s[i] - '0') * 10 + (s[i + 1] - '0');
+                    i += 2;
+                    return true;
+                }
+                return false;
+            };
+            if (i < s.size() && s[i] == '-')
+            {
+                ++i;
+                ok = two(&mo);
+                if (ok && i < s.size() && s[i] == '-')
+                {
+                    ++i;
+                    ok = two(&d);
+                }
+            }
+            if (ok && i < s.size() && (s[i] == 'T' || s[i] == 't' || s[i] == ' '))
+            {
+                ++i;
+                hasTime = true;
+                ok = two(&h) && i < s.size() && s[i] == ':';
+                if (ok)
+                {
+                    ++i;
+                    ok = two(&mi);
+                }
+                if (ok && i < s.size() && s[i] == ':')
+                {
+                    ++i;
+                    ok = two(&sec);
+                    if (ok && i < s.size() && s[i] == '.')
+                    {
+                        ++i;
+                        double scale = 100;
+                        int cnt = 0;
+                        while (i < s.size() && s[i] >= '0' && s[i] <= '9')
+                        {
+                            ms += (s[i] - '0') * scale;
+                            scale /= 10;
+                            ++i;
+                            ++cnt;
+                        }
+                        ms = std::floor(ms);
+                        if (!cnt)
+                            ok = false;
+                    }
+                }
+                if (ok && i < s.size())
+                {
+                    if (s[i] == 'Z' || s[i] == 'z')
+                    {
+                        hasZone = true;
+                        ++i;
+                    }
+                    else if (s[i] == '+' || s[i] == '-')
+                    {
+                        int zs = s[i++] == '-' ? -1 : 1;
+                        int zh = 0, zm = 0;
+                        ok = two(&zh);
+                        if (ok && i < s.size() && s[i] == ':')
+                            ++i;
+                        if (ok)
+                            ok = two(&zm);
+                        zone = zs * (zh * 60 + zm);
+                        hasZone = true;
+                    }
+                }
+            }
+            if (ok && i == s.size())
+            {
+                if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 24 || mi > 59 || sec > 59 || (h == 24 && (mi || sec || ms)))
+                    return 0.0 / 0.0;
+                double t = makeTime(sign < 0 ? -y : y, mo - 1, d, h, mi, sec, ms);
+                if (hasZone)
+                    return t - zone * 60000.0;
+                return hasTime ? toUtc(t) : t;
+            }
+        }
+    }
+    return parseLegacyDate(s);
+}
+
+// the wall clock at the start, moved on as the event loop's clock moves
+double nowMs()
+{
+    static bool started = false;
+    static double base = 0;
+    double passed = virtualNow();
+    if (!started)
+    {
+        auto now = std::chrono::system_clock::now().time_since_epoch();
+        base = (double)std::chrono::duration_cast<std::chrono::milliseconds>(now).count() - passed;
+        started = true;
+    }
+    return std::floor(base + passed);
+}
+
+// ── Date ─────────────────────────────────────────────────────────────────
+
+V dateCtor(V, V *args, int argc)
+{
+    if (g_nativeNewTarget == Undefined)
+    {
+        double t = nowMs();
+        double l = toLocal(t);
+        return str(datePart(l) + " " + timePart(l));
+    }
+    double t;
+    if (argc == 0)
+        t = nowMs();
+    else if (argc == 1)
+    {
+        V v = args[0];
+        if (isObj(v) && op(v)->cls == C_DATE)
+            t = static_cast<JPrim *>(op(v))->num;
+        else
+        {
+            v = toPrimitive(v, 0);
+            t = isStr(v) ? parseDate(toUtf8(sp_(v))) : timeClip(toNumber(v));
+        }
+    }
+    else
+    {
+        double f[7] = {0, 0, 1, 0, 0, 0, 0};
+        for (int i = 0; i < argc && i < 7; ++i)
+            f[i] = toNumber(args[i]);
+        if (f[0] == f[0])
+        {
+            double yi = std::trunc(f[0]);
+            if (yi >= 0 && yi <= 99)
+                f[0] = 1900 + yi;
+        }
+        double lt = makeTime(f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+        t = timeClip(lt != lt ? lt : toUtc(lt));
+    }
+    JPrim *d = static_cast<JPrim *>(allocObj(sizeof(JPrim), C_DATE, protoFromCtor(g_nativeNewTarget, PR.date)));
+    d->val = Undefined;
+    d->num = t;
+    return objv(d);
+}
+
+V dNow(V, V *, int)
+{
+    return num(nowMs());
+}
+
+V dParse(V, V *args, int argc)
+{
+    return num(parseDate(toUtf8V(argOr(args, argc, 0))));
+}
+
+V dUTC(V, V *args, int argc)
+{
+    double f[7] = {0.0 / 0.0, 0, 1, 0, 0, 0, 0};
+    for (int i = 0; i < argc && i < 7; ++i)
+        f[i] = toNumber(args[i]);
+    if (f[0] == f[0])
+    {
+        double yi = std::trunc(f[0]);
+        if (yi >= 0 && yi <= 99)
+            f[0] = 1900 + yi;
+    }
+    return num(timeClip(makeTime(f[0], f[1], f[2], f[3], f[4], f[5], f[6])));
+}
+
+V dGetTime(V thisV, V *, int)
+{
+    return num(thisDate(thisV)->num);
+}
+
+enum Field
+{
+    F_YEAR, F_MONTH, F_DATE, F_DAY, F_HOURS, F_MINUTES, F_SECONDS, F_MS
+};
+
+V getField(V thisV, int field, bool local)
+{
+    double t = thisDate(thisV)->num;
+    if (t != t)
+        return num(t);
+    Parts p;
+    partsOf(local ? toLocal(t) : t, p);
+    switch (field)
+    {
+    case F_YEAR: return num(p.year);
+    case F_MONTH: return num(p.mon);
+    case F_DATE: return num(p.day);
+    case F_DAY: return num(p.wday);
+    case F_HOURS: return num(p.hour);
+    case F_MINUTES: return num(p.min);
+    case F_SECONDS: return num(p.sec);
+    default: return num(p.ms);
+    }
+}
+
+V dGetFullYear(V thisV, V *, int)
+{
+    return getField(thisV, F_YEAR, true);
+}
+
+V dGetUTCFullYear(V thisV, V *, int)
+{
+    return getField(thisV, F_YEAR, false);
+}
+
+V dGetMonth(V thisV, V *, int)
+{
+    return getField(thisV, F_MONTH, true);
+}
+
+V dGetUTCMonth(V thisV, V *, int)
+{
+    return getField(thisV, F_MONTH, false);
+}
+
+V dGetDate(V thisV, V *, int)
+{
+    return getField(thisV, F_DATE, true);
+}
+
+V dGetUTCDate(V thisV, V *, int)
+{
+    return getField(thisV, F_DATE, false);
+}
+
+V dGetDay(V thisV, V *, int)
+{
+    return getField(thisV, F_DAY, true);
+}
+
+V dGetUTCDay(V thisV, V *, int)
+{
+    return getField(thisV, F_DAY, false);
+}
+
+V dGetHours(V thisV, V *, int)
+{
+    return getField(thisV, F_HOURS, true);
+}
+
+V dGetUTCHours(V thisV, V *, int)
+{
+    return getField(thisV, F_HOURS, false);
+}
+
+V dGetMinutes(V thisV, V *, int)
+{
+    return getField(thisV, F_MINUTES, true);
+}
+
+V dGetUTCMinutes(V thisV, V *, int)
+{
+    return getField(thisV, F_MINUTES, false);
+}
+
+V dGetSeconds(V thisV, V *, int)
+{
+    return getField(thisV, F_SECONDS, true);
+}
+
+V dGetUTCSeconds(V thisV, V *, int)
+{
+    return getField(thisV, F_SECONDS, false);
+}
+
+V dGetMilliseconds(V thisV, V *, int)
+{
+    return getField(thisV, F_MS, true);
+}
+
+V dGetUTCMilliseconds(V thisV, V *, int)
+{
+    return getField(thisV, F_MS, false);
+}
+
+V dSetTimeImpl(V thisV, V *args, int argc);
+V dSetFullYear(V thisV, V *args, int argc);
+
+V dSetYear(V thisV, V *args, int argc)
+{
+    double y = toNumber(argOr(args, argc, 0));
+    if (y != y)
+    {
+        V nan = num(y);
+        return dSetTimeImpl(thisV, &nan, 1);
+    }
+    double t = std::trunc(y);
+    if (t >= 0 && t <= 99)
+        t += 1900;
+    V a = num(t);
+    return dSetFullYear(thisV, &a, 1);
+}
+
+V dGetYear(V thisV, V *, int)
+{
+    V y = getField(thisV, F_YEAR, true);
+    return num(numOf(y) - 1900);
+}
+
+V dGetTimezoneOffset(V thisV, V *, int)
+{
+    double t = thisDate(thisV)->num;
+    if (t != t)
+        return num(t);
+    loadTz();
+    return num((double)-g_tzMinutes);
+}
+
+// setX(v...): the first field is `field`, later arguments the ones after it
+V setField(V thisV, V *args, int argc, int field, bool local)
+{
+    JPrim *d = thisDate(thisV);
+    double t = d->num;
+    double vals[4];
+    int n = 0;
+    for (int i = 0; i < argc && i < 4; ++i)
+        vals[n++] = toNumber(args[i]);
+    if (argc == 0)
+    {
+        d->num = 0.0 / 0.0;
+        return num(d->num);
+    }
+    if (t != t)
+    {
+        if (field != F_YEAR)
+            return num(t);
+        t = 0;
+    }
+    else if (local)
+        t = toLocal(t);
+    Parts p;
+    partsOf(t, p);
+    double f[7] = {p.year, (double)p.mon, (double)p.day, (double)p.hour, (double)p.min, (double)p.sec, (double)p.ms};
+    int at = field == F_YEAR ? 0 : field == F_MONTH ? 1 : field == F_DATE ? 2 : field == F_HOURS ? 3 : field == F_MINUTES ? 4 : field == F_SECONDS ? 5 : 6;
+    int maxAt = at <= 2 ? 2 : 6;
+    for (int i = 0; i < n && at + i <= maxAt; ++i)
+        f[at + i] = vals[i];
+    double nt = makeTime(f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+    if (local && nt == nt)
+        nt = toUtc(nt);
+    d->num = timeClip(nt);
+    return num(d->num);
+}
+
+V dSetFullYear(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_YEAR, true);
+}
+
+V dSetUTCFullYear(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_YEAR, false);
+}
+
+V dSetMonth(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_MONTH, true);
+}
+
+V dSetUTCMonth(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_MONTH, false);
+}
+
+V dSetDate(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_DATE, true);
+}
+
+V dSetUTCDate(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_DATE, false);
+}
+
+V dSetHours(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_HOURS, true);
+}
+
+V dSetUTCHours(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_HOURS, false);
+}
+
+V dSetMinutes(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_MINUTES, true);
+}
+
+V dSetUTCMinutes(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_MINUTES, false);
+}
+
+V dSetSeconds(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_SECONDS, true);
+}
+
+V dSetUTCSeconds(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_SECONDS, false);
+}
+
+V dSetMilliseconds(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_MS, true);
+}
+
+V dSetUTCMilliseconds(V thisV, V *args, int argc)
+{
+    return setField(thisV, args, argc, F_MS, false);
+}
+
+V dSetTimeImpl(V thisV, V *args, int argc)
+{
+    JPrim *d = thisDate(thisV);
+    d->num = timeClip(toNumber(argOr(args, argc, 0)));
+    return num(d->num);
+}
+
+V dToISOString(V thisV, V *, int)
+{
+    double t = thisDate(thisV)->num;
+    if (t != t)
+        throwRange("Invalid time value");
+    return str(isoString(t));
+}
+
+V dToJSON(V thisV, V *, int)
+{
+    V ov = toObject(thisV);
+    V tv = toPrimitive(ov, 1);
+    if (isNum(tv) && numOf(tv) - numOf(tv) != 0)
+        return Null;
+    return invoke(ov, atomOf("toISOString"), nullptr, 0);
+}
+
+V dToString(V thisV, V *, int)
+{
+    double t = thisDate(thisV)->num;
+    if (t != t)
+        return strA("Invalid Date");
+    double l = toLocal(t);
+    return str(datePart(l) + " " + timePart(l));
+}
+
+V dToDateString(V thisV, V *, int)
+{
+    double t = thisDate(thisV)->num;
+    if (t != t)
+        return strA("Invalid Date");
+    return str(datePart(toLocal(t)));
+}
+
+V dToTimeString(V thisV, V *, int)
+{
+    double t = thisDate(thisV)->num;
+    if (t != t)
+        return strA("Invalid Date");
+    return str(timePart(toLocal(t)));
+}
+
+V dToUTCString(V thisV, V *, int)
+{
+    double t = thisDate(thisV)->num;
+    if (t != t)
+        return strA("Invalid Date");
+    Parts p;
+    partsOf(t, p);
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s, %02d %s ", DAY_NAMES[p.wday], p.day, MON_NAMES[p.mon]);
+    char tail[32];
+    snprintf(tail, sizeof tail, " %02d:%02d:%02d GMT", p.hour, p.min, p.sec);
+    std::string y = p.year >= 0 ? (p.year <= 9999 ? yearText(p.year) : std::to_string((long long)p.year)) : "-" + std::to_string((long long)-p.year);
+    return str(buf + y + tail);
+}
+
+V dToPrimitive(V thisV, V *args, int argc)
+{
+    if (!isObj(thisV))
+        throwType("Date.prototype[Symbol.toPrimitive] called on non-object");
+    V hint = argOr(args, argc, 0);
+    std::string h = isStr(hint) ? toUtf8(sp_(hint)) : "";
+    if (h != "string" && h != "default" && h != "number")
+        throwType("Invalid hint: " + inspectBrief(hint));
+    bool wantStr = h != "number";
+    V order[2] = {wantStr ? A.toString : A.valueOf, wantStr ? A.valueOf : A.toString};
+    for (int i = 0; i < 2; ++i)
+    {
+        V m = getProp(thisV, order[i]);
+        if (isCallable(m))
+        {
+            V r = call(m, thisV, nullptr, 0);
+            if (!isObj(r))
+                return r;
+        }
+    }
+    throwType("Cannot convert object to primitive value");
+}
+
+// the locale forms go through Intl, loaded when somebody first wants them
+V localeVia(V thisV, V *args, int argc, const char *fn)
+{
+    thisDate(thisV);
+    V intlHelper = getProp(requireModule("intl"), atomOf(fn));
+    V a[3] = {thisV, argOr(args, argc, 0), argOr(args, argc, 1)};
+    return call(intlHelper, Undefined, a, 3);
+}
+
+V dToLocaleString(V thisV, V *args, int argc) { return localeVia(thisV, args, argc, "dateToLocaleString"); }
+V dToLocaleDateString(V thisV, V *args, int argc) { return localeVia(thisV, args, argc, "dateToLocaleDateString"); }
+V dToLocaleTimeString(V thisV, V *args, int argc) { return localeVia(thisV, args, argc, "dateToLocaleTimeString"); }
+
+// ── typed array storage ──────────────────────────────────────────────────
+
+struct JBuffer : Obj
+{
+    uint8_t *data;
+    int64_t size;
+};
+
+enum TAType : uint8_t
+{
+    TA_INT8, TA_UINT8, TA_CLAMPED, TA_INT16, TA_UINT16, TA_INT32, TA_UINT32, TA_FLOAT32, TA_FLOAT64, TA_BIGINT64, TA_BIGUINT64
+};
+
+const int TA_SIZE[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
+const char *const TA_NAMES[] = {"Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array"};
+
+struct JTyped : Obj
+{
+    JBuffer *buf;
+    int64_t offset;
+    int64_t length;
+    uint8_t type;
+};
+
+Obj *g_taProtos[11];
+V g_taCtors[11];
+Obj *g_taHolder = nullptr;
+
+V bufferNew(int64_t size, Obj *proto)
+{
+    JBuffer *b = static_cast<JBuffer *>(allocObj(sizeof(JBuffer), C_ARRAYBUFFER, proto));
+    b->data = static_cast<uint8_t *>(bump((size_t)size + 8));
+    b->size = size;
+    return objv(b);
+}
+
+V bufCtor(V, V *args, int argc)
+{
+    if (g_nativeNewTarget == Undefined)
+        throwType("Constructor ArrayBuffer requires 'new'");
+    double d = toIntegerOrInf(argOr(args, argc, 0));
+    if (d < 0 || d > 2147483647.0)
+        throwRange("Invalid array buffer length");
+    return bufferNew((int64_t)d, protoFromCtor(g_nativeNewTarget, PR.arraybuffer));
+}
+
+JBuffer *thisBuf(V v, const char *name)
+{
+    if (!isObj(v) || op(v)->cls != C_ARRAYBUFFER)
+        throwType(std::string("Method ArrayBuffer.prototype.") + name + " called on incompatible receiver " + inspectBrief(v));
+    return static_cast<JBuffer *>(op(v));
+}
+
+V bufByteLength(V thisV, V *, int)
+{
+    return num((double)thisBuf(thisV, "byteLength")->size);
+}
+
+V bufSlice(V thisV, V *args, int argc)
+{
+    JBuffer *b = thisBuf(thisV, "slice");
+    double s = toIntegerOrInf(argOr(args, argc, 0));
+    V ev = argOr(args, argc, 1);
+    double e = ev == Undefined ? (double)b->size : toIntegerOrInf(ev);
+    double n = (double)b->size;
+    s = s < 0 ? std::fmax(n + s, 0.0) : std::fmin(s, n);
+    e = e < 0 ? std::fmax(n + e, 0.0) : std::fmin(e, n);
+    int64_t size = e > s ? (int64_t)(e - s) : 0;
+    V r = bufferNew(size, PR.arraybuffer);
+    if (size)
+        std::memcpy(static_cast<JBuffer *>(op(r))->data, b->data + (int64_t)s, (size_t)size);
+    return r;
+}
+
+V bufIsView(V, V *args, int argc)
+{
+    V v = argOr(args, argc, 0);
+    if (!isObj(v))
+        return False;
+    if (op(v)->cls == C_TYPEDARRAY || op(v)->cls == C_DATAVIEW)
+        return True;
+    return False;
+}
+
+V typedRead(JTyped *t, int64_t i)
+{
+    uint8_t *p = t->buf->data + t->offset + i * TA_SIZE[t->type];
+    switch (t->type)
+    {
+    case TA_INT8: return num((double)*reinterpret_cast<int8_t *>(p));
+    case TA_UINT8:
+    case TA_CLAMPED: return num((double)*p);
+    case TA_INT16:
+    {
+        int16_t x;
+        std::memcpy(&x, p, 2);
+        return num((double)x);
+    }
+    case TA_UINT16:
+    {
+        uint16_t x;
+        std::memcpy(&x, p, 2);
+        return num((double)x);
+    }
+    case TA_INT32:
+    {
+        int32_t x;
+        std::memcpy(&x, p, 4);
+        return num((double)x);
+    }
+    case TA_UINT32:
+    {
+        uint32_t x;
+        std::memcpy(&x, p, 4);
+        return num((double)x);
+    }
+    case TA_FLOAT32:
+    {
+        float x;
+        std::memcpy(&x, p, 4);
+        return num((double)x);
+    }
+    case TA_FLOAT64:
+    {
+        double x;
+        std::memcpy(&x, p, 8);
+        if (x != x)
+            x = 0.0 / 0.0;
+        return num(x);
+    }
+    case TA_BIGINT64:
+    {
+        int64_t x;
+        std::memcpy(&x, p, 8);
+        return x < 0 ? bigFromU64((uint64_t)0 - (uint64_t)x, true) : bigFromU64((uint64_t)x, false);
+    }
+    default:
+    {
+        uint64_t x;
+        std::memcpy(&x, p, 8);
+        return bigFromU64(x, false);
+    }
+    }
+}
+
+void typedWrite(JTyped *t, int64_t i, V v)
+{
+    uint8_t *p = t->buf->data + t->offset + i * TA_SIZE[t->type];
+    switch (t->type)
+    {
+    case TA_INT8:
+    case TA_UINT8:
+        *p = (uint8_t)toInt32(v);
+        return;
+    case TA_CLAMPED:
+    {
+        double d = toNumber(v);
+        if (!(d > 0))
+            *p = 0;
+        else if (d >= 255)
+            *p = 255;
+        else
+        {
+            double f = std::floor(d);
+            double diff = d - f;
+            int r = (int)f;
+            if (diff > 0.5 || (diff == 0.5 && (r & 1)))
+                ++r;
+            *p = (uint8_t)r;
+        }
+        return;
+    }
+    case TA_INT16:
+    case TA_UINT16:
+    {
+        uint16_t x = (uint16_t)toInt32(v);
+        std::memcpy(p, &x, 2);
+        return;
+    }
+    case TA_INT32:
+    case TA_UINT32:
+    {
+        uint32_t x = (uint32_t)toInt32(v);
+        std::memcpy(p, &x, 4);
+        return;
+    }
+    case TA_FLOAT32:
+    {
+        float x = (float)toNumber(v);
+        std::memcpy(p, &x, 4);
+        return;
+    }
+    case TA_FLOAT64:
+    {
+        double x = toNumber(v);
+        std::memcpy(p, &x, 8);
+        return;
+    }
+    default:
+    {
+        V b = v;
+        if (!isBig(b))
+        {
+            b = toPrimitive(v, 1);
+            if (isBool(b))
+                b = bigFromU64(b == True ? 1 : 0, false);
+            else if (isStr(b))
+            {
+                bool ok = true;
+                JBig *x = bigFromStr(sp_(b), &ok);
+                if (!ok)
+                    throwError(E_SYNTAX, "Cannot convert " + toUtf8(sp_(b)) + " to a BigInt");
+                b = bigv(x);
+            }
+            else if (!isBig(b))
+                throwType("Cannot convert " + inspectBrief(b) + " to a BigInt");
+        }
+        uint64_t x = bigToU64(bigp(b));
+        std::memcpy(p, &x, 8);
+    }
+    }
+}
+
+V typedCtor(V, V *args, int argc)
+{
+    int type = (int)numOf(g_nativeCallee->data);
+    if (g_nativeNewTarget == Undefined)
+        throwType(std::string("Constructor ") + TA_NAMES[type] + " requires 'new'");
+    Obj *proto = protoFromCtor(g_nativeNewTarget, g_taProtos[type]);
+    JTyped *t = static_cast<JTyped *>(allocObj(sizeof(JTyped), C_TYPEDARRAY, proto));
+    t->type = (uint8_t)type;
+    int esz = TA_SIZE[type];
+    V a0 = argOr(args, argc, 0);
+    if (!isObj(a0))
+    {
+        double n = toIntegerOrInf(a0);
+        if (n < 0 || n * esz > 2147483647.0)
+            throwRange("Invalid typed array length: " + numberToStd(n));
+        V b = bufferNew((int64_t)n * esz, PR.arraybuffer);
+        t->buf = static_cast<JBuffer *>(op(b));
+        t->length = (int64_t)n;
+        return objv(t);
+    }
+    if (op(a0)->cls == C_ARRAYBUFFER)
+    {
+        JBuffer *b = static_cast<JBuffer *>(op(a0));
+        double off = toIntegerOrInf(argOr(args, argc, 1));
+        if (std::fmod(off, esz) != 0)
+            throwRange(std::string("start offset of ") + TA_NAMES[type] + " should be a multiple of " + std::to_string(esz));
+        if (off < 0 || off > (double)b->size)
+            throwRange("Start offset " + numberToStd(off) + " is outside the bounds of the buffer");
+        V lv = argOr(args, argc, 2);
+        int64_t len;
+        if (lv == Undefined)
+        {
+            if ((b->size - (int64_t)off) % esz)
+                throwRange(std::string("byte length of ") + TA_NAMES[type] + " should be a multiple of " + std::to_string(esz));
+            len = (b->size - (int64_t)off) / esz;
+        }
+        else
+        {
+            len = (int64_t)toIntegerOrInf(lv);
+            if (len < 0 || (int64_t)off + len * esz > b->size)
+                throwRange("Invalid typed array length: " + std::to_string(len));
+        }
+        t->buf = b;
+        t->offset = (int64_t)off;
+        t->length = len;
+        return objv(t);
+    }
+    // from a list of values
+    std::vector<V> vals;
+    if (op(a0)->cls == C_TYPEDARRAY)
+    {
+        JTyped *src = static_cast<JTyped *>(op(a0));
+        for (int64_t i = 0; i < src->length; ++i)
+            vals.push_back(typedRead(src, i));
+    }
+    else
+    {
+        V m = getProp(a0, WK.iterator);
+        if (!isNullish(m))
+            iterableToVec(a0, vals);
+        else
+        {
+            int64_t n = toLength(getProp(a0, A.length));
+            for (int64_t i = 0; i < n; ++i)
+                vals.push_back(getIdx(a0, (double)i));
+        }
+    }
+    V b = bufferNew((int64_t)vals.size() * esz, PR.arraybuffer);
+    t->buf = static_cast<JBuffer *>(op(b));
+    t->length = (int64_t)vals.size();
+    for (size_t i = 0; i < vals.size(); ++i)
+        typedWrite(t, (int64_t)i, vals[i]);
+    return objv(t);
+}
+
+JTyped *thisTyped(V v)
+{
+    if (!isObj(v) || op(v)->cls != C_TYPEDARRAY)
+        throwType("this is not a typed array.");
+    return static_cast<JTyped *>(op(v));
+}
+
+V taLength(V thisV, V *, int)
+{
+    return num((double)thisTyped(thisV)->length);
+}
+
+V taByteLength(V thisV, V *, int)
+{
+    JTyped *t = thisTyped(thisV);
+    return num((double)(t->length * TA_SIZE[t->type]));
+}
+
+V taByteOffset(V thisV, V *, int)
+{
+    return num((double)thisTyped(thisV)->offset);
+}
+
+V taBuffer(V thisV, V *, int)
+{
+    return objv(thisTyped(thisV)->buf);
+}
+
+V taTag(V thisV, V *, int)
+{
+    if (!isObj(thisV) || op(thisV)->cls != C_TYPEDARRAY)
+        return Undefined;
+    return atomOf(TA_NAMES[static_cast<JTyped *>(op(thisV))->type]);
+}
+
+V taAbstractCtor(V, V *, int)
+{
+    throwType("Abstract class TypedArray not directly constructable");
+}
+
+V speciesThis(V thisV, V *, int)
+{
+    return thisV;
+}
+
+} // namespace
+
+int typedGetKey(Obj *o, V key, V *out)
+{
+    if (!isStr(key))
+        return -1;
+    JStr *k = sp_(key);
+    if (!k->isIdx)
+        return -1;
+    JTyped *t = static_cast<JTyped *>(o);
+    if ((int64_t)k->idx >= t->length)
+        return 0;
+    *out = typedRead(t, k->idx);
+    return 1;
+}
+
+// by number, without making a key of it; -1 when it is no valid index
+int typedGetIndex(Obj *o, double d, V *out)
+{
+    JTyped *t = static_cast<JTyped *>(o);
+    int64_t i = (int64_t)d;
+    if ((double)i != d || i < 0 || (i == 0 && 1 / d < 0))
+        return -1;
+    if (i >= t->length)
+        return 0;
+    *out = typedRead(t, i);
+    return 1;
+}
+
+int typedSetIndex(Obj *o, double d, V val)
+{
+    JTyped *t = static_cast<JTyped *>(o);
+    int64_t i = (int64_t)d;
+    if ((double)i != d || i < 0 || i >= t->length || (i == 0 && 1 / d < 0))
+        return -1;
+    typedWrite(t, i, val);
+    return 1;
+}
+
+int typedSetKey(Obj *o, V key, V val)
+{
+    if (!isStr(key))
+        return -1;
+    JStr *k = sp_(key);
+    if (!k->isIdx)
+        return -1;
+    JTyped *t = static_cast<JTyped *>(o);
+    // converted even when out of range: the conversion can have effects
+    if ((int64_t)k->idx >= t->length)
+    {
+        if (t->type >= TA_BIGINT64)
+            return 0;
+        toNumber(val);
+        return 0;
+    }
+    typedWrite(t, k->idx, val);
+    return 1;
+}
+
+int64_t typedLength(Obj *o)
+{
+    return static_cast<JTyped *>(o)->length;
+}
+
+Obj *typedArrayHolder()
+{
+    return g_taHolder;
+}
+
+// the buffer's bytes, for the JavaScript library
+uint8_t *bufferBytes(V buffer, int64_t *size)
+{
+    JBuffer *b = static_cast<JBuffer *>(op(buffer));
+    *size = b->size;
+    return b->data;
+}
+
+void initDateBuiltins()
+{
+    JFunc *c = defCtor("Date", dateCtor, 7, PR.date);
+    defFn(c, "now", dNow, 0);
+    defFn(c, "parse", dParse, 1);
+    defFn(c, "UTC", dUTC, 7);
+    Obj *p = PR.date;
+    defFn(p, "getFullYear", dGetFullYear, 0);
+    defFn(p, "getUTCFullYear", dGetUTCFullYear, 0);
+    defFn(p, "getMonth", dGetMonth, 0);
+    defFn(p, "getUTCMonth", dGetUTCMonth, 0);
+    defFn(p, "getDate", dGetDate, 0);
+    defFn(p, "getUTCDate", dGetUTCDate, 0);
+    defFn(p, "getDay", dGetDay, 0);
+    defFn(p, "getUTCDay", dGetUTCDay, 0);
+    defFn(p, "getHours", dGetHours, 0);
+    defFn(p, "getUTCHours", dGetUTCHours, 0);
+    defFn(p, "getMinutes", dGetMinutes, 0);
+    defFn(p, "getUTCMinutes", dGetUTCMinutes, 0);
+    defFn(p, "getSeconds", dGetSeconds, 0);
+    defFn(p, "getUTCSeconds", dGetUTCSeconds, 0);
+    defFn(p, "getMilliseconds", dGetMilliseconds, 0);
+    defFn(p, "getUTCMilliseconds", dGetUTCMilliseconds, 0);
+    defFn(p, "setFullYear", dSetFullYear, 3);
+    defFn(p, "setUTCFullYear", dSetUTCFullYear, 3);
+    defFn(p, "setMonth", dSetMonth, 2);
+    defFn(p, "setUTCMonth", dSetUTCMonth, 2);
+    defFn(p, "setDate", dSetDate, 1);
+    defFn(p, "setUTCDate", dSetUTCDate, 1);
+    defFn(p, "setHours", dSetHours, 4);
+    defFn(p, "setUTCHours", dSetUTCHours, 4);
+    defFn(p, "setMinutes", dSetMinutes, 3);
+    defFn(p, "setUTCMinutes", dSetUTCMinutes, 3);
+    defFn(p, "setSeconds", dSetSeconds, 2);
+    defFn(p, "setUTCSeconds", dSetUTCSeconds, 2);
+    defFn(p, "setMilliseconds", dSetMilliseconds, 1);
+    defFn(p, "setUTCMilliseconds", dSetUTCMilliseconds, 1);
+    defFn(p, "getTime", dGetTime, 0);
+    defFn(p, "valueOf", dGetTime, 0);
+    defFn(p, "getYear", dGetYear, 0);
+    defFn(p, "getTimezoneOffset", dGetTimezoneOffset, 0);
+    defFn(p, "setTime", dSetTimeImpl, 1);
+    defFn(p, "toISOString", dToISOString, 0);
+    defFn(p, "toJSON", dToJSON, 1);
+    defFn(p, "toString", dToString, 0);
+    defFn(p, "toDateString", dToDateString, 0);
+    defFn(p, "toTimeString", dToTimeString, 0);
+    defFn(p, "toUTCString", dToUTCString, 0);
+    defineOwn(p, atomOf("toGMTString"), getProp(objv(p), atomOf("toUTCString")), PF_W | PF_C);
+    defFn(p, "setYear", dSetYear, 1);
+    defFn(p, "toLocaleString", dToLocaleString, 0);
+    defFn(p, "toLocaleDateString", dToLocaleDateString, 0);
+    defFn(p, "toLocaleTimeString", dToLocaleTimeString, 0);
+    defineOwn(p, WK.toPrimitive, objv(newNative("[Symbol.toPrimitive]", dToPrimitive, 1)), PF_C);
+}
+
+void initBinaryBuiltins()
+{
+    JFunc *bc = defCtor("ArrayBuffer", bufCtor, 1, PR.arraybuffer);
+    defFn(bc, "isView", bufIsView, 1);
+    defGetterSym(bc, WK.species, "[Symbol.species]", speciesThis);
+    defGetter(PR.arraybuffer, "byteLength", bufByteLength);
+    defFn(PR.arraybuffer, "slice", bufSlice, 2);
+    defineOwn(PR.arraybuffer, WK.toStringTag, atomOf("ArrayBuffer"), PF_C);
+    // %TypedArray%: its methods are in lib/typedarray.sa
+    JFunc *ta = newNative("TypedArray", taAbstractCtor, 0);
+    ta->flags |= OF_CTOR;
+    materializeFn(ta);
+    defineOwn(ta, A.prototype, objv(PR.typedarray), 0);
+    defineOwn(PR.typedarray, A.constructor, objv(ta), PF_W | PF_C);
+    defGetter(PR.typedarray, "length", taLength);
+    defGetter(PR.typedarray, "byteLength", taByteLength);
+    defGetter(PR.typedarray, "byteOffset", taByteOffset);
+    defGetter(PR.typedarray, "buffer", taBuffer);
+    defGetterSym(PR.typedarray, WK.toStringTag, "[Symbol.toStringTag]", taTag);
+    defGetterSym(ta, WK.species, "[Symbol.species]", speciesThis);
+    g_taHolder = newObject();
+    defineOwn(g_taHolder, atomOf("TypedArray"), objv(ta), PF_DEFAULT);
+    for (int i = 0; i < 11; ++i)
+    {
+        Obj *proto = newObjectProto(PR.typedarray);
+        g_taProtos[i] = proto;
+        JFunc *c = newNative(TA_NAMES[i], typedCtor, 3);
+        c->flags |= OF_CTOR;
+        materializeFn(c);
+        defineOwn(c, A.prototype, objv(proto), 0);
+        defineOwn(proto, A.constructor, objv(c), PF_W | PF_C);
+        defineOwn(g_taHolder, atomOf(TA_NAMES[i]), objv(c), PF_DEFAULT);
+        c->data = num((double)i);
+        c->proto = ta;
+        g_taCtors[i] = objv(c);
+        defVal(c, "BYTES_PER_ELEMENT", num((double)TA_SIZE[i]), 0);
+        defVal(proto, "BYTES_PER_ELEMENT", num((double)TA_SIZE[i]), 0);
+    }
+}
+
+} // namespace js

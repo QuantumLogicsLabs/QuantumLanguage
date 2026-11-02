@@ -396,7 +396,6 @@ class Thread
     end
   end
 
-  def self.exit = current.exit
   def self.kill(t) = t.kill
   def self.handle_interrupt(*) = yield
   def self.pending_interrupt? = false

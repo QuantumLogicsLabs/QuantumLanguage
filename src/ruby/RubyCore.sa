@@ -1135,6 +1135,9 @@ int Interp::run(const std::string &src, const std::string &path)
     catch (StopEx &)
     {
     }
+    catch (KillEx &)
+    {
+    }
     // at_exit handlers, last registered first
     while (!atExit.empty())
     {

@@ -1,0 +1,137 @@
+'use strict';
+// The process object.
+const EventEmitter = require('events');
+
+function Process() {
+  EventEmitter.call(this);
+}
+Object.setPrototypeOf(Process.prototype, EventEmitter.prototype);
+Object.setPrototypeOf(Process, EventEmitter);
+
+const process = new Process();
+let exiting = false;
+
+const env = new Proxy({}, {
+  get(t, k) {
+    if (typeof k !== 'string') return t[k];
+    return k in t ? t[k] : internal.getEnv(k);
+  },
+  set(t, k, v) { t[k] = String(v); return true; },
+  has(t, k) { return k in t || internal.getEnv(String(k)) !== undefined; },
+});
+
+function streamOf(write, fd) {
+  const s = new EventEmitter();
+  s.write = (chunk, enc, cb) => {
+    write(typeof chunk === 'string' ? chunk : chunk instanceof Uint8Array ? new TextDecoder().decode(chunk) : String(chunk));
+    const done = typeof enc === 'function' ? enc : cb;
+    if (done) process.nextTick(done);
+    return true;
+  };
+  s.isTTY = false;
+  s.fd = fd;
+  s.writable = true;
+  s.columns = undefined;
+  s.end = () => {};
+  s.cork = () => {};
+  s.uncork = () => {};
+  return s;
+}
+
+const started = internal.now();
+
+const hrtime = (prev) => {
+  const ms = internal.now() - started;
+  let s = Math.floor(ms / 1000), n = Math.round((ms - s * 1000) * 1e6);
+  if (prev) {
+    s -= prev[0];
+    n -= prev[1];
+    if (n < 0) { s -= 1; n += 1e9; }
+  }
+  return [s, n];
+};
+hrtime.bigint = () => BigInt(Math.round((internal.now() - started) * 1e6));
+
+let stdinStream;
+Object.defineProperty(process, 'stdin', {
+  configurable: true,
+  enumerable: true,
+  get() {
+    if (!stdinStream) {
+      const { Readable } = require('stream');
+      let done = false;
+      stdinStream = new Readable({
+        read() {
+          if (done) return;
+          done = true;
+          const text = internal.readStdin();
+          if (text.length) this.push(text);
+          this.push(null);
+        },
+      });
+      stdinStream.fd = 0;
+      stdinStream.isTTY = false;
+    }
+    return stdinStream;
+  },
+});
+
+Object.assign(process, {
+  title: 'node',
+  version: 'v20.20.2',
+  versions: { node: '20.20.2', v8: '11.3.244.8-node.33' },
+  arch: 'x64',
+  platform: 'win32',
+  release: { name: 'node', lts: 'Iron' },
+  argv: ['node', internal.scriptPath()],
+  execArgv: [],
+  env,
+  pid: 4242,
+  ppid: 4241,
+  execPath: 'node',
+  exitCode: undefined,
+  debugPort: 9229,
+  stdout: streamOf(internal.writeOut, 1),
+  stderr: streamOf(internal.writeErr, 2),
+  cwd: () => internal.cwd(),
+  chdir(directory) {
+    if (typeof directory !== 'string') {
+      throw internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "directory" argument must be of type string. Received ${internal.received(directory)}`);
+    }
+  },
+  umask: () => 18,
+  uptime: () => (internal.now() - started) / 1000,
+  hrtime,
+  memoryUsage: Object.assign(() => ({ rss: 50000000, heapTotal: 10000000, heapUsed: 5000000, external: 1000000, arrayBuffers: 10000 }), { rss: () => 50000000 }),
+  cpuUsage: () => ({ user: 1000, system: 500 }),
+  resourceUsage: () => ({}),
+  emitWarning(w) {
+    const text = typeof w === 'string' ? `(node:4242) Warning: ${w}\n` : `(node:4242) ${w.name}: ${w.message}\n`;
+    internal.writeErr(text);
+  },
+  nextTick: (...a) => internal.nextTick(...a),
+  binding() { throw new Error('No such module'); },
+  abort() { internal.exit(134); },
+  kill() { return true; },
+  exit(code) {
+    if (code !== undefined) process.exitCode = code;
+    const c = process.__runExit(process.exitCode ?? 0);
+    internal.exit(c);
+  },
+  __beforeExit(code) {
+    process.emit('beforeExit', code);
+  },
+  __runExit(code) {
+    if (exiting) return process.exitCode ?? code;
+    exiting = true;
+    process.exitCode = code;
+    process.emit('exit', code);
+    return process.exitCode ?? code;
+  },
+});
+
+Object.defineProperty(process, Symbol.toStringTag, { value: 'process', configurable: true });
+
+internal.setProcess(process);
+internal.installGlobal('process', process);
+module.exports = process;

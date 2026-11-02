@@ -1,0 +1,738 @@
+// The assert module. The logic is Node.js's own (lib/assert.js, adapted to run
+// here; the failing call's source is found by a small scanner, not a parser).
+//
+// Copyright Joyent, Inc. and other Node contributors.
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+'use strict';
+
+const { inspect, deepEq, types: { isPromise, isRegExp } } = require('util');
+const AssertionError = require('assertion_error');
+const ArrayPrototypeIndexOf = (a, x) => a.indexOf(x);
+const ArrayPrototypeJoin = (a, s) => a.join(s);
+const ArrayPrototypePush = (a, x) => a.push(x);
+const ArrayPrototypeSlice = (a, x, y) => a.slice(x, y);
+const NumberIsNaN = Number.isNaN;
+const ObjectAssign = Object.assign;
+const ObjectIs = Object.is;
+const ObjectKeys = Object.keys;
+const ObjectPrototypeIsPrototypeOf = (o, v) => Object.prototype.isPrototypeOf.call(o, v);
+const ReflectApply = Reflect.apply;
+const RegExpPrototypeExec = (r, s) => r.exec(s);
+const StringPrototypeIndexOf = (s, x) => s.indexOf(x);
+const StringPrototypeSlice = (s, x, y) => s.slice(x, y);
+const StringPrototypeSplit = (s, x) => s.split(x);
+const isError = (e) => require('util').types.isNativeError(e) || e instanceof Error;
+
+function listOf(items, word) {
+  if (items.length > 2) return `${items.slice(0, -1).join(', ')}, or ${items[items.length - 1]}`;
+  return items.join(` ${word} `);
+}
+const codes = {
+  ERR_AMBIGUOUS_ARGUMENT: function (name, reason) {
+    return internal.nodeError(TypeError, 'ERR_AMBIGUOUS_ARGUMENT', `The "${name}" argument is ambiguous. ${reason}`);
+  },
+  ERR_INVALID_ARG_TYPE: function (name, expected, actual) {
+    const kinds = ['string', 'function', 'number', 'object', 'Function', 'Object', 'boolean', 'bigint', 'symbol'];
+    const list = [].concat(expected);
+    const types = [], instances = [], other = [];
+    for (const v of list) {
+      if (kinds.includes(v)) types.push(v.toLowerCase());
+      else if (/^[A-Z]/.test(v)) instances.push(v);
+      else other.push(v);
+    }
+    if (instances.length > 0) {
+      const at = types.indexOf('object');
+      if (at !== -1) {
+        types.splice(at, 1);
+        instances.push('Object');
+      }
+    }
+    let msg = `The "${name}" ${name.includes('.') ? 'property' : 'argument'} must be `;
+    if (types.length > 0) {
+      msg += types.length > 1 ? `one of type ${listOf(types, 'or')}` : `of type ${types[0]}`;
+      if (instances.length > 0 || other.length > 0) msg += ' or ';
+    }
+    if (instances.length > 0) {
+      msg += `an instance of ${listOf(instances, 'or')}`;
+      if (other.length > 0) msg += ' or ';
+    }
+    if (other.length > 0) msg += other.length > 1 ? `one of ${listOf(other, 'or')}` : `${other[0]}`;
+    return internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `${msg}. Received ${internal.received(actual)}`);
+  },
+  ERR_INVALID_ARG_VALUE: function (name, value, reason = 'is invalid') {
+    let shown = inspect(value);
+    if (shown.length > 128) shown = `${shown.slice(0, 128)}...`;
+    return internal.nodeError(TypeError, 'ERR_INVALID_ARG_VALUE', `The ${name.includes('.') ? 'property' : 'argument'} '${name}' ${reason}. Received ${shown}`);
+  },
+  ERR_INVALID_RETURN_VALUE: function (input, name, value) {
+    return internal.nodeError(TypeError, 'ERR_INVALID_RETURN_VALUE', `Expected ${input} to be returned from the "${name}" function but got ${internal.received(value)}.`);
+  },
+  ERR_MISSING_ARGS: function (...args) {
+    const names = args.map((a) => `"${a}"`);
+    const text = names.length > 1 ? (names.length > 2 ? `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}` : names.join(' and ')) : names[0];
+    return internal.nodeError(TypeError, 'ERR_MISSING_ARGS', `The ${text} argument${names.length > 1 ? 's' : ''} must be specified`);
+  },
+};
+const { ERR_AMBIGUOUS_ARGUMENT, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_RETURN_VALUE, ERR_MISSING_ARGS } = codes;
+const validateFunction = (v, name) => {
+  if (typeof v !== 'function') throw new ERR_INVALID_ARG_TYPE(name, 'Function', v);
+};
+
+// the source of the call that failed, when it can be read
+function callSource(fn) {
+  const holder = {};
+  Error.captureStackTrace(holder, fn);
+  const m = /\((.*):(\d+):(\d+)\)\s*(?:\n|$)|\n\s+at (.*):(\d+):(\d+)\s*(?:\n|$)/.exec(holder.stack.split('\n').slice(0, 2).join('\n'));
+  if (!m) return null;
+  const file = m[1] ?? m[4], lineNo = Number(m[2] ?? m[5]), col = Number(m[3] ?? m[6]);
+  const text = internal.readFile(file);
+  if (text === null || text === undefined) return null;
+  const lines = text.split(/\r?\n/);
+  let line = lines[lineNo - 1];
+  if (line === undefined) return null;
+  // back over the callee's name, forward to the closing parenthesis
+  let start = col - 1;
+  while (start > 0 && /[\w$.]/.test(line[start - 1])) start--;
+  const code = lines.slice(lineNo - 1).join('\n');
+  let depth = 0, quote = null;
+  for (let i = start; i < code.length; i++) {
+    const c = code[i];
+    if (quote) {
+      if (c === '\\') i++;
+      else if (c === quote) quote = null;
+    } else if (c === '"' || c === "'" || c === '`') quote = c;
+    else if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+      if (depth === 0) return code.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function innerOk(fn, argc, value, message) {
+  if (!value) {
+    let generated = false;
+    if (argc === 0) {
+      generated = true;
+      message = 'No value argument passed to `assert.ok()`';
+    } else if (message === undefined) {
+      generated = true;
+      const source = callSource(fn);
+      message = source === null ? `${inspect(value)} == true` : `The expression evaluated to a falsy value:\n\n  ${source.split('\n').join('\n  ')}\n`;
+    } else if (message instanceof Error) throw message;
+    const err = new AssertionError({ actual: value, expected: true, message, operator: '==', stackStartFn: fn });
+    err.generatedMessage = generated;
+    throw err;
+  }
+}
+
+let isDeepEqual;
+let isDeepStrictEqual;
+
+function lazyLoadComparison() {
+  isDeepEqual = (x, y) => deepEq(x, y, false);
+  isDeepStrictEqual = (x, y) => deepEq(x, y, true);
+}
+
+let warned = false;
+
+
+const assert = module.exports = ok;
+
+const NO_EXCEPTION_SENTINEL = {};
+
+
+function innerFail(obj) {
+  if (obj.message instanceof Error) throw obj.message;
+
+  throw new AssertionError(obj);
+}
+
+function fail(actual, expected, message, operator, stackStartFn) {
+  const argsLen = arguments.length;
+
+  let internalMessage = false;
+  if (actual == null && argsLen <= 1) {
+    internalMessage = true;
+    message = 'Failed';
+  } else if (argsLen === 1) {
+    message = actual;
+    actual = undefined;
+  } else {
+    if (warned === false) {
+      warned = true;
+      process.emitWarning(
+        'assert.fail() with more than one argument is deprecated. ' +
+          'Please use assert.strictEqual() instead or only pass a message.',
+        'DeprecationWarning',
+        'DEP0094',
+      );
+    }
+    if (argsLen === 2)
+      operator = '!=';
+  }
+
+  if (message instanceof Error) throw message;
+
+  const errArgs = {
+    actual,
+    expected,
+    operator: operator === undefined ? 'fail' : operator,
+    stackStartFn: stackStartFn || fail,
+    message,
+  };
+  const err = new AssertionError(errArgs);
+  if (internalMessage) {
+    err.generatedMessage = true;
+  }
+  throw err;
+}
+
+assert.fail = fail;
+
+assert.AssertionError = AssertionError;
+
+function ok(...args) {
+  innerOk(ok, args.length, ...args);
+}
+assert.ok = ok;
+
+/* eslint-disable no-restricted-properties */
+assert.equal = function equal(actual, expected, message) {
+  if (arguments.length < 2) {
+    throw new ERR_MISSING_ARGS('actual', 'expected');
+  }
+  if (actual != expected && (!NumberIsNaN(actual) || !NumberIsNaN(expected))) {
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: '==',
+      stackStartFn: equal,
+    });
+  }
+};
+
+assert.notEqual = function notEqual(actual, expected, message) {
+  if (arguments.length < 2) {
+    throw new ERR_MISSING_ARGS('actual', 'expected');
+  }
+  if (actual == expected || (NumberIsNaN(actual) && NumberIsNaN(expected))) {
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: '!=',
+      stackStartFn: notEqual,
+    });
+  }
+};
+
+assert.deepEqual = function deepEqual(actual, expected, message) {
+  if (arguments.length < 2) {
+    throw new ERR_MISSING_ARGS('actual', 'expected');
+  }
+  if (isDeepEqual === undefined) lazyLoadComparison();
+  if (!isDeepEqual(actual, expected)) {
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: 'deepEqual',
+      stackStartFn: deepEqual,
+    });
+  }
+};
+
+assert.notDeepEqual = function notDeepEqual(actual, expected, message) {
+  if (arguments.length < 2) {
+    throw new ERR_MISSING_ARGS('actual', 'expected');
+  }
+  if (isDeepEqual === undefined) lazyLoadComparison();
+  if (isDeepEqual(actual, expected)) {
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: 'notDeepEqual',
+      stackStartFn: notDeepEqual,
+    });
+  }
+};
+/* eslint-enable */
+
+assert.deepStrictEqual = function deepStrictEqual(actual, expected, message) {
+  if (arguments.length < 2) {
+    throw new ERR_MISSING_ARGS('actual', 'expected');
+  }
+  if (isDeepEqual === undefined) lazyLoadComparison();
+  if (!isDeepStrictEqual(actual, expected)) {
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: 'deepStrictEqual',
+      stackStartFn: deepStrictEqual,
+    });
+  }
+};
+
+assert.notDeepStrictEqual = notDeepStrictEqual;
+function notDeepStrictEqual(actual, expected, message) {
+  if (arguments.length < 2) {
+    throw new ERR_MISSING_ARGS('actual', 'expected');
+  }
+  if (isDeepEqual === undefined) lazyLoadComparison();
+  if (isDeepStrictEqual(actual, expected)) {
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: 'notDeepStrictEqual',
+      stackStartFn: notDeepStrictEqual,
+    });
+  }
+}
+
+assert.strictEqual = function strictEqual(actual, expected, message) {
+  if (arguments.length < 2) {
+    throw new ERR_MISSING_ARGS('actual', 'expected');
+  }
+  if (!ObjectIs(actual, expected)) {
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: 'strictEqual',
+      stackStartFn: strictEqual,
+    });
+  }
+};
+
+assert.notStrictEqual = function notStrictEqual(actual, expected, message) {
+  if (arguments.length < 2) {
+    throw new ERR_MISSING_ARGS('actual', 'expected');
+  }
+  if (ObjectIs(actual, expected)) {
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: 'notStrictEqual',
+      stackStartFn: notStrictEqual,
+    });
+  }
+};
+
+class Comparison {
+  constructor(obj, keys, actual) {
+    for (const key of keys) {
+      if (key in obj) {
+        if (actual !== undefined &&
+            typeof actual[key] === 'string' &&
+            isRegExp(obj[key]) &&
+            RegExpPrototypeExec(obj[key], actual[key]) !== null) {
+          this[key] = actual[key];
+        } else {
+          this[key] = obj[key];
+        }
+      }
+    }
+  }
+}
+
+function compareExceptionKey(actual, expected, key, message, keys, fn) {
+  if (!(key in actual) || !isDeepStrictEqual(actual[key], expected[key])) {
+    if (!message) {
+      const a = new Comparison(actual, keys);
+      const b = new Comparison(expected, keys, actual);
+
+      const err = new AssertionError({
+        actual: a,
+        expected: b,
+        operator: 'deepStrictEqual',
+        stackStartFn: fn,
+      });
+      err.actual = actual;
+      err.expected = expected;
+      err.operator = fn.name;
+      throw err;
+    }
+    innerFail({
+      actual,
+      expected,
+      message,
+      operator: fn.name,
+      stackStartFn: fn,
+    });
+  }
+}
+
+function expectedException(actual, expected, message, fn) {
+  let generatedMessage = false;
+  let throwError = false;
+
+  if (typeof expected !== 'function') {
+    if (isRegExp(expected)) {
+      const str = String(actual);
+      if (RegExpPrototypeExec(expected, str) !== null)
+        return;
+
+      if (!message) {
+        generatedMessage = true;
+        message = 'The input did not match the regular expression ' +
+                  `${inspect(expected)}. Input:\n\n${inspect(str)}\n`;
+      }
+      throwError = true;
+    } else if (typeof actual !== 'object' || actual === null) {
+      const err = new AssertionError({
+        actual,
+        expected,
+        message,
+        operator: 'deepStrictEqual',
+        stackStartFn: fn,
+      });
+      err.operator = fn.name;
+      throw err;
+    } else {
+      const keys = ObjectKeys(expected);
+      if (expected instanceof Error) {
+        ArrayPrototypePush(keys, 'name', 'message');
+      } else if (keys.length === 0) {
+        throw new ERR_INVALID_ARG_VALUE('error',
+                                        expected, 'may not be an empty object');
+      }
+      if (isDeepEqual === undefined) lazyLoadComparison();
+      for (const key of keys) {
+        if (typeof actual[key] === 'string' &&
+            isRegExp(expected[key]) &&
+            RegExpPrototypeExec(expected[key], actual[key]) !== null) {
+          continue;
+        }
+        compareExceptionKey(actual, expected, key, message, keys, fn);
+      }
+      return;
+    }
+  } else if (expected.prototype !== undefined && actual instanceof expected) {
+    return;
+  } else if (ObjectPrototypeIsPrototypeOf(Error, expected)) {
+    if (!message) {
+      generatedMessage = true;
+      message = 'The error is expected to be an instance of ' +
+        `"${expected.name}". Received `;
+      if (isError(actual)) {
+        const name = (actual.constructor && actual.constructor.name) ||
+                     actual.name;
+        if (expected.name === name) {
+          message += 'an error with identical name but a different prototype.';
+        } else {
+          message += `"${name}"`;
+        }
+        if (actual.message) {
+          message += `\n\nError message:\n\n${actual.message}`;
+        }
+      } else {
+        message += `"${inspect(actual, { depth: -1 })}"`;
+      }
+    }
+    throwError = true;
+  } else {
+    const res = ReflectApply(expected, {}, [actual]);
+    if (res !== true) {
+      if (!message) {
+        generatedMessage = true;
+        const name = expected.name ? `"${expected.name}" ` : '';
+        message = `The ${name}validation function is expected to return` +
+          ` "true". Received ${inspect(res)}`;
+
+        if (isError(actual)) {
+          message += `\n\nCaught error:\n\n${actual}`;
+        }
+      }
+      throwError = true;
+    }
+  }
+
+  if (throwError) {
+    const err = new AssertionError({
+      actual,
+      expected,
+      message,
+      operator: fn.name,
+      stackStartFn: fn,
+    });
+    err.generatedMessage = generatedMessage;
+    throw err;
+  }
+}
+
+function getActual(fn) {
+  validateFunction(fn, 'fn');
+  try {
+    fn();
+  } catch (e) {
+    return e;
+  }
+  return NO_EXCEPTION_SENTINEL;
+}
+
+function checkIsPromise(obj) {
+  return isPromise(obj) ||
+    (obj !== null && typeof obj === 'object' &&
+    typeof obj.then === 'function' &&
+    typeof obj.catch === 'function');
+}
+
+async function waitForActual(promiseFn) {
+  let resultPromise;
+  if (typeof promiseFn === 'function') {
+    resultPromise = promiseFn();
+    if (!checkIsPromise(resultPromise)) {
+      throw new ERR_INVALID_RETURN_VALUE('instance of Promise',
+                                         'promiseFn', resultPromise);
+    }
+  } else if (checkIsPromise(promiseFn)) {
+    resultPromise = promiseFn;
+  } else {
+    throw new ERR_INVALID_ARG_TYPE(
+      'promiseFn', ['Function', 'Promise'], promiseFn);
+  }
+
+  try {
+    await resultPromise;
+  } catch (e) {
+    return e;
+  }
+  return NO_EXCEPTION_SENTINEL;
+}
+
+function expectsError(stackStartFn, actual, error, message) {
+  if (typeof error === 'string') {
+    if (arguments.length === 4) {
+      throw new ERR_INVALID_ARG_TYPE('error',
+                                     ['Object', 'Error', 'Function', 'RegExp'],
+                                     error);
+    }
+    if (typeof actual === 'object' && actual !== null) {
+      if (actual.message === error) {
+        throw new ERR_AMBIGUOUS_ARGUMENT(
+          'error/message',
+          `The error message "${actual.message}" is identical to the message.`,
+        );
+      }
+    } else if (actual === error) {
+      throw new ERR_AMBIGUOUS_ARGUMENT(
+        'error/message',
+        `The error "${actual}" is identical to the message.`,
+      );
+    }
+    message = error;
+    error = undefined;
+  } else if (error != null &&
+             typeof error !== 'object' &&
+             typeof error !== 'function') {
+    throw new ERR_INVALID_ARG_TYPE('error',
+                                   ['Object', 'Error', 'Function', 'RegExp'],
+                                   error);
+  }
+
+  if (actual === NO_EXCEPTION_SENTINEL) {
+    let details = '';
+    if (error && error.name) {
+      details += ` (${error.name})`;
+    }
+    details += message ? `: ${message}` : '.';
+    const fnType = stackStartFn === assert.rejects ? 'rejection' : 'exception';
+    innerFail({
+      actual: undefined,
+      expected: error,
+      operator: stackStartFn.name,
+      message: `Missing expected ${fnType}${details}`,
+      stackStartFn,
+    });
+  }
+
+  if (!error)
+    return;
+
+  expectedException(actual, error, message, stackStartFn);
+}
+
+function hasMatchingError(actual, expected) {
+  if (typeof expected !== 'function') {
+    if (isRegExp(expected)) {
+      const str = String(actual);
+      return RegExpPrototypeExec(expected, str) !== null;
+    }
+    throw new ERR_INVALID_ARG_TYPE(
+      'expected', ['Function', 'RegExp'], expected,
+    );
+  }
+  if (expected.prototype !== undefined && actual instanceof expected) {
+    return true;
+  }
+  if (ObjectPrototypeIsPrototypeOf(Error, expected)) {
+    return false;
+  }
+  return ReflectApply(expected, {}, [actual]) === true;
+}
+
+function expectsNoError(stackStartFn, actual, error, message) {
+  if (actual === NO_EXCEPTION_SENTINEL)
+    return;
+
+  if (typeof error === 'string') {
+    message = error;
+    error = undefined;
+  }
+
+  if (!error || hasMatchingError(actual, error)) {
+    const details = message ? `: ${message}` : '.';
+    const fnType = stackStartFn === assert.doesNotReject ?
+      'rejection' : 'exception';
+    innerFail({
+      actual,
+      expected: error,
+      operator: stackStartFn.name,
+      message: `Got unwanted ${fnType}${details}\n` +
+               `Actual message: "${actual && actual.message}"`,
+      stackStartFn,
+    });
+  }
+  throw actual;
+}
+
+assert.throws = function throws(promiseFn, ...args) {
+  expectsError(throws, getActual(promiseFn), ...args);
+};
+
+assert.rejects = async function rejects(promiseFn, ...args) {
+  expectsError(rejects, await waitForActual(promiseFn), ...args);
+};
+
+assert.doesNotThrow = function doesNotThrow(fn, ...args) {
+  expectsNoError(doesNotThrow, getActual(fn), ...args);
+};
+
+assert.doesNotReject = async function doesNotReject(fn, ...args) {
+  expectsNoError(doesNotReject, await waitForActual(fn), ...args);
+};
+
+assert.ifError = function ifError(err) {
+  if (err !== null && err !== undefined) {
+    let message = 'ifError got unwanted exception: ';
+    if (typeof err === 'object' && typeof err.message === 'string') {
+      if (err.message.length === 0 && err.constructor) {
+        message += err.constructor.name;
+      } else {
+        message += err.message;
+      }
+    } else {
+      message += inspect(err);
+    }
+
+    const newErr = new AssertionError({
+      actual: err,
+      expected: null,
+      operator: 'ifError',
+      message,
+      stackStartFn: ifError,
+    });
+
+    const origStack = err.stack;
+
+    if (typeof origStack === 'string') {
+      const origStackStart = StringPrototypeIndexOf(origStack, '\n    at');
+      if (origStackStart !== -1) {
+        const originalFrames = StringPrototypeSplit(
+          StringPrototypeSlice(origStack, origStackStart + 1),
+          '\n',
+        );
+        let newFrames = StringPrototypeSplit(newErr.stack, '\n');
+        for (const errFrame of originalFrames) {
+          const pos = ArrayPrototypeIndexOf(newFrames, errFrame);
+          if (pos !== -1) {
+            newFrames = ArrayPrototypeSlice(newFrames, 0, pos);
+            break;
+          }
+        }
+        const stackStart = ArrayPrototypeJoin(newFrames, '\n');
+        const stackEnd = ArrayPrototypeJoin(originalFrames, '\n');
+        newErr.stack = `${stackStart}\n${stackEnd}`;
+      }
+    }
+
+    throw newErr;
+  }
+};
+
+function internalMatch(string, regexp, message, fn) {
+  if (!isRegExp(regexp)) {
+    throw new ERR_INVALID_ARG_TYPE(
+      'regexp', 'RegExp', regexp,
+    );
+  }
+  const match = fn === assert.match;
+  if (typeof string !== 'string' ||
+      RegExpPrototypeExec(regexp, string) !== null !== match) {
+    if (message instanceof Error) {
+      throw message;
+    }
+
+    const generatedMessage = !message;
+
+    message = message || (typeof string !== 'string' ?
+      'The "string" argument must be of type string. Received type ' +
+        `${typeof string} (${inspect(string)})` :
+      (match ?
+        'The input did not match the regular expression ' :
+        'The input was expected to not match the regular expression ') +
+          `${inspect(regexp)}. Input:\n\n${inspect(string)}\n`);
+    const err = new AssertionError({
+      actual: string,
+      expected: regexp,
+      message,
+      operator: fn.name,
+      stackStartFn: fn,
+    });
+    err.generatedMessage = generatedMessage;
+    throw err;
+  }
+}
+
+assert.match = function match(string, regexp, message) {
+  internalMatch(string, regexp, message, match);
+};
+
+assert.doesNotMatch = function doesNotMatch(string, regexp, message) {
+  internalMatch(string, regexp, message, doesNotMatch);
+};
+
+
+function strict(...args) {
+  innerOk(strict, args.length, ...args);
+}
+
+assert.strict = ObjectAssign(strict, assert, {
+  equal: assert.strictEqual,
+  deepEqual: assert.deepStrictEqual,
+  notEqual: assert.notStrictEqual,
+  notDeepEqual: assert.notDeepStrictEqual,
+});
+
+assert.strict.strict = assert.strict;

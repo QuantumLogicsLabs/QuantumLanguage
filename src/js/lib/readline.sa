@@ -1,0 +1,107 @@
+'use strict';
+// The readline module: lines from a stream.
+const EventEmitter = require('events');
+
+class Interface extends EventEmitter {
+  constructor(input, output) {
+    super();
+    const options = input && input.input !== undefined ? input : { input, output };
+    this.input = options.input;
+    this.output = options.output;
+    this.terminal = false;
+    this.line = '';
+    this.closed = false;
+    this._prompt = options.prompt ?? '> ';
+    this._lines = [];
+    this._questions = [];
+    this._pending = '';
+    this._ended = false;
+    this._waiters = [];
+    this.history = [];
+    if (options.crlfDelay !== undefined) this.crlfDelay = options.crlfDelay;
+    if (this.input) {
+      this.input.on('data', (chunk) => this._feed(String(chunk)));
+      this.input.on('end', () => this._finish());
+    }
+  }
+  _feed(text) {
+    this._pending += text;
+    const parts = this._pending.split(/\r\n|\n|\r/);
+    this._pending = parts.pop();
+    for (const line of parts) this._line(line);
+  }
+  _finish() {
+    if (this._pending.length) {
+      const last = this._pending;
+      this._pending = '';
+      this._line(last);
+    }
+    this._ended = true;
+    this.close();
+  }
+  _line(line) {
+    if (this.closed) return;
+    const q = this._questions.shift();
+    if (q) q(line);
+    else {
+      const w = this._waiters.shift();
+      if (w) w({ value: line, done: false });
+      else if (this.listenerCount('line') === 0 && this._iterating) this._lines.push(line);
+      this.emit('line', line);
+    }
+  }
+  setPrompt(p) { this._prompt = p; }
+  getPrompt() { return this._prompt; }
+  prompt() { if (this.output) this.output.write(this._prompt); }
+  question(query, options, cb) {
+    if (typeof options === 'function') cb = options;
+    if (this.closed) {
+      throw internal.nodeError(Error, 'ERR_USE_AFTER_CLOSE', 'readline was closed');
+    }
+    if (this.output) this.output.write(query);
+    this._questions.push(cb);
+  }
+  write() {}
+  pause() { if (this.input && this.input.pause) this.input.pause(); this.emit('pause'); return this; }
+  resume() { if (this.input && this.input.resume) this.input.resume(); this.emit('resume'); return this; }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const w of this._waiters.splice(0)) w({ value: undefined, done: true });
+    this.emit('close');
+  }
+  [Symbol.asyncIterator]() {
+    this._iterating = true;
+    const self = this;
+    return {
+      next() {
+        if (self._lines.length) return Promise.resolve({ value: self._lines.shift(), done: false });
+        if (self.closed) return Promise.resolve({ value: undefined, done: true });
+        return new Promise((resolve) => self._waiters.push(resolve));
+      },
+      return() { self.close(); return Promise.resolve({ value: undefined, done: true }); },
+      [Symbol.asyncIterator]() { return this; },
+    };
+  }
+}
+
+const promises = {
+  Interface,
+  createInterface: (...args) => {
+    const rl = new Interface(...args);
+    const ask = rl.question.bind(rl);
+    rl.question = (q) => new Promise((resolve) => ask(q, resolve));
+    return rl;
+  },
+};
+
+module.exports = {
+  Interface,
+  createInterface: (...args) => new Interface(...args),
+  clearLine() { return true; },
+  clearScreenDown() { return true; },
+  cursorTo() { return true; },
+  moveCursor() { return true; },
+  emitKeypressEvents() {},
+  promises,
+};

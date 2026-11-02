@@ -1,0 +1,471 @@
+'use strict';
+// Intl for the locales programs usually name: en-US, en-GB and de-DE style
+// number punctuation; English names for dates.
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const DE_MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+const DE_SHORT = ['Jan.', 'Feb.', 'März', 'Apr.', 'Mai', 'Juni', 'Juli', 'Aug.', 'Sept.', 'Okt.', 'Nov.', 'Dez.'];
+const DE_DAYS = ['Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag'];
+
+function canonLocale(l) {
+  if (l === undefined) return 'en-US';
+  if (Array.isArray(l)) return l.length ? canonLocale(l[0]) : 'en-US';
+  const s = String(l);
+  if (!/^[a-zA-Z]{2,8}([-_][a-zA-Z0-9]{1,8})*$/.test(s) || /^[a-z]+-invalid-/.test(s) && s.length > 14)
+    throw new RangeError(`Incorrect locale information provided`);
+  const parts = s.replace(/_/g, '-').split('-');
+  parts[0] = parts[0].toLowerCase();
+  for (let i = 1; i < parts.length; i++) {
+    if (parts[i].length === 2) parts[i] = parts[i].toUpperCase();
+    else if (parts[i].length === 4) parts[i] = parts[i][0].toUpperCase() + parts[i].slice(1).toLowerCase();
+  }
+  return parts.join('-');
+}
+
+function punctuation(locale) {
+  const lang = locale.split('-')[0];
+  if (['de', 'es', 'it', 'nl', 'pt', 'tr', 'id', 'da'].includes(lang)) return { group: '.', decimal: ',' };
+  if (['fr', 'ru', 'pl', 'sv', 'nb', 'fi', 'cs', 'uk'].includes(lang)) return { group: lang === 'fr' ? ' ' : ' ', decimal: ',' };
+  return { group: ',', decimal: '.' };
+}
+
+const CURRENCY = { USD: '$', EUR: '€', GBP: '£', JPY: '¥', INR: '₹', CNY: 'CN¥', KRW: '₩', CAD: 'CA$', AUD: 'A$', MXN: 'MX$', BRL: 'R$' };
+
+// ICU works on a number's shortest decimal digits, not on its binary value
+function decimalOf(x) {
+  const text = String(x);
+  const m = /^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/.exec(text);
+  if (!m) return { digits: text, point: text.length };
+  const digits = m[1] + (m[2] ?? '');
+  return { digits, point: m[1].length + Number(m[3] ?? 0) };
+}
+
+function addOne(digits) {
+  const a = digits.split('');
+  let i = a.length - 1;
+  while (i >= 0) {
+    if (a[i] === '9') { a[i] = '0'; i--; } else { a[i] = String(Number(a[i]) + 1); break; }
+  }
+  return (i < 0 ? '1' : '') + a.join('');
+}
+
+function shiftDecimal(d, by) {
+  return { digits: d.digits, point: d.point + by };
+}
+
+// half away from zero, at `places` digits after the point
+function roundDecimal(d, places) {
+  let { digits, point } = d;
+  if (point < 0) { digits = '0'.repeat(-point) + digits; point = 0; }
+  if (point === 0) { digits = '0' + digits; point = 1; }
+  if (point > digits.length) digits += '0'.repeat(point - digits.length);
+  const end = point + places;
+  if (digits.length > end) {
+    const up = end >= 0 && digits[end] >= '5';
+    digits = digits.slice(0, Math.max(end, 0));
+    if (end < 0) digits = '';
+    if (up) {
+      const before = digits.length;
+      digits = addOne(digits.padStart(1, '0'));
+      if (digits.length > Math.max(before, 1)) point += 1;
+    }
+  }
+  if (digits.length < point) digits += '0'.repeat(point - digits.length);
+  return { digits, point };
+}
+
+function decimalText(d, minF) {
+  const ip = d.digits.slice(0, d.point).replace(/^0+(?=\d)/, '') || '0';
+  let fp = d.digits.slice(d.point);
+  let end = fp.length;
+  while (end > minF && fp[end - 1] === '0') end--;
+  fp = fp.slice(0, end).padEnd(minF, '0');
+  return fp ? `${ip}.${fp}` : ip;
+}
+
+function roundedDigits(d, minF, maxF) {
+  return decimalText(roundDecimal(d, maxF), minF);
+}
+
+function significant(d, minS, maxS) {
+  const stripped = d.digits.replace(/^0+/, '');
+  if (!stripped) return minS > 1 ? `0.${'0'.repeat(minS - 1)}` : '0';
+  const lead = d.digits.length - stripped.length;
+  const point = d.point - lead;
+  const places = maxS - point;
+  const r = roundDecimal({ digits: stripped, point }, places);
+  // at least minS significant digits survive
+  const sigBefore = r.point;
+  const minF = Math.max(minS - Math.max(sigBefore, 0), 0);
+  let text = decimalText(r, minF);
+  return text;
+}
+
+function group(intPart, sep, locale) {
+  if (intPart.length <= 3) return intPart;
+  if (locale.startsWith('en-IN') || locale.startsWith('hi')) {
+    const last = intPart.slice(-3);
+    return intPart.slice(0, -3).replace(/\B(?=(\d{2})+$)/g, sep) + sep + last;
+  }
+  if (locale.startsWith('es') && intPart.length <= 4) return intPart;
+  return intPart.replace(/\B(?=(\d{3})+$)/g, sep);
+}
+
+class NumberFormat {
+  #o;
+  constructor(locales, options = {}) {
+    const locale = canonLocale(locales);
+    const style = options.style ?? 'decimal';
+    if (!['decimal', 'percent', 'currency', 'unit'].includes(style)) throw new RangeError(`Value ${style} out of range for Intl.NumberFormat options property style`);
+    if (style === 'currency' && options.currency === undefined) throw new TypeError('Currency code is required with currency style.');
+    const currency = options.currency ? String(options.currency).toUpperCase() : undefined;
+    const cDigits = currency === 'JPY' || currency === 'KRW' ? 0 : 2;
+    let minF = options.minimumFractionDigits, maxF = options.maximumFractionDigits;
+    const dflMin = style === 'currency' ? cDigits : 0;
+    const dflMax = style === 'currency' ? cDigits : style === 'percent' ? 0 : 3;
+    if (maxF !== undefined && (maxF < 0 || maxF > 100)) throw new RangeError('maximumFractionDigits value is out of range.');
+    if (minF !== undefined && (minF < 0 || minF > 100)) throw new RangeError('minimumFractionDigits value is out of range.');
+    if (minF === undefined && maxF === undefined) { minF = dflMin; maxF = dflMax; }
+    else if (minF === undefined) minF = Math.min(dflMin, maxF);
+    else if (maxF === undefined) maxF = Math.max(dflMax, minF);
+    else if (minF > maxF) throw new RangeError('maximumFractionDigits value is out of range.');
+    this.#o = {
+      locale, style, currency, minF, maxF,
+      minI: options.minimumIntegerDigits ?? 1,
+      minS: options.minimumSignificantDigits, maxS: options.maximumSignificantDigits,
+      grouping: options.useGrouping ?? true,
+      notation: options.notation ?? 'standard',
+      compactDisplay: options.compactDisplay ?? 'short',
+      signDisplay: options.signDisplay ?? 'auto',
+      currencyDisplay: options.currencyDisplay ?? 'symbol',
+      unit: options.unit, unitDisplay: options.unitDisplay ?? 'short',
+    };
+    this.format = this.format.bind(this);
+  }
+  format(value) {
+    const o = this.#o;
+    if (typeof value === 'bigint') {
+      const neg = value < 0n;
+      const s = (neg ? -value : value).toString();
+      const p = punctuation(o.locale);
+      return (neg ? '-' : '') + (o.grouping ? group(s, p.group, o.locale) : s);
+    }
+    let x = Number(value);
+    const p = punctuation(o.locale);
+    if (Number.isNaN(x)) return 'NaN';
+    const neg = x < 0 || Object.is(x, -0);
+    const abs = Math.abs(x);
+    if (abs === Infinity) return (neg ? '-' : '') + '∞';
+    let dec = decimalOf(abs);
+    if (o.style === 'percent') dec = shiftDecimal(dec, 2);
+    let suffix = '';
+    let digits;
+    if (o.notation === 'compact') {
+      const steps = o.compactDisplay === 'long' ? [[12, ' trillion'], [9, ' billion'], [6, ' million'], [3, ' thousand']] : [[12, 'T'], [9, 'B'], [6, 'M'], [3, 'K']];
+      const size = abs === 0 ? 1 : dec.point - (dec.digits.length - dec.digits.replace(/^0+/, '').length);
+      for (const [e, l] of steps) {
+        if (size > e) { dec = shiftDecimal(dec, -e); suffix = l; break; }
+      }
+      if (o.maxS !== undefined) digits = significant(dec, o.minS ?? 1, o.maxS);
+      else if (dec.point >= 2) digits = roundedDigits(dec, 0, 0);
+      else digits = significant(dec, 1, 2);
+    } else if (o.notation === 'scientific' || o.notation === 'engineering') {
+      let e = abs === 0 ? 0 : dec.point - 1 - (dec.digits.length - dec.digits.replace(/^0+/, '').length);
+      if (o.notation === 'engineering') e = Math.floor(e / 3) * 3;
+      digits = roundedDigits(shiftDecimal(dec, -e), o.minF, Math.max(o.maxF, 3));
+      suffix = 'E' + e;
+    } else if (o.maxS !== undefined || o.minS !== undefined) digits = significant(dec, o.minS ?? 1, o.maxS ?? 21);
+    else digits = roundedDigits(dec, o.minF, o.maxF);
+    let [ip, fp] = digits.split('.');
+    ip = ip.padStart(o.minI, '0');
+    if (o.grouping && o.grouping !== 'false' && !(o.notation === 'compact' && o.grouping === 'min2')) ip = group(ip, p.group, o.locale);
+    let num = fp ? ip + p.decimal + fp : ip;
+    num += suffix;
+    const isZero = /^[0.,\s]*$/.test(digits);
+    let sign = neg && !(isZero && o.signDisplay === 'exceptZero') ? '-' : '';
+    if (o.signDisplay === 'never') sign = '';
+    if ((o.signDisplay === 'always' || (o.signDisplay === 'exceptZero' && !isZero)) && !neg) sign = '+';
+    switch (o.style) {
+      case 'percent':
+        return sign + num + (p.decimal === ',' ? ' %' : '%');
+      case 'currency': {
+        const sym = o.currencyDisplay === 'code' ? o.currency + ' ' : o.currencyDisplay === 'name' ? '' : (CURRENCY[o.currency] ?? o.currency + ' ');
+        if (o.currencyDisplay === 'name') return sign + num + ' ' + o.currency;
+        return p.decimal === ',' ? sign + num + ' ' + (CURRENCY[o.currency] ?? o.currency) : sign + sym + num;
+      }
+      case 'unit': {
+        const names = { kilometer: 'km', meter: 'm', kilogram: 'kg', liter: 'L', second: 'sec', minute: 'min', hour: 'hr', byte: 'byte', kilobyte: 'kB', megabyte: 'MB', gigabyte: 'GB', percent: '%', celsius: '°C' };
+        if (o.unitDisplay === 'long') return `${sign}${num} ${o.unit}${x === 1 ? '' : 's'}`;
+        return `${sign}${num} ${names[o.unit] ?? o.unit}`;
+      }
+      default:
+        return sign + num;
+    }
+  }
+  formatToParts(v) { return [{ type: 'literal', value: this.format(v) }]; }
+  resolvedOptions() {
+    const o = this.#o;
+    return { locale: o.locale, numberingSystem: 'latn', style: o.style, currency: o.currency, minimumIntegerDigits: o.minI, minimumFractionDigits: o.minF, maximumFractionDigits: o.maxF, useGrouping: o.grouping === true ? 'auto' : o.grouping, notation: o.notation, signDisplay: o.signDisplay, roundingMode: 'halfExpand' };
+  }
+  static supportedLocalesOf(l) { return [].concat(l ?? []); }
+  get [Symbol.toStringTag]() { return 'Intl.NumberFormat'; }
+}
+
+function zoned(date, timeZone) {
+  // the fields of an instant in a zone: UTC or the machine's
+  const utc = timeZone === 'UTC' || timeZone === 'GMT' || timeZone === 'Etc/UTC';
+  return utc
+    ? { y: date.getUTCFullYear(), mo: date.getUTCMonth(), d: date.getUTCDate(), wd: date.getUTCDay(), h: date.getUTCHours(), mi: date.getUTCMinutes(), s: date.getUTCSeconds(), ms: date.getUTCMilliseconds() }
+    : { y: date.getFullYear(), mo: date.getMonth(), d: date.getDate(), wd: date.getDay(), h: date.getHours(), mi: date.getMinutes(), s: date.getSeconds(), ms: date.getMilliseconds() };
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+class DateTimeFormat {
+  #o;
+  constructor(locales, options = {}) {
+    this.#o = { locale: canonLocale(locales), ...options };
+    this.format = this.format.bind(this);
+  }
+  format(value) {
+    const date = value === undefined ? new Date() : value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) throw new RangeError('Invalid time value');
+    return formatDate(date, this.#o);
+  }
+  formatToParts(v) { return [{ type: 'literal', value: this.format(v) }]; }
+  resolvedOptions() {
+    return { locale: this.#o.locale, calendar: 'gregory', numberingSystem: 'latn', timeZone: this.#o.timeZone ?? 'UTC' };
+  }
+  static supportedLocalesOf(l) { return [].concat(l ?? []); }
+  get [Symbol.toStringTag]() { return 'Intl.DateTimeFormat'; }
+}
+
+function datePortion(z, o, gb) {
+  const { weekday, year, month, day } = o;
+  const named = month === 'long' || month === 'short' || month === 'narrow';
+  if (o.locale && o.locale.startsWith('de')) {
+    const dd = day === '2-digit' ? pad2(z.d) : day ? String(z.d) : '';
+    const yy = year === '2-digit' ? pad2(z.y % 100) : year ? String(z.y) : '';
+    const wName = weekday === 'long' ? DE_DAYS[z.wd] : weekday ? DE_DAYS[z.wd].slice(0, 2) + '.' : '';
+    let text;
+    if (named) {
+      const mName = month === 'long' ? DE_MONTHS[z.mo] : month === 'short' ? DE_SHORT[z.mo] : DE_MONTHS[z.mo][0];
+      text = [dd ? dd + '.' : '', mName, yy].filter(Boolean).join(' ');
+    } else {
+      const mm = month === '2-digit' ? pad2(z.mo + 1) : month ? String(z.mo + 1) : '';
+      text = [dd, mm].filter(Boolean).map((v) => v + '.').join('') + yy;
+    }
+    return wName ? (text ? `${wName}, ${text}` : wName) : text;
+  }
+  const mName = month === 'long' ? MONTHS[z.mo] : month === 'short' ? MONTHS[z.mo].slice(0, 3) : month === 'narrow' ? MONTHS[z.mo][0] : '';
+  const wName = weekday === 'long' ? DAYS[z.wd] : weekday === 'short' ? DAYS[z.wd].slice(0, 3) : weekday === 'narrow' ? DAYS[z.wd][0] : '';
+  const dd = day === '2-digit' ? pad2(z.d) : day ? String(z.d) : '';
+  const yy = year === '2-digit' ? pad2(z.y % 100) : year ? String(z.y) : '';
+  if (named) {
+    let s;
+    if (gb) s = [dd, mName, yy].filter(Boolean).join(' ');
+    else {
+      s = mName + (dd ? ' ' + dd : '');
+      if (yy) s += (dd ? ', ' : ' ') + yy;
+    }
+    return wName ? `${wName}${gb ? ' ' : ', '}${s}` : s;
+  }
+  const mm = month === '2-digit' ? pad2(z.mo + 1) : month ? String(z.mo + 1) : '';
+  const nums = gb ? [day ? (day === '2-digit' || true ? pad2(z.d) : dd) : '', month ? pad2(z.mo + 1) : '', yy] : [mm, dd, yy];
+  const s = nums.filter(Boolean).join('/');
+  return wName ? (s ? `${wName}, ${s}` : wName) : s;
+}
+
+function timePortion(z, o, gb) {
+  const h12 = o.hour12 ?? (o.hourCycle ? o.hourCycle === 'h12' || o.hourCycle === 'h11' : !gb);
+  let h = z.h;
+  const parts = [];
+  if (o.hour) {
+    let hs;
+    if (h12) {
+      const hh = h % 12 === 0 ? 12 : h % 12;
+      hs = o.hour === '2-digit' ? pad2(hh) : String(hh);
+    } else hs = pad2(h);
+    parts.push(hs);
+  }
+  if (o.minute) parts.push(o.hour || o.minute === '2-digit' ? pad2(z.mi) : String(z.mi));
+  if (o.second) parts.push(o.minute || o.second === '2-digit' ? pad2(z.s) : String(z.s));
+  let s = parts.join(':');
+  if (o.fractionalSecondDigits) s += '.' + String(z.ms).padStart(3, '0').slice(0, o.fractionalSecondDigits);
+  if (o.hour && h12) s += ` ${h < 12 ? 'AM' : 'PM'}`;
+  if (o.timeZoneName) s += ' ' + (o.timeZone === 'UTC' ? 'UTC' : 'GMT');
+  return s;
+}
+
+function formatDate(date, o) {
+  const z = zoned(date, o.timeZone);
+  const gb = o.locale.startsWith('en-GB') || o.locale.startsWith('de') || o.locale.startsWith('fr') || o.locale.startsWith('es');
+  if (o.dateStyle || o.timeStyle) {
+    let dp = '', tp = '';
+    const de = o.locale.startsWith('de');
+    if (o.dateStyle === 'full') dp = datePortion(z, { locale: o.locale, weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }, gb);
+    else if (o.dateStyle === 'long') dp = datePortion(z, { locale: o.locale, month: 'long', day: 'numeric', year: 'numeric' }, gb);
+    else if (o.dateStyle === 'medium') dp = datePortion(z, de ? { locale: o.locale, month: '2-digit', day: '2-digit', year: 'numeric' } : { month: 'short', day: 'numeric', year: 'numeric' }, gb);
+    else if (o.dateStyle === 'short') dp = datePortion(z, de ? { locale: o.locale, month: '2-digit', day: '2-digit', year: '2-digit' } : { month: 'numeric', day: 'numeric', year: '2-digit' }, gb);
+    if (o.timeStyle === 'short') tp = timePortion(z, { hour: 'numeric', minute: '2-digit', ...o }, gb);
+    else if (o.timeStyle === 'medium') tp = timePortion(z, { hour: 'numeric', minute: '2-digit', second: '2-digit', ...o }, gb);
+    else if (o.timeStyle) tp = timePortion(z, { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short', ...o }, gb);
+    return dp && tp ? `${dp}${o.dateStyle === 'full' || o.dateStyle === 'long' ? ' at ' : ', '}${tp}` : dp || tp;
+  }
+  const hasDate = o.weekday || o.year || o.month || o.day;
+  const hasTime = o.hour || o.minute || o.second || o.fractionalSecondDigits;
+  const dflt = !hasDate && !hasTime;
+  const dOpts = dflt ? { ...o, year: 'numeric', month: 'numeric', day: 'numeric' } : o;
+  const dp = dflt || hasDate ? datePortion(z, dOpts, gb) : '';
+  const tp = hasTime ? timePortion(z, o, gb) : '';
+  return dp && tp ? `${dp}${o.month === 'long' && !gb ? ' at ' : ', '}${tp}` : dp || tp;
+}
+
+function localeHelper(defaults) {
+  return (date, locales, options = {}) => {
+    if (Number.isNaN(date.getTime())) return 'Invalid Date';
+    const o = { locale: canonLocale(locales), ...options };
+    const hasDate = o.weekday || o.year || o.month || o.day || o.dateStyle;
+    const hasTime = o.hour || o.minute || o.second || o.timeStyle || o.fractionalSecondDigits;
+    if (defaults === 'all' && !hasDate && !hasTime) Object.assign(o, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    else if (defaults === 'date' && !hasDate) Object.assign(o, { year: 'numeric', month: 'numeric', day: 'numeric' });
+    else if (defaults === 'time' && !hasTime) Object.assign(o, { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    return formatDate(date, o);
+  };
+}
+
+class Collator {
+  #o;
+  constructor(locales, options = {}) {
+    this.#o = { locale: canonLocale(locales), ...options };
+    const o = this.#o;
+    this.compare = (a, b) => String(a).localeCompare(String(b), o.locale, o);
+  }
+  resolvedOptions() {
+    return { locale: this.#o.locale, usage: 'sort', sensitivity: this.#o.sensitivity ?? 'variant', ignorePunctuation: false, collation: 'default', numeric: !!this.#o.numeric, caseFirst: 'false' };
+  }
+  static supportedLocalesOf(l) { return [].concat(l ?? []); }
+  get [Symbol.toStringTag]() { return 'Intl.Collator'; }
+}
+
+class ListFormat {
+  #o;
+  constructor(locales, options = {}) {
+    this.#o = { locale: canonLocale(locales), type: options.type ?? 'conjunction', style: options.style ?? 'long' };
+  }
+  format(list) {
+    const items = Array.from(list, (x) => {
+      if (typeof x !== 'string') throw new TypeError('Iterable yielded ' + String(x) + ' which is not a string');
+      return x;
+    });
+    const { type, style } = this.#o;
+    if (!items.length) return '';
+    if (items.length === 1) return items[0];
+    if (type === 'unit') return items.join(style === 'narrow' ? ' ' : ', ');
+    const word = type === 'disjunction' ? 'or' : style === 'long' ? 'and' : style === 'short' ? '&' : '';
+    const joinWord = word ? ` ${word} ` : ', ';
+    if (items.length === 2) return items.join(joinWord);
+    return items.slice(0, -1).join(', ') + (word ? `, ${word} ` : ', ') + items[items.length - 1];
+  }
+  get [Symbol.toStringTag]() { return 'Intl.ListFormat'; }
+}
+
+class RelativeTimeFormat {
+  #o;
+  constructor(locales, options = {}) {
+    this.#o = { locale: canonLocale(locales), numeric: options.numeric ?? 'always', style: options.style ?? 'long' };
+  }
+  format(value, unit) {
+    const u = String(unit).replace(/s$/, '');
+    if (!['second', 'minute', 'hour', 'day', 'week', 'month', 'quarter', 'year'].includes(u))
+      throw new RangeError(`Invalid unit argument for format() '${unit}'`);
+    const v = Number(value);
+    if (this.#o.numeric === 'auto') {
+      if (u === 'day' && v === 0) return 'today';
+      if (u === 'day' && v === 1) return 'tomorrow';
+      if (u === 'day' && v === -1) return 'yesterday';
+      if (v === 0) return `this ${u}`;
+      if (v === 1 && u !== 'second' && u !== 'minute' && u !== 'hour') return `next ${u}`;
+      if (v === -1 && u !== 'second' && u !== 'minute' && u !== 'hour') return `last ${u}`;
+    }
+    const abs = Math.abs(v);
+    const n = new NumberFormat('en-US').format(abs);
+    const name = abs === 1 ? u : u + 's';
+    return v < 0 || Object.is(v, -0) ? `${n} ${name} ago` : `in ${n} ${name}`;
+  }
+  get [Symbol.toStringTag]() { return 'Intl.RelativeTimeFormat'; }
+}
+
+class PluralRules {
+  #type;
+  constructor(locales, options = {}) {
+    canonLocale(locales);
+    this.#type = options.type ?? 'cardinal';
+  }
+  select(n) {
+    n = Number(n);
+    if (this.#type === 'ordinal') {
+      const t = n % 100, u = n % 10;
+      if (t >= 11 && t <= 13) return 'other';
+      return u === 1 ? 'one' : u === 2 ? 'two' : u === 3 ? 'few' : 'other';
+    }
+    return n === 1 ? 'one' : 'other';
+  }
+  get [Symbol.toStringTag]() { return 'Intl.PluralRules'; }
+}
+
+class Segmenter {
+  #g;
+  constructor(locales, options = {}) { this.#g = options.granularity ?? 'grapheme'; }
+  segment(s) {
+    const g = this.#g;
+    s = String(s);
+    return {
+      *[Symbol.iterator]() {
+        if (g === 'word') {
+          let i = 0;
+          for (const m of s.matchAll(/[\p{L}\p{N}_']+|[^\p{L}\p{N}_']/gu)) {
+            yield { segment: m[0], index: m.index, input: s, isWordLike: /[\p{L}\p{N}]/u.test(m[0]) };
+            i++;
+          }
+          return;
+        }
+        let at = 0;
+        const chars = s.match(/\P{M}\p{M}*(‍\P{M}\p{M}*)*/gu) ?? [];
+        for (const c of chars) {
+          yield { segment: c, index: at, input: s };
+          at += c.length;
+        }
+      },
+    };
+  }
+}
+
+function callable(C) {
+  function F(...args) { return new C(...args); }
+  Object.defineProperty(F, 'name', { value: C.name, configurable: true });
+  F.prototype = C.prototype;
+  Object.defineProperty(C.prototype, 'constructor', { value: F, writable: true, configurable: true });
+  Object.defineProperty(F, 'supportedLocalesOf', { value: C.supportedLocalesOf, writable: true, configurable: true });
+  return F;
+}
+
+const Intl = {
+  NumberFormat: callable(NumberFormat), DateTimeFormat: callable(DateTimeFormat), Collator: callable(Collator), ListFormat, RelativeTimeFormat, PluralRules, Segmenter,
+  getCanonicalLocales: (l) => (l === undefined ? [] : [].concat(l).map(canonLocale)),
+  supportedValuesOf: () => [],
+  [Symbol.toStringTag]: 'Intl',
+};
+for (const k of ['NumberFormat', 'DateTimeFormat', 'Collator']) {
+  const C = Intl[k];
+  Object.defineProperty(Intl, k, { value: C, enumerable: false, writable: true, configurable: true });
+}
+
+internal.installGlobal('Intl', Intl);
+
+module.exports = {
+  Intl,
+  dateToLocaleString: localeHelper('all'),
+  dateToLocaleDateString: localeHelper('date'),
+  dateToLocaleTimeString: localeHelper('time'),
+};

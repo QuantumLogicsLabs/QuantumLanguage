@@ -2,6 +2,9 @@
 Thread = __thread_class
 
 class Thread
+  # here, not in core_ext: Kernel#exit would hide it from a method-missing load
+  def self.exit = current.kill
+
   class Mutex
     def initialize
       @owner = nil

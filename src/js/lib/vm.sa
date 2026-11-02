@@ -1,0 +1,28 @@
+'use strict';
+// The vm module: scripts run in the one realm, with a context's names in scope.
+function inContext(code, context) {
+  const names = Object.keys(context);
+  // assignments land in the context through `with`
+  const run = new Function('__context', '__code', 'with (__context) { return eval(__code); }');
+  return run(context, code);
+}
+class Script {
+  #code;
+  constructor(code) {
+    this.#code = String(code);
+    new Function(this.#code.includes('return') ? '' : this.#code);
+  }
+  runInThisContext() { return (0, eval)(this.#code); }
+  runInContext(c) { return inContext(this.#code, c); }
+  runInNewContext(c = {}) { return inContext(this.#code, c); }
+}
+const contexts = new WeakSet();
+module.exports = {
+  Script,
+  createContext(o = {}) { contexts.add(o); return o; },
+  isContext: (o) => contexts.has(o),
+  runInThisContext: (code) => (0, eval)(String(code)),
+  runInNewContext: (code, c = {}) => inContext(String(code), c),
+  runInContext: (code, c) => inContext(String(code), c),
+  compileFunction: (code, params = []) => new Function(...params, code),
+};

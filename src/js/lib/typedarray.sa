@@ -1,0 +1,257 @@
+'use strict';
+// %TypedArray%'s methods, DataView and friends. The storage is native.
+const { TypedArray } = internal.typed;
+const P = TypedArray.prototype;
+
+for (const name of ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array'])
+  internal.installGlobal(name, internal.typed[name]);
+
+function check(t) {
+  if (!ArrayBuffer.isView(t) || internal.classOf(t) !== 22) throw new TypeError('this is not a typed array.');
+  return t;
+}
+
+function fn(f, name) {
+  if (typeof f !== 'function') throw new TypeError(`${require('util').inspect(f)} is not a function`);
+  return f;
+}
+
+const rel = (v, len, d) => {
+  if (v === undefined) return d;
+  const n = Math.trunc(Number(v)) || 0;
+  return n < 0 ? Math.max(len + n, 0) : Math.min(n, len);
+};
+
+function speciesOf(t) {
+  const dflt = internal.typed[t[Symbol.toStringTag]];
+  const c = t.constructor;
+  if (c === undefined) return dflt;
+  const s = c[Symbol.species];
+  return s == null ? dflt : s;
+}
+
+const methods = {
+  at(i) {
+    check(this);
+    const n = Math.trunc(Number(i)) || 0;
+    const k = n < 0 ? this.length + n : n;
+    return k < 0 || k >= this.length ? undefined : this[k];
+  },
+  copyWithin(target, start, end) {
+    check(this);
+    const n = this.length;
+    let to = rel(target, n, 0), from = rel(start, n, 0);
+    const fin = rel(end, n, n);
+    let count = Math.min(fin - from, n - to);
+    const copy = Array.from(this);
+    for (let i = 0; i < count; i++) this[to + i] = copy[from + i];
+    return this;
+  },
+  entries() { check(this); return Array.prototype.entries.call(this); },
+  keys() { check(this); return Array.prototype.keys.call(this); },
+  values() { check(this); return Array.prototype.values.call(this); },
+  every(f, a) { check(this); return Array.prototype.every.call(this, fn(f), a); },
+  some(f, a) { check(this); return Array.prototype.some.call(this, fn(f), a); },
+  fill(v, s, e) {
+    check(this);
+    const n = this.length;
+    const a = rel(s, n, 0), b = rel(e, n, n);
+    for (let i = a; i < b; i++) this[i] = v;
+    return this;
+  },
+  filter(f, a) {
+    check(this);
+    const out = [];
+    for (let i = 0; i < this.length; i++) if (fn(f).call(a, this[i], i, this)) out.push(this[i]);
+    return new (speciesOf(this))(out);
+  },
+  find(f, a) { check(this); return Array.prototype.find.call(this, fn(f), a); },
+  findIndex(f, a) { check(this); return Array.prototype.findIndex.call(this, fn(f), a); },
+  findLast(f, a) { check(this); return Array.prototype.findLast.call(this, fn(f), a); },
+  findLastIndex(f, a) { check(this); return Array.prototype.findLastIndex.call(this, fn(f), a); },
+  forEach(f, a) { check(this); return Array.prototype.forEach.call(this, fn(f), a); },
+  includes(x, s) { check(this); return Array.prototype.includes.call(this, x, s); },
+  indexOf(x, s) { check(this); return Array.prototype.indexOf.call(this, x, s); },
+  join(sep) { check(this); return Array.prototype.join.call(this, sep); },
+  lastIndexOf(...a) { check(this); return Array.prototype.lastIndexOf.apply(this, a); },
+  map(f, a) {
+    check(this);
+    const r = new (speciesOf(this))(this.length);
+    for (let i = 0; i < this.length; i++) r[i] = fn(f).call(a, this[i], i, this);
+    return r;
+  },
+  reduce(...a) { check(this); return Array.prototype.reduce.apply(this, a); },
+  reduceRight(...a) { check(this); return Array.prototype.reduceRight.apply(this, a); },
+  reverse() {
+    check(this);
+    for (let l = 0, h = this.length - 1; l < h; l++, h--) {
+      const t = this[l];
+      this[l] = this[h];
+      this[h] = t;
+    }
+    return this;
+  },
+  set(src, offset = 0) {
+    check(this);
+    const off = Math.trunc(Number(offset)) || 0;
+    if (off < 0) throw new RangeError('offset is out of bounds');
+    const list = Array.isArray(src) || ArrayBuffer.isView(src) ? src : Object(src);
+    const n = list.length >>> 0;
+    if (n + off > this.length) throw new RangeError('offset is out of bounds');
+    const copy = ArrayBuffer.isView(list) && list.buffer === this.buffer ? Array.from(list) : list;
+    for (let i = 0; i < n; i++) this[off + i] = copy[i];
+  },
+  slice(s, e) {
+    check(this);
+    const n = this.length;
+    const a = rel(s, n, 0), b = rel(e, n, n);
+    const count = Math.max(b - a, 0);
+    const r = new (speciesOf(this))(count);
+    for (let i = 0; i < count; i++) r[i] = this[a + i];
+    return r;
+  },
+  sort(cmp) {
+    if (cmp !== undefined && typeof cmp !== 'function') throw new TypeError('The comparison function must be either a function or undefined');
+    check(this);
+    const list = Array.from(this);
+    list.sort(cmp ?? ((a, b) => {
+      if (a < b) return -1;
+      if (a > b) return 1;
+      if (a === 0 && b === 0) return Object.is(a, -0) ? (Object.is(b, -0) ? 0 : -1) : (Object.is(b, -0) ? 1 : 0);
+      if (a !== a) return b !== b ? 0 : 1;
+      if (b !== b) return -1;
+      return 0;
+    }));
+    for (let i = 0; i < list.length; i++) this[i] = list[i];
+    return this;
+  },
+  subarray(s, e) {
+    check(this);
+    const n = this.length;
+    const a = rel(s, n, 0), b = rel(e, n, n);
+    return new (speciesOf(this))(this.buffer, this.byteOffset + a * this.BYTES_PER_ELEMENT, Math.max(b - a, 0));
+  },
+  toLocaleString() { check(this); return Array.prototype.toLocaleString.call(this); },
+  toReversed() { check(this); return new (internal.typed[this[Symbol.toStringTag]])(this).reverse(); },
+  toSorted(c) { check(this); return new (internal.typed[this[Symbol.toStringTag]])(this).sort(c); },
+  with(i, v) {
+    check(this);
+    const n = Math.trunc(Number(i)) || 0;
+    const k = n < 0 ? this.length + n : n;
+    if (k < 0 || k >= this.length) throw new RangeError('Invalid typed array index');
+    const r = new (internal.typed[this[Symbol.toStringTag]])(this);
+    r[k] = v;
+    return r;
+  },
+};
+
+for (const name of Object.keys(methods))
+  Object.defineProperty(P, name, { value: methods[name], writable: true, configurable: true });
+Object.defineProperty(P, 'toString', { value: Array.prototype.toString, writable: true, configurable: true });
+Object.defineProperty(P, Symbol.iterator, { value: methods.values, writable: true, configurable: true });
+
+Object.defineProperty(TypedArray, 'from', {
+  value: function from(src, mapFn, thisArg) {
+    if (mapFn !== undefined && typeof mapFn !== 'function') throw new TypeError(`${require('util').inspect(mapFn)} is not a function`);
+    const list = Array.from(src);
+    const r = new this(list.length);
+    for (let i = 0; i < list.length; i++) r[i] = mapFn ? mapFn.call(thisArg, list[i], i) : list[i];
+    return r;
+  },
+  writable: true,
+  configurable: true,
+});
+Object.defineProperty(TypedArray, 'of', {
+  value: function of(...items) {
+    const r = new this(items.length);
+    for (let i = 0; i < items.length; i++) r[i] = items[i];
+    return r;
+  },
+  writable: true,
+  configurable: true,
+});
+
+// ── DataView ─────────────────────────────────────────────────────────────
+
+const scratch = new ArrayBuffer(8);
+const sb = new Uint8Array(scratch);
+const sf32 = new Float32Array(scratch), sf64 = new Float64Array(scratch);
+const si8 = new Int8Array(scratch), si16 = new Int16Array(scratch), su16 = new Uint16Array(scratch), si32 = new Int32Array(scratch), su32 = new Uint32Array(scratch);
+const sbi = new BigInt64Array(scratch), sbu = new BigUint64Array(scratch);
+
+class DataView {
+  #bytes; #buffer; #offset; #length;
+  constructor(buffer, byteOffset = undefined, byteLength = undefined) {
+    if (!(buffer instanceof ArrayBuffer)) throw new TypeError('First argument to DataView constructor must be an ArrayBuffer');
+    const off = byteOffset === undefined ? 0 : Math.trunc(Number(byteOffset)) || 0;
+    if (off < 0 || off > buffer.byteLength) throw new RangeError(`Start offset ${off} is outside the bounds of the buffer`);
+    const len = byteLength === undefined ? buffer.byteLength - off : Math.trunc(Number(byteLength)) || 0;
+    if (len < 0 || off + len > buffer.byteLength) throw new RangeError(`Invalid DataView length ${len}`);
+    this.#buffer = buffer;
+    this.#offset = off;
+    this.#length = len;
+    this.#bytes = new Uint8Array(buffer, off, len);
+  }
+  static #read(dv, pos, size, little, view) {
+    const p = Math.trunc(Number(pos)) || 0;
+    if (p < 0 || p + size > dv.#length) throw new RangeError('Offset is outside the bounds of the DataView');
+    for (let i = 0; i < size; i++) sb[little ? i : size - 1 - i] = dv.#bytes[p + i];
+    return view[0];
+  }
+  static #write(dv, pos, size, little, view, value) {
+    const p = Math.trunc(Number(pos)) || 0;
+    view[0] = value;
+    if (p < 0 || p + size > dv.#length) throw new RangeError('Offset is outside the bounds of the DataView');
+    for (let i = 0; i < size; i++) dv.#bytes[p + i] = sb[little ? i : size - 1 - i];
+  }
+  get buffer() { return this.#buffer; }
+  get byteOffset() { return this.#offset; }
+  get byteLength() { return this.#length; }
+  getInt8(p) { return DataView.#read(this, p, 1, true, si8); }
+  getUint8(p) { return DataView.#read(this, p, 1, true, sb); }
+  getInt16(p, l = false) { return DataView.#read(this, p, 2, l, si16); }
+  getUint16(p, l = false) { return DataView.#read(this, p, 2, l, su16); }
+  getInt32(p, l = false) { return DataView.#read(this, p, 4, l, si32); }
+  getUint32(p, l = false) { return DataView.#read(this, p, 4, l, su32); }
+  getFloat32(p, l = false) { return DataView.#read(this, p, 4, l, sf32); }
+  getFloat64(p, l = false) { return DataView.#read(this, p, 8, l, sf64); }
+  getBigInt64(p, l = false) { return DataView.#read(this, p, 8, l, sbi); }
+  getBigUint64(p, l = false) { return DataView.#read(this, p, 8, l, sbu); }
+  setInt8(p, v) { DataView.#write(this, p, 1, true, si8, v); }
+  setUint8(p, v) { DataView.#write(this, p, 1, true, sb, v); }
+  setInt16(p, v, l = false) { DataView.#write(this, p, 2, l, si16, v); }
+  setUint16(p, v, l = false) { DataView.#write(this, p, 2, l, su16, v); }
+  setInt32(p, v, l = false) { DataView.#write(this, p, 4, l, si32, v); }
+  setUint32(p, v, l = false) { DataView.#write(this, p, 4, l, su32, v); }
+  setFloat32(p, v, l = false) { DataView.#write(this, p, 4, l, sf32, v); }
+  setFloat64(p, v, l = false) { DataView.#write(this, p, 8, l, sf64, v); }
+  setBigInt64(p, v, l = false) { DataView.#write(this, p, 8, l, sbi, v); }
+  setBigUint64(p, v, l = false) { DataView.#write(this, p, 8, l, sbu, v); }
+}
+Object.defineProperty(DataView.prototype, Symbol.toStringTag, { value: 'DataView', configurable: true });
+internal.installGlobal('DataView', DataView);
+
+class SharedArrayBuffer {
+  constructor() { throw new TypeError('SharedArrayBuffer is not available'); }
+}
+internal.installGlobal('SharedArrayBuffer', SharedArrayBuffer);
+
+const Atomics = {};
+const atomicMethods = {
+  load(a, i) { return a[i]; },
+  store(a, i, v) { a[i] = v; return v; },
+  add(a, i, v) { const o = a[i]; a[i] = o + v; return o; },
+  sub(a, i, v) { const o = a[i]; a[i] = o - v; return o; },
+  and(a, i, v) { const o = a[i]; a[i] = o & v; return o; },
+  or(a, i, v) { const o = a[i]; a[i] = o | v; return o; },
+  xor(a, i, v) { const o = a[i]; a[i] = o ^ v; return o; },
+  exchange(a, i, v) { const o = a[i]; a[i] = v; return o; },
+  compareExchange(a, i, e, v) { const o = a[i]; if (o === e) a[i] = v; return o; },
+  isLockFree(n) { return n === 1 || n === 2 || n === 4 || n === 8; },
+  wait(a, i, v, t) { return a[i] !== v ? 'not-equal' : 'timed-out'; },
+  waitAsync(a, i, v, t) { return { async: false, value: a[i] !== v ? 'not-equal' : 'timed-out' }; },
+  notify(a, i, c) { return 0; },
+};
+for (const k of Object.keys(atomicMethods)) Object.defineProperty(Atomics, k, { value: atomicMethods[k], writable: true, configurable: true });
+Object.defineProperty(Atomics, Symbol.toStringTag, { value: 'Atomics', configurable: true });
+internal.installGlobal('Atomics', Atomics);

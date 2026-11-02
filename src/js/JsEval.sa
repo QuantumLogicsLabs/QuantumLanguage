@@ -1,0 +1,3749 @@
+// quantum: cpp
+// JavaScript front-end: the tree-walking interpreter. Statements report break,
+// continue and return through g_comp; thrown values travel as C++ exceptions.
+// JavaScript code never runs inside a C++ catch block, because a generator can
+// switch stacks and the exception state is per-stack.
+#include "JsRt.h.sa"
+#include "JsInternal.h.sa"
+#include "JsMain.h.sa"
+
+#include <cmath>
+
+namespace js
+{
+
+V g_evalFn = 0;
+
+namespace
+{
+[[noreturn]] void errSpreadNullish(Node *src, V v);
+[[noreturn]] void errCalleeNotFunction(Node *c);
+[[noreturn]] void errCalleeNotConstructor(Node *c);
+[[noreturn]] void errClassCall(JFunc *fn);
+V taggedCall(Node *n, Frame *f, Node *c, V fn, V thisV);
+V bigLiteralOf(Node *n);
+V templateObject(Node *n);
+} // namespace
+
+namespace
+{
+
+V *allocSlots(int n)
+{
+    return static_cast<V *>(bump(sizeof(V) * (size_t)(n ? n : 1)));
+}
+
+Env *newEnv(Env *parent, Scope *s)
+{
+    int n = s->nEnv;
+    Env *e = static_cast<Env *>(bump(sizeof(Env) + sizeof(V) * (size_t)n));
+    e->parent = parent;
+    e->scope = s;
+    V *slots = reinterpret_cast<V *>(e + 1);
+    e->slots = slots;
+    for (int i = 0; i < n; ++i)
+        slots[i] = Undefined;
+    e->withObj = 0;
+    return e;
+}
+
+[[noreturn]] void tdzError(V name)
+{
+    throwError(E_REFERENCE, "Cannot access '" + toUtf8(sp_(name)) + "' before initialization");
+}
+
+[[noreturn]] void constError()
+{
+    throwType("Assignment to constant variable.");
+}
+
+} // namespace
+
+void enterScopeSlow(Scope *s, Frame *f)
+{
+    if (s->hasEnv)
+    {
+        Env *e = newEnv(f->env, s);
+        f->env = e;
+        for (int t : s->tdzEnv)
+            e->slots[t] = Hole;
+    }
+    for (int i = 0; i < s->nTdzLocals; ++i)
+        f->locals[s->tdzLocalsP[i]] = Hole;
+    for (int i = 0; i < s->nFuncDecls; ++i)
+    {
+        Node *d = s->funcDeclsP[i];
+        V fn = makeClosure(d->func, f->env, f);
+        Node *t = d->a;
+        if (t->k == N_LOCAL)
+            f->locals[t->slot] = fn;
+        else if (t->k == N_ENVVAR)
+        {
+            Env *e = f->env;
+            for (int h = t->hops; h > 0; --h)
+                e = e->parent;
+            e->slots[t->slot] = fn;
+        }
+        else if (t->k == N_DYNAMIC)
+            assignNode(t, fn, f, true);
+    }
+}
+
+V makeClosure(FuncNode *node, Env *env, Frame *f)
+{
+    JFunc *fn = static_cast<JFunc *>(bump(sizeof(JFunc)));
+    fn->shape = g_rootShape;
+    fn->cls = C_FUNCTION;
+    fn->node = node;
+    fn->env = env;
+    fn->thisV = Undefined;
+    fn->newTarget = Undefined;
+    fn->home = Undefined;
+    fn->data = Undefined;
+    fn->data2 = Undefined;
+    fn->target = Undefined;
+    fn->flags = OF_CALLABLE | OF_LAZYFN;
+    if (node->isGen)
+    {
+        fn->kind = node->isAsync ? FK_ASYNCGEN : FK_GENERATOR;
+        fn->proto = node->isAsync ? PR.asyncGenFunction : PR.generatorFunction;
+    }
+    else if (node->isAsync)
+    {
+        fn->kind = FK_ASYNC;
+        fn->proto = PR.asyncFunction;
+    }
+    else
+    {
+        fn->proto = PR.function;
+        if (node->isArrow)
+            fn->kind = FK_ARROW;
+        else
+        {
+            fn->kind = FK_NORMAL;
+            if (!node->isMethod)
+                fn->flags |= OF_CTOR;
+        }
+    }
+    if (node->isArrow && f)
+    {
+        fn->thisV = f->thisV;
+        fn->newTarget = f->newTarget;
+        if (f->fn)
+            fn->home = f->fn->home;
+    }
+    return objv(fn);
+}
+
+// ── names found at run time ──────────────────────────────────────────────
+
+namespace
+{
+
+// the slot of a name among the environments; a `with` object is reported in *obj
+V *lookupDynamic(V name, Frame *f, Obj **obj)
+{
+    *obj = nullptr;
+    for (Env *e = f->env; e; e = e->parent)
+    {
+        if (e->withObj)
+        {
+            Obj *w = op(e->withObj);
+            if (hasProp(w, name))
+            {
+                V un = getProp(e->withObj, WK.unscopables);
+                if (!isObj(un) || !truthy(getProp(un, name)))
+                {
+                    *obj = w;
+                    return nullptr;
+                }
+            }
+            continue;
+        }
+        if (e->dyn && hasOwn(e->dyn, name))
+        {
+            *obj = e->dyn;
+            return nullptr;
+        }
+        Binding *b = e->scope ? e->scope->find(name) : nullptr;
+        if (b && b->captured)
+            return &e->slots[b->slot];
+    }
+    return nullptr;
+}
+
+V dynamicGet(Node *n, Frame *f, bool forTypeof)
+{
+    Obj *obj;
+    V *slot = lookupDynamic(n->val, f, &obj);
+    if (slot)
+    {
+        if (*slot == Hole)
+            tdzError(n->val);
+        return *slot;
+    }
+    if (obj)
+        return getPropObj(obj, n->val, objv(obj));
+    if (n->val == A.undefined)
+        return Undefined;
+    if (hasProp(g_global, n->val) || autoloadGlobal(n->val))
+        return getPropObj(g_global, n->val, objv(g_global));
+    if (forTypeof)
+        return Undefined;
+    errNotDefined(n->val);
+}
+
+V globalGet(Node *n, bool forTypeof)
+{
+    V name = n->val;
+    uint8_t fl;
+    int idx = shapeFind(g_global->shape, name, &fl);
+    if (idx >= 0)
+    {
+        V v = g_global->slots[idx];
+        if (fl & PF_ACCESSOR)
+            return getPropObj(g_global, name, objv(g_global));
+        return v;
+    }
+    if (autoloadGlobal(name))
+        return getPropObj(g_global, name, objv(g_global));
+    if (hasProp(g_global, name))
+        return getPropObj(g_global, name, objv(g_global));
+    if (forTypeof)
+        return Undefined;
+    throwError(E_REFERENCE, toUtf8(sp_(name)) + " is not defined");
+}
+
+// what a call's callee looked like, the way V8 prints it in messages
+const char *binaryText(int o)
+{
+    static const char *const names[] = {"+", "-", "*", "/", "%", "**", "&", "|", "^", "<<", ">>", ">>>", "==", "!=", "===", "!==", "<", "<=", ">", ">=", "in", "instanceof"};
+    return names[o];
+}
+
+void printNode(Node *n, std::string &o);
+
+// a + b + c prints as one list
+void printChain(Node *n, std::string &o)
+{
+    if (n->a->k == n->k && n->a->op == n->op && n->k == N_BINARY && n->op <= OP_USHR && n->op != OP_EXP)
+        printChain(n->a, o);
+    else
+        printNode(n->a, o);
+    o += " ";
+    o += binaryText(n->op);
+    o += " ";
+    printNode(n->b, o);
+}
+
+void printLogical(Node *n, const char *text, std::string &o)
+{
+    if (n->a->k == n->k)
+        printLogical(n->a, text, o);
+    else
+        printNode(n->a, o);
+    o += " ";
+    o += text;
+    o += " ";
+    printNode(n->b, o);
+}
+
+void printNode(Node *n, std::string &o)
+{
+    switch (n->k)
+    {
+    case N_LOCAL:
+    case N_ENVVAR:
+    case N_GLOBAL:
+    case N_DYNAMIC:
+    case N_IDENT:
+        o += toUtf8(sp_(n->val));
+        return;
+    case N_UNDEF:
+        o += "undefined";
+        return;
+    case N_THIS:
+        o += "this";
+        return;
+    case N_NULL:
+        o += "null";
+        return;
+    case N_TRUE:
+        o += "true";
+        return;
+    case N_FALSE:
+        o += "false";
+        return;
+    case N_NUM:
+        o += numberToStd(numOf(n->val));
+        return;
+    case N_STR:
+        o += "\"" + toUtf8(sp_(n->val)) + "\"";
+        return;
+    case N_MEMBER:
+        printNode(n->a, o);
+        o += n->opt ? "?." : ".";
+        o += toUtf8(sp_(n->val));
+        return;
+    case N_PRIVATE:
+        printNode(n->a, o);
+        o += ".";
+        o += toUtf8(sp_(n->b->val));
+        return;
+    case N_INDEX:
+        printNode(n->a, o);
+        if (n->b->k == N_STR || (n->b->k == N_TEMPLATE && n->b->n == 1))
+        {
+            Node *key = n->b->k == N_STR ? n->b : n->b->items[0];
+            o += n->opt ? "?." : ".";
+            o += toUtf8(sp_(key->val));
+            return;
+        }
+        o += n->opt ? "?.[" : "[";
+        printNode(n->b, o);
+        o += "]";
+        return;
+    case N_CALL:
+        printNode(n->a, o);
+        o += "(...)";
+        return;
+    case N_CHAIN:
+        printNode(n->a, o);
+        return;
+    case N_SUPERMEMBER:
+        o += "(intermediate value).";
+        o += toUtf8(sp_(n->val));
+        return;
+    case N_OBJECT:
+        o += "{";
+        for (int i = 0; i < n->n; ++i)
+            o += "(intermediate value)";
+        o += "}";
+        return;
+    case N_ARRAY:
+        o += "[";
+        for (int i = 0; i < n->n; ++i)
+        {
+            if (i)
+                o += ",";
+            printNode(n->items[i], o);
+        }
+        o += "]";
+        return;
+    case N_TEMPLATE:
+        if (n->n == 1)
+            printNode(n->items[0], o);
+        else
+            for (int i = 1; i < n->n; i += 2)
+                printNode(n->items[i], o);
+        return;
+    case N_REGEX:
+        o += "/" + toUtf8(sp_(n->val)) + "/" + toUtf8(sp_(n->val2));
+        return;
+    case N_NEWTARGET:
+        o += ".new.target";
+        return;
+    case N_COND:
+        o += "(intermediate value)(intermediate value)(intermediate value)";
+        return;
+    case N_AND:
+    case N_OR:
+    case N_NULLISH:
+        o += "(";
+        printLogical(n, n->k == N_AND ? "&&" : n->k == N_OR ? "||" : "??", o);
+        o += ")";
+        return;
+    case N_SEQ:
+        o += "(";
+        for (int i = 0; i < n->n; ++i)
+        {
+            if (i)
+                o += " , ";
+            printNode(n->items[i], o);
+        }
+        o += ")";
+        return;
+    case N_UNARY:
+    {
+        o += "(";
+        o += n->op == OP_NEG ? "-" : n->op == OP_PLUS ? "+" : n->op == OP_NOT ? "!" : n->op == OP_BITNOT ? "~" : "void ";
+        printNode(n->a, o);
+        o += ")";
+        return;
+    }
+    case N_TYPEOF:
+        o += "(typeof ";
+        printNode(n->a, o);
+        o += ")";
+        return;
+    case N_DELETE:
+        o += "(delete ";
+        printNode(n->a, o);
+        o += ")";
+        return;
+    case N_BINARY:
+        o += "(";
+        printChain(n, o);
+        o += ")";
+        return;
+    default:
+        o += "(intermediate value)";
+    }
+}
+
+} // namespace
+
+std::string nodeToCallText(Node *n)
+{
+    std::string o;
+    printNode(n, o);
+    return o;
+}
+
+// the message names the expression, as the program wrote it
+void requireIterable(V v, Node *src)
+{
+    if (isObj(v) && op(v)->cls == C_ARRAY)
+        return;
+    if (isStr(v))
+        return;
+    if (isNullish(v) || !isCallable(getProp(v, WK.iterator)))
+    {
+        if (src->k == N_CALL || src->k == N_NEW)
+            throwType(nodeToCallText(src->a) + " is not a function or its return value is not iterable");
+        throwType(nodeToCallText(src) + " is not iterable");
+    }
+}
+
+namespace
+{
+
+// V8 finds the source of a declaration's value only for these
+bool declSourceFound(Node *n)
+{
+    switch (n->k)
+    {
+    case N_NUM:
+    case N_STR:
+    case N_TRUE:
+    case N_FALSE:
+    case N_NULL:
+    case N_UNDEF:
+    case N_LOCAL:
+    case N_ENVVAR:
+    case N_GLOBAL:
+    case N_DYNAMIC:
+    case N_IDENT:
+    case N_CALL:
+    case N_NEW:
+    case N_OBJECT:
+    case N_ARRAY:
+    case N_COND:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void markNestedPattern(Node *t)
+{
+    if (t->k == N_DEFAULT)
+        t = t->a;
+    if (t->k == N_OBJECTPAT)
+        t->opt = true;
+}
+
+} // namespace
+
+// ── property access ──────────────────────────────────────────────────────
+
+namespace
+{
+
+V memberSlow(Node *n, V o)
+{
+    V key = n->val;
+    g_frame->cur = n;
+    if (isObj(o))
+    {
+        Obj *p = op(o);
+        if (p->flags & OF_LAZYFN)
+            materializeFn(static_cast<JFunc *>(p));
+        if (p->cls == C_ARRAY && key == A.length)
+            return num((double)static_cast<JArray *>(p)->len);
+        // remember where it was, for next time
+        if (!p->shape->isDict && p->cls != C_PROXY)
+        {
+            uint8_t fl;
+            int idx = shapeFind(p->shape, key, &fl);
+            if (idx >= 0)
+            {
+                if (!(fl & PF_ACCESSOR))
+                {
+                    n->icShape = p->shape;
+                    n->icSlot = idx;
+                    n->icProtoShape = nullptr;
+                    return p->slots[idx];
+                }
+            }
+            else
+            {
+                Obj *h = p->proto;
+                if (h && !h->shape->isDict && h->cls != C_PROXY && h != PR.function && !(key == A.length) && p->cls != C_STRING && p->cls != C_TYPEDARRAY && p->cls != C_ARGUMENTS)
+                {
+                    if (h->flags & OF_LAZYFN)
+                        materializeFn(static_cast<JFunc *>(h));
+                    int hi = shapeFind(h->shape, key, &fl);
+                    if (hi >= 0 && !(fl & PF_ACCESSOR))
+                    {
+                        n->icShape = p->shape;
+                        n->icProtoShape = h->shape;
+                        n->icSlot = hi;
+                        return h->slots[hi];
+                    }
+                }
+            }
+        }
+        return getPropObj(p, key, o);
+    }
+    if (isStr(o))
+    {
+        if (key == A.length)
+            return num((double)sp_(o)->len);
+        return getPropObj(PR.string, key, o);
+    }
+    if (o == OptShort)
+        return OptShort;
+    if (isNullish(o))
+    {
+        if (n->opt)
+            return OptShort;
+        errReadNullish(o, key);
+    }
+    return getProp(o, key);
+}
+
+// a local or a constant, read without a call: most operands are one of these
+#define EVAL_QUICK(x, out)                        \
+    do                                            \
+    {                                             \
+        Node *quick_ = (x);                       \
+        if (quick_->k == N_LOCAL)                 \
+        {                                         \
+            out = f->locals[quick_->slot];        \
+            if (out == Hole)                      \
+                out = evalNode(quick_, f);        \
+        }                                         \
+        else if (quick_->k == N_NUM)              \
+            out = quick_->val;                    \
+        else                                      \
+            out = evalNode(quick_, f);            \
+    } while (0)
+
+#define GET_MEMBER(n, o, out)                                                                  \
+    do                                                                                         \
+    {                                                                                          \
+        if (isObj(o))                                                                          \
+        {                                                                                      \
+            Obj *_p = op(o);                                                                   \
+            if (_p->shape == (n)->icShape)                                                     \
+            {                                                                                  \
+                if (!(n)->icProtoShape)                                                        \
+                {                                                                              \
+                    out = _p->slots[(n)->icSlot];                                              \
+                    break;                                                                     \
+                }                                                                              \
+                if (_p->proto && _p->proto->shape == (n)->icProtoShape)                        \
+                {                                                                              \
+                    out = _p->proto->slots[(n)->icSlot];                                       \
+                    break;                                                                     \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+        out = memberSlow(n, o);                                                                \
+    } while (0)
+
+V indexGet(Node *n, V o, V k)
+{
+    if (isObj(o))
+    {
+        Obj *p = op(o);
+        if (isNum(k))
+        {
+            double d = D(k);
+            if (p->cls == C_ARRAY)
+            {
+                JArray *a = static_cast<JArray *>(p);
+                uint32_t i = (uint32_t)d;
+                if ((double)i == d && i < a->used && a->el[i] != Hole)
+                    return a->el[i];
+            }
+            else if (p->cls == C_TYPEDARRAY)
+            {
+                V out;
+                int r = typedGetIndex(p, d, &out);
+                if (r == 1)
+                    return out;
+                if (r == 0)
+                    return Undefined;
+            }
+        }
+        return getPropObj(p, toKey(k), o);
+    }
+    if (isStr(o))
+    {
+        if (isNum(k))
+        {
+            double d = D(k);
+            JStr *s = sp_(o);
+            int i = (int)d;
+            if ((double)i == d && i >= 0 && i < s->len)
+            {
+                s = flat_(s);
+                return strv(charStr(unitAt(s, i)));
+            }
+        }
+        return getProp(o, toKey(k));
+    }
+    if (o == OptShort)
+        return OptShort;
+    if (isNullish(o))
+    {
+        if (n->opt)
+            return OptShort;
+        // the key is converted only after the base is checked
+        errReadNullish(o, k);
+    }
+    return getProp(o, toKey(k));
+}
+
+void memberSet(Node *n, V o, V val)
+{
+    if (isObj(o))
+    {
+        Obj *p = op(o);
+        if (p->shape == n->icShape)
+        {
+            if (n->icKeep == 0)
+            {
+                p->slots[n->icSlot] = val;
+                return;
+            }
+            // adding the property: the same shape change as last time
+            if (p->proto == n->icHolder && !(p->flags & OF_NONEXT) && n->icSlot < p->cap)
+            {
+                p->slots[n->icSlot] = val;
+                p->shape = n->icProtoShape;
+                return;
+            }
+        }
+        V key = n->val;
+        if (p->cls == C_OBJECT || p->cls == C_ERROR)
+        {
+            Shape *before = p->shape;
+            if (!before->isDict)
+            {
+                uint8_t fl;
+                int idx = shapeFind(before, key, &fl);
+                if (idx >= 0 && (fl & PF_W) && !(fl & PF_ACCESSOR))
+                {
+                    n->icShape = before;
+                    n->icKeep = 0;
+                    n->icSlot = idx;
+                    p->slots[idx] = val;
+                    return;
+                }
+                if (idx < 0)
+                {
+                    putProp(o, key, val, n->strict);
+                    if (p->shape != before && !p->shape->isDict && p->shape->parent == before && p->shape->key == key && p->slots[p->shape->index] == val)
+                    {
+                        n->icShape = before;
+                        n->icKeep = 1;
+                        n->icSlot = p->shape->index;
+                        n->icProtoShape = p->shape;
+                        n->icHolder = p->proto;
+                    }
+                    return;
+                }
+            }
+        }
+        putProp(o, key, val, n->strict);
+        return;
+    }
+    putProp(o, n->val, val, n->strict);
+}
+
+void indexSet(Node *n, V o, V k, V val)
+{
+    if (isObj(o) && isNum(k))
+    {
+        Obj *p = op(o);
+        if (p->cls == C_ARRAY && !(p->flags & (OF_FROZEN | OF_NONEXT)))
+        {
+            JArray *a = static_cast<JArray *>(p);
+            double d = D(k);
+            uint32_t i = (uint32_t)d;
+            if ((double)i == d && i < 4294967295u)
+            {
+                if (i < a->used)
+                {
+                    a->el[i] = val;
+                    return;
+                }
+                arraySetIndex(a, i, val);
+                return;
+            }
+        }
+        else if (p->cls == C_TYPEDARRAY && typedSetIndex(p, D(k), val) >= 0)
+            return;
+    }
+    if (isNullish(o))
+    {
+        errSetNullish(o, k);
+    }
+    putProp(o, toKey(k), val, n->strict);
+}
+
+V nameValue(Node *t, Frame *f);
+
+V privateKey(Node *ident, Frame *f)
+{
+    return nameValue(ident, f);
+}
+
+V privateGet(Node *n, V o, Frame *f)
+{
+    V key = privateKey(n->b, f);
+    if (o == OptShort)
+        return OptShort;
+    if (n->opt && isNullish(o))
+        return OptShort;
+    if (isObj(o))
+    {
+        Obj *p = op(o);
+        uint8_t fl;
+        int idx = shapeFind(p->shape, key, &fl);
+        if (idx >= 0)
+        {
+            if (fl & PF_ACCESSOR)
+            {
+                Accessor *ac = static_cast<Accessor *>(op(p->slots[idx]));
+                if (ac->get == Undefined)
+                    throwType("'" + keyText2(key) + "' was defined without a getter");
+                return call(ac->get, o, nullptr, 0);
+            }
+            return p->slots[idx];
+        }
+    }
+    throwType("Cannot read private member " + keyText2(key) + " from an object whose class did not declare it");
+}
+
+void privateSet(Node *n, V o, V val, Frame *f)
+{
+    V key = privateKey(n->b, f);
+    if (isObj(o))
+    {
+        Obj *p = op(o);
+        uint8_t fl;
+        int idx = shapeFind(p->shape, key, &fl);
+        if (idx >= 0)
+        {
+            if (fl & PF_ACCESSOR)
+            {
+                Accessor *ac = static_cast<Accessor *>(op(p->slots[idx]));
+                if (ac->set == Undefined)
+                    throwType("'" + keyText2(key) + "' was defined without a setter");
+                V a = val;
+                call(ac->set, o, &a, 1);
+                return;
+            }
+            if (!(fl & PF_W))
+                throwType("Private method '" + keyText2(key) + "' is not writable");
+            p->slots[idx] = val;
+            return;
+        }
+    }
+    throwType("Cannot write private member " + keyText2(key) + " to an object whose class did not declare it");
+}
+
+Obj *homeProto(Frame *f)
+{
+    V home = f->fn ? f->fn->home : Undefined;
+    if (!isObj(home))
+        throwError(E_SYNTAX, "'super' keyword unexpected here");
+    return protoOf(op(home));
+}
+
+V thisOf(Frame *f)
+{
+    if (f->thisV == Hole)
+        throwError(E_REFERENCE, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
+    return f->thisV;
+}
+
+V nameValue(Node *t, Frame *f)
+{
+    switch (t->k)
+    {
+    case N_LOCAL:
+        return f->locals[t->slot];
+    case N_ENVVAR:
+    {
+        Env *e = f->env;
+        for (int h = t->hops; h > 0; --h)
+            e = e->parent;
+        return e->slots[t->slot];
+    }
+    default:
+        return evalNode(t, f);
+    }
+}
+
+} // namespace
+
+// ── assignment targets ───────────────────────────────────────────────────
+
+namespace
+{
+void destructureArray(Node *p, V val, Frame *f, bool init);
+void destructureObject(Node *p, V val, Frame *f, bool init);
+
+V evalAnonNamed(Node *value, V key, Frame *f)
+{
+    // a computed or later-known name for an anonymous function or class
+    V v = evalNode(value, f);
+    if (isObj(v) && isCallable(v) && ((value->k == N_FUNC && !value->func->name) || (value->k == N_CLASS && !value->val && !value->val2)))
+    {
+        JFunc *fn = static_cast<JFunc *>(op(v));
+        if (fn->flags & OF_LAZYFN)
+            fn->fnName = isSym(key) ? (symp(key)->desc == Undefined ? A.empty : atomStr(concatStr(concatStr(newStrAscii("["), sp_(symp(key)->desc)), newStrAscii("]")))) : key;
+        else
+            defineOwn(fn, A.name, isSym(key) ? (symp(key)->desc == Undefined ? A.empty : atomStr(concatStr(concatStr(newStrAscii("["), sp_(symp(key)->desc)), newStrAscii("]")))) : key, PF_C);
+    }
+    return v;
+}
+} // namespace
+
+void assignNode(Node *t, V val, Frame *f, bool init)
+{
+    switch (t->k)
+    {
+    case N_LOCAL:
+        if (!init)
+        {
+            if (t->tdz && f->locals[t->slot] == Hole)
+                tdzError(t->val);
+            if (t->isConst)
+                constError();
+            if (t->op == 1)
+            {
+                if (t->strict)
+                    constError();
+                return;
+            }
+        }
+        f->locals[t->slot] = val;
+        return;
+    case N_ENVVAR:
+    {
+        Env *e = f->env;
+        for (int h = t->hops; h > 0; --h)
+            e = e->parent;
+        if (!init)
+        {
+            if (t->tdz && e->slots[t->slot] == Hole)
+                tdzError(t->val);
+            if (t->isConst)
+                constError();
+            if (t->op == 1)
+            {
+                if (t->strict)
+                    constError();
+                return;
+            }
+        }
+        e->slots[t->slot] = val;
+        return;
+    }
+    case N_GLOBAL:
+    {
+        if (t->strict && !hasProp(g_global, t->val))
+            errNotDefined(t->val);
+        putProp(objv(g_global), t->val, val, t->strict);
+        return;
+    }
+    case N_UNDEF:
+        if (t->strict)
+            throwType("Cannot assign to read only property 'undefined' of object '#<Object>'");
+        return;
+    case N_DYNAMIC:
+    {
+        Obj *obj;
+        V *slot = lookupDynamic(t->val, f, &obj);
+        if (slot)
+        {
+            *slot = val;
+            return;
+        }
+        if (obj)
+        {
+            putProp(objv(obj), t->val, val, t->strict);
+            return;
+        }
+        if (t->strict && !hasProp(g_global, t->val))
+            errNotDefined(t->val);
+        putProp(objv(g_global), t->val, val, t->strict);
+        return;
+    }
+    case N_MEMBER:
+    {
+        V o = evalNode(t->a, f);
+        memberSet(t, o, val);
+        return;
+    }
+    case N_INDEX:
+    {
+        V o = evalNode(t->a, f);
+        V k = evalNode(t->b, f);
+        indexSet(t, o, k, val);
+        return;
+    }
+    case N_PRIVATE:
+    {
+        V o = evalNode(t->a, f);
+        privateSet(t, o, val, f);
+        return;
+    }
+    case N_SUPERMEMBER:
+    {
+        setPropObj(homeProto(f), t->val, val, thisOf(f));
+        return;
+    }
+    case N_SUPERINDEX:
+    {
+        V k = evalNode(t->b, f);
+        setPropObj(homeProto(f), toKey(k), val, thisOf(f));
+        return;
+    }
+    case N_ARRAYPAT:
+        destructureArray(t, val, f, init);
+        return;
+    case N_OBJECTPAT:
+        destructureObject(t, val, f, init);
+        return;
+    case N_DEFAULT:
+    {
+        if (val == Undefined)
+            val = evalNode(t->b, f);
+        assignNode(t->a, val, f, init);
+        return;
+    }
+    default:
+        throwError(E_SYNTAX, "Invalid assignment target");
+    }
+}
+
+namespace
+{
+
+void destructureArray(Node *p, V val, Frame *f, bool init)
+{
+    if (p->c && declSourceFound(p->c))
+        requireIterable(val, p->c);
+    for (int i = 0; i < p->n; ++i)
+        if (p->items[i]->k != N_HOLE && p->items[i]->k != N_REST)
+            markNestedPattern(p->items[i]);
+    Iter it;
+    iterOpen(it, val);
+    bool threw = true;
+    Env *savedEnv = f->env;
+    (void)savedEnv;
+    JsState st0;
+    try
+    {
+        for (int i = 0; i < p->n; ++i)
+        {
+            Node *e = p->items[i];
+            if (e->k == N_HOLE)
+            {
+                V ignore;
+                if (!it.done)
+                    iterStep(it, &ignore);
+                continue;
+            }
+            if (e->k == N_REST)
+            {
+                JArray *rest = newArray();
+                V x;
+                while (!it.done && iterStep(it, &x))
+                    arrayPush(rest, x);
+                assignNode(e->a, objv(rest), f, init);
+                continue;
+            }
+            V x = Undefined;
+            if (!it.done && !iterStep(it, &x))
+                x = Undefined;
+            assignNode(e, x, f, init);
+        }
+        threw = false;
+    }
+    catch (JsThrow &)
+    {
+        st0.restore();
+        // the error goes on; the iterator stays as it is if it caused it
+        if (!it.done)
+            it.done = true;
+        throw;
+    }
+    if (!threw && !it.done)
+        iterClose(it);
+}
+
+void destructureObject(Node *p, V val, Frame *f, bool init)
+{
+    if (isNullish(val))
+    {
+        const char *what = val == Null ? "null" : "undefined";
+        std::string from = p->c ? nodeToCallText(p->c) : defaultCallSite(val);
+        if (p->n > 0 && p->items[0]->k == N_PATPROP && !p->items[0]->computed)
+        {
+            if (p->opt)
+                throwType(std::string("Cannot read properties of ") + what + " (reading '" + toUtf8(sp_(p->items[0]->val)) + "')");
+            throwType("Cannot destructure property '" + toUtf8(sp_(p->items[0]->val)) + "' of '" + from + "' as it is " + what + ".");
+        }
+        throwType("Cannot destructure '" + from + "' as it is " + what + ".");
+    }
+    std::vector<V> seen;
+    bool hasRest = p->n > 0 && p->items[p->n - 1]->k == N_REST;
+    for (int i = 0; i < p->n; ++i)
+    {
+        Node *e = p->items[i];
+        if (e->k == N_REST)
+        {
+            Obj *r = newObject();
+            if (isObj(val) || isStr(val))
+            {
+                V src = toObject(val);
+                std::vector<V> keys;
+                ownKeys(op(src), keys, true, true, false);
+                for (V k : keys)
+                {
+                    bool skip = false;
+                    for (V s : seen)
+                        if (s == k)
+                            skip = true;
+                    if (skip)
+                        continue;
+                    V v0, g0, s0;
+                    uint8_t fl = 0;
+                    if (getOwnDesc(op(src), k, &v0, &g0, &s0, &fl) && (fl & PF_E))
+                        defineOwn(r, k, getPropObj(op(src), k, val), PF_DEFAULT);
+                }
+            }
+            assignNode(e->a, objv(r), f, init);
+            continue;
+        }
+        V key = e->computed ? toKey(evalNode(e->a, f)) : e->val;
+        if (hasRest)
+            seen.push_back(key);
+        V x = getProp(val, key);
+        markNestedPattern(e->b);
+        assignNode(e->b, x, f, init);
+    }
+}
+
+} // namespace
+
+// ── operators ────────────────────────────────────────────────────────────
+
+namespace
+{
+
+V addSlow(V a, V b)
+{
+    a = toPrimitive(a, 0);
+    b = toPrimitive(b, 0);
+    if (isStr(a) || isStr(b))
+    {
+        JStr *x = toStr(a);
+        JStr *y = toStr(b);
+        return strv(concatStr(x, y));
+    }
+    a = toNumeric(a);
+    b = toNumeric(b);
+    if (isNum(a) && isNum(b))
+        return num(D(a) + D(b));
+    if (isBig(a) && isBig(b))
+        return bigAdd(bigp(a), bigp(b));
+    throwType("Cannot mix BigInt and other types, use explicit conversions");
+}
+
+int compareSlow(V a, V b)
+{
+    // -1 less, 0 equal, 1 greater, 2 unordered
+    a = toPrimitive(a, 1);
+    b = toPrimitive(b, 1);
+    if (isStr(a) && isStr(b))
+        return compareStr(sp_(a), sp_(b));
+    if (isBig(a) && isStr(b))
+    {
+        bool ok = true;
+        JBig *y = bigFromStr(sp_(b), &ok);
+        if (!ok)
+            return 2;
+        return bigCmp(bigp(a), y);
+    }
+    if (isStr(a) && isBig(b))
+    {
+        bool ok = true;
+        JBig *x = bigFromStr(sp_(a), &ok);
+        if (!ok)
+            return 2;
+        return bigCmp(x, bigp(b));
+    }
+    a = toNumeric(a);
+    b = toNumeric(b);
+    if (isNum(a) && isNum(b))
+    {
+        double x = D(a), y = D(b);
+        if (x != x || y != y)
+            return 2;
+        return x < y ? -1 : x > y ? 1 : 0;
+    }
+    if (isBig(a) && isBig(b))
+        return bigCmp(bigp(a), bigp(b));
+    if (isBig(a))
+    {
+        double y = D(b);
+        if (y != y)
+            return 2;
+        return bigCmpDouble(bigp(a), y);
+    }
+    double x = D(a);
+    if (x != x)
+        return 2;
+    return -bigCmpDouble(bigp(b), x);
+}
+
+double jsMod(double a, double b)
+{
+    if (b - b != 0 && b == b && a - a == 0)
+        return a;
+    return std::fmod(a, b);
+}
+
+double jsPow(double a, double b)
+{
+    if (b != b)
+        return b;
+    if (b == 0)
+        return 1;
+    if ((a == 1 || a == -1) && b - b != 0)
+        return 0.0 / 0.0;
+    return mathPow(a, b);
+}
+
+V arithSlow(int o, V a, V b)
+{
+    a = toNumeric(a);
+    b = toNumeric(b);
+    if (isBig(a) != isBig(b))
+        throwType("Cannot mix BigInt and other types, use explicit conversions");
+    if (isBig(a))
+    {
+        JBig *x = bigp(a), *y = bigp(b);
+        switch (o)
+        {
+        case OP_SUB: return bigSub(x, y);
+        case OP_MUL: return bigMul(x, y);
+        case OP_DIV: return bigDiv(x, y);
+        case OP_MOD: return bigMod(x, y);
+        case OP_EXP: return bigExp(x, y);
+        case OP_BITAND:
+        case OP_BITOR:
+        case OP_BITXOR: return bigBit(x, y, o);
+        case OP_SHL: return bigShift(x, y, true);
+        case OP_SHR: return bigShift(x, y, false);
+        default: throwType("BigInts have no unsigned right shift, use >> instead");
+        }
+    }
+    double x = D(a), y = D(b);
+    switch (o)
+    {
+    case OP_SUB: return num(x - y);
+    case OP_MUL: return num(x * y);
+    case OP_DIV: return num(x / y);
+    case OP_MOD: return num(jsMod(x, y));
+    case OP_EXP: return num(jsPow(x, y));
+    case OP_BITAND: return num((double)(toInt32(a) & toInt32(b)));
+    case OP_BITOR: return num((double)(toInt32(a) | toInt32(b)));
+    case OP_BITXOR: return num((double)(toInt32(a) ^ toInt32(b)));
+    case OP_SHL: return num((double)(int32_t)((uint32_t)toInt32(a) << (toUint32(b) & 31)));
+    case OP_SHR: return num((double)(toInt32(a) >> (toUint32(b) & 31)));
+    default: return num((double)(toUint32(a) >> (toUint32(b) & 31)));
+    }
+}
+
+V binaryOp(int o, V a, V b)
+{
+    switch (o)
+    {
+    case OP_ADD:
+        if (isNum(a) && isNum(b))
+        {
+            double r = D(a) + D(b);
+            return BITS(r);
+        }
+        if (isStr(a) && isStr(b))
+            return strv(concatStr(sp_(a), sp_(b)));
+        return addSlow(a, b);
+    case OP_SUB:
+        if (isNum(a) && isNum(b))
+        {
+            double r = D(a) - D(b);
+            return BITS(r);
+        }
+        return arithSlow(o, a, b);
+    case OP_MUL:
+        if (isNum(a) && isNum(b))
+        {
+            double r = D(a) * D(b);
+            return BITS(r);
+        }
+        return arithSlow(o, a, b);
+    case OP_DIV:
+        if (isNum(a) && isNum(b))
+        {
+            double r = D(a) / D(b);
+            return BITS(r);
+        }
+        return arithSlow(o, a, b);
+    case OP_MOD:
+        if (isNum(a) && isNum(b))
+        {
+            double x = D(a), y = D(b);
+            // the integer case is much the commonest
+            if (x >= 0 && x <= 2147483647.0 && y > 0 && y <= 2147483647.0)
+            {
+                int32_t xi = (int32_t)x, yi = (int32_t)y;
+                if ((double)xi == x && (double)yi == y)
+                {
+                    double r = (double)(xi % yi);
+                    return BITS(r);
+                }
+            }
+            double r = jsMod(x, y);
+            return BITS(r);
+        }
+        return arithSlow(o, a, b);
+    case OP_EQ: return boolv(looseEq(a, b));
+    case OP_NE: return boolv(!looseEq(a, b));
+    case OP_SEQ: return boolv(strictEq(a, b));
+    case OP_SNE: return boolv(!strictEq(a, b));
+    case OP_LT:
+        if (isNum(a) && isNum(b))
+            return boolv(D(a) < D(b));
+        return boolv(compareSlow(a, b) == -1);
+    case OP_LE:
+        if (isNum(a) && isNum(b))
+            return boolv(D(a) <= D(b));
+        {
+            int c = compareSlow(a, b);
+            return boolv(c == -1 || c == 0);
+        }
+    case OP_GT:
+        if (isNum(a) && isNum(b))
+            return boolv(D(a) > D(b));
+        return boolv(compareSlow(a, b) == 1);
+    case OP_GE:
+        if (isNum(a) && isNum(b))
+            return boolv(D(a) >= D(b));
+        {
+            int c = compareSlow(a, b);
+            return boolv(c == 1 || c == 0);
+        }
+    case OP_BITAND:
+        if (isNum(a) && isNum(b))
+        {
+            double r = (double)(toInt32(a) & toInt32(b));
+            return BITS(r);
+        }
+        return arithSlow(o, a, b);
+    case OP_BITOR:
+        if (isNum(a) && isNum(b))
+        {
+            double r = (double)(toInt32(a) | toInt32(b));
+            return BITS(r);
+        }
+        return arithSlow(o, a, b);
+    case OP_IN:
+        if (!isObj(b))
+            errInOperator(a, b);
+        return boolv(hasProp(op(b), toKey(a)));
+    case OP_INSTANCEOF:
+        return boolv(instanceOf(a, b));
+    default:
+        return arithSlow(o, a, b);
+    }
+}
+
+V unaryOp(int o, V a)
+{
+    switch (o)
+    {
+    case OP_NOT:
+        return boolv(!truthy(a));
+    case OP_NEG:
+    {
+        V n = toNumeric(a);
+        if (isBig(n))
+            return bigNeg(bigp(n));
+        return num(-D(n));
+    }
+    case OP_PLUS:
+        return num(toNumber(a));
+    case OP_BITNOT:
+    {
+        V n = toNumeric(a);
+        if (isBig(n))
+            return bigNot(bigp(n));
+        return num((double)~toInt32(n));
+    }
+    default:
+        return Undefined;
+    }
+}
+
+V typeofNode(Node *a, Frame *f)
+{
+    if (a->k == N_GLOBAL)
+        return typeOf(globalGet(a, true));
+    if (a->k == N_DYNAMIC)
+        return typeOf(dynamicGet(a, f, true));
+    return typeOf(evalNode(a, f));
+}
+
+V deleteNode(Node *n, Frame *f)
+{
+    Node *a = n->a;
+    if (a->k == N_CHAIN)
+    {
+        // delete a?.b
+        V o = evalNode(a->a->a, f);
+        if (o == OptShort || isNullish(o))
+            return True;
+        a = a->a;
+        V key = a->k == N_MEMBER ? a->val : toKey(evalNode(a->b, f));
+        return boolv(deleteProp(op(toObject(o)), key));
+    }
+    if (a->k == N_MEMBER || a->k == N_INDEX)
+    {
+        V o = evalNode(a->a, f);
+        V key;
+        if (a->k == N_MEMBER)
+            key = a->val;
+        else
+        {
+            V kv = evalNode(a->b, f);
+            if (isNullish(o))
+                throwType("Cannot convert undefined or null to object");
+            key = toKey(kv);
+        }
+        if (isNullish(o))
+            throwType("Cannot convert undefined or null to object");
+        V ob = toObject(o);
+        bool ok = deleteProp(op(ob), key);
+        if (!ok && n->strict)
+            throwType("Cannot delete property '" + keyText(key) + "' of " + inspectBrief(ob));
+        return boolv(ok);
+    }
+    if (a->k == N_LOCAL || a->k == N_ENVVAR)
+        return False;
+    if (a->k == N_GLOBAL)
+    {
+        return boolv(deleteProp(g_global, a->val));
+    }
+    if (a->k == N_DYNAMIC)
+    {
+        Obj *obj;
+        V *slot = lookupDynamic(a->val, f, &obj);
+        if (slot)
+            return False;
+        if (obj)
+            return boolv(deleteProp(obj, a->val));
+        return boolv(deleteProp(g_global, a->val));
+    }
+    evalNode(a, f);
+    return True;
+}
+
+// x++ and friends: the old value converted, then the new one stored
+V updateNode(Node *n, Frame *f)
+{
+    Node *t = n->a;
+    int delta = n->slot;
+    bool prefix = n->flag;
+    if (t->k == N_LOCAL)
+    {
+        V old = f->locals[t->slot];
+        if (isNum(old) && !t->isConst && t->op == 0)
+        {
+            double r = D(old) + delta;
+            f->locals[t->slot] = BITS(r);
+            return prefix ? BITS(r) : old;
+        }
+    }
+    V o = 0, k = 0, old;
+    switch (t->k)
+    {
+    case N_MEMBER:
+        o = evalNode(t->a, f);
+        old = memberSlow(t, o);
+        break;
+    case N_INDEX:
+        o = evalNode(t->a, f);
+        k = evalNode(t->b, f);
+        old = indexGet(t, o, k);
+        break;
+    case N_PRIVATE:
+        o = evalNode(t->a, f);
+        old = privateGet(t, o, f);
+        break;
+    default:
+        old = evalNode(t, f);
+    }
+    V oldNum = toNumeric(old);
+    V nv = isBig(oldNum) ? (delta > 0 ? bigAdd(bigp(oldNum), bigFromDouble(1)) : bigSub(bigp(oldNum), bigFromDouble(1))) : num(D(oldNum) + delta);
+    switch (t->k)
+    {
+    case N_MEMBER:
+        memberSet(t, o, nv);
+        break;
+    case N_INDEX:
+        indexSet(t, o, k, nv);
+        break;
+    case N_PRIVATE:
+        privateSet(t, o, nv, f);
+        break;
+    default:
+        assignNode(t, nv, f, false);
+    }
+    return prefix ? nv : oldNum;
+}
+
+V opAssignNode(Node *n, Frame *f)
+{
+    Node *t = n->a;
+    int o = n->op;
+    if (t->k == N_LOCAL && !t->isConst && t->op == 0)
+    {
+        V cur = f->locals[t->slot];
+        if (cur != Hole)
+        {
+            V r;
+            EVAL_QUICK(n->b, r);
+            if (o == OP_ADD && isNum(cur) && isNum(r))
+            {
+                double sum = D(cur) + D(r);
+                V res = BITS(sum);
+                f->locals[t->slot] = res;
+                return res;
+            }
+            V res = binaryOp(o, cur, r);
+            f->locals[t->slot] = res;
+            return res;
+        }
+    }
+    if (t->k == N_MEMBER)
+    {
+        V base = evalNode(t->a, f);
+        V cur;
+        GET_MEMBER(t, base, cur);
+        V r = evalNode(n->b, f);
+        V res = binaryOp(o, cur, r);
+        memberSet(t, base, res);
+        return res;
+    }
+    if (t->k == N_INDEX)
+    {
+        V base = evalNode(t->a, f);
+        V k = evalNode(t->b, f);
+        if (!isNum(k) && !isStr(k) && !isSym(k) && !isNullish(base))
+            k = toKey(k);
+        V cur = indexGet(t, base, k);
+        V r = evalNode(n->b, f);
+        V res = binaryOp(o, cur, r);
+        indexSet(t, base, k, res);
+        return res;
+    }
+    if (t->k == N_PRIVATE)
+    {
+        V base = evalNode(t->a, f);
+        V cur = privateGet(t, base, f);
+        V res = binaryOp(o, cur, evalNode(n->b, f));
+        privateSet(t, base, res, f);
+        return res;
+    }
+    V cur = evalNode(t, f);
+    V r = evalNode(n->b, f);
+    V res = binaryOp(o, cur, r);
+    assignNode(t, res, f, false);
+    return res;
+}
+
+bool logicalKeep(int kind, V cur)
+{
+    if (kind == N_AND)
+        return !truthy(cur);
+    if (kind == N_OR)
+        return truthy(cur);
+    return !isNullish(cur);
+}
+
+V logAssignNode(Node *n, Frame *f)
+{
+    Node *t = n->a;
+    int kind = n->op;
+    if (t->k == N_MEMBER)
+    {
+        V base = evalNode(t->a, f);
+        V cur = memberSlow(t, base);
+        if (logicalKeep(kind, cur))
+            return cur;
+        V r = evalNode(n->b, f);
+        memberSet(t, base, r);
+        return r;
+    }
+    if (t->k == N_INDEX)
+    {
+        V base = evalNode(t->a, f);
+        V k = evalNode(t->b, f);
+        if (!isNum(k) && !isNullish(base))
+            k = toKey(k);
+        V cur = indexGet(t, base, k);
+        if (logicalKeep(kind, cur))
+            return cur;
+        V r = evalNode(n->b, f);
+        indexSet(t, base, k, r);
+        return r;
+    }
+    V cur = evalNode(t, f);
+    if (logicalKeep(kind, cur))
+        return cur;
+    V r = evalNode(n->b, f);
+    assignNode(t, r, f, false);
+    return r;
+}
+
+V templateObject(Node *n)
+{
+    if (n->val)
+        return n->val;
+    JArray *a = newArray((uint32_t)n->n);
+    JArray *raw = newArray((uint32_t)n->n2);
+    for (int i = 0; i < n->n; ++i)
+        arrayPush(a, n->items[i]->k == N_UNDEF ? Undefined : n->items[i]->val);
+    for (int i = 0; i < n->n2; ++i)
+        arrayPush(raw, n->list2[i]->val);
+    freezeObj(raw, true);
+    defineOwn(a, A.raw, objv(raw), 0);
+    freezeObj(a, true);
+    n->val = objv(a);
+    return n->val;
+}
+
+// ── literals ─────────────────────────────────────────────────────────────
+
+V arrayLiteral(Node *n, Frame *f)
+{
+    JArray *a = newArray((uint32_t)n->n);
+    for (int i = 0; i < n->n; ++i)
+    {
+        Node *e = n->items[i];
+        if (e->k == N_HOLE)
+        {
+            if (a->used < a->len)
+                arrayPush(a, Hole);
+            else
+                arrayPush(a, Hole);
+        }
+        else if (e->k == N_SPREAD)
+        {
+            V iterable = evalNode(e->a, f);
+            requireIterable(iterable, e->a);
+            Iter it;
+            iterOpen(it, iterable);
+            V x;
+            while (iterStep(it, &x))
+                arrayPush(a, x);
+        }
+        else
+        {
+            V v = evalNode(e, f);
+            arrayPush(a, v);
+        }
+    }
+    return objv(a);
+}
+
+void setFnName(V fn, V key, const char *prefix)
+{
+    if (!isCallable(fn))
+        return;
+    JFunc *jf = static_cast<JFunc *>(op(fn));
+    JStr *name;
+    if (isSym(key))
+    {
+        V d = symp(key)->desc;
+        name = d == Undefined ? sp_(A.empty) : concatStr(concatStr(newStrAscii("["), sp_(d)), newStrAscii("]"));
+    }
+    else
+        name = sp_(key);
+    if (prefix)
+        name = concatStr(newStrAscii(prefix), name);
+    V nv = atomStr(name);
+    if (jf->flags & OF_LAZYFN)
+        jf->fnName = nv;
+    else
+        defineOwn(jf, A.name, nv, PF_C);
+}
+
+V objectLiteral(Node *n, Frame *f)
+{
+    // the same literal makes the same shape: go straight there
+    if (n->icShape)
+    {
+        Obj *o = static_cast<Obj *>(bump(sizeof(Obj)));
+        o->proto = PR.object;
+        o->cls = C_OBJECT;
+        int cnt = n->n;
+        V *slots = allocSlots(cnt);
+        o->slots = slots;
+        o->cap = cnt;
+        o->shape = g_rootShape;
+        for (int i = 0; i < cnt; ++i)
+            slots[i] = evalNode(n->items[i]->b, f);
+        o->shape = n->icShape;
+        return objv(o);
+    }
+    Obj *o = newObject();
+    V ov = objv(o);
+    bool simple = n->n > 0 && n->n <= 32;
+    for (int i = 0; i < n->n; ++i)
+    {
+        Node *m = n->items[i];
+        switch (m->op)
+        {
+        case P_SPREAD:
+        {
+            simple = false;
+            V src = evalNode(m->b, f);
+            if (isNullish(src))
+                break;
+            V so = toObject(src);
+            std::vector<V> keys;
+            ownKeys(op(so), keys, true, true, false);
+            for (V k : keys)
+            {
+                V v0, g0, s0;
+                uint8_t fl = 0;
+                if (getOwnDesc(op(so), k, &v0, &g0, &s0, &fl) && (fl & PF_E))
+                    defineOwn(o, k, getPropObj(op(so), k, so), PF_DEFAULT);
+            }
+            break;
+        }
+        case P_PROTO:
+        {
+            simple = false;
+            V p = evalNode(m->b, f);
+            if (isObj(p))
+                o->proto = op(p);
+            else if (p == Null)
+                o->proto = nullptr;
+            break;
+        }
+        case P_GET:
+        case P_SET:
+        {
+            simple = false;
+            V key = m->computed ? toKey(evalNode(m->a, f)) : m->val;
+            V fn = makeClosure(m->b->func, f->env, f);
+            static_cast<JFunc *>(op(fn))->home = ov;
+            if (m->computed)
+                setFnName(fn, key, m->op == P_GET ? "get " : "set ");
+            defineAccessor(o, key, m->op == P_GET ? fn : Hole, m->op == P_SET ? fn : Hole, PF_E | PF_C);
+            break;
+        }
+        case P_METHOD:
+        {
+            V key = m->computed ? toKey(evalNode(m->a, f)) : m->val;
+            V fn = makeClosure(m->b->func, f->env, f);
+            static_cast<JFunc *>(op(fn))->home = ov;
+            if (m->computed)
+            {
+                simple = false;
+                setFnName(fn, key, nullptr);
+            }
+            defineOwn(o, key, fn, PF_DEFAULT);
+            // the method needs its home object: the fast path cannot make those
+            simple = false;
+            break;
+        }
+        default:
+        {
+            V key;
+            V v;
+            if (m->computed)
+            {
+                simple = false;
+                key = toKey(evalNode(m->a, f));
+                v = evalAnonNamed(m->b, key, f);
+            }
+            else
+            {
+                key = m->val;
+                if (sp_(key)->isIdx)
+                    simple = false;
+                v = evalNode(m->b, f);
+            }
+            defineOwn(o, key, v, PF_DEFAULT);
+        }
+        }
+    }
+    if (simple && !o->shape->isDict && o->shape->count == n->n)
+        n->icShape = o->shape;
+    return ov;
+}
+
+// ── classes ──────────────────────────────────────────────────────────────
+
+V evalClass(Node *n, Frame *f)
+{
+    Env *savedEnv = f->env;
+    Scope *s = n->scope;
+    if (!s->plain)
+        enterScopeSlow(s, f);
+    // private names, new for each evaluation
+    for (Binding *b : s->vars)
+        if (b->kind == B_PRIVATE)
+        {
+            JSym *sym = NEW(JSym);
+            sym->desc = b->name;
+            sym->isPrivate = true;
+            V sv = symv(sym);
+            if (b->captured)
+                f->env->slots[b->slot] = sv;
+            else
+                f->locals[b->slot] = sv;
+        }
+    Obj *protoParent = PR.object;
+    Obj *ctorParent = PR.function;
+    if (n->a)
+    {
+        V sup = evalNode(n->a, f);
+        if (sup == Null)
+        {
+            protoParent = nullptr;
+        }
+        else
+        {
+            if (!isCtor(sup))
+                throwType("Class extends value " + inspectForExtends(sup) + " is not a constructor or null");
+            V pp = getProp(sup, A.prototype);
+            if (isObj(pp))
+                protoParent = op(pp);
+            else if (pp == Null)
+                protoParent = nullptr;
+            else
+                throwType("Class extends value does not have valid prototype property " + toUtf8V(pp));
+            ctorParent = op(sup);
+        }
+    }
+    Obj *proto = newObjectProto(protoParent);
+    FuncNode *ctorNode = n->func;
+    V fnv = makeClosure(ctorNode, f->env, f);
+    JFunc *F = static_cast<JFunc *>(op(fnv));
+    F->kind = FK_CLASS;
+    F->flags = OF_CALLABLE | OF_CTOR;
+    F->proto = ctorParent;
+    F->home = objv(proto);
+    F->fnName = n->val ? n->val : (n->val2 ? n->val2 : A.empty);
+    defineOwn(F, A.length, num((double)ctorNode->length), PF_C);
+    defineOwn(F, A.name, F->fnName, PF_C);
+    defineOwn(F, A.prototype, objv(proto), 0);
+    addProp(proto, A.constructor, fnv, PF_W | PF_C);
+    std::vector<V> fields;
+    std::vector<Node *> staticInits;
+    std::vector<V> staticKeys;
+    std::vector<V> privMethods;
+    for (int i = 0; i < n->n; ++i)
+    {
+        Node *m = n->items[i];
+        Obj *target = m->flag ? static_cast<Obj *>(F) : proto;
+        V tv = objv(target);
+        bool isPriv = m->c != nullptr;
+        V key = 0;
+        if (m->op != P_STATICBLOCK)
+        {
+            if (isPriv)
+                key = nameValue(m->c, f);
+            else
+                key = m->computed ? toKey(evalNode(m->a, f)) : m->val;
+        }
+        switch (m->op)
+        {
+        case P_METHOD:
+        {
+            V fn = makeClosure(m->b->func, f->env, f);
+            static_cast<JFunc *>(op(fn))->home = tv;
+            if (m->computed)
+                setFnName(fn, key, nullptr);
+            if (isPriv)
+            {
+                if (m->flag)
+                    defineOwn(F, key, fn, 0);
+                else
+                {
+                    privMethods.push_back(key);
+                    privMethods.push_back(fn);
+                    privMethods.push_back(Undefined);
+                }
+            }
+            else
+                defineOwn(target, key, fn, PF_W | PF_C);
+            break;
+        }
+        case P_GET:
+        case P_SET:
+        {
+            V fn = makeClosure(m->b->func, f->env, f);
+            static_cast<JFunc *>(op(fn))->home = tv;
+            if (m->computed)
+                setFnName(fn, key, m->op == P_GET ? "get " : "set ");
+            if (isPriv && !m->flag)
+            {
+                bool merged = false;
+                for (size_t k = 0; k < privMethods.size(); k += 3)
+                    if (privMethods[k] == key)
+                    {
+                        if (m->op == P_GET)
+                            privMethods[k + 1] = fn;
+                        else
+                            privMethods[k + 2] = fn;
+                        merged = true;
+                    }
+                if (!merged)
+                {
+                    privMethods.push_back(key);
+                    privMethods.push_back(m->op == P_GET ? fn : Hole);
+                    privMethods.push_back(m->op == P_SET ? fn : Hole);
+                }
+            }
+            else
+                defineAccessor(target, key, m->op == P_GET ? fn : Hole, m->op == P_SET ? fn : Hole, PF_C);
+            break;
+        }
+        case P_FIELD:
+        {
+            V fn = makeClosure(m->b->func, f->env, f);
+            static_cast<JFunc *>(op(fn))->home = tv;
+            if (m->flag)
+            {
+                staticInits.push_back(m);
+                staticKeys.push_back(key);
+                staticKeys.push_back(fn);
+            }
+            else
+            {
+                fields.push_back(key);
+                fields.push_back(fn);
+                fields.push_back(boolv(m->spread));
+            }
+            break;
+        }
+        case P_STATICBLOCK:
+        {
+            V fn = makeClosure(m->b->func, f->env, f);
+            static_cast<JFunc *>(op(fn))->home = fnv;
+            staticInits.push_back(m);
+            staticKeys.push_back(0);
+            staticKeys.push_back(fn);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    // private methods come first on each instance, then fields in order
+    size_t total = privMethods.size() + fields.size();
+    if (total)
+    {
+        F->fieldsInit = allocSlots((int)total);
+        size_t w = 0;
+        for (size_t i = 0; i < privMethods.size(); i += 3)
+        {
+            F->fieldsInit[w++] = privMethods[i];
+            F->fieldsInit[w++] = privMethods[i + 1];
+            F->fieldsInit[w++] = privMethods[i + 2];
+        }
+        F->nFields = (int)(w / 3);
+        int nPrivCount = F->nFields;
+        for (size_t i = 0; i < fields.size(); i += 3)
+        {
+            F->fieldsInit[w++] = fields[i];
+            F->fieldsInit[w++] = fields[i + 1];
+            F->fieldsInit[w++] = fields[i + 2];
+        }
+        F->nFields = (int)(w / 3);
+        F->natLen = nPrivCount;
+    }
+    if (n->b)
+        assignNode(n->b, fnv, f, true);
+    // static fields and blocks run now, in order, with this = the class
+    for (size_t i = 0; i < staticInits.size(); ++i)
+    {
+        Node *m = staticInits[i];
+        V key = staticKeys[i * 2];
+        V fn = staticKeys[i * 2 + 1];
+        V v = call(fn, fnv, nullptr, 0);
+        if (m->op == P_FIELD)
+        {
+            if (m->spread && isCallable(v))
+                setFnName(v, key, nullptr);
+            if (m->c)
+                addProp(F, key, v, PF_W);
+            else
+                defineOwn(F, key, v, PF_DEFAULT);
+        }
+    }
+    f->env = savedEnv;
+    return fnv;
+}
+
+} // namespace
+
+std::string keyText2(V key)
+{
+    if (isSym(key) && symp(key)->desc != Undefined)
+        return toUtf8(sp_(symp(key)->desc));
+    return keyText(key);
+}
+
+std::string inspectForExtends(V v)
+{
+    if (isCallable(v))
+        return inspectBrief(v);
+    if (isStr(v))
+        return toUtf8(sp_(v));
+    if (isObj(v))
+        return "#<" + ctorNameOf(op(v)) + ">";
+    return toUtf8V(v);
+}
+
+// instance fields of class F on a new object
+void initFields(JFunc *F, V self)
+{
+    if (!F->nFields)
+        return;
+    Obj *o = op(self);
+    int priv = F->natLen;
+    for (int i = 0; i < F->nFields; ++i)
+    {
+        V key = F->fieldsInit[i * 3];
+        V a = F->fieldsInit[i * 3 + 1];
+        V b = F->fieldsInit[i * 3 + 2];
+        if (i < priv)
+        {
+            uint8_t fl;
+            if (shapeFind(o->shape, key, &fl) >= 0)
+                throwType("Cannot initialize " + keyText2(key) + " twice on the same object");
+            if (b == Undefined)
+                addProp(o, key, a, 0);
+            else
+                defineAccessor(o, key, a, b, 0);
+            continue;
+        }
+        V v = call(a, self, nullptr, 0);
+        if (isSym(key) && symp(key)->isPrivate)
+        {
+            uint8_t fl;
+            if (shapeFind(o->shape, key, &fl) >= 0)
+                throwType("Cannot initialize " + keyText2(key) + " twice on the same object");
+            addProp(o, key, v, PF_W);
+        }
+        else
+        {
+            if (b == True && isCallable(v))
+                setFnName(v, key, nullptr);
+            defineOwn(o, key, v, PF_DEFAULT);
+        }
+    }
+}
+
+// ── calls ────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+// evaluates arguments onto the value stack, or the heap if they might suspend
+int evalArgs(Node *n, Frame *f, V **out, std::vector<V> *spreadBuf)
+{
+    int argc = n->n;
+    if (n->spread)
+    {
+        for (int i = 0; i < argc; ++i)
+        {
+            Node *e = n->items[i];
+            if (e->k == N_SPREAD)
+            {
+                V iterable = evalNode(e->a, f);
+                if (isNullish(iterable))
+                    errSpreadNullish(e->a, iterable);
+                if (!isCallable(getProp(iterable, WK.iterator)))
+                    throwType("Spread syntax requires ...iterable[Symbol.iterator] to be a function");
+                Iter it;
+                iterOpen(it, iterable);
+                V x;
+                while (iterStep(it, &x))
+                    spreadBuf->push_back(x);
+            }
+            else
+                spreadBuf->push_back(evalNode(e, f));
+        }
+        V *mem = allocSlots((int)spreadBuf->size());
+        for (size_t i = 0; i < spreadBuf->size(); ++i)
+            mem[i] = (*spreadBuf)[i];
+        *out = mem;
+        return (int)spreadBuf->size();
+    }
+    if (n->suspend)
+    {
+        V *mem = allocSlots(argc);
+        for (int i = 0; i < argc; ++i)
+            mem[i] = evalNode(n->items[i], f);
+        *out = mem;
+        return argc;
+    }
+    V *base = g_sp;
+    if (base + argc + 16 >= g_spEnd)
+        throwRange("Maximum call stack size exceeded");
+    g_sp = base + argc;
+    for (int i = 0; i < argc; ++i)
+        EVAL_QUICK(n->items[i], base[i]);
+    *out = base;
+    return argc;
+}
+
+V evalCallCold(Node *n, Frame *f);
+
+V evalCall(Node *n, Frame *f)
+{
+    Node *c = n->a;
+    V fn, thisV;
+    if (c->k == N_MEMBER)
+    {
+        V o = evalNode(c->a, f);
+        GET_MEMBER(c, o, fn);
+        if (fn == OptShort)
+            return OptShort;
+        thisV = o;
+    }
+    else if (c->k == N_LOCAL)
+    {
+        fn = f->locals[c->slot];
+        if (fn == Hole)
+            tdzError(c->val);
+        thisV = Undefined;
+    }
+    else if (c->k == N_ENVVAR)
+    {
+        Env *e = f->env;
+        for (int h = c->hops; h > 0; --h)
+            e = e->parent;
+        fn = e->slots[c->slot];
+        if (fn == Hole)
+            tdzError(c->val);
+        thisV = Undefined;
+    }
+    else
+        return evalCallCold(n, f);
+    if (n->opt && isNullish(fn))
+        return OptShort;
+    V *savedSp = g_sp;
+    V *argv;
+    std::vector<V> *buf = nullptr;
+    int argc;
+    if (n->spread)
+    {
+        buf = new std::vector<V>();
+        argc = evalArgs(n, f, &argv, buf);
+        delete buf;
+    }
+    else
+        argc = evalArgs(n, f, &argv, nullptr);
+    f->cur = n;
+    if (!isCallable(fn))
+        errCalleeNotFunction(c);
+    V r = callFunc(static_cast<JFunc *>(op(fn)), thisV, argv, argc, Undefined);
+    g_sp = savedSp;
+    return r;
+}
+
+V evalCallCold(Node *n, Frame *f)
+{
+    Node *c = n->a;
+    V fn, thisV = Undefined;
+    switch (c->k)
+    {
+    case N_INDEX:
+    {
+        V o = evalNode(c->a, f);
+        V k = evalNode(c->b, f);
+        fn = indexGet(c, o, k);
+        if (fn == OptShort)
+            return OptShort;
+        thisV = o;
+        break;
+    }
+    case N_PRIVATE:
+    {
+        V o = evalNode(c->a, f);
+        fn = privateGet(c, o, f);
+        if (fn == OptShort)
+            return OptShort;
+        thisV = o;
+        break;
+    }
+    case N_SUPERMEMBER:
+    {
+        V self = thisOf(f);
+        fn = getPropObj(homeProto(f), c->val, self);
+        thisV = self;
+        break;
+    }
+    case N_SUPERINDEX:
+    {
+        V self = thisOf(f);
+        fn = getPropObj(homeProto(f), toKey(evalNode(c->b, f)), self);
+        thisV = self;
+        break;
+    }
+    case N_CHAIN:
+    {
+        // (a?.b)() : the chain's value, with its object
+        Node *m = c->a;
+        if (m->k == N_MEMBER || m->k == N_INDEX)
+        {
+            V o = evalNode(m->a, f);
+            fn = m->k == N_MEMBER ? memberSlow(m, o) : indexGet(m, o, evalNode(m->b, f));
+            thisV = o;
+        }
+        else
+            fn = evalNode(m, f);
+        if (fn == OptShort)
+            fn = Undefined;
+        break;
+    }
+    case N_DYNAMIC:
+    {
+        Obj *obj;
+        V *slot = lookupDynamic(c->val, f, &obj);
+        if (slot)
+        {
+            if (*slot == Hole)
+                tdzError(c->val);
+            fn = *slot;
+        }
+        else if (obj)
+        {
+            fn = getPropObj(obj, c->val, objv(obj));
+            // a with object is the receiver; eval's own variables are not
+            for (Env *e = f->env; e; e = e->parent)
+                if (e->withObj && op(e->withObj) == obj)
+                    thisV = objv(obj);
+        }
+        else
+            fn = dynamicGet(c, f, false);
+        break;
+    }
+    default:
+        fn = evalNode(c, f);
+        if (fn == OptShort)
+            return OptShort;
+    }
+    if (n->opt && isNullish(fn))
+        return OptShort;
+    V *savedSp = g_sp;
+    V *argv;
+    std::vector<V> buf;
+    int argc = evalArgs(n, f, &argv, &buf);
+    f->cur = n;
+    if (!isCallable(fn))
+        throwType(nodeToCallText(c) + " is not a function");
+    // a direct eval sees the caller's variables
+    if (fn == g_evalFn && (c->k == N_GLOBAL || c->k == N_DYNAMIC) && c->val == atomOf("eval") && !n->opt)
+    {
+        V r = argc ? (isStr(argv[0]) ? directEval(argv[0], f, n->strict) : argv[0]) : Undefined;
+        g_sp = savedSp;
+        return r;
+    }
+    V r = callFunc(static_cast<JFunc *>(op(fn)), thisV, argv, argc, Undefined);
+    g_sp = savedSp;
+    return r;
+}
+
+V evalNew(Node *n, Frame *f)
+{
+    V fn = evalNode(n->a, f);
+    V *savedSp = g_sp;
+    V *argv = g_sp;
+    std::vector<V> *buf = nullptr;
+    int argc = 0;
+    if (n->items)
+    {
+        if (n->spread)
+        {
+            buf = new std::vector<V>();
+            argc = evalArgs(n, f, &argv, buf);
+            delete buf;
+        }
+        else
+            argc = evalArgs(n, f, &argv, nullptr);
+    }
+    f->cur = n;
+    if (!isCtor(fn))
+        errCalleeNotConstructor(n->a);
+    V r = construct(fn, argv, argc, fn);
+    g_sp = savedSp;
+    return r;
+}
+
+V evalSuperCall(Node *n, Frame *f)
+{
+    // in an arrow, the constructor around it is out of reach: its home says which
+    JFunc *active = f->fn;
+    Obj *parent = active ? protoOf(active) : nullptr;
+    if (active && active->kind == FK_ARROW)
+    {
+        V ctor = getProp(active->home, A.constructor);
+        parent = protoOf(op(ctor));
+        active = static_cast<JFunc *>(op(ctor));
+    }
+    V *savedSp = g_sp;
+    V *argv;
+    std::vector<V> buf;
+    int argc = evalArgs(n, f, &argv, &buf);
+    f->cur = n;
+    if (!parent || !(parent->flags & OF_CTOR))
+        throwType("Super constructor " + (parent && parent != PR.function ? inspectBrief(objv(parent)) : std::string("null")) + " of " + classLabel(f->fn) + " is not a constructor");
+    V r = construct(objv(parent), argv, argc, f->newTarget);
+    g_sp = savedSp;
+    if (f->thisV != Hole)
+        throwError(E_REFERENCE, "Super constructor may only be called once");
+    f->thisV = r;
+    initFields(active, r);
+    return r;
+}
+
+} // namespace
+
+// ── expressions ──────────────────────────────────────────────────────────
+
+V evalNode(Node *n, Frame *f)
+{
+    switch (n->k)
+    {
+    case N_LOCAL:
+    {
+        V v = f->locals[n->slot];
+        if (v == Hole && n->tdz)
+            tdzError(n->val);
+        return v;
+    }
+    case N_ENVVAR:
+    {
+        Env *e = f->env;
+        for (int h = n->hops; h > 0; --h)
+            e = e->parent;
+        V v = e->slots[n->slot];
+        if (v == Hole && n->tdz)
+            tdzError(n->val);
+        return v;
+    }
+    case N_NUM:
+    case N_STR:
+        return n->val;
+    case N_MEMBER:
+    {
+        V o;
+        EVAL_QUICK(n->a, o);
+        V r;
+        GET_MEMBER(n, o, r);
+        return r;
+    }
+    case N_INDEX:
+    {
+        V o, k;
+        EVAL_QUICK(n->a, o);
+        EVAL_QUICK(n->b, k);
+        if (isNum(k) && isObj(o))
+        {
+            Obj *p = op(o);
+            if (p->cls == C_ARRAY)
+            {
+                JArray *a = static_cast<JArray *>(p);
+                double d = D(k);
+                uint32_t i = (uint32_t)d;
+                if ((double)i == d && i < a->used && a->el[i] != Hole)
+                    return a->el[i];
+            }
+        }
+        return indexGet(n, o, k);
+    }
+    case N_BINARY:
+    {
+        V a, b;
+        EVAL_QUICK(n->a, a);
+        EVAL_QUICK(n->b, b);
+        if (isNum(a) && isNum(b))
+        {
+            switch (n->op)
+            {
+            case OP_ADD:
+            {
+                double r = D(a) + D(b);
+                return BITS(r);
+            }
+            case OP_SUB:
+            {
+                double r = D(a) - D(b);
+                return BITS(r);
+            }
+            case OP_MUL:
+            {
+                double r = D(a) * D(b);
+                return BITS(r);
+            }
+            case OP_LT: return D(a) < D(b) ? True : False;
+            case OP_GT: return D(a) > D(b) ? True : False;
+            case OP_LE: return D(a) <= D(b) ? True : False;
+            case OP_GE: return D(a) >= D(b) ? True : False;
+            case OP_SEQ:
+            case OP_EQ: return D(a) == D(b) ? True : False;
+            case OP_SNE:
+            case OP_NE: return D(a) != D(b) ? True : False;
+            default: break;
+            }
+        }
+        return binaryOp(n->op, a, b);
+    }
+    case N_CALL:
+        return evalCall(n, f);
+    case N_ASSIGN:
+    {
+        Node *t = n->a;
+        switch (t->k)
+        {
+        case N_LOCAL:
+        {
+            V v;
+            EVAL_QUICK(n->b, v);
+            if (!t->tdz && !t->isConst && t->op == 0)
+            {
+                f->locals[t->slot] = v;
+                return v;
+            }
+            assignNode(t, v, f, false);
+            return v;
+        }
+        case N_MEMBER:
+        {
+            V o = evalNode(t->a, f);
+            V v = evalNode(n->b, f);
+            memberSet(t, o, v);
+            return v;
+        }
+        case N_INDEX:
+        {
+            V o = evalNode(t->a, f);
+            V k = evalNode(t->b, f);
+            V v = evalNode(n->b, f);
+            indexSet(t, o, k, v);
+            return v;
+        }
+        case N_PRIVATE:
+        {
+            V o = evalNode(t->a, f);
+            V v = evalNode(n->b, f);
+            privateSet(t, o, v, f);
+            return v;
+        }
+        default:
+        {
+            V v = evalNode(n->b, f);
+            assignNode(t, v, f, false);
+            return v;
+        }
+        }
+    }
+    case N_UPDATE:
+        return updateNode(n, f);
+    case N_OPASSIGN:
+        return opAssignNode(n, f);
+    case N_LOGASSIGN:
+        return logAssignNode(n, f);
+    case N_AND:
+    {
+        V a = evalNode(n->a, f);
+        return truthy(a) ? evalNode(n->b, f) : a;
+    }
+    case N_OR:
+    {
+        V a = evalNode(n->a, f);
+        return truthy(a) ? a : evalNode(n->b, f);
+    }
+    case N_NULLISH:
+    {
+        V a = evalNode(n->a, f);
+        return isNullish(a) ? evalNode(n->b, f) : a;
+    }
+    case N_COND:
+        return truthy(evalNode(n->a, f)) ? evalNode(n->b, f) : evalNode(n->c, f);
+    case N_UNARY:
+    {
+        V a = evalNode(n->a, f);
+        if (n->op == OP_NEG && isNum(a))
+        {
+            double r = -D(a);
+            return BITS(r);
+        }
+        return unaryOp(n->op, a);
+    }
+    case N_THIS:
+        if (f->thisV == Hole)
+            return thisOf(f);
+        return f->thisV;
+    case N_UNDEF: return Undefined;
+    case N_NULL: return Null;
+    case N_TRUE: return True;
+    case N_FALSE: return False;
+    case N_GLOBAL: return globalGet(n, false);
+    case N_DYNAMIC: return dynamicGet(n, f, false);
+    case N_TYPEOF: return typeofNode(n->a, f);
+    case N_DELETE: return deleteNode(n, f);
+    case N_SEQ:
+    {
+        V r = Undefined;
+        for (int i = 0; i < n->n; ++i)
+            r = evalNode(n->items[i], f);
+        return r;
+    }
+    case N_ARRAY: return arrayLiteral(n, f);
+    case N_OBJECT: return objectLiteral(n, f);
+    case N_FUNC: return makeClosure(n->func, f->env, f);
+    case N_CLASS: return evalClass(n, f);
+    case N_NEW: return evalNew(n, f);
+    case N_TEMPLATE:
+    {
+        JStr *s = sp_(A.empty);
+        for (int i = 0; i < n->n; ++i)
+        {
+            Node *e = n->items[i];
+            if (e->k == N_STR)
+                s = concatStr(s, sp_(e->val));
+            else
+            {
+                V v = evalNode(e, f);
+                if (isSym(v))
+                    throwType("Cannot convert a Symbol value to a string");
+                s = concatStr(s, toStr(v));
+            }
+        }
+        return strv(s);
+    }
+    case N_TAGGED:
+    {
+        Node *c = n->a;
+        V fn, thisV = Undefined;
+        if (c->k == N_MEMBER)
+        {
+            thisV = evalNode(c->a, f);
+            fn = memberSlow(c, thisV);
+        }
+        else if (c->k == N_INDEX)
+        {
+            thisV = evalNode(c->a, f);
+            fn = indexGet(c, thisV, evalNode(c->b, f));
+        }
+        else
+            fn = evalNode(c, f);
+        return taggedCall(n, f, c, fn, thisV);
+    }
+    case N_REGEX: return regexpNew(n->val, n->val2);
+    case N_BIGINT:
+    {
+        if (n->val2)
+            return n->val2;
+        return bigLiteralOf(n);
+    }
+    case N_CHAIN:
+    {
+        V v = evalNode(n->a, f);
+        return v == OptShort ? Undefined : v;
+    }
+    case N_PRIVATE:
+    {
+        V o = evalNode(n->a, f);
+        return privateGet(n, o, f);
+    }
+    case N_PRIVATEIN:
+    {
+        V o = evalNode(n->a, f);
+        if (!isObj(o))
+            errInOperator(n->b->val, o);
+        V key = nameValue(n->b, f);
+        uint8_t fl;
+        return boolv(shapeFind(op(o)->shape, key, &fl) >= 0);
+    }
+    case N_SUPERMEMBER:
+    {
+        V self = thisOf(f);
+        return getPropObj(homeProto(f), n->val, self);
+    }
+    case N_SUPERINDEX:
+    {
+        V self = thisOf(f);
+        return getPropObj(homeProto(f), toKey(evalNode(n->b, f)), self);
+    }
+    case N_SUPERCALL: return evalSuperCall(n, f);
+    case N_NEWTARGET: return f->newTarget;
+    case N_YIELD:
+    {
+        V v = n->a ? evalNode(n->a, f) : Undefined;
+        return n->flag ? doYieldStar(v, f) : doYield(v, f);
+    }
+    case N_AWAIT:
+    {
+        V v = evalNode(n->a, f);
+        return doAwait(v, f);
+    }
+    case N_HOLE:
+        return Undefined;
+    default:
+        throwError(E_SYNTAX, "Unexpected syntax");
+    }
+}
+
+// ── statements ───────────────────────────────────────────────────────────
+
+namespace
+{
+
+std::string classLabel(JFunc *fn)
+{
+    std::string name = fn ? toUtf8V(getProp(objv(fn), A.name)) : std::string();
+    return name.empty() ? std::string("anonymous class") : name;
+}
+
+[[noreturn]] void errSpreadNullish(Node *src, V v)
+{
+    throwType(nodeToCallText(src) + " is not iterable (cannot read property " + (v == Null ? "null" : "undefined") + ")");
+}
+
+[[noreturn]] void errCalleeNotFunction(Node *c)
+{
+    throwType(nodeToCallText(c) + " is not a function");
+}
+
+[[noreturn]] void errCalleeNotConstructor(Node *c)
+{
+    throwType(nodeToCallText(c) + " is not a constructor");
+}
+
+[[noreturn]] void errClassCall(JFunc *fn)
+{
+    std::string cname = toUtf8V(getProp(objv(fn), A.name));
+    if (cname.empty())
+        throwType("Class constructors cannot be invoked without 'new'");
+    throwType("Class constructor " + cname + " cannot be invoked without 'new'");
+}
+
+V taggedCall(Node *n, Frame *f, Node *c, V fn, V thisV)
+{
+    std::vector<V> args;
+    args.push_back(templateObject(n->b));
+    for (int i = 0; i < n->n; ++i)
+        args.push_back(evalNode(n->items[i], f));
+    if (!isCallable(fn))
+        errCalleeNotFunction(c);
+    V *mem = allocSlots((int)args.size());
+    for (size_t i = 0; i < args.size(); ++i)
+        mem[i] = args[i];
+    f->cur = n;
+    return callFunc(static_cast<JFunc *>(op(fn)), thisV, mem, (int)args.size(), Undefined);
+}
+
+V bigLiteralOf(Node *n)
+{
+    V b = bigParseLiteral(toUtf8(sp_(n->val)));
+    n->val2 = b;
+    return b;
+}
+
+// each iteration has its own copy of the loop's variables
+void copyLoopEnv(Scope *s, Frame *f)
+{
+    Env *o = f->env;
+    Env *e = static_cast<Env *>(bump(sizeof(Env) + sizeof(V) * (size_t)s->nEnv));
+    e->parent = o->parent;
+    e->scope = s;
+    e->slots = reinterpret_cast<V *>(e + 1);
+    for (int i = 0; i < s->nEnv; ++i)
+        e->slots[i] = o->slots[i];
+    f->env = e;
+}
+
+void execFor(Node *n, Frame *f)
+{
+    Env *savedEnv = f->env;
+    Scope *s = n->scope;
+    if (s && !s->plain)
+        enterScopeSlow(s, f);
+    bool perIter = s && s->hasEnv && n->a && n->a->k == N_VAR && n->a->op != D_VAR;
+    Node *init = n->a, *test = n->b, *update = n->c, *body = n->d;
+    if (init)
+    {
+        if (init->k == N_VAR)
+            execNode(init, f);
+        else
+            evalNode(init, f);
+    }
+    if (perIter)
+        copyLoopEnv(s, f);
+    for (;;)
+    {
+        if (test && !truthy(evalNode(test, f)))
+            break;
+        execNode(body, f);
+        if (g_comp)
+        {
+            if (g_comp == CO_BREAK && (!g_compLabel || g_compLabel == n->val))
+            {
+                g_comp = CO_NONE;
+                g_compLabel = 0;
+                break;
+            }
+            if (g_comp == CO_CONTINUE && (!g_compLabel || g_compLabel == n->val))
+            {
+                g_comp = CO_NONE;
+                g_compLabel = 0;
+            }
+            else
+            {
+                f->env = savedEnv;
+                return;
+            }
+        }
+        if (perIter)
+            copyLoopEnv(s, f);
+        if (update)
+            evalNode(update, f);
+    }
+    f->env = savedEnv;
+}
+
+void bindLoopVar(Node *target, V v, Frame *f)
+{
+    if (target->k == N_VAR)
+    {
+        Node *d = target->items[0];
+        assignNode(d->a, v, f, true);
+    }
+    else
+        assignNode(target, v, f, false);
+}
+
+// true if the loop should stop; g_comp stays set when it must keep unwinding
+bool loopCompletion(Node *n)
+{
+    if (!g_comp)
+        return false;
+    if (g_comp == CO_BREAK && (!g_compLabel || g_compLabel == n->val))
+    {
+        g_comp = CO_NONE;
+        g_compLabel = 0;
+        return true;
+    }
+    if (g_comp == CO_CONTINUE && (!g_compLabel || g_compLabel == n->val))
+    {
+        g_comp = CO_NONE;
+        g_compLabel = 0;
+        return false;
+    }
+    return true;
+}
+
+void execForIn(Node *n, Frame *f)
+{
+    Env *savedEnv = f->env;
+    Scope *s = n->scope;
+    // the target's scope exists while the object expression runs, uninitialized
+    if (s && !s->plain)
+        enterScopeSlow(s, f);
+    V target = evalNode(n->b, f);
+    f->env = savedEnv;
+    if (isNullish(target))
+        return;
+    V ov = toObject(target);
+    std::vector<V> names;
+    std::vector<V> seen;
+    Obj *o = op(ov);
+    for (Obj *p = o; p; p = protoOf(p))
+    {
+        std::vector<V> keys;
+        ownKeys(p, keys, true, false, false);
+        for (V k : keys)
+        {
+            bool dup = false;
+            if (p != o)
+                for (V x : seen)
+                    if (x == k)
+                    {
+                        dup = true;
+                        break;
+                    }
+            if (dup)
+                continue;
+            seen.push_back(k);
+            V v0, g0, s0;
+            uint8_t fl = 0;
+            if (getOwnDesc(p, k, &v0, &g0, &s0, &fl) && (fl & PF_E))
+                names.push_back(k);
+        }
+    }
+    for (V k : names)
+    {
+        // deleted along the way: skipped
+        if (!hasProp(o, k))
+            continue;
+        if (s && !s->plain)
+            enterScopeSlow(s, f);
+        bindLoopVar(n->a, k, f);
+        execNode(n->d, f);
+        f->env = savedEnv;
+        if (loopCompletion(n))
+            break;
+    }
+    f->env = savedEnv;
+}
+
+void execForOf(Node *n, Frame *f)
+{
+    Env *savedEnv = f->env;
+    Scope *s = n->scope;
+    if (s && !s->plain)
+        enterScopeSlow(s, f);
+    V iterable = evalNode(n->b, f);
+    f->env = savedEnv;
+    if (n->flag)
+    {
+        forAwaitLoop(n, iterable, f);
+        return;
+    }
+    if (n->b->k != N_COND)
+        requireIterable(iterable, n->b);
+    Iter it;
+    iterOpen(it, iterable);
+    V *savedSp = g_sp;
+    Frame *savedFrame = g_frame;
+    for (;;)
+    {
+        V v;
+        if (!iterStep(it, &v))
+            break;
+        bool threw = false;
+        V exc = 0;
+        bool gr = false;
+        JsState st1;
+        try
+        {
+            if (s && !s->plain)
+                enterScopeSlow(s, f);
+            bindLoopVar(n->a, v, f);
+            execNode(n->d, f);
+        }
+        catch (JsThrow &t)
+        {
+            st1.restore();
+            threw = true;
+            exc = t.val;
+        }
+        catch (GenReturn &g)
+        {
+            st1.restore();
+            gr = true;
+            exc = g.val;
+        }
+        f->env = savedEnv;
+        if (threw || gr)
+        {
+            g_sp = savedSp;
+            g_frame = savedFrame;
+            // the loop's error wins over one from closing the iterator
+            if (!it.fastArr)
+            {
+                JsState st2;
+                try
+                {
+                    iterClose(it);
+                }
+                catch (JsThrow &)
+                {
+                    st2.restore();
+                }
+            }
+            if (gr)
+                throw GenReturn{exc};
+            throw JsThrow{exc};
+        }
+        if (loopCompletion(n))
+        {
+            if (!it.fastArr)
+            {
+                uint8_t c = g_comp;
+                V l = g_compLabel, r = g_retVal;
+                g_comp = CO_NONE;
+                iterClose(it);
+                g_comp = c;
+                g_compLabel = l;
+                g_retVal = r;
+            }
+            break;
+        }
+    }
+    f->env = savedEnv;
+}
+
+void execTry(Node *n, Frame *f)
+{
+    Env *savedEnv = f->env;
+    V *savedSp = g_sp;
+    Frame *savedFrame = g_frame;
+    bool threw = false;
+    bool genRet = false;
+    V exc = Undefined;
+    JsState st3;
+    try
+    {
+        execNode(n->a, f);
+    }
+    catch (JsThrow &t)
+    {
+        st3.restore();
+        threw = true;
+        exc = t.val;
+    }
+    catch (GenReturn &g)
+    {
+        st3.restore();
+        genRet = true;
+        exc = g.val;
+    }
+    if (threw || genRet)
+    {
+        f->env = savedEnv;
+        g_sp = savedSp;
+        g_frame = savedFrame;
+        g_comp = CO_NONE;
+    }
+    if (threw && n->c)
+    {
+        threw = false;
+        V caught = exc;
+        JsState st4;
+        try
+        {
+            Scope *s = n->scope;
+            if (s && !s->plain)
+                enterScopeSlow(s, f);
+            if (n->b)
+                assignNode(n->b, caught, f, true);
+            execNode(n->c, f);
+        }
+        catch (JsThrow &t)
+        {
+            st4.restore();
+            threw = true;
+            exc = t.val;
+        }
+        catch (GenReturn &g)
+        {
+            st4.restore();
+            genRet = true;
+            exc = g.val;
+        }
+        f->env = savedEnv;
+        if (threw || genRet)
+        {
+            g_sp = savedSp;
+            g_frame = savedFrame;
+            g_comp = CO_NONE;
+        }
+    }
+    if (n->d)
+    {
+        uint8_t c = g_comp;
+        V l = g_compLabel, r = g_retVal;
+        g_comp = CO_NONE;
+        execNode(n->d, f);
+        if (g_comp)
+            return; // the finally block's own jump wins over everything
+        g_comp = c;
+        g_compLabel = l;
+        g_retVal = r;
+    }
+    if (genRet)
+        throw GenReturn{exc};
+    if (threw)
+        throw JsThrow{exc};
+}
+
+void execSwitch(Node *n, Frame *f)
+{
+    V v = evalNode(n->a, f);
+    Env *savedEnv = f->env;
+    Scope *s = n->scope;
+    if (s && !s->plain)
+        enterScopeSlow(s, f);
+    int start = -1;
+    for (int i = 0; i < n->n; ++i)
+    {
+        Node *c = n->items[i];
+        if (c->a && strictEq(v, evalNode(c->a, f)))
+        {
+            start = i;
+            break;
+        }
+    }
+    if (start < 0)
+        for (int i = 0; i < n->n; ++i)
+            if (!n->items[i]->a)
+            {
+                start = i;
+                break;
+            }
+    if (start >= 0)
+        for (int i = start; i < n->n; ++i)
+        {
+            Node *c = n->items[i];
+            for (int k = 0; k < c->n; ++k)
+            {
+                execNode(c->items[k], f);
+                if (g_comp)
+                {
+                    if (g_comp == CO_BREAK && !g_compLabel)
+                        g_comp = CO_NONE;
+                    f->env = savedEnv;
+                    return;
+                }
+            }
+        }
+    f->env = savedEnv;
+}
+
+} // namespace
+
+void execNode(Node *n, Frame *f)
+{
+    switch (n->k)
+    {
+    case N_EXPR:
+        evalNode(n->a, f);
+        return;
+    case N_VAR:
+        for (int i = 0; i < n->n; ++i)
+        {
+            Node *d = n->items[i];
+            if (d->b)
+            {
+                V v = evalNode(d->b, f);
+                Node *t = d->a;
+                if (t->k == N_LOCAL)
+                    f->locals[t->slot] = v;
+                else
+                {
+                    if (t->k == N_OBJECTPAT && !t->c)
+                        t->c = d->b;
+                    assignNode(t, v, f, true);
+                }
+            }
+            else if (n->op == D_LET)
+                assignNode(d->a, Undefined, f, true);
+        }
+        return;
+    case N_RETURN:
+        g_retVal = n->a ? evalNode(n->a, f) : Undefined;
+        g_comp = CO_RETURN;
+        return;
+    case N_IF:
+        if (truthy(evalNode(n->a, f)))
+            execNode(n->b, f);
+        else if (n->c)
+            execNode(n->c, f);
+        return;
+    case N_BLOCK:
+    {
+        Scope *s = n->scope;
+        if (s && !s->plain)
+        {
+            Env *savedEnv = f->env;
+            enterScopeSlow(s, f);
+            for (int i = 0; i < n->n; ++i)
+            {
+                execNode(n->items[i], f);
+                if (g_comp)
+                    break;
+            }
+            f->env = savedEnv;
+            return;
+        }
+        for (int i = 0; i < n->n; ++i)
+        {
+            execNode(n->items[i], f);
+            if (g_comp)
+                return;
+        }
+        return;
+    }
+    case N_FOR:
+        execFor(n, f);
+        return;
+    case N_WHILE:
+        while (truthy(evalNode(n->a, f)))
+        {
+            execNode(n->d, f);
+            if (g_comp && loopCompletion(n))
+                return;
+        }
+        return;
+    case N_DOWHILE:
+        do
+        {
+            execNode(n->d, f);
+            if (g_comp && loopCompletion(n))
+                return;
+        } while (truthy(evalNode(n->a, f)));
+        return;
+    case N_FOROF:
+        execForOf(n, f);
+        return;
+    case N_FORIN:
+        execForIn(n, f);
+        return;
+    case N_BREAK:
+        g_comp = CO_BREAK;
+        g_compLabel = n->val;
+        return;
+    case N_CONTINUE:
+        g_comp = CO_CONTINUE;
+        g_compLabel = n->val;
+        return;
+    case N_THROW:
+    {
+        V v = evalNode(n->a, f);
+        f->cur = n;
+        throwV(v);
+    }
+    case N_TRY:
+        execTry(n, f);
+        return;
+    case N_SWITCH:
+        execSwitch(n, f);
+        return;
+    case N_LABELED:
+        execNode(n->a, f);
+        if (g_comp == CO_BREAK && g_compLabel == n->val)
+        {
+            g_comp = CO_NONE;
+            g_compLabel = 0;
+        }
+        return;
+    case N_EMPTY:
+        return;
+    case N_FUNCDECL:
+        // a block's function also becomes a var, when the declaration is reached
+        if (n->b)
+            assignNode(n->b, evalNode(n->c, f), f, true);
+        return;
+    case N_CLASSDECL:
+    {
+        V c = evalClass(n->b, f);
+        assignNode(n->a, c, f, true);
+        return;
+    }
+    case N_WITH:
+    {
+        V ov = toObject(evalNode(n->a, f));
+        Env *savedEnv = f->env;
+        Env *e = newEnv(f->env, n->scope);
+        e->withObj = ov;
+        f->env = e;
+        execNode(n->b, f);
+        f->env = savedEnv;
+        return;
+    }
+    default:
+        evalNode(n, f);
+    }
+}
+
+// ── entering a function ──────────────────────────────────────────────────
+
+namespace
+{
+
+V makeArguments(Frame *f, FuncNode *node)
+{
+    JArgs *a = static_cast<JArgs *>(allocObj(sizeof(JArgs), C_ARGUMENTS, PR.object));
+    int argc = f->argc;
+    a->el = allocSlots(argc);
+    for (int i = 0; i < argc; ++i)
+        a->el[i] = f->args[i];
+    a->used = (uint32_t)argc;
+    a->len = (uint32_t)argc;
+    defineOwn(a, A.length, num((double)argc), PF_W | PF_C);
+    defineOwn(a, WK.iterator, getProp(objv(PR.array), WK.iterator), PF_W | PF_C);
+    if (!node->strict && node->simple)
+    {
+        defineOwn(a, A.callee, objv(f->fn), PF_W | PF_C);
+        int n = argc < node->nParams ? argc : node->nParams;
+        if (n)
+        {
+            a->map = static_cast<int *>(bump(sizeof(int) * (size_t)n));
+            a->nMap = n;
+            a->env = f->env;
+            for (int i = 0; i < n; ++i)
+            {
+                int ps = node->paramSlots ? node->paramSlots[i] : 0;
+                a->map[i] = ps < 0 ? -1 - ps : -1;
+            }
+            // with a repeated name, only the last one aliases
+            for (int i = 0; i < n; ++i)
+                for (int k = i + 1; k < n; ++k)
+                    if (a->map[i] == a->map[k])
+                        a->map[i] = -1;
+        }
+    }
+    else
+    {
+        defineAccessor(a, A.callee, throwerFn(), throwerFn(), 0);
+    }
+    return objv(a);
+}
+
+} // namespace
+
+// binds parameters, arguments and hoisted declarations
+void setupCall(Frame *f, FuncNode *node, JFunc *fn)
+{
+    Scope *s = node->scope;
+    int nl = node->nLocals;
+    V *locals = f->locals;
+    for (int i = 0; i < nl; ++i)
+        locals[i] = Undefined;
+    if (s->hasEnv)
+    {
+        Env *e = newEnv(f->env, s);
+        f->env = e;
+        for (int t : s->tdzEnv)
+            e->slots[t] = Hole;
+    }
+    for (int i = 0; i < s->nTdzLocals; ++i)
+        locals[s->tdzLocalsP[i]] = Hole;
+    if (node->selfBinding)
+    {
+        Binding *b = node->selfBinding;
+        if (b->kind == B_SELF)
+        {
+            if (b->captured)
+                f->env->slots[b->slot] = objv(fn);
+            else
+                locals[b->slot] = objv(fn);
+        }
+    }
+    int argc = f->argc;
+    if (node->simple)
+    {
+        int np = node->nParams;
+        int *ps = node->paramSlots;
+        V *args = f->args;
+        Env *env = f->env;
+        for (int i = 0; i < np; ++i)
+        {
+            V v = i < argc ? args[i] : Undefined;
+            int slot = ps[i];
+            if (slot >= 0)
+                locals[slot] = v;
+            else
+                env->slots[-1 - slot] = v;
+        }
+    }
+    if (node->argsBinding)
+    {
+        Binding *b = node->argsBinding;
+        V av = makeArguments(f, node);
+        if (b->captured)
+            f->env->slots[b->slot] = av;
+        else
+            locals[b->slot] = av;
+    }
+    if (!node->simple)
+    {
+        for (int i = 0; i < node->nParams; ++i)
+        {
+            Node *p = node->paramsP[i];
+            if (p->k == N_REST)
+            {
+                JArray *rest = newArray();
+                for (int k = i; k < argc; ++k)
+                    arrayPush(rest, f->args[k]);
+                assignNode(p->a, objv(rest), f, true);
+            }
+            else
+                assignNode(p, i < argc ? f->args[i] : Undefined, f, true);
+        }
+    }
+    for (int i = 0; i < s->nFuncDecls; ++i)
+    {
+        Node *d = s->funcDeclsP[i];
+        V c = makeClosure(d->func, f->env, f);
+        Node *t = d->a;
+        if (t->k == N_LOCAL)
+            locals[t->slot] = c;
+        else
+            assignNode(t, c, f, true);
+    }
+}
+
+V runFunctionBody(Node *body, Frame *f)
+{
+    if (body->k == N_EXPRBODY)
+        return body->a ? evalNode(body->a, f) : Undefined;
+    int n = body->n;
+    Node **items = body->items;
+    for (int i = 0; i < n; ++i)
+    {
+        execNode(items[i], f);
+        if (g_comp)
+        {
+            if (g_comp == CO_RETURN)
+            {
+                g_comp = CO_NONE;
+                return g_retVal;
+            }
+            g_comp = CO_NONE;
+            g_compLabel = 0;
+            return Undefined;
+        }
+    }
+    return Undefined;
+}
+
+namespace
+{
+
+V callJs(JFunc *fn, V thisV, V *args, int argc, V newTarget)
+{
+    char probe;
+    if (&probe < g_stackLimit)
+        throwRange("Maximum call stack size exceeded");
+    FuncNode *node = fn->node;
+    Frame fr;
+    fr.fn = fn;
+    fr.node = node;
+    fr.env = fn->env;
+    fr.newTarget = newTarget;
+    fr.args = args;
+    fr.argc = argc;
+    fr.prev = g_frame;
+    fr.cur = nullptr;
+    fr.co = nullptr;
+    fr.isNative = false;
+    if (fn->kind == FK_ARROW)
+    {
+        fr.receiver = thisV;
+        fr.thisV = fn->thisV;
+        fr.newTarget = fn->newTarget;
+    }
+    else if (node->strict)
+        fr.thisV = thisV;
+    else if (node->usesThis)
+    {
+        if (isNullish(thisV))
+            fr.thisV = objv(g_global);
+        else
+            fr.thisV = isObj(thisV) ? thisV : toObject(thisV);
+    }
+    else
+        fr.thisV = thisV;
+    V *savedSp = g_sp;
+    int nl = node->nLocals;
+    if (savedSp + nl + 64 >= g_spEnd)
+        throwRange("Maximum call stack size exceeded");
+    fr.locals = savedSp;
+    g_sp = savedSp + nl;
+    g_frame = &fr;
+    setupCall(&fr, node, fn);
+    V r = runFunctionBody(node->body, &fr);
+    g_frame = fr.prev;
+    g_sp = savedSp;
+    return r;
+}
+
+// `new` on a function written in JavaScript
+V constructJs(JFunc *fn, V *args, int argc, V newTarget)
+{
+    char probe;
+    if (&probe < g_stackLimit)
+        throwRange("Maximum call stack size exceeded");
+    FuncNode *node = fn->node;
+    bool derived = node->isDerived;
+    V self = Hole;
+    if (!derived)
+    {
+        Obj *proto = protoFromCtor(newTarget, PR.object);
+        self = objv(newObjectProto(proto));
+        if (fn->nFields)
+            initFields(fn, self);
+    }
+    if (node->defaultCtor)
+    {
+        if (!derived)
+            return self;
+        Obj *parent = protoOf(fn);
+        if (!parent || !(parent->flags & OF_CTOR))
+            throwType("Super constructor " + (parent && parent != PR.function ? inspectBrief(objv(parent)) : std::string("null")) + " of " + classLabel(fn) + " is not a constructor");
+        V r = construct(objv(parent), args, argc, newTarget);
+        initFields(fn, r);
+        return r;
+    }
+    Frame fr;
+    fr.fn = fn;
+    fr.node = node;
+    fr.env = fn->env;
+    fr.newTarget = newTarget;
+    fr.args = args;
+    fr.argc = argc;
+    fr.prev = g_frame;
+    fr.cur = nullptr;
+    fr.co = nullptr;
+    fr.isNative = false;
+    fr.thisV = self;
+    V *savedSp = g_sp;
+    int nl = node->nLocals;
+    if (savedSp + nl + 64 >= g_spEnd)
+        throwRange("Maximum call stack size exceeded");
+    fr.locals = savedSp;
+    g_sp = savedSp + nl;
+    g_frame = &fr;
+    setupCall(&fr, node, fn);
+    V r = runFunctionBody(node->body, &fr);
+    g_frame = fr.prev;
+    g_sp = savedSp;
+    if (isObj(r))
+        return r;
+    if (derived)
+    {
+        if (r != Undefined)
+            throwType("Derived constructors may only return object or undefined");
+        if (fr.thisV == Hole)
+            throwError(E_REFERENCE, "Must call super constructor in derived class before accessing 'this' or returning from derived constructor");
+    }
+    return fr.thisV;
+}
+
+V callNative(JFunc *fn, V thisV, V *args, int argc, V newTarget)
+{
+    char probe;
+    if (&probe < g_stackLimit)
+        throwRange("Maximum call stack size exceeded");
+    JFunc *savedCallee = g_nativeCallee;
+    V savedNt = g_nativeNewTarget;
+    g_nativeCallee = fn;
+    g_nativeNewTarget = newTarget;
+    Frame fr;
+    fr.fn = fn;
+    fr.node = nullptr;
+    fr.thisV = thisV;
+    fr.prev = g_frame;
+    fr.cur = nullptr;
+    fr.isNative = true;
+    fr.newTarget = newTarget;
+    fr.co = nullptr;
+    g_frame = &fr;
+    V r = fn->nat(thisV, args, argc);
+    g_frame = fr.prev;
+    g_nativeCallee = savedCallee;
+    g_nativeNewTarget = savedNt;
+    return r;
+}
+
+} // namespace
+
+V callFunc(JFunc *fn, V thisV, V *args, int argc, V newTarget)
+{
+    switch (fn->kind)
+    {
+    case FK_NORMAL:
+    case FK_ARROW:
+        return callJs(fn, thisV, args, argc, newTarget);
+    case FK_NATIVE:
+        return callNative(fn, thisV, args, argc, newTarget);
+    case FK_GENERATOR:
+        return generatorStart(fn, thisV, args, argc);
+    case FK_ASYNC:
+        return asyncStart(fn, thisV, args, argc);
+    case FK_ASYNCGEN:
+        return asyncGenStart(fn, thisV, args, argc);
+    case FK_CLASS:
+    {
+        errClassCall(fn);
+    }
+    case FK_BOUND:
+    {
+        int n = fn->nBound + argc;
+        V *mem = n ? allocSlots(n) : nullptr;
+        for (int i = 0; i < fn->nBound; ++i)
+            mem[i] = fn->boundArgs[i];
+        for (int i = 0; i < argc; ++i)
+            mem[fn->nBound + i] = args[i];
+        return callFunc(static_cast<JFunc *>(op(fn->target)), fn->thisV, mem, n, Undefined);
+    }
+    case FK_PROXY:
+        return proxyCall(fn, thisV, args, argc);
+    default:
+        throwType("not a function");
+    }
+}
+
+V call(V fn, V thisV, V *args, int argc)
+{
+    if (!isCallable(fn))
+        errNotCallable(fn);
+    return callFunc(static_cast<JFunc *>(op(fn)), thisV, args, argc, Undefined);
+}
+
+V construct(V fnv, V *args, int argc, V newTarget)
+{
+    if (!isCtor(fnv))
+        errNotConstructor(fnv);
+    JFunc *fn = static_cast<JFunc *>(op(fnv));
+    switch (fn->kind)
+    {
+    case FK_NATIVE:
+        return callNative(fn, Undefined, args, argc, newTarget);
+    case FK_NORMAL:
+    case FK_CLASS:
+        return constructJs(fn, args, argc, newTarget);
+    case FK_BOUND:
+    {
+        int n = fn->nBound + argc;
+        V *mem = n ? allocSlots(n) : nullptr;
+        for (int i = 0; i < fn->nBound; ++i)
+            mem[i] = fn->boundArgs[i];
+        for (int i = 0; i < argc; ++i)
+            mem[fn->nBound + i] = args[i];
+        return construct(fn->target, mem, n, newTarget == fnv ? fn->target : newTarget);
+    }
+    case FK_PROXY:
+        return proxyConstruct(fn, args, argc, newTarget);
+    default:
+        throwType("not a constructor");
+    }
+}
+
+// ── iteration ────────────────────────────────────────────────────────────
+
+V iterResult(V value, bool done)
+{
+    static Shape *shape = nullptr;
+    Obj *o = newObject();
+    if (shape)
+    {
+        o->slots = allocSlots(2);
+        o->cap = 2;
+        o->slots[0] = value;
+        o->slots[1] = boolv(done);
+        o->shape = shape;
+        return objv(o);
+    }
+    addProp(o, A.value, value, PF_DEFAULT);
+    addProp(o, A.done, boolv(done), PF_DEFAULT);
+    shape = o->shape;
+    return objv(o);
+}
+
+V g_arrayValuesFn = 0;
+V g_arrayIterNext = 0;
+
+void iterOpen(Iter &it, V iterable)
+{
+    it.fastArr = nullptr;
+    it.fastI = 0;
+    it.done = false;
+    it.iter = 0;
+    it.next = 0;
+    if (isNullish(iterable))
+        errNotIterable(iterable);
+    V m = getProp(iterable, WK.iterator);
+    if (isObj(iterable) && op(iterable)->cls == C_ARRAY && m == g_arrayValuesFn)
+    {
+        // nobody has replaced the array iterator's next either
+        uint8_t fl;
+        int idx = shapeFind(PR.arrayIter->shape, A.next, &fl);
+        if (idx >= 0 && PR.arrayIter->slots[idx] == g_arrayIterNext)
+        {
+            it.fastArr = static_cast<JArray *>(op(iterable));
+            return;
+        }
+    }
+    if (!isCallable(m))
+        errNotIterable(iterable);
+    V iter = call(m, iterable, nullptr, 0);
+    if (!isObj(iter))
+        throwType("Result of the Symbol.iterator method is not an object");
+    it.iter = iter;
+    it.next = getProp(iter, A.next);
+}
+
+bool iterStep(Iter &it, V *out)
+{
+    if (it.fastArr)
+    {
+        JArray *a = it.fastArr;
+        uint32_t i = it.fastI;
+        if (i >= a->len)
+        {
+            it.done = true;
+            return false;
+        }
+        it.fastI = i + 1;
+        V v = i < a->used ? a->el[i] : Hole;
+        *out = v == Hole ? getIdx(objv(a), (double)i) : v;
+        return true;
+    }
+    V r = call(it.next, it.iter, nullptr, 0);
+    if (!isObj(r))
+        errIteratorResult(r);
+    if (truthy(getProp(r, A.done)))
+    {
+        it.done = true;
+        return false;
+    }
+    *out = getProp(r, A.value);
+    return true;
+}
+
+void iterClose(Iter &it)
+{
+    if (it.fastArr || it.done || !it.iter)
+        return;
+    it.done = true;
+    V m = getProp(it.iter, A.ret);
+    if (isNullish(m))
+        return;
+    V r = call(m, it.iter, nullptr, 0);
+    if (!isObj(r))
+        throwType("Iterator result " + toUtf8V(r) + " is not an object");
+}
+
+void iterableToVec(V iterable, std::vector<V> &out)
+{
+    Iter it;
+    iterOpen(it, iterable);
+    V x;
+    while (iterStep(it, &x))
+        out.push_back(x);
+}
+
+std::string describeForIter(V v)
+{
+    if (isStr(v))
+        return "\"" + toUtf8(sp_(v)) + "\"";
+    if (isObj(v))
+    {
+        if (isCallable(v))
+            return inspectBrief(v);
+        return inspectBrief(v);
+    }
+    if (isSym(v))
+        return keyText(v);
+    return toUtf8V(v);
+}
+
+// ── eval ─────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+// runs eval'd code in a frame like the caller's
+V runEvalProgram(FuncNode *node, Frame *caller, Env *env, V thisV)
+{
+    Frame fr;
+    fr.fn = caller ? caller->fn : nullptr;
+    fr.node = node;
+    fr.env = env;
+    fr.thisV = thisV;
+    fr.newTarget = caller ? caller->newTarget : Undefined;
+    fr.args = caller ? caller->args : nullptr;
+    fr.argc = caller ? caller->argc : 0;
+    fr.prev = g_frame;
+    fr.cur = nullptr;
+    fr.co = nullptr;
+    fr.isNative = false;
+    V *savedSp = g_sp;
+    fr.locals = savedSp;
+    g_sp = savedSp + node->nLocals;
+    g_frame = &fr;
+    setupCall(&fr, node, fr.fn);
+    // the value of the last expression statement
+    V result = Undefined;
+    Node *body = node->body;
+    for (int i = 0; i < body->n; ++i)
+    {
+        Node *st = body->items[i];
+        if (st->k == N_EXPR)
+            result = evalNode(st->a, &fr);
+        else
+            execNode(st, &fr);
+        if (g_comp)
+            break;
+    }
+    // a sloppy eval's variables go on living beyond it
+    if (!node->strict)
+    {
+        Scope *s = node->scope;
+        for (Binding *b : s->vars)
+            if (b->kind == B_VAR || b->kind == B_FUNC)
+            {
+                V val = b->captured ? fr.env->slots[b->slot] : fr.locals[b->slot];
+                if (caller)
+                {
+                    Env *fe = env;
+                    while (fe && !(fe->scope && fe->scope->isFunc))
+                        fe = fe->parent;
+                    if (fe)
+                    {
+                        if (!fe->dyn)
+                            fe->dyn = newObjectProto(nullptr);
+                        defineOwn(fe->dyn, b->name, val, PF_DEFAULT);
+                        continue;
+                    }
+                }
+                defineOwn(g_global, b->name, val, PF_DEFAULT);
+            }
+    }
+    g_frame = fr.prev;
+    g_sp = savedSp;
+    return result;
+}
+
+[[noreturn]] void rethrowSyntax(const ParseError &e)
+{
+    throwError(E_SYNTAX, e.message);
+}
+
+} // namespace
+
+V directEval(V src, Frame *f, bool strictCaller)
+{
+    std::string text = toUtf8(sp_(src));
+    FuncNode *node;
+    bool failed = false;
+    std::string why;
+    Scope *site = f->env ? f->env->scope : (f->node ? f->node->scope : nullptr);
+    JsState st5;
+    try
+    {
+        node = parseProgramSource(text, "<anonymous>", site, strictCaller, false, nullptr);
+    }
+    catch (ParseError &e)
+    {
+        st5.restore();
+        failed = true;
+        why = e.message;
+    }
+    if (failed)
+        throwError(E_SYNTAX, why);
+    return runEvalProgram(node, f, f->env, f->thisV);
+}
+
+V indirectEval(V src)
+{
+    if (!isStr(src))
+        return src;
+    std::string text = toUtf8(sp_(src));
+    FuncNode *node = nullptr;
+    bool failed = false;
+    std::string why;
+    JsState st6;
+    try
+    {
+        node = parseProgramSource(text, "<anonymous>", nullptr, false, false, nullptr);
+    }
+    catch (ParseError &e)
+    {
+        st6.restore();
+        failed = true;
+        why = e.message;
+    }
+    if (failed)
+        throwError(E_SYNTAX, why);
+    return runEvalProgram(node, nullptr, nullptr, objv(g_global));
+}
+
+// new Function(args, body), and the generator and async kinds
+V makeFunctionFromStrings(int kind, V *args, int argc)
+{
+    std::string params, body;
+    for (int i = 0; i + 1 < argc; ++i)
+    {
+        if (i)
+            params += ",";
+        params += toUtf8V(args[i]);
+    }
+    if (argc)
+        body = toUtf8V(args[argc - 1]);
+    const char *head = kind == 1 ? "function*" : kind == 2 ? "async function" : kind == 3 ? "async function*" : "function";
+    std::string text = std::string("(") + head + " anonymous(" + params + "\n) {\n" + body + "\n})";
+    FuncNode *node = nullptr;
+    bool failed = false;
+    std::string why;
+    JsState st7;
+    try
+    {
+        node = parseProgramSource(text, "<anonymous>", nullptr, false, false, nullptr);
+    }
+    catch (ParseError &e)
+    {
+        st7.restore();
+        failed = true;
+        why = e.message;
+    }
+    if (failed)
+        throwError(E_SYNTAX, why);
+    V fn = runEvalProgram(node, nullptr, nullptr, objv(g_global));
+    // toString shows it without the parentheses it was parsed in
+    return fn;
+}
+
+// ── the program ──────────────────────────────────────────────────────────
+
+V runModuleFunction(FuncNode *node, V thisV, V *args, int argc)
+{
+    V fn = makeClosure(node, nullptr, nullptr);
+    return callFunc(static_cast<JFunc *>(op(fn)), thisV, args, argc, Undefined);
+}
+
+} // namespace js

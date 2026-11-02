@@ -1,0 +1,731 @@
+// quantum: cpp
+// JavaScript front-end: memory, strings and atoms. An atom is the one string
+// object for its spelling; property keys are always atoms or symbols, so
+// comparing keys compares words.
+#include "JsRt.h.sa"
+
+#include <cstdio>
+#include <cstdlib>
+
+namespace __dll_kernel32
+{
+void *VirtualAlloc(void *address, size_t size, unsigned long type, unsigned long protect);
+} // namespace __dll_kernel32
+
+namespace js
+{
+
+Atoms A;
+void (*g_strTooLong)() = nullptr;
+
+namespace
+{
+char *g_bumpPtr = nullptr;
+char *g_bumpEnd = nullptr;
+
+JStr **g_atoms = nullptr;
+uint32_t g_atomCap = 0;
+uint32_t g_atomCount = 0;
+V g_indexAtoms[1024];
+JStr *g_charStrs[256];
+} // namespace
+
+void *zalloc(size_t size)
+{
+    // large blocks come zeroed from the system, untouched until used
+    if (size >= (1u << 16))
+        return __dll_kernel32::VirtualAlloc(nullptr, size, 0x3000, 4);
+    void *p = malloc(size);
+    std::memset(p, 0, size);
+    return p;
+}
+
+void *bump(size_t size)
+{
+    size = (size + 7) & ~(size_t)7;
+    if ((size_t)(g_bumpEnd - g_bumpPtr) < size)
+    {
+        if (size >= (1u << 20))
+            return zalloc(size);
+        size_t chunk = 16u << 20;
+        g_bumpPtr = static_cast<char *>(zalloc(chunk));
+        g_bumpEnd = g_bumpPtr + chunk;
+    }
+    char *p = g_bumpPtr;
+    g_bumpPtr += size;
+    return p;
+}
+
+JStr *newStrBytes(const char *s, int len)
+{
+    JStr *r = NEW(JStr);
+    r->len = len;
+    r->flat = 1;
+    uint8_t *m = static_cast<uint8_t *>(bump((size_t)len + 1));
+    if (len)
+        std::memcpy(m, s, (size_t)len);
+    r->a = m;
+    return r;
+}
+
+JStr *newStrAscii(const char *s)
+{
+    return newStrBytes(s, (int)std::strlen(s));
+}
+
+JStr *newStrUnits(const uint16_t *w, int len)
+{
+    bool wide = false;
+    for (int i = 0; i < len; ++i)
+        if (w[i] > 255)
+        {
+            wide = true;
+            break;
+        }
+    JStr *r = NEW(JStr);
+    r->len = len;
+    r->flat = 1;
+    if (wide)
+    {
+        uint16_t *m = static_cast<uint16_t *>(bump((size_t)len * 2 + 2));
+        std::memcpy(m, w, (size_t)len * 2);
+        r->w = m;
+        r->wide = 1;
+    }
+    else
+    {
+        uint8_t *m = static_cast<uint8_t *>(bump((size_t)len + 1));
+        for (int i = 0; i < len; ++i)
+            m[i] = (uint8_t)w[i];
+        r->a = m;
+    }
+    return r;
+}
+
+JStr *newStrFromUnitsVec(const std::vector<uint16_t> &u)
+{
+    return newStrUnits(u.data(), (int)u.size());
+}
+
+JStr *fromUtf8(const std::string &s)
+{
+    size_t n = s.size();
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(s.data());
+    bool ascii = true;
+    for (size_t i = 0; i < n; ++i)
+        if (p[i] >= 0x80)
+        {
+            ascii = false;
+            break;
+        }
+    if (ascii)
+        return newStrBytes(s.data(), (int)n);
+    std::vector<uint16_t> u;
+    u.reserve(n);
+    size_t i = 0;
+    while (i < n)
+    {
+        unsigned c = p[i];
+        unsigned cp = 0xFFFD;
+        int more = 0;
+        if (c < 0x80)
+            cp = c;
+        else if (c >= 0xC2 && c < 0xE0)
+        {
+            cp = c & 0x1F;
+            more = 1;
+        }
+        else if (c >= 0xE0 && c < 0xF0)
+        {
+            cp = c & 0x0F;
+            more = 2;
+        }
+        else if (c >= 0xF0 && c < 0xF5)
+        {
+            cp = c & 0x07;
+            more = 3;
+        }
+        ++i;
+        bool ok = true;
+        for (int k = 0; k < more; ++k)
+        {
+            if (i < n && (p[i] & 0xC0) == 0x80)
+                cp = (cp << 6) | (p[i++] & 0x3F);
+            else
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok)
+            cp = 0xFFFD;
+        if (cp >= 0x10000)
+        {
+            cp -= 0x10000;
+            u.push_back((uint16_t)(0xD800 + (cp >> 10)));
+            u.push_back((uint16_t)(0xDC00 + (cp & 0x3FF)));
+        }
+        else
+            u.push_back((uint16_t)cp);
+    }
+    return newStrFromUnitsVec(u);
+}
+
+std::string toUtf8(JStr *s)
+{
+    s = flat_(s);
+    std::string out;
+    out.reserve((size_t)s->len);
+    int n = s->len;
+    for (int i = 0; i < n; ++i)
+    {
+        unsigned c = (unsigned)unitAt(s, i);
+        if (c < 0x80)
+            out += (char)c;
+        else if (c < 0x800)
+        {
+            out += (char)(0xC0 | (c >> 6));
+            out += (char)(0x80 | (c & 0x3F));
+        }
+        else if (c >= 0xD800 && c < 0xDC00 && i + 1 < n && unitAt(s, i + 1) >= 0xDC00 && unitAt(s, i + 1) < 0xE000)
+        {
+            unsigned cp = 0x10000 + ((c - 0xD800) << 10) + ((unsigned)unitAt(s, i + 1) - 0xDC00);
+            ++i;
+            out += (char)(0xF0 | (cp >> 18));
+            out += (char)(0x80 | ((cp >> 12) & 0x3F));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        }
+        else
+        {
+            if (c >= 0xD800 && c < 0xE000)
+                c = 0xFFFD;
+            out += (char)(0xE0 | (c >> 12));
+            out += (char)(0x80 | ((c >> 6) & 0x3F));
+            out += (char)(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+}
+
+JStr *flatten(JStr *s)
+{
+    if (s->flat)
+        return s;
+    int n = s->len;
+    bool wide = s->wide != 0;
+    uint8_t *ma = nullptr;
+    uint16_t *mw = nullptr;
+    if (wide)
+        mw = static_cast<uint16_t *>(bump((size_t)n * 2 + 2));
+    else
+        ma = static_cast<uint8_t *>(bump((size_t)n + 1));
+    // written from the end: left-deep ropes are the common shape
+    std::vector<JStr *> st;
+    st.push_back(s);
+    int at = n;
+    while (!st.empty())
+    {
+        JStr *x = st.back();
+        st.pop_back();
+        if (!x->flat)
+        {
+            st.push_back(x->left);
+            st.push_back(x->right);
+            continue;
+        }
+        at -= x->len;
+        if (wide)
+        {
+            if (x->wide)
+                std::memcpy(mw + at, x->w, (size_t)x->len * 2);
+            else
+                for (int i = 0; i < x->len; ++i)
+                    mw[at + i] = x->a[i];
+        }
+        else if (x->len)
+            std::memcpy(ma + at, x->a, (size_t)x->len);
+    }
+    s->a = ma;
+    s->w = mw;
+    s->flat = 1;
+    s->left = nullptr;
+    s->right = nullptr;
+    return s;
+}
+
+JStr *concatStr(JStr *a, JStr *b)
+{
+    if (!a->len)
+        return b;
+    if (!b->len)
+        return a;
+    int64_t total = (int64_t)a->len + b->len;
+    if (total > 536870888)
+        g_strTooLong();
+    JStr *r = NEW(JStr);
+    r->len = (int32_t)total;
+    bool wide = a->wide || b->wide;
+    r->wide = wide;
+    if (total < 32 && a->flat && b->flat)
+    {
+        r->flat = 1;
+        if (wide)
+        {
+            uint16_t *m = static_cast<uint16_t *>(bump((size_t)total * 2 + 2));
+            for (int i = 0; i < a->len; ++i)
+                m[i] = (uint16_t)unitAt(a, i);
+            for (int i = 0; i < b->len; ++i)
+                m[a->len + i] = (uint16_t)unitAt(b, i);
+            r->w = m;
+        }
+        else
+        {
+            uint8_t *m = static_cast<uint8_t *>(bump((size_t)total + 1));
+            for (int i = 0; i < a->len; ++i)
+                m[i] = a->a[i];
+            for (int i = 0; i < b->len; ++i)
+                m[a->len + i] = b->a[i];
+            r->a = m;
+        }
+        return r;
+    }
+    r->left = a;
+    r->right = b;
+    return r;
+}
+
+JStr *charStr(int unit)
+{
+    if (unit >= 0 && unit < 256)
+    {
+        JStr *c = g_charStrs[unit];
+        if (!c)
+        {
+            char ch = (char)unit;
+            c = newStrBytes(&ch, 1);
+            g_charStrs[unit] = c;
+        }
+        return c;
+    }
+    uint16_t u = (uint16_t)unit;
+    return newStrUnits(&u, 1);
+}
+
+JStr *substr(JStr *s, int from, int to)
+{
+    s = flat_(s);
+    if (from >= to)
+        return sp_(A.empty);
+    if (from == 0 && to == s->len)
+        return s;
+    if (to - from == 1)
+        return charStr(unitAt(s, from));
+    JStr *r = NEW(JStr);
+    r->len = to - from;
+    r->flat = 1;
+    if (s->wide)
+    {
+        // units slice in place; a slice of only narrow units stays wide, which
+        // everything handles
+        r->wide = 1;
+        r->w = s->w + from;
+    }
+    else
+        r->a = s->a + from;
+    return r;
+}
+
+int compareStr(JStr *a, JStr *b)
+{
+    a = flat_(a);
+    b = flat_(b);
+    int n = a->len < b->len ? a->len : b->len;
+    if (!a->wide && !b->wide)
+    {
+        int c = n ? std::memcmp(a->a, b->a, (size_t)n) : 0;
+        if (c)
+            return c < 0 ? -1 : 1;
+    }
+    else
+        for (int i = 0; i < n; ++i)
+        {
+            int x = unitAt(a, i), y = unitAt(b, i);
+            if (x != y)
+                return x < y ? -1 : 1;
+        }
+    return a->len < b->len ? -1 : a->len > b->len ? 1 : 0;
+}
+
+bool eqStr(JStr *a, JStr *b)
+{
+    if (a == b)
+        return true;
+    if (a->len != b->len)
+        return false;
+    if (a->isAtom && b->isAtom)
+        return false;
+    a = flat_(a);
+    b = flat_(b);
+    if (!a->wide && !b->wide)
+        return a->len == 0 || std::memcmp(a->a, b->a, (size_t)a->len) == 0;
+    for (int i = 0; i < a->len; ++i)
+        if (unitAt(a, i) != unitAt(b, i))
+            return false;
+    return true;
+}
+
+uint32_t hashStr(JStr *s)
+{
+    if (s->hash)
+        return s->hash;
+    s = flat_(s);
+    uint32_t h = 2166136261u;
+    int n = s->len;
+    if (s->wide)
+        for (int i = 0; i < n; ++i)
+            h = (h ^ s->w[i]) * 16777619u;
+    else
+    {
+        const uint8_t *p = s->a;
+        for (int i = 0; i < n; ++i)
+            h = (h ^ p[i]) * 16777619u;
+    }
+    if (!h)
+        h = 1;
+    s->hash = h;
+    return h;
+}
+
+namespace
+{
+void atomsGrow()
+{
+    uint32_t cap = g_atomCap ? g_atomCap * 2 : 4096;
+    JStr **t = static_cast<JStr **>(zalloc(cap * sizeof(JStr *)));
+    for (uint32_t i = 0; i < g_atomCap; ++i)
+    {
+        JStr *s = g_atoms[i];
+        if (!s)
+            continue;
+        uint32_t h = s->hash & (cap - 1);
+        while (t[h])
+            h = (h + 1) & (cap - 1);
+        t[h] = s;
+    }
+    g_atoms = t;
+    g_atomCap = cap;
+}
+
+void markIndex(JStr *s)
+{
+    int n = s->len;
+    if (n == 0 || n > 10)
+        return;
+    uint64_t v = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        int c = unitAt(s, i);
+        if (c < '0' || c > '9')
+            return;
+        v = v * 10 + (uint64_t)(c - '0');
+    }
+    if (n > 1 && unitAt(s, 0) == '0')
+        return;
+    if (v >= 4294967295ULL)
+        return;
+    s->isIdx = 1;
+    s->idx = (uint32_t)v;
+}
+} // namespace
+
+V atomStr(JStr *s)
+{
+    if (s->isAtom)
+        return strv(s);
+    if (s->atom)
+        return strv(s->atom);
+    if ((g_atomCount + 1) * 2 > g_atomCap)
+        atomsGrow();
+    uint32_t h0 = hashStr(s);
+    s = flat_(s);
+    uint32_t h = h0 & (g_atomCap - 1);
+    for (;;)
+    {
+        JStr *t = g_atoms[h];
+        if (!t)
+            break;
+        if (t->hash == h0 && t->len == s->len)
+        {
+            bool same = true;
+            for (int i = 0; i < s->len; ++i)
+                if (unitAt(t, i) != unitAt(s, i))
+                {
+                    same = false;
+                    break;
+                }
+            if (same)
+            {
+                s->atom = t;
+                return strv(t);
+            }
+        }
+        h = (h + 1) & (g_atomCap - 1);
+    }
+    s->isAtom = 1;
+    markIndex(s);
+    g_atoms[h] = s;
+    ++g_atomCount;
+    return strv(s);
+}
+
+V atomOf(const char *c)
+{
+    return atomStr(newStrAscii(c));
+}
+
+V atomIndex(uint32_t i)
+{
+    if (i < 1024 && g_indexAtoms[i])
+        return g_indexAtoms[i];
+    char buf[16];
+    int n = 0;
+    uint32_t x = i;
+    char tmp[16];
+    do
+    {
+        tmp[n++] = (char)('0' + x % 10);
+        x /= 10;
+    } while (x);
+    for (int k = 0; k < n; ++k)
+        buf[k] = tmp[n - 1 - k];
+    V a = atomStr(newStrBytes(buf, n));
+    if (i < 1024)
+        g_indexAtoms[i] = a;
+    return a;
+}
+
+V str(const std::string &utf8)
+{
+    return strv(fromUtf8(utf8));
+}
+
+V strA(const char *ascii)
+{
+    return strv(newStrAscii(ascii));
+}
+
+V num(double d)
+{
+    return BITS(d);
+}
+
+double numOf(V v)
+{
+    return D(v);
+}
+
+int indexOfStr(JStr *hay, JStr *needle, int from)
+{
+    hay = flat_(hay);
+    needle = flat_(needle);
+    int n = hay->len, m = needle->len;
+    if (from < 0)
+        from = 0;
+    if (m == 0)
+        return from <= n ? from : n;
+    if (m > n)
+        return -1;
+    int first = unitAt(needle, 0);
+    int last = n - m;
+    if (!hay->wide && !needle->wide)
+    {
+        const uint8_t *h = hay->a;
+        const uint8_t *q = needle->a;
+        for (int i = from; i <= last; ++i)
+        {
+            if (h[i] != first)
+                continue;
+            int j = 1;
+            while (j < m && h[i + j] == q[j])
+                ++j;
+            if (j == m)
+                return i;
+        }
+        return -1;
+    }
+    for (int i = from; i <= last; ++i)
+    {
+        if (unitAt(hay, i) != first)
+            continue;
+        int j = 1;
+        while (j < m && unitAt(hay, i + j) == unitAt(needle, j))
+            ++j;
+        if (j == m)
+            return i;
+    }
+    return -1;
+}
+
+// the digits of the shortest decimal that reads back as d (d > 0, finite), and
+// the exponent of the first digit
+void shortestDigits(double d, std::string &digits, int &exp10)
+{
+    char buf[40];
+    uint64_t bits = *reinterpret_cast<uint64_t *>(&d);
+    bool denormal = (bits >> 52 & 0x7FF) == 0;
+    bool powerOfTwo = (bits & (((uint64_t)1 << 52) - 1)) == 0;
+    // fifteen digits always survive a round trip, except below the normal range
+    bool found = false;
+    for (int prec = denormal ? 0 : 14; prec <= 16 && !found; ++prec)
+    {
+        snprintf(buf, sizeof buf, "%.*e", prec, d);
+        found = prec == 16 || std::strtod(buf, nullptr) == d;
+        // a power of two has a narrower gap below it: the nearest number of this
+        // length can miss while its neighbour above still reads back as d
+        if (!found && powerOfTwo && !denormal)
+        {
+            char up[40];
+            std::strcpy(up, buf);
+            int at = prec == 0 ? 0 : prec + 1;
+            while (at >= 0 && (up[at] == '9' || up[at] == '.'))
+            {
+                if (up[at] == '9')
+                    up[at] = '0';
+                --at;
+            }
+            if (at >= 0)
+            {
+                ++up[at];
+                if (std::strtod(up, nullptr) == d)
+                {
+                    std::strcpy(buf, up);
+                    found = true;
+                }
+            }
+        }
+    }
+    digits.clear();
+    const char *p = buf;
+    for (; *p && *p != 'e'; ++p)
+        if (*p != '.')
+            digits += *p;
+    exp10 = std::atoi(p + 1);
+    while (digits.size() > 1 && digits[digits.size() - 1] == '0')
+        digits.pop_back();
+}
+
+std::string numberToStd(double d)
+{
+    if (d != d)
+        return "NaN";
+    if (d == 0)
+        return "0";
+    if (d == 1.0 / 0.0)
+        return "Infinity";
+    if (d == -1.0 / 0.0)
+        return "-Infinity";
+    if (d > -1e15 && d < 1e15)
+    {
+        int64_t iv = (int64_t)d;
+        if ((double)iv == d)
+        {
+            char buf[24];
+            int n = 0;
+            bool neg = iv < 0;
+            uint64_t x = neg ? (uint64_t)-iv : (uint64_t)iv;
+            char tmp[24];
+            do
+            {
+                tmp[n++] = (char)('0' + x % 10);
+                x /= 10;
+            } while (x);
+            int m = 0;
+            if (neg)
+                buf[m++] = '-';
+            while (n)
+                buf[m++] = tmp[--n];
+            return std::string(buf, (size_t)m);
+        }
+    }
+    std::string sign = d < 0 ? "-" : "";
+    std::string digits;
+    int e;
+    shortestDigits(d < 0 ? -d : d, digits, e);
+    int k = (int)digits.size();
+    int n = e + 1;
+    if (k <= n && n <= 21)
+        return sign + digits + std::string((size_t)(n - k), '0');
+    if (0 < n && n <= 21)
+        return sign + digits.substr(0, (size_t)n) + "." + digits.substr((size_t)n);
+    if (-6 < n && n <= 0)
+        return sign + "0." + std::string((size_t)-n, '0') + digits;
+    int x = n - 1;
+    std::string exp = (x < 0 ? "-" : "+") + std::to_string(x < 0 ? -x : x);
+    if (k == 1)
+        return sign + digits + "e" + exp;
+    return sign + digits.substr(0, 1) + "." + digits.substr(1) + "e" + exp;
+}
+
+void setAtoms()
+{
+    A.empty = atomOf("");
+    A.length = atomOf("length");
+    A.prototype = atomOf("prototype");
+    A.constructor = atomOf("constructor");
+    A.name = atomOf("name");
+    A.message = atomOf("message");
+    A.stack = atomOf("stack");
+    A.cause = atomOf("cause");
+    A.errors = atomOf("errors");
+    A.value = atomOf("value");
+    A.done = atomOf("done");
+    A.next = atomOf("next");
+    A.ret = atomOf("return");
+    A.throw_ = atomOf("throw");
+    A.get = atomOf("get");
+    A.set = atomOf("set");
+    A.writable = atomOf("writable");
+    A.enumerable = atomOf("enumerable");
+    A.configurable = atomOf("configurable");
+    A.toString = atomOf("toString");
+    A.valueOf = atomOf("valueOf");
+    A.toJSON = atomOf("toJSON");
+    A.callee = atomOf("callee");
+    A.caller = atomOf("caller");
+    A.arguments_ = atomOf("arguments");
+    A.index = atomOf("index");
+    A.input = atomOf("input");
+    A.groups = atomOf("groups");
+    A.indices = atomOf("indices");
+    A.lastIndex = atomOf("lastIndex");
+    A.source = atomOf("source");
+    A.flags = atomOf("flags");
+    A.raw = atomOf("raw");
+    A.then = atomOf("then");
+    A.undefined = atomOf("undefined");
+    A.null_ = atomOf("null");
+    A.true_ = atomOf("true");
+    A.false_ = atomOf("false");
+    A.object = atomOf("object");
+    A.function = atomOf("function");
+    A.number = atomOf("number");
+    A.string = atomOf("string");
+    A.boolean = atomOf("boolean");
+    A.symbol = atomOf("symbol");
+    A.bigint = atomOf("bigint");
+    A.default_ = atomOf("default");
+    A.join = atomOf("join");
+    A.proto = atomOf("__proto__");
+    A.global = atomOf("global");
+    A.deref = atomOf("deref");
+    A.size = atomOf("size");
+    A.has = atomOf("has");
+    A.add = atomOf("add");
+    A.keys = atomOf("keys");
+    A.exec = atomOf("exec");
+    A.code = atomOf("code");
+    A.anonymous = atomOf("anonymous");
+}
+
+} // namespace js

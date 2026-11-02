@@ -1,0 +1,3910 @@
+// quantum: cpp
+// JavaScript front-end: lexer, parser and name resolution. The parser is
+// driven by a recursive descent over tokens made on demand, because whether
+// `/` starts a regular expression, or `}` resumes a template, depends on where
+// the parser is. Scopes are built along the way; once a whole program is read,
+// every name is resolved to a frame slot, an environment slot or a global.
+#include "JsRt.h.sa"
+#include "JsMain.h.sa"
+
+#include <cmath>
+#include <cstdlib>
+#include <unordered_map>
+
+namespace js
+{
+
+Binding *Scope::find(V name)
+{
+    for (Binding *b : vars)
+        if (b->name == name)
+            return b;
+    return nullptr;
+}
+
+Binding *Scope::add(V name, uint8_t kind)
+{
+    Binding *b = new Binding();
+    b->name = name;
+    b->kind = kind;
+    b->captured = false;
+    b->isConst = kind == B_CONST;
+    b->lexical = kind == B_LET || kind == B_CONST || kind == B_CLASS;
+    b->slot = -1;
+    vars.push_back(b);
+    return b;
+}
+
+namespace
+{
+
+enum Tok : uint8_t
+{
+    T_EOF,
+    T_NAME,
+    T_PRIVATE,
+    T_NUM,
+    T_BIGINT,
+    T_STR,
+    T_TEMPLATE,
+    T_REGEX,
+    T_PUNCT
+};
+
+enum Pu : uint8_t
+{
+    PU_NONE, PU_LBRACE, PU_RBRACE, PU_LPAREN, PU_RPAREN, PU_LBRACK, PU_RBRACK, PU_DOT, PU_ELLIPSIS, PU_SEMI, PU_COMMA,
+    PU_LT, PU_GT, PU_LE, PU_GE, PU_EQ, PU_NE, PU_SEQ, PU_SNE, PU_PLUS, PU_MINUS, PU_STAR, PU_SLASH, PU_PERCENT, PU_STARSTAR,
+    PU_INC, PU_DEC, PU_SHL, PU_SHR, PU_USHR, PU_AND, PU_OR, PU_XOR, PU_NOT, PU_TILDE, PU_LAND, PU_LOR, PU_NULLISH, PU_QUESTION,
+    PU_OPTDOT, PU_COLON, PU_ASSIGN, PU_ADDA, PU_SUBA, PU_MULA, PU_DIVA, PU_MODA, PU_EXPA, PU_SHLA, PU_SHRA, PU_USHRA, PU_ANDA,
+    PU_ORA, PU_XORA, PU_LANDA, PU_LORA, PU_NULLA, PU_ARROW
+};
+
+enum Kw : uint8_t
+{
+    K_NONE, K_BREAK, K_CASE, K_CATCH, K_CLASS, K_CONST, K_CONTINUE, K_DEBUGGER, K_DEFAULT, K_DELETE, K_DO, K_ELSE, K_ENUM, K_EXPORT,
+    K_EXTENDS, K_FALSE, K_FINALLY, K_FOR, K_FUNCTION, K_IF, K_IMPORT, K_IN, K_INSTANCEOF, K_NEW, K_NULL, K_RETURN, K_SUPER, K_SWITCH,
+    K_THIS, K_THROW, K_TRUE, K_TRY, K_TYPEOF, K_VAR, K_VOID, K_WHILE, K_WITH,
+    // contextual
+    K_LET, K_STATIC, K_YIELD, K_AWAIT, K_ASYNC, K_OF, K_GET, K_SET
+};
+
+struct Token
+{
+    uint8_t t;
+    uint8_t pu;
+    uint8_t kw;
+    bool nl;      // a line break before it
+    bool escaped;
+    bool tail;    // a template's last piece
+    bool badEscape;
+    int pos, end, line, col;
+    V val, val2;
+    double num;
+};
+
+std::unordered_map<V, uint8_t> *g_kwTable = nullptr;
+V g_aEval, g_aUseStrict, g_aConstructor, g_aPrototype, g_aAsync;
+
+void initKeywords()
+{
+    if (g_kwTable)
+        return;
+    g_kwTable = new std::unordered_map<V, uint8_t>();
+    static const char *words[] = {"", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else",
+                                  "enum", "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "new",
+                                  "null", "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with",
+                                  "let", "static", "yield", "await", "async", "of", "get", "set"};
+    for (int i = 1; i <= K_SET; ++i)
+        (*g_kwTable)[atomOf(words[i])] = (uint8_t)i;
+    g_aEval = atomOf("eval");
+    g_aUseStrict = atomOf("use strict");
+    g_aConstructor = atomOf("constructor");
+    g_aPrototype = atomOf("prototype");
+    g_aAsync = atomOf("async");
+}
+
+bool isIdStart(int c)
+{
+    if (c < 128)
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_';
+    // half of a pair: the lexer sees units, and astral names are rare enough
+    if (c >= 0xD800 && c < 0xE000)
+        return true;
+    return uniIdStart(c);
+}
+
+bool isIdPart(int c)
+{
+    if (c < 128)
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '$' || c == '_';
+    if (c >= 0xD800 && c < 0xE000)
+        return true;
+    return uniIdContinue(c) || c == 0x200C || c == 0x200D;
+}
+
+int hexVal(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+void appendCp(std::vector<uint16_t> &u, uint32_t cp)
+{
+    if (cp >= 0x10000)
+    {
+        cp -= 0x10000;
+        u.push_back((uint16_t)(0xD800 + (cp >> 10)));
+        u.push_back((uint16_t)(0xDC00 + (cp & 0x3FF)));
+    }
+    else
+        u.push_back((uint16_t)cp);
+}
+
+struct Parser
+{
+    const uint16_t *src = nullptr;
+    int len = 0;
+    int pos = 0;
+    int line = 1;
+    int lineStart = 0;
+    Token tok;
+    int prevEnd = 0;
+    int prevLine = 1;
+    std::string *file = nullptr;
+    Scope *scope = nullptr;
+    FuncNode *func = nullptr;
+    bool strict = false;
+    bool inGen = false;
+    bool inAsync = false;
+    bool noIn = false;
+    bool evalMode = false;
+    std::unordered_map<int, bool> arrowMemo;
+
+    [[noreturn]] void failAt(const std::string &msg, int ln, int col)
+    {
+        throw ParseError{msg, ln, col};
+    }
+
+    [[noreturn]] void fail(const std::string &msg)
+    {
+        failAt(msg, tok.line, tok.col);
+    }
+
+    [[noreturn]] void unexpected()
+    {
+        if (tok.t == T_EOF)
+            fail("Unexpected end of input");
+        if (tok.t == T_NUM || tok.t == T_BIGINT)
+            fail("Unexpected number");
+        if (tok.t == T_STR)
+            fail("Unexpected string");
+        if (tok.t == T_TEMPLATE)
+            fail("Unexpected template string");
+        if (tok.t == T_NAME && tok.kw == K_NONE)
+            fail("Unexpected identifier '" + toUtf8(sp_(tok.val)) + "'");
+        if (tok.t == T_NAME && tok.kw >= K_LET && strict)
+            fail("Unexpected strict mode reserved word");
+        if (tok.t == T_NAME && tok.kw >= K_LET)
+            fail("Unexpected identifier '" + toUtf8(sp_(tok.val)) + "'");
+        std::vector<uint16_t> u(src + tok.pos, src + tok.end);
+        fail("Unexpected token '" + toUtf8(newStrFromUnitsVec(u)) + "'");
+    }
+
+    // ── lexer ────────────────────────────────────────────────────────────
+
+    void newline(int at)
+    {
+        ++line;
+        lineStart = at;
+    }
+
+    bool isLineTerm(int c)
+    {
+        return c == '\n' || c == '\r' || c == 0x2028 || c == 0x2029;
+    }
+
+    void skipSpace(bool &nl)
+    {
+        while (pos < len)
+        {
+            int c = src[pos];
+            if (c == ' ' || c == '\t' || c == 0x0B || c == 0x0C || c == 0xA0 || c == 0xFEFF || (c >= 0x2000 && c <= 0x200A) || c == 0x3000 || c == 0x1680 || c == 0x202F || c == 0x205F)
+                ++pos;
+            else if (isLineTerm(c))
+            {
+                ++pos;
+                if (c == '\r' && pos < len && src[pos] == '\n')
+                    ++pos;
+                newline(pos);
+                nl = true;
+            }
+            else if (c == '/' && pos + 1 < len && src[pos + 1] == '/')
+            {
+                pos += 2;
+                while (pos < len && !isLineTerm(src[pos]))
+                    ++pos;
+            }
+            else if (c == '/' && pos + 1 < len && src[pos + 1] == '*')
+            {
+                pos += 2;
+                bool closed = false;
+                while (pos < len)
+                {
+                    int d = src[pos];
+                    if (d == '*' && pos + 1 < len && src[pos + 1] == '/')
+                    {
+                        pos += 2;
+                        closed = true;
+                        break;
+                    }
+                    if (isLineTerm(d))
+                    {
+                        ++pos;
+                        if (d == '\r' && pos < len && src[pos] == '\n')
+                            ++pos;
+                        newline(pos);
+                        nl = true;
+                    }
+                    else
+                        ++pos;
+                }
+                if (!closed)
+                    failAt("Invalid or unexpected token", line, pos - lineStart + 1);
+            }
+            else
+                break;
+        }
+    }
+
+    void setPunct(uint8_t p, int n)
+    {
+        tok.t = T_PUNCT;
+        tok.pu = p;
+        pos += n;
+    }
+
+    int at(int i)
+    {
+        return pos + i < len ? src[pos + i] : -1;
+    }
+
+    void next()
+    {
+        prevEnd = tok.end;
+        prevLine = line;
+        tok.nl = false;
+        bool nl = false;
+        skipSpace(nl);
+        tok.nl = nl;
+        tok.pos = pos;
+        tok.line = line;
+        tok.col = pos - lineStart + 1;
+        tok.kw = K_NONE;
+        tok.pu = PU_NONE;
+        tok.escaped = false;
+        if (pos >= len)
+        {
+            tok.t = T_EOF;
+            tok.end = pos;
+            return;
+        }
+        int c = src[pos];
+        if (c < 128 ? isIdStart(c) : isIdStart(c))
+            lexName();
+        else if (c == '\\')
+            lexName();
+        else if ((c >= '0' && c <= '9') || (c == '.' && at(1) >= '0' && at(1) <= '9'))
+            lexNumber();
+        else if (c == '"' || c == '\'')
+            lexString(c);
+        else if (c == '`')
+        {
+            ++pos;
+            lexTemplate();
+        }
+        else if (c == '#' && pos + 1 < len && (isIdStart(src[pos + 1]) || src[pos + 1] == '\\'))
+        {
+            ++pos;
+            lexName();
+            tok.t = T_PRIVATE;
+            tok.kw = K_NONE;
+        }
+        else
+            lexPunct(c);
+        tok.end = pos;
+    }
+
+    void lexName()
+    {
+        int start = pos;
+        bool simple = true;
+        while (pos < len)
+        {
+            int c = src[pos];
+            if (c == '\\')
+            {
+                simple = false;
+                break;
+            }
+            if (!isIdPart(c))
+                break;
+            ++pos;
+        }
+        JStr *s;
+        if (simple)
+            s = newStrUnits(src + start, pos - start);
+        else
+        {
+            std::vector<uint16_t> u(src + start, src + pos);
+            while (pos < len)
+            {
+                int c = src[pos];
+                if (c == '\\')
+                {
+                    if (at(1) != 'u')
+                        failAt("Invalid Unicode escape sequence", line, pos - lineStart + 1);
+                    pos += 2;
+                    appendCp(u, readUnicodeEscape());
+                    tok.escaped = true;
+                }
+                else if (isIdPart(c))
+                {
+                    u.push_back((uint16_t)c);
+                    ++pos;
+                }
+                else
+                    break;
+            }
+            s = newStrFromUnitsVec(u);
+        }
+        tok.t = T_NAME;
+        tok.val = atomStr(s);
+        auto it = g_kwTable->find(tok.val);
+        tok.kw = it == g_kwTable->end() || tok.escaped ? (uint8_t)K_NONE : it->second;
+    }
+
+    uint32_t readUnicodeEscape()
+    {
+        if (pos < len && src[pos] == '{')
+        {
+            ++pos;
+            uint32_t v = 0;
+            int n = 0;
+            while (pos < len && src[pos] != '}')
+            {
+                int h = hexVal(src[pos]);
+                if (h < 0)
+                    failAt("Invalid Unicode escape sequence", line, pos - lineStart + 1);
+                v = v * 16 + (uint32_t)h;
+                if (v > 0x10FFFF)
+                    failAt("Undefined Unicode code-point", line, pos - lineStart + 1);
+                ++pos;
+                ++n;
+            }
+            if (pos >= len || !n)
+                failAt("Invalid Unicode escape sequence", line, pos - lineStart + 1);
+            ++pos;
+            return v;
+        }
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i)
+        {
+            int h = pos < len ? hexVal(src[pos]) : -1;
+            if (h < 0)
+                failAt("Invalid Unicode escape sequence", line, pos - lineStart + 1);
+            v = v * 16 + (uint32_t)h;
+            ++pos;
+        }
+        return v;
+    }
+
+    void separatorAt(int at, bool digitFollows)
+    {
+        if (at + 1 < len && src[at + 1] == '_')
+            failAt("Only one underscore is allowed as numeric separator", line, at - lineStart + 1);
+        if (!digitFollows)
+            failAt("Numeric separators are not allowed at the end of numeric literals", line, at - lineStart + 1);
+    }
+
+    void lexNumber()
+    {
+        int start = pos;
+        int c = src[pos];
+        tok.t = T_NUM;
+        if (c == '0' && (at(1) == 'x' || at(1) == 'X' || at(1) == 'o' || at(1) == 'O' || at(1) == 'b' || at(1) == 'B'))
+        {
+            int radix = (at(1) == 'x' || at(1) == 'X') ? 16 : (at(1) == 'o' || at(1) == 'O') ? 8 : 2;
+            pos += 2;
+            double v = 0;
+            std::string digits;
+            int count = 0;
+            while (pos < len)
+            {
+                int d = src[pos];
+                if (d == '_')
+                {
+                    separatorAt(pos, hexVal(pos + 1 < len ? src[pos + 1] : 0) >= 0);
+                    ++pos;
+                    continue;
+                }
+                int h = hexVal(d);
+                if (h < 0 || h >= radix)
+                    break;
+                v = v * radix + h;
+                digits += (char)d;
+                ++pos;
+                ++count;
+            }
+            if (!count)
+                failAt("Invalid or unexpected token", line, start - lineStart + 1);
+            if (pos < len && src[pos] == 'n')
+            {
+                ++pos;
+                tok.t = T_BIGINT;
+                std::string text = radix == 16 ? "0x" : radix == 8 ? "0o" : "0b";
+                tok.val = strv(newStrAscii((text + digits).c_str()));
+                return;
+            }
+            tok.num = v;
+            return;
+        }
+        std::string text;
+        // 010 is octal; 08 is decimal
+        if (c == '0' && at(1) >= '0' && at(1) <= '9')
+        {
+            int p = pos;
+            bool octal = true;
+            while (p < len && src[p] >= '0' && src[p] <= '9')
+            {
+                if (src[p] >= '8')
+                    octal = false;
+                ++p;
+            }
+            if (octal)
+            {
+                if (strict)
+                    failAt("Octal literals are not allowed in strict mode.", line, start - lineStart + 1);
+                double v = 0;
+                while (pos < p)
+                    v = v * 8 + (src[pos++] - '0');
+                tok.num = v;
+                return;
+            }
+        }
+        while (pos < len && ((src[pos] >= '0' && src[pos] <= '9') || src[pos] == '_'))
+        {
+            if (src[pos] != '_')
+                text += (char)src[pos];
+            else
+                separatorAt(pos, pos + 1 < len && src[pos + 1] >= '0' && src[pos + 1] <= '9');
+            ++pos;
+        }
+        if (pos < len && src[pos] == 'n')
+        {
+            if (text.size() > 1 && text[0] == '0')
+                failAt("Invalid or unexpected token", line, pos - lineStart + 1);
+            ++pos;
+            tok.t = T_BIGINT;
+            tok.val = strv(newStrAscii(text.c_str()));
+            return;
+        }
+        if (pos < len && src[pos] == '.')
+        {
+            text += '.';
+            ++pos;
+            while (pos < len && ((src[pos] >= '0' && src[pos] <= '9') || src[pos] == '_'))
+            {
+                if (src[pos] != '_')
+                    text += (char)src[pos];
+                else
+                    separatorAt(pos, pos + 1 < len && src[pos + 1] >= '0' && src[pos + 1] <= '9');
+                ++pos;
+            }
+        }
+        if (pos < len && (src[pos] == 'e' || src[pos] == 'E'))
+        {
+            int p = pos + 1;
+            if (p < len && (src[p] == '+' || src[p] == '-'))
+                ++p;
+            if (p < len && src[p] >= '0' && src[p] <= '9')
+            {
+                text += 'e';
+                if (src[pos + 1] == '-')
+                    text += '-';
+                pos = p;
+                while (pos < len && src[pos] >= '0' && src[pos] <= '9')
+                    text += (char)src[pos++];
+            }
+            else
+                failAt("Invalid or unexpected token", line, pos - lineStart + 1);
+        }
+        if (pos < len && isIdStart(src[pos]))
+            failAt("Invalid or unexpected token", line, pos - lineStart + 1);
+        tok.num = std::strtod(text.c_str(), nullptr);
+    }
+
+    // one escape after the backslash; false for one a template must not contain
+    bool readEscape(std::vector<uint16_t> &u, bool inTemplate)
+    {
+        int c = src[pos++];
+        switch (c)
+        {
+        case 'n': u.push_back('\n'); return true;
+        case 't': u.push_back('\t'); return true;
+        case 'r': u.push_back('\r'); return true;
+        case 'b': u.push_back('\b'); return true;
+        case 'v': u.push_back(0x0B); return true;
+        case 'f': u.push_back(0x0C); return true;
+        case 'x':
+        {
+            int a = pos < len ? hexVal(src[pos]) : -1;
+            int b = pos + 1 < len ? hexVal(src[pos + 1]) : -1;
+            if (a < 0 || b < 0)
+            {
+                if (inTemplate)
+                    return false;
+                failAt("Invalid hexadecimal escape sequence", line, pos - lineStart);
+            }
+            pos += 2;
+            u.push_back((uint16_t)(a * 16 + b));
+            return true;
+        }
+        case 'u':
+        {
+            if (inTemplate)
+            {
+                // check first: a bad escape is only an error when not tagged
+                int p = pos;
+                bool ok = true;
+                if (p < len && src[p] == '{')
+                {
+                    ++p;
+                    uint32_t v = 0;
+                    int count = 0;
+                    while (p < len && src[p] != '}')
+                    {
+                        int h = hexVal(src[p]);
+                        if (h < 0)
+                        {
+                            ok = false;
+                            break;
+                        }
+                        v = v * 16 + (uint32_t)h;
+                        if (v > 0x10FFFF)
+                        {
+                            ok = false;
+                            break;
+                        }
+                        ++p;
+                        ++count;
+                    }
+                    if (p >= len || !count)
+                        ok = false;
+                }
+                else
+                    for (int i = 0; i < 4; ++i)
+                        if (p + i >= len || hexVal(src[p + i]) < 0)
+                            ok = false;
+                if (!ok)
+                    return false;
+            }
+            appendCp(u, readUnicodeEscape());
+            return true;
+        }
+        case '\r':
+            if (pos < len && src[pos] == '\n')
+                ++pos;
+            newline(pos);
+            return true;
+        case '\n':
+        case 0x2028:
+        case 0x2029:
+            newline(pos);
+            return true;
+        default:
+            if (c >= '0' && c <= '9')
+            {
+                if (c == '0' && !(pos < len && src[pos] >= '0' && src[pos] <= '9'))
+                {
+                    u.push_back(0);
+                    return true;
+                }
+                if (inTemplate)
+                    return false;
+                if (strict)
+                    failAt("Octal escape sequences are not allowed in strict mode.", line, pos - lineStart);
+                if (c >= '8')
+                {
+                    u.push_back((uint16_t)c);
+                    return true;
+                }
+                int v = c - '0';
+                if (pos < len && src[pos] >= '0' && src[pos] <= '7')
+                {
+                    v = v * 8 + (src[pos++] - '0');
+                    if (v < 32 && pos < len && src[pos] >= '0' && src[pos] <= '7')
+                        v = v * 8 + (src[pos++] - '0');
+                }
+                u.push_back((uint16_t)v);
+                return true;
+            }
+            u.push_back((uint16_t)c);
+            return true;
+        }
+    }
+
+    void lexString(int quote)
+    {
+        ++pos;
+        int start = pos;
+        // the common case needs no copy through a vector
+        while (pos < len && src[pos] != quote && src[pos] != '\\' && src[pos] != '\n' && src[pos] != '\r')
+            ++pos;
+        tok.t = T_STR;
+        if (pos < len && src[pos] == quote)
+        {
+            tok.val = atomStr(newStrUnits(src + start, pos - start));
+            tok.escaped = false;
+            ++pos;
+            return;
+        }
+        std::vector<uint16_t> u(src + start, src + pos);
+        for (;;)
+        {
+            if (pos >= len)
+                failAt("Invalid or unexpected token", tok.line, tok.col);
+            int c = src[pos];
+            if (c == quote)
+            {
+                ++pos;
+                break;
+            }
+            if (c == '\n' || c == '\r')
+                failAt("Invalid or unexpected token", tok.line, tok.col);
+            if (c == '\\')
+            {
+                ++pos;
+                if (pos >= len)
+                    failAt("Invalid or unexpected token", tok.line, tok.col);
+                tok.escaped = true;
+                readEscape(u, false);
+            }
+            else
+            {
+                u.push_back((uint16_t)c);
+                ++pos;
+            }
+        }
+        tok.val = atomStr(newStrFromUnitsVec(u));
+    }
+
+    // from just after ` or }: up to ${ or the closing `
+    void lexTemplate()
+    {
+        std::vector<uint16_t> cooked, raw;
+        tok.t = T_TEMPLATE;
+        tok.badEscape = false;
+        for (;;)
+        {
+            if (pos >= len)
+                failAt("Unterminated template literal", tok.line, tok.col);
+            int c = src[pos];
+            if (c == '`')
+            {
+                ++pos;
+                tok.tail = true;
+                break;
+            }
+            if (c == '$' && at(1) == '{')
+            {
+                pos += 2;
+                tok.tail = false;
+                break;
+            }
+            if (c == '\\')
+            {
+                int s = pos;
+                ++pos;
+                if (pos >= len)
+                    failAt("Unterminated template literal", tok.line, tok.col);
+                if (!readEscape(cooked, true))
+                    tok.badEscape = true;
+                for (int i = s; i < pos; ++i)
+                {
+                    if (src[i] == '\r')
+                    {
+                        raw.push_back('\n');
+                        if (i + 1 < pos && src[i + 1] == '\n')
+                            ++i;
+                    }
+                    else
+                        raw.push_back(src[i]);
+                }
+            }
+            else if (c == '\r')
+            {
+                ++pos;
+                if (pos < len && src[pos] == '\n')
+                    ++pos;
+                newline(pos);
+                cooked.push_back('\n');
+                raw.push_back('\n');
+            }
+            else
+            {
+                if (c == '\n' || c == 0x2028 || c == 0x2029)
+                    newline(pos + 1);
+                cooked.push_back((uint16_t)c);
+                raw.push_back((uint16_t)c);
+                ++pos;
+            }
+        }
+        tok.val = atomStr(newStrFromUnitsVec(cooked));
+        tok.val2 = atomStr(newStrFromUnitsVec(raw));
+    }
+
+    void lexPunct(int c)
+    {
+        int b = at(1), d = at(2), e = at(3);
+        switch (c)
+        {
+        case '{': setPunct(PU_LBRACE, 1); return;
+        case '}': setPunct(PU_RBRACE, 1); return;
+        case '(': setPunct(PU_LPAREN, 1); return;
+        case ')': setPunct(PU_RPAREN, 1); return;
+        case '[': setPunct(PU_LBRACK, 1); return;
+        case ']': setPunct(PU_RBRACK, 1); return;
+        case ';': setPunct(PU_SEMI, 1); return;
+        case ',': setPunct(PU_COMMA, 1); return;
+        case '~': setPunct(PU_TILDE, 1); return;
+        case ':': setPunct(PU_COLON, 1); return;
+        case '.':
+            if (b == '.' && d == '.')
+                setPunct(PU_ELLIPSIS, 3);
+            else
+                setPunct(PU_DOT, 1);
+            return;
+        case '<':
+            if (b == '<')
+                setPunct(d == '=' ? PU_SHLA : PU_SHL, d == '=' ? 3 : 2);
+            else
+                setPunct(b == '=' ? PU_LE : PU_LT, b == '=' ? 2 : 1);
+            return;
+        case '>':
+            if (b == '>' && d == '>')
+                setPunct(e == '=' ? PU_USHRA : PU_USHR, e == '=' ? 4 : 3);
+            else if (b == '>')
+                setPunct(d == '=' ? PU_SHRA : PU_SHR, d == '=' ? 3 : 2);
+            else
+                setPunct(b == '=' ? PU_GE : PU_GT, b == '=' ? 2 : 1);
+            return;
+        case '=':
+            if (b == '=')
+                setPunct(d == '=' ? PU_SEQ : PU_EQ, d == '=' ? 3 : 2);
+            else if (b == '>')
+                setPunct(PU_ARROW, 2);
+            else
+                setPunct(PU_ASSIGN, 1);
+            return;
+        case '!':
+            if (b == '=')
+                setPunct(d == '=' ? PU_SNE : PU_NE, d == '=' ? 3 : 2);
+            else
+                setPunct(PU_NOT, 1);
+            return;
+        case '+':
+            if (b == '+')
+                setPunct(PU_INC, 2);
+            else
+                setPunct(b == '=' ? PU_ADDA : PU_PLUS, b == '=' ? 2 : 1);
+            return;
+        case '-':
+            if (b == '-')
+                setPunct(PU_DEC, 2);
+            else
+                setPunct(b == '=' ? PU_SUBA : PU_MINUS, b == '=' ? 2 : 1);
+            return;
+        case '*':
+            if (b == '*')
+                setPunct(d == '=' ? PU_EXPA : PU_STARSTAR, d == '=' ? 3 : 2);
+            else
+                setPunct(b == '=' ? PU_MULA : PU_STAR, b == '=' ? 2 : 1);
+            return;
+        case '/': setPunct(b == '=' ? PU_DIVA : PU_SLASH, b == '=' ? 2 : 1); return;
+        case '%': setPunct(b == '=' ? PU_MODA : PU_PERCENT, b == '=' ? 2 : 1); return;
+        case '&':
+            if (b == '&')
+                setPunct(d == '=' ? PU_LANDA : PU_LAND, d == '=' ? 3 : 2);
+            else
+                setPunct(b == '=' ? PU_ANDA : PU_AND, b == '=' ? 2 : 1);
+            return;
+        case '|':
+            if (b == '|')
+                setPunct(d == '=' ? PU_LORA : PU_LOR, d == '=' ? 3 : 2);
+            else
+                setPunct(b == '=' ? PU_ORA : PU_OR, b == '=' ? 2 : 1);
+            return;
+        case '^': setPunct(b == '=' ? PU_XORA : PU_XOR, b == '=' ? 2 : 1); return;
+        case '?':
+            if (b == '?')
+                setPunct(d == '=' ? PU_NULLA : PU_NULLISH, d == '=' ? 3 : 2);
+            else if (b == '.' && !(d >= '0' && d <= '9'))
+                setPunct(PU_OPTDOT, 2);
+            else
+                setPunct(PU_QUESTION, 1);
+            return;
+        default:
+            failAt("Invalid or unexpected token", line, pos - lineStart + 1);
+        }
+    }
+
+    // the current token was read as / or /=: it starts a regular expression
+    void rescanRegex()
+    {
+        pos = tok.pos + 1;
+        bool inClass = false;
+        int start = pos;
+        for (;;)
+        {
+            if (pos >= len || isLineTerm(src[pos]))
+                fail("Invalid regular expression: missing /");
+            int c = src[pos];
+            if (c == '\\')
+            {
+                ++pos;
+                if (pos >= len || isLineTerm(src[pos]))
+                    fail("Invalid regular expression: missing /");
+            }
+            else if (c == '[')
+                inClass = true;
+            else if (c == ']')
+                inClass = false;
+            else if (c == '/' && !inClass)
+                break;
+            ++pos;
+        }
+        tok.val = strv(newStrUnits(src + start, pos - start));
+        ++pos;
+        int fs = pos;
+        while (pos < len && isIdPart(src[pos]))
+            ++pos;
+        tok.val2 = strv(newStrUnits(src + fs, pos - fs));
+        tok.t = T_REGEX;
+        tok.pu = PU_NONE;
+        tok.end = pos;
+    }
+
+    bool isP(uint8_t p)
+    {
+        return tok.t == T_PUNCT && tok.pu == p;
+    }
+
+    bool isK(uint8_t k)
+    {
+        return tok.t == T_NAME && tok.kw == k;
+    }
+
+    bool eatP(uint8_t p)
+    {
+        if (isP(p))
+        {
+            next();
+            return true;
+        }
+        return false;
+    }
+
+    void expectP(uint8_t p)
+    {
+        if (!isP(p))
+            unexpected();
+        next();
+    }
+
+    void expectK(uint8_t k)
+    {
+        if (!isK(k))
+            unexpected();
+        next();
+    }
+
+    void semicolon()
+    {
+        if (eatP(PU_SEMI))
+            return;
+        if (isP(PU_RBRACE) || tok.t == T_EOF || tok.nl)
+            return;
+        unexpected();
+    }
+
+    // ── looking ahead at the characters ──────────────────────────────────
+
+    int skipBlank(int p, bool *sawNl = nullptr)
+    {
+        while (p < len)
+        {
+            int c = src[p];
+            if (isLineTerm(c))
+            {
+                if (sawNl)
+                    *sawNl = true;
+                ++p;
+            }
+            else if (c == ' ' || c == '\t' || c == 0x0B || c == 0x0C || c == 0xA0 || c == 0xFEFF)
+                ++p;
+            else if (c == '/' && p + 1 < len && src[p + 1] == '/')
+            {
+                while (p < len && !isLineTerm(src[p]))
+                    ++p;
+            }
+            else if (c == '/' && p + 1 < len && src[p + 1] == '*')
+            {
+                p += 2;
+                while (p + 1 < len && !(src[p] == '*' && src[p + 1] == '/'))
+                {
+                    if (sawNl && isLineTerm(src[p]))
+                        *sawNl = true;
+                    ++p;
+                }
+                p += 2;
+            }
+            else
+                break;
+        }
+        return p;
+    }
+
+    bool nextIsArrow()
+    {
+        bool nl = false;
+        int p = skipBlank(pos, &nl);
+        return !nl && p + 1 < len && src[p] == '=' && src[p + 1] == '>';
+    }
+
+    int skipStringAt(int p)
+    {
+        int q = src[p++];
+        while (p < len && src[p] != q)
+        {
+            if (src[p] == '\\')
+                ++p;
+            ++p;
+        }
+        return p + 1;
+    }
+
+    int skipTemplateAt(int p)
+    {
+        ++p;
+        while (p < len && src[p] != '`')
+        {
+            if (src[p] == '\\')
+                p += 2;
+            else if (src[p] == '$' && p + 1 < len && src[p + 1] == '{')
+                p = skipBalanced(p + 1) ;
+            else
+                ++p;
+        }
+        return p + 1;
+    }
+
+    // p at an opening bracket: the position after its match
+    int skipBalanced(int p)
+    {
+        int depth = 0;
+        int prev = '('; // what came before, to tell a regex from a division
+        while (p < len)
+        {
+            p = skipBlank(p);
+            if (p >= len)
+                break;
+            int c = src[p];
+            if (c == '(' || c == '[' || c == '{')
+            {
+                ++depth;
+                prev = c;
+                ++p;
+            }
+            else if (c == ')' || c == ']' || c == '}')
+            {
+                --depth;
+                ++p;
+                prev = c;
+                if (depth == 0)
+                    return p;
+            }
+            else if (c == '"' || c == '\'')
+            {
+                p = skipStringAt(p);
+                prev = 'a';
+            }
+            else if (c == '`')
+            {
+                p = skipTemplateAt(p);
+                prev = 'a';
+            }
+            else if (c == '/')
+            {
+                bool regex = !(prev == 'a' || prev == ')' || prev == ']' || prev == '}');
+                if (regex)
+                {
+                    ++p;
+                    bool cl = false;
+                    while (p < len && !isLineTerm(src[p]))
+                    {
+                        int d = src[p];
+                        if (d == '\\')
+                            ++p;
+                        else if (d == '[')
+                            cl = true;
+                        else if (d == ']')
+                            cl = false;
+                        else if (d == '/' && !cl)
+                            break;
+                        ++p;
+                    }
+                    ++p;
+                    prev = 'a';
+                }
+                else
+                {
+                    ++p;
+                    prev = '/';
+                }
+            }
+            else if (isIdPart(c))
+            {
+                int s = p;
+                while (p < len && isIdPart(src[p]))
+                    ++p;
+                prev = 'a';
+                // after these words a slash starts a regular expression
+                int n = p - s;
+                if ((n == 6 && src[s] == 'r' && src[s + 1] == 'e' && src[s + 2] == 't') || (n == 6 && src[s] == 't' && src[s + 1] == 'y') || (n == 2 && src[s] == 'i' && src[s + 1] == 'n') || (n == 2 && src[s] == 'o' && src[s + 1] == 'f') || (n == 4 && src[s] == 'c' && src[s + 1] == 'a' && src[s + 2] == 's'))
+                    prev = '(';
+            }
+            else
+            {
+                prev = c;
+                ++p;
+            }
+        }
+        return p;
+    }
+
+    // the token is `(`: does a parameter list and => follow?
+    bool parenIsArrow()
+    {
+        auto it = arrowMemo.find(tok.pos);
+        if (it != arrowMemo.end())
+            return it->second;
+        int p = skipBalanced(tok.pos);
+        bool nl = false;
+        p = skipBlank(p, &nl);
+        bool r = !nl && p + 1 < len && src[p] == '=' && src[p + 1] == '>';
+        arrowMemo[tok.pos] = r;
+        return r;
+    }
+
+    // ── nodes and scopes ─────────────────────────────────────────────────
+
+    Node *mk(N k)
+    {
+        Node *n = NEW(Node);
+        n->k = k;
+        n->line = tok.line;
+        n->col = tok.col;
+        n->strict = strict;
+        n->srcStart = tok.pos;
+        return n;
+    }
+
+    Node *mkAt(N k, Node *at)
+    {
+        Node *n = NEW(Node);
+        n->k = k;
+        n->line = at->line;
+        n->col = at->col;
+        n->strict = strict;
+        n->srcStart = at->srcStart;
+        return n;
+    }
+
+    void setItems(Node *n, const std::vector<Node *> &v)
+    {
+        n->n = (int)v.size();
+        n->items = static_cast<Node **>(bump(sizeof(Node *) * (v.size() + 1)));
+        for (size_t i = 0; i < v.size(); ++i)
+            n->items[i] = v[i];
+    }
+
+    Scope *pushScope(bool isFunc)
+    {
+        Scope *s = new Scope();
+        s->parent = scope;
+        s->func = func;
+        s->isFunc = isFunc;
+        if (scope)
+            scope->kids.push_back(s);
+        scope = s;
+        return s;
+    }
+
+    void popScope()
+    {
+        scope = scope->parent;
+    }
+
+    Scope *funcScope()
+    {
+        Scope *s = scope;
+        while (!s->isFunc)
+            s = s->parent;
+        return s;
+    }
+
+    void declareVar(V name)
+    {
+        // a var passes through block scopes to its function's
+        Scope *s = scope;
+        for (;;)
+        {
+            Binding *b = s->find(name);
+            if (b && (b->kind == B_LET || b->kind == B_CONST || b->kind == B_CLASS))
+                fail("Identifier '" + toUtf8(sp_(name)) + "' has already been declared");
+            if (s->isFunc)
+                break;
+            s = s->parent;
+        }
+        if (!s->find(name))
+            s->add(name, B_VAR);
+    }
+
+    void declareLex(V name, uint8_t kind)
+    {
+        Binding *b = scope->find(name);
+        if (b && !(b->kind == B_SELF))
+        {
+            if (b->kind == B_FUNC && kind == B_FUNC && !scope->isFunc && !strict)
+                return;
+            if (!(scope->isFunc && kind == B_FUNC))
+                fail("Identifier '" + toUtf8(sp_(name)) + "' has already been declared");
+            return;
+        }
+        if (b)
+        {
+            b->kind = kind;
+            b->isConst = kind == B_CONST;
+            b->lexical = kind != B_FUNC;
+            return;
+        }
+        scope->add(name, kind);
+    }
+
+    Node *ident(V name)
+    {
+        Node *n = mk(N_IDENT);
+        n->val = name;
+        scope->refs.push_back(n);
+        return n;
+    }
+
+    bool isReservedForIdent()
+    {
+        if (tok.t != T_NAME)
+            return true;
+        if (tok.kw == K_NONE)
+            return false;
+        if (tok.kw < K_LET)
+            return true;
+        if (tok.kw == K_YIELD)
+            return inGen || strict;
+        if (tok.kw == K_AWAIT)
+            return inAsync;
+        if (tok.kw == K_LET || tok.kw == K_STATIC)
+            return strict;
+        return false;
+    }
+
+    bool isStrictForbidden(V name)
+    {
+        if (!isStr(name))
+            return false;
+        std::string text = toUtf8(sp_(name));
+        return text == "eval" || text == "arguments";
+    }
+
+    V bindingName()
+    {
+        if (isReservedForIdent())
+            unexpected();
+        V name = tok.val;
+        if (strict && isStrictForbidden(name))
+            fail("Unexpected eval or arguments in strict mode");
+        next();
+        return name;
+    }
+
+    // ── binding patterns ─────────────────────────────────────────────────
+
+    Node *bindingTarget(uint8_t kind)
+    {
+        if (isP(PU_LBRACK))
+            return arrayBindingPattern(kind);
+        if (isP(PU_LBRACE))
+            return objectBindingPattern(kind);
+        Node *n = mk(N_IDENT);
+        if (kind != B_VAR && tok.t == T_NAME && toUtf8(sp_(tok.val)) == "let")
+            fail("let is disallowed as a lexically bound name");
+        V name = bindingName();
+        n->val = name;
+        declare(name, kind);
+        scope->refs.push_back(n);
+        return n;
+    }
+
+    void declare(V name, uint8_t kind)
+    {
+        if (kind == B_VAR)
+            declareVar(name);
+        else if (kind == B_PARAM)
+        {
+            if (!scope->find(name))
+                scope->add(name, B_PARAM);
+        }
+        else if (kind == B_CATCH)
+        {
+            if (!scope->find(name))
+                scope->add(name, B_CATCH);
+        }
+        else
+            declareLex(name, kind);
+    }
+
+    Node *withDefault(Node *target)
+    {
+        if (!isP(PU_ASSIGN))
+            return target;
+        Node *d = mkAt(N_DEFAULT, target);
+        next();
+        d->a = target;
+        d->b = assignExpr();
+        nameAnon(d->b, target);
+        return d;
+    }
+
+    Node *arrayBindingPattern(uint8_t kind)
+    {
+        Node *p = mk(N_ARRAYPAT);
+        next();
+        std::vector<Node *> items;
+        while (!isP(PU_RBRACK))
+        {
+            if (isP(PU_COMMA))
+            {
+                items.push_back(mk(N_HOLE));
+                next();
+                continue;
+            }
+            if (isP(PU_ELLIPSIS))
+            {
+                Node *r = mk(N_REST);
+                next();
+                r->a = bindingTarget(kind);
+                items.push_back(r);
+            }
+            else
+                items.push_back(withDefault(bindingTarget(kind)));
+            if (!isP(PU_RBRACK))
+                expectP(PU_COMMA);
+        }
+        next();
+        setItems(p, items);
+        return p;
+    }
+
+    Node *objectBindingPattern(uint8_t kind)
+    {
+        Node *p = mk(N_OBJECTPAT);
+        next();
+        std::vector<Node *> items;
+        while (!isP(PU_RBRACE))
+        {
+            if (isP(PU_ELLIPSIS))
+            {
+                Node *r = mk(N_REST);
+                next();
+                r->a = bindingTarget(kind);
+                items.push_back(r);
+            }
+            else
+            {
+                Node *pp = mk(N_PATPROP);
+                bool shorthandOk = tok.t == T_NAME;
+                V nameTok = tok.val;
+                bool reserved = shorthandOk && isReservedForIdent();
+                propertyKey(pp);
+                if (eatP(PU_COLON))
+                    pp->b = withDefault(bindingTarget(kind));
+                else
+                {
+                    if (!shorthandOk || pp->computed || reserved)
+                        unexpected();
+                    Node *t = mkAt(N_IDENT, pp);
+                    t->val = nameTok;
+                    declare(nameTok, kind);
+                    scope->refs.push_back(t);
+                    pp->b = withDefault(t);
+                }
+                items.push_back(pp);
+            }
+            if (!isP(PU_RBRACE))
+                expectP(PU_COMMA);
+        }
+        next();
+        setItems(p, items);
+        return p;
+    }
+
+    // a key in an object literal, class or pattern: sets val, or computed and a
+    void propertyKey(Node *n)
+    {
+        if (tok.t == T_NAME || tok.t == T_STR)
+        {
+            n->val = tok.val;
+            next();
+        }
+        else if (tok.t == T_NUM)
+        {
+            n->val = atomStr(fromUtf8(numberToStd(tok.num)));
+            next();
+        }
+        else if (tok.t == T_BIGINT)
+        {
+            n->val = atomStr(sp_(tok.val));
+            next();
+        }
+        else if (isP(PU_LBRACK))
+        {
+            next();
+            bool saved = noIn;
+            noIn = false;
+            n->a = assignExpr();
+            noIn = saved;
+            n->computed = true;
+            expectP(PU_RBRACK);
+        }
+        else
+            unexpected();
+    }
+
+    // ── expressions ──────────────────────────────────────────────────────
+
+    // a function or class without a name takes the name of what it is assigned to
+    void nameAnon(Node *value, Node *target)
+    {
+        if (target && target->k == N_IDENT)
+            nameAnonKey(value, target->val);
+    }
+
+    void nameAnonKey(Node *value, V name)
+    {
+        if (!value)
+            return;
+        if (value->k == N_FUNC && !value->func->name)
+            value->func->name = name;
+        else if (value->k == N_CLASS && !value->val)
+        {
+            value->val2 = name;
+        }
+    }
+
+    Node *expression()
+    {
+        Node *e = assignExpr();
+        if (isP(PU_COMMA))
+        {
+            Node *s = mkAt(N_SEQ, e);
+            std::vector<Node *> items;
+            items.push_back(e);
+            while (eatP(PU_COMMA))
+                items.push_back(assignExpr());
+            setItems(s, items);
+            return s;
+        }
+        return e;
+    }
+
+    // an expression read as an array or object literal turns out to be a target
+    Node *toPattern(Node *e)
+    {
+        switch (e->k)
+        {
+        case N_IDENT:
+        case N_MEMBER:
+        case N_INDEX:
+        case N_PRIVATE:
+        case N_SUPERMEMBER:
+        case N_SUPERINDEX:
+        case N_ARRAYPAT:
+        case N_OBJECTPAT:
+            return e;
+        case N_ASSIGN:
+        {
+            Node *d = mkAt(N_DEFAULT, e);
+            d->a = toPattern(e->a);
+            d->b = e->b;
+            return d;
+        }
+        case N_ARRAY:
+        {
+            e->k = N_ARRAYPAT;
+            for (int i = 0; i < e->n; ++i)
+            {
+                Node *x = e->items[i];
+                if (x->k == N_HOLE)
+                    continue;
+                if (x->k == N_SPREAD)
+                {
+                    x->k = N_REST;
+                    x->a = toPattern(x->a);
+                }
+                else
+                    e->items[i] = toPattern(x);
+            }
+            return e;
+        }
+        case N_OBJECT:
+        {
+            e->k = N_OBJECTPAT;
+            for (int i = 0; i < e->n; ++i)
+            {
+                Node *x = e->items[i];
+                if (x->op == P_SPREAD)
+                {
+                    x->k = N_REST;
+                    x->a = toPattern(x->b);
+                }
+                else if (x->op == P_INIT || x->op == P_PROTO)
+                {
+                    x->k = N_PATPROP;
+                    x->b = toPattern(x->b);
+                }
+                else
+                    failAt("Invalid destructuring assignment target", x->line, x->col);
+            }
+            return e;
+        }
+        default:
+            failAt("Invalid destructuring assignment target", e->line, e->col);
+        }
+    }
+
+    bool isSimpleTarget(Node *e)
+    {
+        return e->k == N_IDENT || e->k == N_MEMBER || e->k == N_INDEX || e->k == N_PRIVATE || e->k == N_SUPERMEMBER || e->k == N_SUPERINDEX;
+    }
+
+    Node *assignExpr()
+    {
+        if (isK(K_YIELD) && inGen)
+            return yieldExpr();
+        // arrows
+        if (tok.t == T_NAME && tok.kw == K_ASYNC && !tok.escaped)
+        {
+            int p = skipBlank(pos);
+            bool nl = false;
+            skipBlank(pos, &nl);
+            if (!nl && p < len && src[p] == '(')
+            {
+                int after = skipBalanced(p);
+                bool nl2 = false;
+                after = skipBlank(after, &nl2);
+                if (!nl2 && after + 1 < len && src[after] == '=' && src[after + 1] == '>')
+                {
+                    int start = tok.pos, ln = tok.line, col = tok.col;
+                    next();
+                    return arrowFunction(true, start, ln, col);
+                }
+            }
+            else if (!nl && p < len && isIdStart(src[p]))
+            {
+                // async x => ...
+                int q = p;
+                while (q < len && isIdPart(src[q]))
+                    ++q;
+                bool nl2 = false;
+                int r = skipBlank(q, &nl2);
+                bool isFunctionWord = q - p == 8 && src[p] == 'f' && src[p + 1] == 'u' && src[p + 2] == 'n' && src[p + 3] == 'c';
+                if (!isFunctionWord && !nl2 && r + 1 < len && src[r] == '=' && src[r + 1] == '>')
+                {
+                    int start = tok.pos, ln = tok.line, col = tok.col;
+                    next();
+                    return arrowFunction(true, start, ln, col);
+                }
+            }
+        }
+        if (isP(PU_LPAREN) && parenIsArrow())
+            return arrowFunction(false, tok.pos, tok.line, tok.col);
+        if (tok.t == T_NAME && !isReservedForIdent() && nextIsArrow())
+            return arrowFunction(false, tok.pos, tok.line, tok.col);
+
+        Node *left = condExpr();
+        if (tok.t != T_PUNCT)
+            return left;
+        uint8_t p = tok.pu;
+        if (p == PU_ASSIGN)
+        {
+            Node *as = mkAt(N_ASSIGN, left);
+            if ((left->k == N_ARRAY || left->k == N_OBJECT) && left == lastParen)
+                fail("Invalid left-hand side in assignment");
+            if (strict && left->k == N_IDENT && isStrictForbidden(left->val))
+                fail("Unexpected eval or arguments in strict mode");
+            if (left->k == N_ARRAY || left->k == N_OBJECT)
+                left = toPattern(left);
+            else if (!isSimpleTarget(left))
+                fail("Invalid left-hand side in assignment");
+            next();
+            as->a = left;
+            as->b = assignExpr();
+            if (as->a->k == N_OBJECTPAT)
+                as->a->c = as->b;
+            nameAnon(as->b, left);
+            return as;
+        }
+        int bop = -1;
+        int logical = -1;
+        switch (p)
+        {
+        case PU_ADDA: bop = OP_ADD; break;
+        case PU_SUBA: bop = OP_SUB; break;
+        case PU_MULA: bop = OP_MUL; break;
+        case PU_DIVA: bop = OP_DIV; break;
+        case PU_MODA: bop = OP_MOD; break;
+        case PU_EXPA: bop = OP_EXP; break;
+        case PU_SHLA: bop = OP_SHL; break;
+        case PU_SHRA: bop = OP_SHR; break;
+        case PU_USHRA: bop = OP_USHR; break;
+        case PU_ANDA: bop = OP_BITAND; break;
+        case PU_ORA: bop = OP_BITOR; break;
+        case PU_XORA: bop = OP_BITXOR; break;
+        case PU_LANDA: logical = N_AND; break;
+        case PU_LORA: logical = N_OR; break;
+        case PU_NULLA: logical = N_NULLISH; break;
+        default: return left;
+        }
+        if (!isSimpleTarget(left))
+            fail("Invalid left-hand side in assignment");
+        Node *as = mkAt(bop >= 0 ? N_OPASSIGN : N_LOGASSIGN, left);
+        as->op = (uint8_t)(bop >= 0 ? bop : logical);
+        next();
+        as->a = left;
+        as->b = assignExpr();
+        if (logical >= 0)
+            nameAnon(as->b, left);
+        return as;
+    }
+
+    Node *yieldExpr()
+    {
+        Node *y = mk(N_YIELD);
+        func->suspendPoints++;
+        next();
+        if (tok.nl || isP(PU_RPAREN) || isP(PU_RBRACK) || isP(PU_RBRACE) || isP(PU_COMMA) || isP(PU_SEMI) || isP(PU_COLON) || tok.t == T_EOF || (isK(K_IN) ))
+            return y;
+        if (eatP(PU_STAR))
+            y->flag = true;
+        y->a = assignExpr();
+        return y;
+    }
+
+    Node *condExpr()
+    {
+        Node *c = binaryExpr(0);
+        if (!isP(PU_QUESTION))
+            return c;
+        Node *n = mkAt(N_COND, c);
+        next();
+        bool saved = noIn;
+        noIn = false;
+        n->a = c;
+        n->b = assignExpr();
+        noIn = saved;
+        expectP(PU_COLON);
+        n->c = assignExpr();
+        return n;
+    }
+
+    int binaryPrec()
+    {
+        if (tok.t == T_NAME)
+        {
+            if (tok.kw == K_INSTANCEOF)
+                return 7;
+            if (tok.kw == K_IN && !noIn)
+                return 7;
+            return -1;
+        }
+        if (tok.t != T_PUNCT)
+            return -1;
+        switch (tok.pu)
+        {
+        case PU_NULLISH: return 1;
+        case PU_LOR: return 1;
+        case PU_LAND: return 2;
+        case PU_OR: return 3;
+        case PU_XOR: return 4;
+        case PU_AND: return 5;
+        case PU_EQ:
+        case PU_NE:
+        case PU_SEQ:
+        case PU_SNE: return 6;
+        case PU_LT:
+        case PU_GT:
+        case PU_LE:
+        case PU_GE: return 7;
+        case PU_SHL:
+        case PU_SHR:
+        case PU_USHR: return 8;
+        case PU_PLUS:
+        case PU_MINUS: return 9;
+        case PU_STAR:
+        case PU_SLASH:
+        case PU_PERCENT: return 10;
+        case PU_STARSTAR: return 11;
+        default: return -1;
+        }
+    }
+
+    Node *binaryExpr(int minPrec)
+    {
+        Node *left;
+        if (tok.t == T_PRIVATE)
+        {
+            // #x in obj
+            Node *pi = mk(N_PRIVATEIN);
+            pi->b = ident(privAtom(tok.val));
+            next();
+            if (!isK(K_IN))
+                unexpected();
+            next();
+            pi->a = binaryExpr(8);
+            left = pi;
+        }
+        else
+            left = unaryExpr();
+        for (;;)
+        {
+            int prec = binaryPrec();
+            if (prec < 0 || prec <= minPrec)
+            {
+                if (!(prec == 11 && minPrec == 11))
+                    break;
+            }
+            uint8_t pu = tok.pu;
+            uint8_t kw = tok.kw;
+            bool isName = tok.t == T_NAME;
+            int opLine = tok.line, opCol = tok.col;
+            next();
+            Node *right = binaryExpr(prec == 11 ? 10 : prec);
+            N k = N_BINARY;
+            int o = 0;
+            if (isName)
+                o = kw == K_IN ? OP_IN : OP_INSTANCEOF;
+            else
+                switch (pu)
+                {
+                case PU_NULLISH: k = N_NULLISH; break;
+                case PU_LOR: k = N_OR; break;
+                case PU_LAND: k = N_AND; break;
+                case PU_OR: o = OP_BITOR; break;
+                case PU_XOR: o = OP_BITXOR; break;
+                case PU_AND: o = OP_BITAND; break;
+                case PU_EQ: o = OP_EQ; break;
+                case PU_NE: o = OP_NE; break;
+                case PU_SEQ: o = OP_SEQ; break;
+                case PU_SNE: o = OP_SNE; break;
+                case PU_LT: o = OP_LT; break;
+                case PU_GT: o = OP_GT; break;
+                case PU_LE: o = OP_LE; break;
+                case PU_GE: o = OP_GE; break;
+                case PU_SHL: o = OP_SHL; break;
+                case PU_SHR: o = OP_SHR; break;
+                case PU_USHR: o = OP_USHR; break;
+                case PU_PLUS: o = OP_ADD; break;
+                case PU_MINUS: o = OP_SUB; break;
+                case PU_STAR: o = OP_MUL; break;
+                case PU_SLASH: o = OP_DIV; break;
+                case PU_PERCENT: o = OP_MOD; break;
+                case PU_STARSTAR: o = OP_EXP; break;
+                default: break;
+                }
+            Node *b = mkAt(k, left);
+            b->op = (uint8_t)o;
+            b->a = left;
+            b->b = right;
+            (void)opLine;
+            (void)opCol;
+            left = b;
+        }
+        return left;
+    }
+
+    Node *unaryExpr()
+    {
+        if (tok.t == T_PUNCT)
+        {
+            int o = -1;
+            switch (tok.pu)
+            {
+            case PU_NOT: o = OP_NOT; break;
+            case PU_MINUS: o = OP_NEG; break;
+            case PU_PLUS: o = OP_PLUS; break;
+            case PU_TILDE: o = OP_BITNOT; break;
+            case PU_INC:
+            case PU_DEC:
+            {
+                Node *u = mk(N_UPDATE);
+                u->slot = tok.pu == PU_INC ? 1 : -1;
+                u->flag = true;
+                next();
+                u->a = unaryExpr();
+                if (!isSimpleTarget(u->a))
+                    fail("Invalid left-hand side expression in prefix operation");
+                return u;
+            }
+            default: break;
+            }
+            if (o >= 0)
+            {
+                Node *u = mk(N_UNARY);
+                u->op = (uint8_t)o;
+                next();
+                u->a = unaryExpr();
+                // -5 as a constant
+                if (o == OP_NEG && u->a->k == N_NUM)
+                {
+                    u->a->val = num(-numOf(u->a->val));
+                    u->a->line = u->line;
+                    u->a->col = u->col;
+                    return u->a;
+                }
+                return u;
+            }
+        }
+        else if (tok.t == T_NAME)
+        {
+            if (tok.kw == K_TYPEOF)
+            {
+                Node *u = mk(N_TYPEOF);
+                next();
+                u->a = unaryExpr();
+                return u;
+            }
+            if (tok.kw == K_VOID)
+            {
+                Node *u = mk(N_UNARY);
+                u->op = OP_VOID;
+                next();
+                u->a = unaryExpr();
+                return u;
+            }
+            if (tok.kw == K_DELETE)
+            {
+                Node *u = mk(N_DELETE);
+                next();
+                u->a = unaryExpr();
+                if (strict && u->a->k == N_IDENT)
+                    fail("Delete of an unqualified identifier in strict mode.");
+                return u;
+            }
+            if (tok.kw == K_AWAIT && !inAsync)
+            {
+                // an operand on the same line: somebody meant the operator
+                int p = pos;
+                while (p < len && (src[p] == ' ' || src[p] == '\t'))
+                    ++p;
+                int c = p < len ? src[p] : 0;
+                bool word = isIdStart(c);
+                if (word)
+                {
+                    int e = p;
+                    while (e < len && isIdPart(src[e]))
+                        ++e;
+                    int size = e - p;
+                    if ((size == 2 && src[p] == 'i' && src[p + 1] == 'n') || (size == 2 && src[p] == 'o' && src[p + 1] == 'f') ||
+                        (size == 10 && src[p] == 'i' && src[p + 1] == 'n' && src[p + 2] == 's'))
+                        word = false;
+                }
+                if (word || (c >= '0' && c <= '9') || c == '"' || c == '\'')
+                    fail("await is only valid in async functions and the top level bodies of modules");
+            }
+            if (tok.kw == K_AWAIT && inAsync)
+            {
+                Node *u = mk(N_AWAIT);
+                func->suspendPoints++;
+                next();
+                u->a = unaryExpr();
+                return u;
+            }
+        }
+        return postfixExpr();
+    }
+
+    Node *postfixExpr()
+    {
+        Node *e = lhsExpr();
+        if (tok.t == T_PUNCT && (tok.pu == PU_INC || tok.pu == PU_DEC) && !tok.nl)
+        {
+            if (!isSimpleTarget(e))
+                fail("Invalid left-hand side expression in postfix operation");
+            Node *u = mkAt(N_UPDATE, e);
+            u->slot = tok.pu == PU_INC ? 1 : -1;
+            u->flag = false;
+            u->a = e;
+            next();
+            return u;
+        }
+        return e;
+    }
+
+    void arguments(Node *call)
+    {
+        // at (
+        next();
+        std::vector<Node *> args;
+        bool saved = noIn;
+        noIn = false;
+        int suspendBefore = func->suspendPoints;
+        while (!isP(PU_RPAREN))
+        {
+            if (isP(PU_ELLIPSIS))
+            {
+                Node *s = mk(N_SPREAD);
+                next();
+                s->a = assignExpr();
+                args.push_back(s);
+                call->spread = true;
+            }
+            else
+                args.push_back(assignExpr());
+            if (!isP(PU_RPAREN))
+            {
+                if (!isP(PU_COMMA))
+                {
+                    if (tok.t == T_EOF)
+                        fail("missing ) after argument list");
+                    fail("missing ) after argument list");
+                }
+                next();
+            }
+        }
+        noIn = saved;
+        call->suspend = func->suspendPoints != suspendBefore;
+        next();
+        setItems(call, args);
+    }
+
+    V privAtom(V name)
+    {
+        return atomStr(concatStr(newStrAscii("#"), sp_(name)));
+    }
+
+    Node *newExpr()
+    {
+        Node *n = mk(N_NEW);
+        next();
+        if (isP(PU_DOT))
+        {
+            next();
+            if (!(tok.t == T_NAME && toUtf8(sp_(tok.val)) == "target"))
+                unexpected();
+            n->k = N_NEWTARGET;
+            if (!allowNewTarget)
+                fail("new.target expression is not allowed here");
+            next();
+            return n;
+        }
+        Node *callee;
+        if (isK(K_NEW))
+            callee = newExpr();
+        else
+            callee = primaryExpr();
+        // member accesses bind to the callee; calls do not
+        for (;;)
+        {
+            if (isP(PU_DOT))
+            {
+                next();
+                if (tok.t == T_PRIVATE)
+                {
+                    Node *m = mkAt(N_PRIVATE, callee);
+                    m->col = tok.col;
+                    m->a = callee;
+                    m->b = ident(privAtom(tok.val));
+                    next();
+                    callee = m;
+                    continue;
+                }
+                if (tok.t != T_NAME)
+                    unexpected();
+                Node *m = mkAt(N_MEMBER, callee);
+                m->col = tok.col;
+                m->line = tok.line;
+                m->a = callee;
+                m->val = tok.val;
+                next();
+                callee = m;
+            }
+            else if (isP(PU_LBRACK))
+            {
+                next();
+                Node *m = mkAt(N_INDEX, callee);
+                m->a = callee;
+                bool saved = noIn;
+                noIn = false;
+                m->b = expression();
+                noIn = saved;
+                expectP(PU_RBRACK);
+                callee = m;
+            }
+            else if (tok.t == T_TEMPLATE)
+                callee = taggedTemplate(callee);
+            else
+                break;
+        }
+        n->a = callee;
+        if (isP(PU_LPAREN))
+            arguments(n);
+        else
+            n->items = nullptr;
+        return n;
+    }
+
+    Node *lhsExpr()
+    {
+        Node *e;
+        if (isK(K_NEW))
+            e = newExpr();
+        else if (isK(K_SUPER))
+        {
+            Node *s = mk(N_SUPERMEMBER);
+            next();
+            funcUsesThis();
+            if (isP(PU_LPAREN) ? !allowSuperCall : !allowSuperProp)
+                fail("'super' keyword unexpected here");
+            if (isP(PU_LPAREN))
+            {
+                s->k = N_SUPERCALL;
+                arguments(s);
+            }
+            else if (isP(PU_DOT))
+            {
+                next();
+                if (tok.t != T_NAME)
+                    unexpected();
+                s->val = tok.val;
+                next();
+            }
+            else if (isP(PU_LBRACK))
+            {
+                next();
+                s->k = N_SUPERINDEX;
+                s->b = expression();
+                expectP(PU_RBRACK);
+            }
+            else
+                fail("'super' keyword unexpected here");
+            e = s;
+        }
+        else
+            e = primaryExpr();
+        bool inChain = false;
+        for (;;)
+        {
+            if (tok.t == T_TEMPLATE)
+            {
+                e = taggedTemplate(e);
+                continue;
+            }
+            if (tok.t != T_PUNCT)
+                break;
+            uint8_t p = tok.pu;
+            if (p == PU_DOT)
+            {
+                next();
+                if (tok.t == T_PRIVATE)
+                {
+                    Node *m = mkAt(N_PRIVATE, e);
+                    m->line = tok.line;
+                    m->col = tok.col;
+                    m->a = e;
+                    m->b = ident(privAtom(tok.val));
+                    next();
+                    e = m;
+                    continue;
+                }
+                if (tok.t != T_NAME)
+                    unexpected();
+                Node *m = mkAt(N_MEMBER, e);
+                m->line = tok.line;
+                m->col = tok.col;
+                m->a = e;
+                m->val = tok.val;
+                next();
+                e = m;
+            }
+            else if (p == PU_LBRACK)
+            {
+                Node *m = mkAt(N_INDEX, e);
+                m->line = tok.line;
+                m->col = tok.col;
+                next();
+                m->a = e;
+                bool saved = noIn;
+                noIn = false;
+                m->b = expression();
+                noIn = saved;
+                expectP(PU_RBRACK);
+                e = m;
+            }
+            else if (p == PU_LPAREN)
+            {
+                Node *c = mkAt(N_CALL, e);
+                // a stack trace points at the callee's name, if it ends in one,
+                // and otherwise at the parenthesis
+                bool named = (e->k == N_IDENT || e->k == N_MEMBER || e->k == N_PRIVATE || e->k == N_SUPERMEMBER) && e != lastParen;
+                c->line = named ? e->line : tok.line;
+                c->col = named ? e->col : tok.col;
+                c->a = e;
+                c->scope = scope;
+                arguments(c);
+                if (e->k == N_IDENT && e->val == g_aEval)
+                    markDirectEval();
+                e = c;
+            }
+            else if (p == PU_OPTDOT)
+            {
+                inChain = true;
+                next();
+                if (isP(PU_LPAREN))
+                {
+                    Node *c = mkAt(N_CALL, e);
+                    c->a = e;
+                    c->opt = true;
+                    c->scope = scope;
+                    arguments(c);
+                    e = c;
+                }
+                else if (isP(PU_LBRACK))
+                {
+                    Node *m = mkAt(N_INDEX, e);
+                    next();
+                    m->a = e;
+                    m->opt = true;
+                    m->b = expression();
+                    expectP(PU_RBRACK);
+                    e = m;
+                }
+                else if (tok.t == T_PRIVATE)
+                {
+                    Node *m = mkAt(N_PRIVATE, e);
+                    m->a = e;
+                    m->opt = true;
+                    m->b = ident(privAtom(tok.val));
+                    next();
+                    e = m;
+                }
+                else
+                {
+                    if (tok.t != T_NAME)
+                        unexpected();
+                    Node *m = mkAt(N_MEMBER, e);
+                    m->line = tok.line;
+                    m->col = tok.col;
+                    m->a = e;
+                    m->opt = true;
+                    m->val = tok.val;
+                    next();
+                    e = m;
+                }
+            }
+            else
+                break;
+        }
+        if (inChain)
+        {
+            Node *c = mkAt(N_CHAIN, e);
+            c->a = e;
+            return c;
+        }
+        return e;
+    }
+
+    void funcUsesThis()
+    {
+        func->usesThis = true;
+    }
+
+    void markDirectEval()
+    {
+        for (Scope *s = scope; s; s = s->parent)
+            s->dynamic = true;
+        func->hasEval = true;
+        func->usesThis = true;
+    }
+
+    Node *taggedTemplate(Node *tag)
+    {
+        Node *t = mkAt(N_TAGGED, tag);
+        t->a = tag;
+        std::vector<Node *> cooked, raws, subs;
+        for (;;)
+        {
+            Node *c = mk(N_STR);
+            if (tok.badEscape)
+                c->k = N_UNDEF;
+            else
+                c->val = tok.val;
+            cooked.push_back(c);
+            Node *r = mk(N_STR);
+            r->val = tok.val2;
+            raws.push_back(r);
+            if (tok.tail)
+                break;
+            next();
+            bool saved = noIn;
+            noIn = false;
+            subs.push_back(expression());
+            noIn = saved;
+            if (!isP(PU_RBRACE))
+                unexpected();
+            pos = tok.pos + 1;
+            lexTemplate();
+            tok.end = pos;
+        }
+        next();
+        Node *obj = mk(N_TEMPLATEOBJ);
+        setItems(obj, cooked);
+        obj->n2 = (int)raws.size();
+        obj->list2 = static_cast<Node **>(bump(sizeof(Node *) * raws.size()));
+        for (size_t i = 0; i < raws.size(); ++i)
+            obj->list2[i] = raws[i];
+        t->b = obj;
+        setItems(t, subs);
+        return t;
+    }
+
+    Node *templateLiteral()
+    {
+        Node *t = mk(N_TEMPLATE);
+        std::vector<Node *> items;
+        for (;;)
+        {
+            if (tok.badEscape)
+                fail("Invalid escape sequence in template");
+            Node *s = mk(N_STR);
+            s->val = tok.val;
+            items.push_back(s);
+            if (tok.tail)
+                break;
+            next();
+            bool saved = noIn;
+            noIn = false;
+            items.push_back(expression());
+            noIn = saved;
+            if (!isP(PU_RBRACE))
+                unexpected();
+            pos = tok.pos + 1;
+            lexTemplate();
+            tok.end = pos;
+        }
+        next();
+        setItems(t, items);
+        return t;
+    }
+
+    Node *primaryExpr()
+    {
+        switch (tok.t)
+        {
+        case T_NUM:
+        {
+            Node *n = mk(N_NUM);
+            n->val = num(tok.num);
+            next();
+            return n;
+        }
+        case T_BIGINT:
+        {
+            Node *n = mk(N_BIGINT);
+            n->val = tok.val;
+            next();
+            return n;
+        }
+        case T_STR:
+        {
+            Node *n = mk(N_STR);
+            n->val = tok.val;
+            next();
+            return n;
+        }
+        case T_TEMPLATE:
+            return templateLiteral();
+        case T_NAME:
+            return primaryName();
+        case T_PUNCT:
+            switch (tok.pu)
+            {
+            case PU_LPAREN:
+            {
+                next();
+                bool saved = noIn;
+                noIn = false;
+                Node *e = expression();
+                noIn = saved;
+                expectP(PU_RPAREN);
+                lastParen = e;
+                // (a) = 1 is fine, ({}) = 1 is not; a marker keeps names off (f) = function
+                return e;
+            }
+            case PU_LBRACK:
+                return arrayLiteral();
+            case PU_LBRACE:
+                return objectLiteral();
+            case PU_SLASH:
+            case PU_DIVA:
+            {
+                rescanRegex();
+                Node *n = mk(N_REGEX);
+                n->val = tok.val;
+                n->val2 = tok.val2;
+                next();
+                return n;
+            }
+            default:
+                unexpected();
+            }
+        default:
+            unexpected();
+        }
+    }
+
+    Node *primaryName()
+    {
+        switch (tok.kw)
+        {
+        case K_THIS:
+        {
+            Node *n = mk(N_THIS);
+            funcUsesThis();
+            next();
+            return n;
+        }
+        case K_NULL:
+        {
+            Node *n = mk(N_NULL);
+            next();
+            return n;
+        }
+        case K_TRUE:
+        {
+            Node *n = mk(N_TRUE);
+            next();
+            return n;
+        }
+        case K_FALSE:
+        {
+            Node *n = mk(N_FALSE);
+            next();
+            return n;
+        }
+        case K_FUNCTION:
+            return functionExpr(false);
+        case K_CLASS:
+            return classExpr();
+        case K_ASYNC:
+        {
+            bool nl = false;
+            int p = skipBlank(pos, &nl);
+            if (!nl && p + 8 <= len && src[p] == 'f' && src[p + 1] == 'u' && src[p + 2] == 'n' && src[p + 3] == 'c' && src[p + 4] == 't' && src[p + 5] == 'i' && src[p + 6] == 'o' && src[p + 7] == 'n' && !(p + 8 < len && isIdPart(src[p + 8])))
+                return functionExpr(true);
+            break;
+        }
+        default:
+            break;
+        }
+        if (isReservedForIdent())
+            unexpected();
+        Node *n = ident(tok.val);
+        next();
+        return n;
+    }
+
+    Node *arrayLiteral()
+    {
+        Node *a = mk(N_ARRAY);
+        next();
+        std::vector<Node *> items;
+        bool saved = noIn;
+        noIn = false;
+        while (!isP(PU_RBRACK))
+        {
+            if (isP(PU_COMMA))
+            {
+                items.push_back(mk(N_HOLE));
+                next();
+                continue;
+            }
+            if (isP(PU_ELLIPSIS))
+            {
+                Node *s = mk(N_SPREAD);
+                next();
+                s->a = assignExpr();
+                items.push_back(s);
+                a->spread = true;
+            }
+            else
+                items.push_back(assignExpr());
+            if (!isP(PU_RBRACK))
+                expectP(PU_COMMA);
+        }
+        noIn = saved;
+        next();
+        setItems(a, items);
+        return a;
+    }
+
+    Node *objectLiteral()
+    {
+        Node *o = mk(N_OBJECT);
+        next();
+        std::vector<Node *> items;
+        bool saved = noIn;
+        noIn = false;
+        while (!isP(PU_RBRACE))
+        {
+            items.push_back(objectMember());
+            if (!isP(PU_RBRACE))
+                expectP(PU_COMMA);
+        }
+        noIn = saved;
+        next();
+        setItems(o, items);
+        return o;
+    }
+
+    // after a name that may be a modifier: does a key follow?
+    bool modifierFollowedByKey()
+    {
+        int p = skipBlank(pos);
+        if (p >= len)
+            return false;
+        int c = src[p];
+        return !(c == ',' || c == ':' || c == '(' || c == '}' || c == '=' || c == ';');
+    }
+
+    Node *objectMember()
+    {
+        Node *m = mk(N_PROP);
+        m->op = P_INIT;
+        if (isP(PU_ELLIPSIS))
+        {
+            next();
+            m->op = P_SPREAD;
+            m->b = assignExpr();
+            return m;
+        }
+        bool isAsync = false, isGen = false;
+        int start = tok.pos, ln = tok.line, col = tok.col;
+        if (tok.t == T_NAME && tok.kw == K_ASYNC && modifierFollowedByKey())
+        {
+            bool nl = false;
+            skipBlank(pos, &nl);
+            if (!nl)
+            {
+                isAsync = true;
+                next();
+            }
+        }
+        if (isP(PU_STAR))
+        {
+            isGen = true;
+            next();
+        }
+        if (!isAsync && !isGen && tok.t == T_NAME && (tok.kw == K_GET || tok.kw == K_SET) && modifierFollowedByKey())
+        {
+            bool getter = tok.kw == K_GET;
+            next();
+            m->op = getter ? P_GET : P_SET;
+            propertyKey(m);
+            m->b = methodFunction(false, false, start, ln, col, m, getter ? "get " : "set ");
+            m->b->func->isGetSet = true;
+            return m;
+        }
+        bool nameTok = tok.t == T_NAME;
+        bool reserved = nameTok && isReservedForIdent();
+        V keyName = tok.val;
+        uint8_t keyKw = tok.kw;
+        bool plainKey = nameTok || tok.t == T_STR;
+        Node *shortNode = nameTok ? mk(N_IDENT) : nullptr;
+        propertyKey(m);
+        if (isAsync || isGen || isP(PU_LPAREN))
+        {
+            m->op = P_METHOD;
+            m->b = methodFunction(isAsync, isGen, start, ln, col, m, "");
+            return m;
+        }
+        if (eatP(PU_COLON))
+        {
+            m->b = assignExpr();
+            if (!m->computed)
+            {
+                if (plainKey && m->val == A.proto)
+                    m->op = P_PROTO;
+                else
+                    nameAnonKey(m->b, m->val);
+            }
+            return m;
+        }
+        (void)keyKw;
+        // shorthand { a } and { a = 1 } (a pattern, later)
+        if (!nameTok || m->computed || reserved)
+            unexpected();
+        shortNode->val = keyName;
+        scope->refs.push_back(shortNode);
+        if (isP(PU_ASSIGN))
+        {
+            Node *as = mkAt(N_ASSIGN, shortNode);
+            next();
+            as->a = shortNode;
+            as->b = assignExpr();
+            nameAnon(as->b, shortNode);
+            m->b = as;
+        }
+        else
+            m->b = shortNode;
+        return m;
+    }
+
+    // ── functions ────────────────────────────────────────────────────────
+
+    struct LabelEntry
+    {
+        V name;
+        bool loop;
+    };
+    std::vector<LabelEntry> labels;
+    int loopDepth = 0, breakDepth = 0, pendingLabels = 0;
+    bool topIsFunction = false; // a module's top level may return
+    bool allowSuperProp = false, allowSuperCall = false, allowNewTarget = false;
+    Node *lastParen = nullptr; // the last parenthesized expression
+
+    struct FnState
+    {
+        FuncNode *func;
+        bool strict, inGen, inAsync, noIn;
+        std::vector<LabelEntry> labels;
+        int loopDepth, breakDepth;
+        bool allowSuperProp, allowSuperCall, allowNewTarget;
+    };
+
+    FnState enterFunction(FuncNode *fn)
+    {
+        FnState st{func, strict, inGen, inAsync, noIn, labels, loopDepth, breakDepth, allowSuperProp, allowSuperCall, allowNewTarget};
+        if (!fn->isArrow)
+        {
+            allowSuperProp = fn->isMethod || fn->isClassCtor || fn->isFieldInit;
+            allowSuperCall = fn->isClassCtor && fn->isDerived;
+            allowNewTarget = true;
+        }
+        labels.clear();
+        loopDepth = 0;
+        breakDepth = 0;
+        fn->file = file;
+        fn->src = src;
+        func = fn;
+        inGen = fn->isGen;
+        inAsync = fn->isAsync;
+        noIn = false;
+        fn->scope = pushScope(true);
+        fn->heapFrame = fn->isGen || fn->isAsync;
+        return st;
+    }
+
+    void leaveFunction(const FnState &st)
+    {
+        func->strict = strict;
+        popScope();
+        func = st.func;
+        strict = st.strict;
+        inGen = st.inGen;
+        inAsync = st.inAsync;
+        noIn = st.noIn;
+        allowSuperProp = st.allowSuperProp;
+        allowSuperCall = st.allowSuperCall;
+        allowNewTarget = st.allowNewTarget;
+        labels = st.labels;
+        loopDepth = st.loopDepth;
+        breakDepth = st.breakDepth;
+    }
+
+    void paramList(FuncNode *fn)
+    {
+        // at (
+        expectP(PU_LPAREN);
+        int count = 0;
+        bool seenDefault = false;
+        while (!isP(PU_RPAREN))
+        {
+            Node *p;
+            if (isP(PU_ELLIPSIS))
+            {
+                p = mk(N_REST);
+                next();
+                p->a = bindingTarget(B_PARAM);
+                fn->simple = false;
+                seenDefault = true;
+            }
+            else
+            {
+                Node *t = bindingTarget(B_PARAM);
+                if (t->k != N_IDENT)
+                    fn->simple = false;
+                p = t;
+                if (isP(PU_ASSIGN))
+                {
+                    p = withDefault(t);
+                    fn->simple = false;
+                    seenDefault = true;
+                }
+                if (!seenDefault)
+                    ++count;
+            }
+            fn->params.push_back(p);
+            if (!isP(PU_RPAREN))
+                expectP(PU_COMMA);
+        }
+        next();
+        fn->length = count;
+    }
+
+    void finishParams(FuncNode *fn)
+    {
+        fn->nParams = (int)fn->params.size();
+        fn->paramsP = static_cast<Node **>(bump(sizeof(Node *) * (fn->params.size() + 1)));
+        for (size_t i = 0; i < fn->params.size(); ++i)
+            fn->paramsP[i] = fn->params[i];
+    }
+
+    void functionBody(FuncNode *fn)
+    {
+        // at {
+        if (!isP(PU_LBRACE))
+            unexpected();
+        Node *b = mk(N_BLOCK);
+        next();
+        std::vector<Node *> items;
+        directives();
+        while (!isP(PU_RBRACE))
+        {
+            if (tok.t == T_EOF)
+                unexpected();
+            items.push_back(statement());
+        }
+        fn->srcEnd = tok.end;
+        // the next token is lexed outside this function's rules
+        bool saveStrict = strict;
+        next();
+        strict = saveStrict;
+        setItems(b, items);
+        fn->body = b;
+    }
+
+    void directives()
+    {
+        // string literals at the start: "use strict" counts when spelled plainly
+        int p = pos;
+        int savedTokPos = tok.pos;
+        (void)p;
+        (void)savedTokPos;
+        Token saved = tok;
+        int sPos = pos, sLine = line, sStart = lineStart;
+        while (tok.t == T_STR)
+        {
+            bool isUse = tok.val == g_aUseStrict && !tok.escaped && tok.end - tok.pos == 12;
+            next();
+            if (!(isP(PU_SEMI) || isP(PU_RBRACE) || tok.t == T_EOF || tok.nl))
+                break;
+            if (isUse)
+                strict = true;
+            eatP(PU_SEMI);
+        }
+        tok = saved;
+        pos = sPos;
+        line = sLine;
+        lineStart = sStart;
+    }
+
+    Node *functionExpr(bool isAsync)
+    {
+        int start = tok.pos, ln = tok.line, col = tok.col;
+        if (isAsync)
+            next();
+        expectK(K_FUNCTION);
+        FuncNode *fn = new FuncNode();
+        fn->isAsync = isAsync;
+        if (eatP(PU_STAR))
+            fn->isGen = true;
+        fn->srcStart = start;
+        fn->line = ln;
+        fn->col = col;
+        V selfName = 0;
+        if (tok.t == T_NAME && !isP(PU_LPAREN))
+        {
+            // a generator's name may not be yield; an ordinary one is a name
+            bool savedGen = inGen, savedAsync = inAsync;
+            inGen = fn->isGen;
+            inAsync = fn->isAsync;
+            selfName = bindingName();
+            inGen = savedGen;
+            inAsync = savedAsync;
+            fn->name = selfName;
+        }
+        Node *n = NEW(Node);
+        n->k = N_FUNC;
+        n->line = ln;
+        n->col = col;
+        n->func = fn;
+        n->strict = strict;
+        n->srcStart = start;
+        FnState st = enterFunction(fn);
+        if (selfName)
+            fn->selfBinding = scope->add(selfName, B_SELF);
+        paramList(fn);
+        finishParams(fn);
+        functionBody(fn);
+        leaveFunction(st);
+        return n;
+    }
+
+    Node *functionDeclaration(bool isAsync)
+    {
+        int start = tok.pos, ln = tok.line, col = tok.col;
+        if (isAsync)
+            next();
+        expectK(K_FUNCTION);
+        FuncNode *fn = new FuncNode();
+        fn->isAsync = isAsync;
+        if (eatP(PU_STAR))
+            fn->isGen = true;
+        fn->srcStart = start;
+        fn->line = ln;
+        fn->col = col;
+        V name = bindingName();
+        fn->name = name;
+        // at the top of a function it is like a var; in a block it is block
+        // scoped, and sloppy code also sees it as a var
+        Node *decl = NEW(Node);
+        decl->k = N_FUNCDECL;
+        decl->line = ln;
+        decl->col = col;
+        decl->func = fn;
+        decl->strict = strict;
+        decl->srcStart = start;
+        Scope *fs = funcScope();
+        Node *target = NEW(Node);
+        target->k = N_IDENT;
+        target->val = name;
+        target->line = ln;
+        target->col = col;
+        decl->a = target;
+        if (scope == fs)
+        {
+            Binding *ex = scope->find(name);
+            if (ex && (ex->kind == B_LET || ex->kind == B_CONST || ex->kind == B_CLASS))
+                failAt("Identifier '" + toUtf8(sp_(name)) + "' has already been declared", ln, col);
+            if (ex && ex->kind == B_SELF)
+            {
+                ex->kind = B_FUNC;
+            }
+            else if (!ex)
+                scope->add(name, B_FUNC);
+            else if (ex->kind == B_VAR)
+                ex->kind = B_FUNC;
+            scope->refs.push_back(target);
+            scope->funcDecls.push_back(decl);
+        }
+        else
+        {
+            declareLex(name, B_FUNC);
+            scope->refs.push_back(target);
+            scope->funcDecls.push_back(decl);
+            if (!strict)
+            {
+                // the var copy, unless a lexical name in between would clash
+                bool clash = false;
+                for (Scope *s = scope->parent; s; s = s->parent)
+                {
+                    Binding *b = s->find(name);
+                    if (b && (b->kind == B_LET || b->kind == B_CONST || b->kind == B_CLASS))
+                        clash = true;
+                    if (s->isFunc)
+                        break;
+                }
+                if (!clash)
+                {
+                    if (!fs->find(name))
+                        fs->add(name, B_VAR);
+                    Node *outer = NEW(Node);
+                    outer->k = N_IDENT;
+                    outer->val = name;
+                    outer->line = ln;
+                    outer->col = col;
+                    fs->refs.push_back(outer);
+                    decl->b = outer;
+                    Node *inner = NEW(Node);
+                    inner->k = N_IDENT;
+                    inner->val = name;
+                    inner->line = ln;
+                    inner->col = col;
+                    scope->refs.push_back(inner);
+                    decl->c = inner;
+                }
+            }
+        }
+        FnState st = enterFunction(fn);
+        paramList(fn);
+        finishParams(fn);
+        functionBody(fn);
+        leaveFunction(st);
+        return decl;
+    }
+
+    Node *methodFunction(bool isAsync, bool isGen, int start, int ln, int col, Node *key, const char *prefix)
+    {
+        FuncNode *fn = new FuncNode();
+        fn->isAsync = isAsync;
+        fn->isGen = isGen;
+        fn->isMethod = true;
+        fn->srcStart = start;
+        fn->line = ln;
+        fn->col = col;
+        if (key && !key->computed && key->val)
+            fn->name = *prefix ? atomStr(concatStr(newStrAscii(prefix), sp_(key->val))) : key->val;
+        Node *n = NEW(Node);
+        n->k = N_FUNC;
+        n->line = ln;
+        n->col = col;
+        n->func = fn;
+        n->strict = strict;
+        n->srcStart = start;
+        FnState st = enterFunction(fn);
+        paramList(fn);
+        finishParams(fn);
+        functionBody(fn);
+        leaveFunction(st);
+        return n;
+    }
+
+    Node *arrowFunction(bool isAsync, int start, int ln, int col)
+    {
+        FuncNode *fn = new FuncNode();
+        fn->isArrow = true;
+        fn->isAsync = isAsync;
+        fn->srcStart = start;
+        fn->line = ln;
+        fn->col = col;
+        Node *n = NEW(Node);
+        n->k = N_FUNC;
+        n->line = ln;
+        n->col = col;
+        n->func = fn;
+        n->strict = strict;
+        n->srcStart = start;
+        bool outerNoIn = noIn;
+        FnState st = enterFunction(fn);
+        // an arrow keeps the enclosing generator-ness out, but `await` only in async
+        inGen = false;
+        if (isP(PU_LPAREN))
+            paramList(fn);
+        else
+        {
+            Node *t = mk(N_IDENT);
+            V name = bindingName();
+            t->val = name;
+            scope->add(name, B_PARAM);
+            scope->refs.push_back(t);
+            fn->params.push_back(t);
+            fn->length = 1;
+        }
+        finishParams(fn);
+        if (!isP(PU_ARROW) || tok.nl)
+            unexpected();
+        next();
+        if (isP(PU_LBRACE))
+            functionBody(fn);
+        else
+        {
+            noIn = outerNoIn;
+            Node *b = mk(N_EXPRBODY);
+            b->a = assignExpr();
+            fn->body = b;
+            fn->srcEnd = prevEnd;
+        }
+        leaveFunction(st);
+        return n;
+    }
+
+    // ── classes ──────────────────────────────────────────────────────────
+
+    Node *classExpr()
+    {
+        Node *c = mk(N_CLASS);
+        int start = tok.pos, ln = tok.line, col = tok.col;
+        next();
+        bool savedStrict = strict;
+        strict = true;
+        V name = 0;
+        if (tok.t == T_NAME && tok.kw != K_EXTENDS)
+            name = bindingName();
+        c->val = name;
+        c->scope = pushScope(false);
+        if (name)
+        {
+            Node *inner = mk(N_IDENT);
+            inner->val = name;
+            scope->add(name, B_CONST);
+            scope->refs.push_back(inner);
+            c->b = inner;
+        }
+        if (isK(K_EXTENDS))
+        {
+            next();
+            c->a = lhsExpr();
+        }
+        if (!isP(PU_LBRACE))
+            unexpected();
+        next();
+        std::vector<Node *> defs;
+        FuncNode *ctor = nullptr;
+        // private names first: members may refer to ones declared later
+        scanPrivateNames();
+        while (!isP(PU_RBRACE))
+        {
+            if (eatP(PU_SEMI))
+                continue;
+            Node *d = classMember(c, &ctor);
+            if (d)
+                defs.push_back(d);
+        }
+        int endPos = tok.end;
+        popScope();
+        strict = savedStrict;
+        next();
+        c->srcEnd = endPos;
+        if (!ctor)
+        {
+            ctor = new FuncNode();
+            ctor->defaultCtor = true;
+            ctor->isClassCtor = true;
+            ctor->isDerived = c->a != nullptr;
+            ctor->strict = true;
+            ctor->file = file;
+            ctor->src = src;
+            ctor->line = ln;
+            ctor->col = col;
+            Scope *savedScope = scope;
+            scope = c->scope;
+            FuncNode *savedFunc = func;
+            func = ctor;
+            ctor->scope = pushScope(true);
+            popScope();
+            func = savedFunc;
+            scope = savedScope;
+            finishParams(ctor);
+        }
+        ctor->srcStart = start;
+        ctor->srcEnd = endPos;
+        c->func = ctor;
+        setItems(c, defs);
+        return c;
+    }
+
+    void scanPrivateNames()
+    {
+        // run the lexer over the class body once, at the first nesting level
+        int savePos = pos, saveLine = line, saveStart = lineStart;
+        Token saved = tok;
+        int p = tok.pos;
+        int depth = 0;
+        int prev = '{';
+        bool done = false;
+        while (p < len && !done)
+        {
+            p = skipBlank(p);
+            if (p >= len)
+                break;
+            int c = src[p];
+            if (c == '{' || c == '(' || c == '[')
+            {
+                ++depth;
+                prev = c;
+                ++p;
+            }
+            else if (c == '}' || c == ')' || c == ']')
+            {
+                if (depth == 0)
+                    done = true;
+                --depth;
+                prev = c;
+                ++p;
+            }
+            else if (c == '"' || c == '\'')
+            {
+                p = skipStringAt(p);
+                prev = 'a';
+            }
+            else if (c == '`')
+            {
+                p = skipTemplateAt(p);
+                prev = 'a';
+            }
+            else if (c == '/' && !(prev == 'a' || prev == ')' || prev == ']' || prev == '}'))
+            {
+                ++p;
+                bool cl = false;
+                while (p < len && !isLineTerm(src[p]))
+                {
+                    int d = src[p];
+                    if (d == '\\')
+                        ++p;
+                    else if (d == '[')
+                        cl = true;
+                    else if (d == ']')
+                        cl = false;
+                    else if (d == '/' && !cl)
+                        break;
+                    ++p;
+                }
+                ++p;
+                prev = 'a';
+            }
+            else if (c == '#' && depth == 0 && p + 1 < len && isIdStart(src[p + 1]))
+            {
+                int s = p;
+                ++p;
+                while (p < len && isIdPart(src[p]))
+                    ++p;
+                V name = atomStr(newStrUnits(src + s, p - s));
+                if (!scope->find(name))
+                {
+                    Binding *b = scope->add(name, B_PRIVATE);
+                    b->isConst = true;
+                }
+                prev = 'a';
+            }
+            else if (isIdPart(c))
+            {
+                while (p < len && isIdPart(src[p]))
+                    ++p;
+                prev = 'a';
+            }
+            else
+            {
+                prev = c;
+                ++p;
+            }
+        }
+        tok = saved;
+        pos = savePos;
+        line = saveLine;
+        lineStart = saveStart;
+    }
+
+    Node *classMember(Node *cls, FuncNode **ctorOut)
+    {
+        Node *m = mk(N_MEMBERDEF);
+        m->op = P_METHOD;
+        int start = tok.pos, ln = tok.line, col = tok.col;
+        bool isStatic = false;
+        bool isAsync = false, isGen = false;
+        int acc = 0;
+        if (isK(K_STATIC) && modifierFollowedByKey())
+        {
+            isStatic = true;
+            next();
+            start = tok.pos;
+            if (isP(PU_LBRACE))
+            {
+                // static { ... }
+                m->flag = true;
+                m->op = P_STATICBLOCK;
+                FuncNode *fn = new FuncNode();
+                fn->isMethod = true;
+                fn->srcStart = start;
+                fn->line = ln;
+                fn->col = col;
+                fn->isFieldInit = true;
+                FnState st = enterFunction(fn);
+                finishParams(fn);
+                functionBody(fn);
+                leaveFunction(st);
+                Node *n = NEW(Node);
+                n->k = N_FUNC;
+                n->func = fn;
+                n->line = ln;
+                n->col = col;
+                n->strict = true;
+                m->b = n;
+                return m;
+            }
+        }
+        if (isK(K_ASYNC) && modifierFollowedByKey())
+        {
+            bool nl = false;
+            skipBlank(pos, &nl);
+            if (!nl)
+            {
+                isAsync = true;
+                next();
+            }
+        }
+        if (isP(PU_STAR))
+        {
+            isGen = true;
+            next();
+        }
+        if (!isAsync && !isGen && (isK(K_GET) || isK(K_SET)) && modifierFollowedByKey())
+        {
+            acc = tok.kw == K_GET ? 1 : 2;
+            next();
+        }
+        m->flag = isStatic;
+        bool isPrivate = tok.t == T_PRIVATE;
+        V keyVal = tok.val;
+        if (isPrivate)
+        {
+            V pname = privAtom(tok.val);
+            m->c = ident(pname);
+            m->val = pname;
+            next();
+        }
+        else
+            propertyKey(m);
+        (void)keyVal;
+        bool isMethodShape = isP(PU_LPAREN);
+        if (isMethodShape)
+        {
+            bool isCtor = !isStatic && !isPrivate && !m->computed && m->val == g_aConstructor && !acc && !isAsync && !isGen;
+            if (isCtor)
+            {
+                if (*ctorOut)
+                    fail("A class may only have one constructor");
+                FuncNode *fn = new FuncNode();
+                fn->isClassCtor = true;
+                fn->isDerived = cls->a != nullptr;
+                fn->srcStart = start;
+                fn->line = ln;
+                fn->col = col;
+                FnState st = enterFunction(fn);
+                paramList(fn);
+                finishParams(fn);
+                functionBody(fn);
+                leaveFunction(st);
+                *ctorOut = fn;
+                return nullptr;
+            }
+            m->op = acc == 1 ? P_GET : acc == 2 ? P_SET : P_METHOD;
+            m->b = methodFunction(isAsync, isGen, start, ln, col, m, acc == 1 ? "get " : acc == 2 ? "set " : "");
+            if (acc)
+                m->b->func->isGetSet = true;
+            return m;
+        }
+        if (acc || isAsync || isGen)
+            unexpected();
+        // a field: its initializer runs as a method of the instance
+        m->op = P_FIELD;
+        FuncNode *fn = new FuncNode();
+        fn->isMethod = true;
+        fn->isFieldInit = true;
+        fn->srcStart = tok.pos;
+        fn->line = tok.line;
+        fn->col = tok.col;
+        FnState st = enterFunction(fn);
+        finishParams(fn);
+        Node *exprBody = mk(N_EXPRBODY);
+        if (eatP(PU_ASSIGN))
+        {
+            exprBody->a = assignExpr();
+            if (!m->computed)
+                nameAnonKey(exprBody->a, m->val);
+            else
+                m->spread = true; // computed: named at run time
+        }
+        fn->body = exprBody;
+        fn->srcEnd = tok.pos;
+        leaveFunction(st);
+        semicolon();
+        Node *n = NEW(Node);
+        n->k = N_FUNC;
+        n->func = fn;
+        n->line = ln;
+        n->col = col;
+        n->strict = true;
+        m->b = n;
+        return m;
+    }
+
+    // ── statements ───────────────────────────────────────────────────────
+
+    Node *blockStatement()
+    {
+        Node *b = mk(N_BLOCK);
+        b->scope = pushScope(false);
+        next();
+        std::vector<Node *> items;
+        while (!isP(PU_RBRACE))
+        {
+            if (tok.t == T_EOF)
+                unexpected();
+            items.push_back(statement());
+        }
+        next();
+        popScope();
+        setItems(b, items);
+        return b;
+    }
+
+    Node *varStatement(uint8_t kind)
+    {
+        Node *v = mk(N_VAR);
+        v->op = kind;
+        next();
+        varDeclarations(v, kind, true);
+        semicolon();
+        return v;
+    }
+
+    void varDeclarations(Node *v, uint8_t kind, bool needInit)
+    {
+        std::vector<Node *> decls;
+        uint8_t bk = kind == D_VAR ? (uint8_t)B_VAR : kind == D_LET ? (uint8_t)B_LET : (uint8_t)B_CONST;
+        for (;;)
+        {
+            Node *d = mk(N_DECL);
+            d->a = bindingTarget(bk);
+            if (eatP(PU_ASSIGN))
+            {
+                d->b = assignExpr();
+                nameAnon(d->b, d->a);
+                // error messages name what is being taken apart
+                if (d->a->k == N_ARRAYPAT || d->a->k == N_OBJECTPAT)
+                    d->a->c = d->b;
+            }
+            else if (needInit && (kind == D_CONST))
+                fail("Missing initializer in const declaration");
+            else if (needInit && d->a->k != N_IDENT)
+                fail("Missing initializer in destructuring declaration");
+            decls.push_back(d);
+            if (!eatP(PU_COMMA))
+                break;
+        }
+        setItems(v, decls);
+    }
+
+    bool letStartsDeclaration()
+    {
+        int p = skipBlank(pos);
+        if (p >= len)
+            return false;
+        int c = src[p];
+        if (c == '[' || c == '{')
+            return true;
+        return isIdStart(c) || c == '\\';
+    }
+
+    // labels directly on a loop can be continued
+    void enterLoop(int pending)
+    {
+        for (int i = 0; i < pending; ++i)
+            labels[labels.size() - 1 - (size_t)i].loop = true;
+        ++loopDepth;
+        ++breakDepth;
+    }
+
+    struct LoopExit
+    {
+        Parser *p;
+        bool loop;
+        LoopExit(Parser *parser, bool isLoop = true) : p(parser), loop(isLoop) {}
+        ~LoopExit()
+        {
+            if (loop)
+                --p->loopDepth;
+            --p->breakDepth;
+        }
+    };
+
+    Node *statement()
+    {
+        int pending = pendingLabels;
+        pendingLabels = 0;
+        if (tok.t == T_PUNCT)
+        {
+            switch (tok.pu)
+            {
+            case PU_LBRACE:
+                return blockStatement();
+            case PU_SEMI:
+            {
+                Node *n = mk(N_EMPTY);
+                next();
+                return n;
+            }
+            default:
+                break;
+            }
+        }
+        else if (tok.t == T_NAME)
+        {
+            switch (tok.kw)
+            {
+            case K_VAR: return varStatement(D_VAR);
+            case K_CONST: return varStatement(D_CONST);
+            case K_LET:
+                if (letStartsDeclaration())
+                    return varStatement(D_LET);
+                break;
+            case K_FUNCTION: return functionDeclaration(false);
+            case K_ASYNC:
+            {
+                bool nl = false;
+                int p = skipBlank(pos, &nl);
+                if (!nl && p + 8 <= len && src[p] == 'f' && src[p + 1] == 'u' && src[p + 2] == 'n' && src[p + 3] == 'c' && src[p + 4] == 't' && src[p + 5] == 'i' && src[p + 6] == 'o' && src[p + 7] == 'n' && !(p + 8 < len && isIdPart(src[p + 8])))
+                    return functionDeclaration(true);
+                break;
+            }
+            case K_CLASS:
+            {
+                Node *d = mk(N_CLASSDECL);
+                // the outer binding exists from the start of the block
+                int p = skipBlank(pos);
+                int q = p;
+                while (q < len && isIdPart(src[q]))
+                    ++q;
+                if (q == p || (q - p == 7 && src[p] == 'e' && src[p + 1] == 'x'))
+                    fail("Unexpected token '{'");
+                V name = atomStr(newStrUnits(src + p, q - p));
+                declareLex(name, B_CLASS);
+                Node *target = mk(N_IDENT);
+                target->val = name;
+                scope->refs.push_back(target);
+                d->a = target;
+                d->b = classExpr();
+                return d;
+            }
+            case K_IF: return ifStatement();
+            case K_FOR:
+            {
+                enterLoop(pending);
+                Node *n = forStatement();
+                --loopDepth;
+                --breakDepth;
+                return n;
+            }
+            case K_WHILE:
+            {
+                enterLoop(pending);
+                LoopExit done(this);
+                Node *n = mk(N_WHILE);
+                next();
+                expectP(PU_LPAREN);
+                n->a = expression();
+                expectP(PU_RPAREN);
+                n->d = statement();
+                return n;
+            }
+            case K_DO:
+            {
+                enterLoop(pending);
+                LoopExit done(this);
+                Node *n = mk(N_DOWHILE);
+                next();
+                n->d = statement();
+                expectK(K_WHILE);
+                expectP(PU_LPAREN);
+                n->a = expression();
+                expectP(PU_RPAREN);
+                eatP(PU_SEMI);
+                return n;
+            }
+            case K_RETURN:
+            {
+                Node *n = mk(N_RETURN);
+                if (func->isProgram && !topIsFunction)
+                    fail("Illegal return statement");
+                next();
+                if (!isP(PU_SEMI) && !isP(PU_RBRACE) && tok.t != T_EOF && !tok.nl)
+                    n->a = expression();
+                semicolon();
+                return n;
+            }
+            case K_BREAK:
+            case K_CONTINUE:
+            {
+                bool isBreak = tok.kw == K_BREAK;
+                Node *n = mk(isBreak ? N_BREAK : N_CONTINUE);
+                next();
+                if (tok.t == T_NAME && !tok.nl && !isReservedForIdent())
+                {
+                    n->val = tok.val;
+                    const LabelEntry *found = nullptr;
+                    for (const LabelEntry &e : labels)
+                        if (e.name == tok.val)
+                            found = &e;
+                    if (!found)
+                        fail("Undefined label '" + toUtf8(sp_(tok.val)) + "'");
+                    if (!isBreak && !found->loop)
+                        fail("Illegal continue statement: '" + toUtf8(sp_(tok.val)) + "' does not denote an iteration statement");
+                    next();
+                }
+                else if (isBreak && !breakDepth)
+                    fail("Illegal break statement");
+                else if (!isBreak && !loopDepth)
+                    fail("Illegal continue statement: no surrounding iteration statement");
+                semicolon();
+                return n;
+            }
+            case K_THROW:
+            {
+                Node *n = mk(N_THROW);
+                next();
+                if (tok.nl)
+                    fail("Illegal newline after throw");
+                n->a = expression();
+                semicolon();
+                return n;
+            }
+            case K_TRY: return tryStatement();
+            case K_SWITCH: return switchStatement();
+            case K_WITH:
+            {
+                if (strict)
+                    fail("Strict mode code may not include a with statement");
+                Node *n = mk(N_WITH);
+                next();
+                expectP(PU_LPAREN);
+                n->a = expression();
+                expectP(PU_RPAREN);
+                n->scope = pushScope(false);
+                n->scope->isWith = true;
+                for (Scope *s = scope; s; s = s->parent)
+                    s->dynamic = true;
+                n->b = statement();
+                popScope();
+                return n;
+            }
+            case K_DEBUGGER:
+            {
+                Node *n = mk(N_EMPTY);
+                next();
+                semicolon();
+                return n;
+            }
+            case K_IMPORT:
+            case K_EXPORT:
+                fail(tok.kw == K_IMPORT ? "Cannot use import statement outside a module" : "Unexpected token 'export'");
+            default:
+                break;
+            }
+            // a label?
+            if (!isReservedForIdent())
+            {
+                int p = skipBlank(pos);
+                if (p < len && src[p] == ':')
+                {
+                    Node *l = mk(N_LABELED);
+                    l->val = tok.val;
+                    for (const LabelEntry &e : labels)
+                        if (e.name == tok.val)
+                            fail("Label '" + toUtf8(sp_(tok.val)) + "' has already been declared");
+                    LabelEntry entry;
+                    entry.name = tok.val;
+                    entry.loop = false;
+                    labels.push_back(entry);
+                    next();
+                    next();
+                    pendingLabels = pending + 1;
+                    l->a = statement();
+                    labels.pop_back();
+                    // loops know their label so `continue label` finds them
+                    Node *inner = l->a;
+                    if (inner->k == N_FOR || inner->k == N_FORIN || inner->k == N_FOROF || inner->k == N_WHILE || inner->k == N_DOWHILE)
+                        inner->val = l->val;
+                    return l;
+                }
+            }
+        }
+        Node *e = mk(N_EXPR);
+        e->a = expression();
+        semicolon();
+        return e;
+    }
+
+    Node *ifStatement()
+    {
+        Node *n = mk(N_IF);
+        next();
+        expectP(PU_LPAREN);
+        n->a = expression();
+        expectP(PU_RPAREN);
+        n->b = subStatement();
+        if (isK(K_ELSE))
+        {
+            next();
+            n->c = subStatement();
+        }
+        return n;
+    }
+
+    // a function declaration as the body of an if gets a block of its own
+    Node *subStatement()
+    {
+        if (isK(K_FUNCTION))
+        {
+            Node *b = mk(N_BLOCK);
+            b->scope = pushScope(false);
+            std::vector<Node *> items;
+            items.push_back(statement());
+            popScope();
+            setItems(b, items);
+            return b;
+        }
+        return statement();
+    }
+
+    Node *forStatement()
+    {
+        Node *n = mk(N_FOR);
+        next();
+        bool isAwait = false;
+        if (isK(K_AWAIT))
+        {
+            isAwait = true;
+            func->suspendPoints++;
+            next();
+        }
+        expectP(PU_LPAREN);
+        n->scope = pushScope(false);
+        Node *init = nullptr;
+        if (isP(PU_SEMI))
+        {
+        }
+        else if (isK(K_VAR) || isK(K_CONST) || (isK(K_LET) && letStartsDeclaration()))
+        {
+            uint8_t kind = isK(K_VAR) ? (uint8_t)D_VAR : isK(K_CONST) ? (uint8_t)D_CONST : (uint8_t)D_LET;
+            Node *v = mk(N_VAR);
+            v->op = kind;
+            next();
+            bool saved = noIn;
+            noIn = true;
+            varDeclarations(v, kind, false);
+            noIn = saved;
+            init = v;
+        }
+        else
+        {
+            bool saved = noIn;
+            noIn = true;
+            init = expression();
+            noIn = saved;
+        }
+        if (init && (isK(K_OF) || isK(K_IN)))
+        {
+            n->k = isK(K_OF) ? N_FOROF : N_FORIN;
+            n->flag = isAwait;
+            bool isOf = isK(K_OF);
+            next();
+            if (init->k != N_VAR && init->k != N_ARRAY && init->k != N_OBJECT && !isSimpleTarget(init))
+                fail("Invalid left-hand side in for-loop");
+            if (init->k == N_ARRAY || init->k == N_OBJECT)
+                init = toPattern(init);
+            n->a = init;
+            if (init->k == N_VAR && init->n == 1 && (init->items[0]->a->k == N_ARRAYPAT || init->items[0]->a->k == N_OBJECTPAT))
+                init->items[0]->a->c = ident(atomOf(".for"));
+            n->b = isOf ? assignExpr() : expression();
+            expectP(PU_RPAREN);
+            n->d = statement();
+            popScope();
+            return n;
+        }
+        if (init && init->k == N_VAR)
+            for (int i = 0; i < init->n; ++i)
+            {
+                Node *d = init->items[i];
+                if (!d->b && init->op == D_CONST)
+                    fail("Missing initializer in const declaration");
+                if (!d->b && d->a->k != N_IDENT)
+                    fail("Missing initializer in destructuring declaration");
+            }
+        n->a = init;
+        expectP(PU_SEMI);
+        if (!isP(PU_SEMI))
+            n->b = expression();
+        expectP(PU_SEMI);
+        if (!isP(PU_RPAREN))
+            n->c = expression();
+        expectP(PU_RPAREN);
+        n->d = statement();
+        popScope();
+        return n;
+    }
+
+    Node *tryStatement()
+    {
+        Node *n = mk(N_TRY);
+        next();
+        if (!isP(PU_LBRACE))
+            unexpected();
+        n->a = blockStatement();
+        if (isK(K_CATCH))
+        {
+            next();
+            n->scope = pushScope(false);
+            if (eatP(PU_LPAREN))
+            {
+                n->b = bindingTarget(B_CATCH);
+                expectP(PU_RPAREN);
+            }
+            if (!isP(PU_LBRACE))
+                unexpected();
+            n->c = blockStatement();
+            popScope();
+        }
+        if (isK(K_FINALLY))
+        {
+            next();
+            if (!isP(PU_LBRACE))
+                unexpected();
+            n->d = blockStatement();
+        }
+        if (!n->c && !n->d)
+            fail("Missing catch or finally after try");
+        return n;
+    }
+
+    Node *switchStatement()
+    {
+        ++breakDepth;
+        LoopExit done(this, false);
+        Node *n = mk(N_SWITCH);
+        next();
+        expectP(PU_LPAREN);
+        n->a = expression();
+        expectP(PU_RPAREN);
+        expectP(PU_LBRACE);
+        n->scope = pushScope(false);
+        std::vector<Node *> cases;
+        while (!isP(PU_RBRACE))
+        {
+            Node *c = mk(N_CASE);
+            if (isK(K_DEFAULT))
+                next();
+            else
+            {
+                expectK(K_CASE);
+                c->a = expression();
+                c->flag = true;
+            }
+            expectP(PU_COLON);
+            std::vector<Node *> body;
+            while (!isP(PU_RBRACE) && !isK(K_CASE) && !isK(K_DEFAULT))
+            {
+                if (tok.t == T_EOF)
+                    unexpected();
+                body.push_back(statement());
+            }
+            setItems(c, body);
+            cases.push_back(c);
+        }
+        next();
+        popScope();
+        setItems(n, cases);
+        return n;
+    }
+
+    // ── a whole program ──────────────────────────────────────────────────
+
+    void parseBodyStatements(FuncNode *fn)
+    {
+        Node *b = mk(N_BLOCK);
+        std::vector<Node *> items;
+        directives();
+        while (tok.t != T_EOF)
+            items.push_back(statement());
+        setItems(b, items);
+        fn->body = b;
+    }
+};
+
+// ── resolution ───────────────────────────────────────────────────────────
+
+void resolveRefs(Scope *s)
+{
+    for (Node *n : s->refs)
+    {
+        V name = n->val;
+        bool crossedFunc = false;
+        bool dynamic = false;
+        bool anyDynamic = false;
+        Binding *found = nullptr;
+        Scope *where = nullptr;
+        for (Scope *c = s; c; c = c->parent)
+        {
+            if (c->isWith)
+                dynamic = true;
+            if (c->dynamic)
+                anyDynamic = true;
+            Binding *b = c->find(name);
+            if (b)
+            {
+                found = b;
+                where = c;
+                break;
+            }
+            if (c->isFunc && name == A.arguments_ && c->func && !c->func->isArrow && !c->func->isFieldInit && !c->isEval)
+            {
+                found = c->add(name, B_ARGS);
+                c->func->usesArgs = true;
+                c->func->argsBinding = found;
+                where = c;
+                break;
+            }
+            if (c->isFunc)
+                crossedFunc = true;
+        }
+        if (found && crossedFunc)
+            found->captured = true;
+        n->icHolder = found;
+        n->scope = where;
+        n->flag = dynamic || (!found && anyDynamic);
+    }
+    for (Scope *k : s->kids)
+        resolveRefs(k);
+}
+
+void assignSlots(Scope *s)
+{
+    if (s->resolved)
+    {
+        for (Scope *k : s->kids)
+            assignSlots(k);
+        return;
+    }
+    if (s->func && s->func->hasEval)
+        s->dynamic = true;
+    FuncNode *fn = s->func;
+    // sloppy arguments alias simple parameters: those live where it can reach
+    if (fn && s == fn->scope && fn->hasEval && !fn->isArrow && !fn->argsBinding)
+    {
+        fn->argsBinding = s->add(A.arguments_, B_ARGS);
+        fn->usesArgs = true;
+    }
+    if (fn && s == fn->scope && fn->usesArgs && !fn->strict && fn->simple)
+        for (Binding *b : s->vars)
+            if (b->kind == B_PARAM)
+                b->captured = true;
+    for (Binding *b : s->vars)
+    {
+        if (s->dynamic)
+            b->captured = true;
+        if (b->captured)
+            b->slot = s->nEnv++;
+        else
+            b->slot = fn->nLocals++;
+        if (b->lexical)
+        {
+            if (b->captured)
+                s->tdzEnv.push_back(b->slot);
+            else
+                s->tdzLocals.push_back(b->slot);
+        }
+    }
+    s->hasEnv = s->nEnv > 0 || s->dynamic || s->isWith;
+    s->nTdzLocals = (int)s->tdzLocals.size();
+    s->nTdzEnv = (int)s->tdzEnv.size();
+    if (s->nTdzLocals)
+    {
+        s->tdzLocalsP = static_cast<int *>(bump(sizeof(int) * s->tdzLocals.size()));
+        for (int i = 0; i < s->nTdzLocals; ++i)
+            s->tdzLocalsP[i] = s->tdzLocals[(size_t)i];
+    }
+    s->nFuncDecls = (int)s->funcDecls.size();
+    if (s->nFuncDecls)
+    {
+        s->funcDeclsP = static_cast<Node **>(bump(sizeof(Node *) * s->funcDecls.size()));
+        for (int i = 0; i < s->nFuncDecls; ++i)
+            s->funcDeclsP[i] = s->funcDecls[(size_t)i];
+    }
+    s->plain = !s->hasEnv && !s->nTdzLocals && !s->nFuncDecls;
+    s->resolved = true;
+    for (Scope *k : s->kids)
+        assignSlots(k);
+}
+
+void patchRefs(Scope *s)
+{
+    for (Node *n : s->refs)
+    {
+        Binding *b = static_cast<Binding *>(n->icHolder);
+        Scope *where = n->scope;
+        bool dynamic = n->flag;
+        n->icHolder = nullptr;
+        n->flag = false;
+        if (dynamic)
+        {
+            n->k = N_DYNAMIC;
+            n->scope = s;
+            continue;
+        }
+        if (!b)
+        {
+            if (n->val == A.undefined)
+                n->k = N_UNDEF;
+            else if (isStr(n->val) && sp_(n->val)->len && unitAt(sp_(n->val), 0) == '#')
+                throw ParseError{"Private field '" + toUtf8(sp_(n->val)) + "' must be declared in an enclosing class", n->line, n->col};
+            else
+                n->k = N_GLOBAL;
+            n->scope = nullptr;
+            continue;
+        }
+        n->tdz = b->lexical;
+        n->isConst = b->isConst;
+        // the name of a function expression: assigning does nothing (sloppy)
+        n->op = b->kind == B_SELF ? 1 : 0;
+        n->scope = nullptr;
+        if (!b->captured)
+        {
+            n->k = N_LOCAL;
+            n->slot = b->slot;
+            continue;
+        }
+        int hops = 0;
+        for (Scope *c = s; c != where; c = c->parent)
+            if (c->hasEnv)
+                ++hops;
+        n->k = N_ENVVAR;
+        n->slot = b->slot;
+        n->hops = hops;
+    }
+    s->refs.clear();
+    for (Scope *k : s->kids)
+        patchRefs(k);
+}
+
+void setupParams(Scope *s)
+{
+    if (s->isFunc && s->func && s->func->scope == s)
+    {
+        FuncNode *fn = s->func;
+        if (fn->simple && fn->nParams)
+        {
+            fn->paramSlots = static_cast<int *>(bump(sizeof(int) * (size_t)fn->nParams));
+            for (int i = 0; i < fn->nParams; ++i)
+            {
+                // resolved by now
+                Node *p = fn->paramsP[i];
+                fn->paramSlots[i] = p->k == N_LOCAL ? p->slot : -1 - p->slot;
+            }
+        }
+    }
+    for (Scope *k : s->kids)
+        setupParams(k);
+}
+
+} // namespace
+
+FuncNode *parseProgramSource(const std::string &utf8, const std::string &file, Scope *evalParent, bool strictEval, bool isWrapper, const std::vector<std::string> *wrapperParams)
+{
+    initKeywords();
+    JStr *s = fromUtf8(utf8);
+    s = flat_(s);
+    uint16_t *units = static_cast<uint16_t *>(bump(((size_t)s->len + 1) * 2));
+    for (int i = 0; i < s->len; ++i)
+        units[i] = (uint16_t)unitAt(s, i);
+    Parser p;
+    p.src = units;
+    p.len = s->len;
+    p.file = new std::string(file);
+    // #! line
+    if (p.len > 1 && units[0] == '#' && units[1] == '!')
+        while (p.pos < p.len && !p.isLineTerm(units[p.pos]))
+            ++p.pos;
+    FuncNode *fn = new FuncNode();
+    fn->isProgram = true;
+    fn->file = p.file;
+    fn->src = units;
+    fn->srcEnd = p.len;
+    fn->name = A.empty;
+    p.func = fn;
+    p.strict = strictEval;
+    p.topIsFunction = isWrapper;
+    // eval runs where it was called: what is legal there was decided there
+    p.allowSuperProp = evalParent != nullptr;
+    p.allowSuperCall = evalParent != nullptr;
+    p.allowNewTarget = evalParent != nullptr || isWrapper;
+    if (evalParent)
+    {
+        p.scope = evalParent;
+        fn->isArrow = true; // this and arguments come from the caller
+    }
+    p.scope = evalParent;
+    Scope *root = p.pushScope(true);
+    if (evalParent)
+    {
+        evalParent->kids.pop_back();
+        root->isEval = true;
+        root->dynamic = true;
+    }
+    fn->scope = root;
+    if (isWrapper && wrapperParams)
+    {
+        for (const std::string &name : *wrapperParams)
+        {
+            V a = atomStr(fromUtf8(name));
+            Node *t = NEW(Node);
+            t->k = N_IDENT;
+            t->val = a;
+            root->add(a, B_PARAM);
+            root->refs.push_back(t);
+            fn->params.push_back(t);
+        }
+        p.finishParams(fn);
+    }
+    p.tok = Token();
+    p.next();
+    p.parseBodyStatements(fn);
+    fn->strict = p.strict;
+    // an eval's own sloppy vars are looked up by name, like a with's
+    resolveRefs(root);
+    assignSlots(root);
+    patchRefs(root);
+    setupParams(root);
+    return fn;
+}
+
+// new Function(...): the parameters and body as source text
+FuncNode *parseFunctionText(const std::string &text, const std::string &file)
+{
+    return parseProgramSource(text, file, nullptr, false, false, nullptr);
+}
+
+bool canRun(const std::string &source, const std::string &path, std::string &why)
+{
+    static bool ready = false;
+    if (!ready)
+    {
+        setAtoms();
+        ready = true;
+    }
+    static const std::vector<std::string> params = {"exports", "require", "module", "__filename", "__dirname"};
+    try
+    {
+        parseProgramSource(source, path, nullptr, false, true, &params);
+        return true;
+    }
+    catch (ParseError &e)
+    {
+        why = e.message;
+        return false;
+    }
+}
+
+} // namespace js

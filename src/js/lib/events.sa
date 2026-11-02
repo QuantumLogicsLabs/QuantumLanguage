@@ -1,0 +1,252 @@
+'use strict';
+// Node's EventEmitter.
+const kCapture = Symbol('kCapture');
+const kShapeMode = Symbol('shapeMode');
+
+function EventEmitter(opts) {
+  EventEmitter.init.call(this, opts);
+}
+
+EventEmitter.prototype._events = undefined;
+EventEmitter.prototype._eventsCount = 0;
+EventEmitter.prototype._maxListeners = undefined;
+EventEmitter.defaultMaxListeners = 10;
+EventEmitter.captureRejectionSymbol = Symbol.for('nodejs.rejection');
+EventEmitter.errorMonitor = Symbol('events.errorMonitor');
+
+EventEmitter.init = function (opts) {
+  if (this._events === undefined || this._events === Object.getPrototypeOf(this)._events) {
+    this._events = Object.create(null);
+    this._eventsCount = 0;
+  }
+  this._maxListeners = this._maxListeners || undefined;
+  this[kShapeMode] = false;
+  this[kCapture] = false;
+};
+
+function checkListener(listener) {
+  if (typeof listener !== 'function') {
+    throw internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "listener" argument must be of type function. Received ${internal.received(listener)}`);
+  }
+}
+
+const P = EventEmitter.prototype;
+
+P.setMaxListeners = function (n) {
+  this._maxListeners = n;
+  return this;
+};
+P.getMaxListeners = function () {
+  return this._maxListeners === undefined ? EventEmitter.defaultMaxListeners : this._maxListeners;
+};
+
+P.emit = function emit(type, ...args) {
+  const events = this._events;
+  let doError = type === 'error';
+  if (events !== undefined) {
+    if (doError && events[EventEmitter.errorMonitor] !== undefined) this.emit(EventEmitter.errorMonitor, ...args);
+    doError = doError && events.error === undefined;
+  } else if (!doError) return false;
+  if (doError) {
+    const er = args[0];
+    if (er instanceof Error) throw er;
+    const err = new Error('Unhandled error. (' + (typeof er === 'string' ? `'${er}'` : require('util').inspect(er)) + ')');
+    err.context = er;
+    err.code = 'ERR_UNHANDLED_ERROR';
+    throw err;
+  }
+  const handler = events[type];
+  if (handler === undefined) return false;
+  if (typeof handler === 'function') handler.apply(this, args);
+  else {
+    const list = handler.slice();
+    for (let i = 0; i < list.length; ++i) list[i].apply(this, args);
+  }
+  return true;
+};
+
+function addListener(target, type, listener, prepend) {
+  checkListener(listener);
+  let events = target._events;
+  if (events === undefined) {
+    events = target._events = Object.create(null);
+    target._eventsCount = 0;
+  } else if (events.newListener !== undefined) {
+    target.emit('newListener', type, listener.listener ?? listener);
+    events = target._events;
+  }
+  const existing = events[type];
+  if (existing === undefined) {
+    events[type] = listener;
+    ++target._eventsCount;
+  } else if (typeof existing === 'function') {
+    events[type] = prepend ? [listener, existing] : [existing, listener];
+  } else if (prepend) existing.unshift(listener);
+  else existing.push(listener);
+  return target;
+}
+
+P.addListener = function addListener_(type, listener) {
+  return addListener(this, type, listener, false);
+};
+P.on = P.addListener;
+P.prependListener = function (type, listener) {
+  return addListener(this, type, listener, true);
+};
+
+function onceWrap(target, type, listener) {
+  const state = { fired: false, wrapFn: undefined, target, type, listener };
+  const wrapped = function (...args) {
+    if (!state.fired) {
+      state.target.removeListener(state.type, state.wrapFn);
+      state.fired = true;
+      return state.listener.apply(state.target, args);
+    }
+  };
+  wrapped.listener = listener;
+  state.wrapFn = wrapped;
+  return wrapped;
+}
+
+P.once = function once(type, listener) {
+  checkListener(listener);
+  this.on(type, onceWrap(this, type, listener));
+  return this;
+};
+P.prependOnceListener = function (type, listener) {
+  checkListener(listener);
+  this.prependListener(type, onceWrap(this, type, listener));
+  return this;
+};
+
+P.removeListener = function removeListener(type, listener) {
+  checkListener(listener);
+  const events = this._events;
+  if (events === undefined) return this;
+  const list = events[type];
+  if (list === undefined) return this;
+  if (list === listener || list.listener === listener) {
+    this._eventsCount -= 1;
+    if (this._eventsCount === 0) this._events = Object.create(null);
+    else {
+      delete events[type];
+      if (events.removeListener) this.emit('removeListener', type, list.listener || listener);
+    }
+  } else if (typeof list !== 'function') {
+    let position = -1;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i] === listener || list[i].listener === listener) {
+        position = i;
+        break;
+      }
+    }
+    if (position < 0) return this;
+    if (position === 0) list.shift();
+    else list.splice(position, 1);
+    if (list.length === 1) events[type] = list[0];
+    if (events.removeListener !== undefined) this.emit('removeListener', type, listener);
+  }
+  return this;
+};
+P.off = P.removeListener;
+
+P.removeAllListeners = function (type) {
+  const events = this._events;
+  if (events === undefined) return this;
+  if (arguments.length === 0) {
+    this._events = Object.create(null);
+    this._eventsCount = 0;
+  } else if (events[type] !== undefined) {
+    if (--this._eventsCount === 0) this._events = Object.create(null);
+    else delete events[type];
+  }
+  return this;
+};
+
+function listenersOf(target, type, unwrap) {
+  const events = target._events;
+  if (events === undefined) return [];
+  const l = events[type];
+  if (l === undefined) return [];
+  if (typeof l === 'function') return unwrap ? [l.listener || l] : [l];
+  return unwrap ? l.map((f) => f.listener || f) : l.slice();
+}
+
+P.listeners = function (type) {
+  return listenersOf(this, type, true);
+};
+P.rawListeners = function (type) {
+  return listenersOf(this, type, false);
+};
+P.listenerCount = function (type) {
+  const events = this._events;
+  if (events !== undefined) {
+    const l = events[type];
+    if (typeof l === 'function') return 1;
+    if (l !== undefined) return l.length;
+  }
+  return 0;
+};
+P.eventNames = function () {
+  return this._eventsCount > 0 ? Reflect.ownKeys(this._events) : [];
+};
+
+EventEmitter.listenerCount = (em, type) => em.listenerCount(type);
+
+EventEmitter.once = async function once(emitter, name, options) {
+  return new Promise((resolve, reject) => {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const errorListener = (err) => {
+      emitter.removeListener(name, resolver);
+      reject(err);
+    };
+    const resolver = (...args) => {
+      if (typeof emitter.removeListener === 'function') emitter.removeListener('error', errorListener);
+      resolve(args);
+    };
+    if (typeof emitter.addEventListener === 'function') {
+      emitter.addEventListener(name, (e) => resolve([e]), { once: true });
+      return;
+    }
+    emitter.once(name, resolver);
+    if (name !== 'error') emitter.once('error', errorListener);
+  });
+};
+
+EventEmitter.on = function (emitter, name) {
+  const queue = [], waiting = [];
+  let failed = null, finished = false;
+  const handler = (...args) => {
+    const w = waiting.shift();
+    if (w) w.resolve({ value: args, done: false });
+    else queue.push(args);
+  };
+  emitter.on(name, handler);
+  if (name !== 'error') emitter.on('error', (e) => {
+    const w = waiting.shift();
+    if (w) w.reject(e);
+    else failed = e;
+  });
+  return {
+    next() {
+      if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+      if (failed) { const e = failed; failed = null; return Promise.reject(e); }
+      if (finished) return Promise.resolve({ value: undefined, done: true });
+      return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+    },
+    return() {
+      emitter.removeListener(name, handler);
+      finished = true;
+      for (const w of waiting) w.resolve({ value: undefined, done: true });
+      return Promise.resolve({ value: undefined, done: true });
+    },
+    [Symbol.asyncIterator]() { return this; },
+  };
+};
+
+EventEmitter.EventEmitter = EventEmitter;
+module.exports = EventEmitter;

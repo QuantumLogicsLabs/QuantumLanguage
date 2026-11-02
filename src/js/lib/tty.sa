@@ -1,0 +1,3 @@
+'use strict';
+// No terminal behind any stream here: output is captured like a pipe.
+module.exports = { isatty: () => false };

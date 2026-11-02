@@ -1,0 +1,174 @@
+'use strict';
+// Node's util module; inspect and format live in util_inspect.
+const insp = require('util_inspect');
+const inspect = insp.inspect;
+const cls = internal.classOf;
+const C = { ARRAY: 1, ERROR: 3, BOOLEAN: 4, NUMBER: 5, STRING: 6, SYMBOL: 7, BIGINT: 8, DATE: 9, REGEXP: 10, MAP: 11, SET: 12, WEAKMAP: 13, WEAKSET: 14, ARGUMENTS: 16, PROMISE: 17, GENERATOR: 18, PROXY: 20, ARRAYBUFFER: 21, TYPEDARRAY: 22, MAPITER: 26, SETITER: 27 };
+
+const types = {
+  isMap: (v) => cls(v) === C.MAP,
+  isSet: (v) => cls(v) === C.SET,
+  isWeakMap: (v) => cls(v) === C.WEAKMAP,
+  isWeakSet: (v) => cls(v) === C.WEAKSET,
+  isDate: (v) => cls(v) === C.DATE,
+  isRegExp: (v) => cls(v) === C.REGEXP,
+  isPromise: (v) => cls(v) === C.PROMISE,
+  isNativeError: (v) => cls(v) === C.ERROR,
+  isProxy: (v) => cls(v) === C.PROXY,
+  isArgumentsObject: (v) => cls(v) === C.ARGUMENTS,
+  isArrayBuffer: (v) => cls(v) === C.ARRAYBUFFER,
+  isAnyArrayBuffer: (v) => cls(v) === C.ARRAYBUFFER,
+  isSharedArrayBuffer: () => false,
+  isTypedArray: (v) => cls(v) === C.TYPEDARRAY,
+  isUint8Array: (v) => v instanceof Uint8Array,
+  isArrayBufferView: (v) => ArrayBuffer.isView(v) || (globalThis.DataView !== undefined && v instanceof globalThis.DataView),
+  isDataView: (v) => globalThis.DataView !== undefined && v instanceof globalThis.DataView,
+  isMapIterator: (v) => cls(v) === C.MAPITER,
+  isSetIterator: (v) => cls(v) === C.SETITER,
+  isGeneratorObject: (v) => cls(v) === C.GENERATOR || cls(v) === 19,
+  isGeneratorFunction: (v) => { const k = internal.fnKind(v); return k === 3 || k === 5; },
+  isAsyncFunction: (v) => { const k = internal.fnKind(v); return k === 4 || k === 5; },
+  isBoxedPrimitive: (v) => { const c = cls(v); return c >= C.BOOLEAN && c <= C.BIGINT; },
+  isNumberObject: (v) => cls(v) === C.NUMBER,
+  isStringObject: (v) => cls(v) === C.STRING,
+  isBooleanObject: (v) => cls(v) === C.BOOLEAN,
+  isBigIntObject: (v) => cls(v) === C.BIGINT,
+  isSymbolObject: (v) => cls(v) === C.SYMBOL,
+  isModuleNamespaceObject: () => false,
+  isExternal: () => false,
+};
+
+// deep equality: the same checks assert.deepStrictEqual makes
+function deepEq(a, b, strict, seen) {
+  if (strict ? Object.is(a, b) : a == b || (a !== a && b !== b)) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+  const ca = cls(a), cb = cls(b);
+  if (ca !== cb) {
+    if (strict || (ca !== 0 && cb !== 0)) return false;
+  }
+  if (ca === C.ARRAY && a.length !== b.length) return false;
+  if (ca === C.DATE && a.getTime() !== b.getTime()) return false;
+  if (ca === C.REGEXP && (a.source !== b.source || a.flags !== b.flags || a.lastIndex !== b.lastIndex)) return false;
+  if (ca === C.ERROR && (a.message !== b.message || a.name !== b.name)) return false;
+  if (ca >= C.BOOLEAN && ca <= C.BIGINT && !Object.is(a.valueOf(), b.valueOf())) return false;
+  if (ca === C.TYPEDARRAY) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i]) && (strict || a[i] != b[i])) return false;
+  }
+  seen = seen ?? [];
+  for (const [x, y] of seen) if (x === a && y === b) return true;
+  seen.push([a, b]);
+  const keysOf = (o) => strict ? Reflect.ownKeys(o).filter((k) => Object.prototype.propertyIsEnumerable.call(o, k)) : Object.keys(o);
+  const ka = keysOf(a), kb = keysOf(b);
+  if (ka.length !== kb.length) return false;
+  for (const k of ka) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!deepEq(a[k], b[k], strict, seen)) return false;
+  }
+  if (ca === C.SET) {
+    if (a.size !== b.size) return false;
+    outer: for (const x of a) {
+      if (b.has(x)) continue;
+      if (typeof x !== 'object' || x === null) return false;
+      for (const y of b) if (deepEq(x, y, strict, seen)) continue outer;
+      return false;
+    }
+  }
+  if (ca === C.MAP) {
+    if (a.size !== b.size) return false;
+    outer: for (const [k, v] of a) {
+      if (b.has(k)) {
+        if (!deepEq(v, b.get(k), strict, seen)) return false;
+        continue;
+      }
+      if (typeof k !== 'object' || k === null) return false;
+      for (const [k2, v2] of b) if (deepEq(k, k2, strict, seen) && deepEq(v, v2, strict, seen)) continue outer;
+      return false;
+    }
+  }
+  return true;
+}
+
+const kCustomPromisify = Symbol.for('nodejs.util.promisify.custom');
+
+function promisify(original) {
+  if (typeof original !== 'function') {
+    throw internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "original" argument must be of type function. Received ${internal.received(original)}`);
+  }
+  if (original[kCustomPromisify]) return original[kCustomPromisify];
+  function fn(...args) {
+    return new Promise((resolve, reject) => {
+      Reflect.apply(original, this, [...args, (err, ...values) => {
+        if (err) return reject(err);
+        resolve(values[0]);
+      }]);
+    });
+  }
+  Object.setPrototypeOf(fn, Object.getPrototypeOf(original));
+  Object.defineProperty(fn, 'name', { value: original.name, configurable: true });
+  return fn;
+}
+promisify.custom = kCustomPromisify;
+
+// setTimeout and setImmediate have promise forms
+const timersPromises = () => require('timers/promises');
+Object.defineProperty(setTimeout, kCustomPromisify, { get() { return timersPromises().setTimeout; }, configurable: true });
+Object.defineProperty(setImmediate, kCustomPromisify, { get() { return timersPromises().setImmediate; }, configurable: true });
+
+function callbackify(original) {
+  function callbackified(...args) {
+    const cb = args.pop();
+    Reflect.apply(original, this, args).then(
+      (ret) => process.nextTick(cb, null, ret),
+      (rej) => process.nextTick(cb, rej || new Error('Promise was rejected with a falsy value')),
+    );
+  }
+  return callbackified;
+}
+
+function inherits(ctor, superCtor) {
+  const check = (name, v) => {
+    if (typeof v !== 'function') {
+      throw internal.nodeError(TypeError, 'ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type function. Received ${internal.received(v)}`);
+    }
+  };
+  check('ctor', ctor);
+  check('superCtor', superCtor);
+  Object.defineProperty(ctor, 'super_', { value: superCtor, writable: true, configurable: true });
+  Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
+}
+
+module.exports = {
+  inspect,
+  format: insp.format,
+  formatWithOptions: insp.formatWithOptions,
+  getStringWidth: insp.getStringWidth,
+  stripVTControlCharacters: insp.stripVTControlCharacters,
+  isDeepStrictEqual: (a, b) => deepEq(a, b, true),
+  toUSVString: (s) => String(s).toWellFormed(),
+  deepEq,
+  promisify,
+  callbackify,
+  inherits,
+  types,
+  deprecate: (fn) => fn,
+  debuglog: () => Object.assign(() => {}, { enabled: false }),
+  debug: () => () => {},
+  isArray: Array.isArray,
+  isBoolean: (v) => typeof v === 'boolean',
+  isNull: (v) => v === null,
+  isNullOrUndefined: (v) => v == null,
+  isNumber: (v) => typeof v === 'number',
+  isString: (v) => typeof v === 'string',
+  isSymbol: (v) => typeof v === 'symbol',
+  isUndefined: (v) => v === undefined,
+  isRegExp: types.isRegExp,
+  isObject: (v) => v !== null && typeof v === 'object',
+  isDate: types.isDate,
+  isError: (v) => v instanceof Error,
+  isFunction: (v) => typeof v === 'function',
+  isPrimitive: (v) => v === null || (typeof v !== 'object' && typeof v !== 'function'),
+  get TextEncoder() { return globalThis.TextEncoder; },
+  get TextDecoder() { return globalThis.TextDecoder; },
+};

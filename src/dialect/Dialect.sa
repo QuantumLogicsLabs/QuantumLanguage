@@ -1,4 +1,5 @@
 // quantum: cpp
+#include "../js/JsMain.h.sa"
 #include "../ruby/RubyMain.h.sa"
 #include "Dialect.h.sa"
 
@@ -98,6 +99,15 @@ std::string applyDialect(std::string source, const std::string &path)
         source = applyJavaDialect(source);
         if (std::getenv("QUANTUM_DEBUG_JAVA"))
             std::cerr << "----- Java-style pass -----\n" << source << "----- end -----\n";
+    }
+
+    if (ext == ".js")
+    {
+        // A .js file runs on the JavaScript front-end (src/js) when it can
+        // parse it; the program travels inside the chunk as a string
+        std::string why;
+        if (js::canRun(source, path, why))
+            return "__js_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
     }
 
     if (ext == ".rb")
