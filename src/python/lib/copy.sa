@@ -1,0 +1,128 @@
+"""Generic (shallow and deep) copying operations."""
+
+
+class Error(Exception):
+    pass
+
+
+error = Error
+
+_atomic = (type(None), int, float, bool, complex, str, bytes, type, range, type(len), type(lambda: 0),
+           type(Ellipsis), type(NotImplemented), property)
+
+
+def copy(x):
+    cls = type(x)
+    if cls in _atomic or issubclass(cls, type):
+        return x
+    if cls in (list, dict, set, bytearray):
+        return cls.copy(x)
+    if cls in (tuple, frozenset):
+        return x
+    copier = getattr(cls, "__copy__", None)
+    if copier is not None:
+        return copier(x)
+    return _reconstruct(x, None)
+
+
+def deepcopy(x, memo=None, _nil=[]):
+    if memo is None:
+        memo = {}
+    d = id(x)
+    y = memo.get(d, _nil)
+    if y is not _nil:
+        return y
+    cls = type(x)
+    if cls in _atomic or issubclass(cls, type):
+        return x
+    if cls is list:
+        y = []
+        memo[d] = y
+        for a in x:
+            y.append(deepcopy(a, memo))
+    elif cls is tuple:
+        y = tuple(deepcopy(a, memo) for a in x)
+        if all(a is b for a, b in zip(x, y)):
+            y = x
+    elif cls is dict:
+        y = {}
+        memo[d] = y
+        for key, value in x.items():
+            y[deepcopy(key, memo)] = deepcopy(value, memo)
+    elif cls is set:
+        y = set(deepcopy(a, memo) for a in x)
+    elif cls is frozenset:
+        y = x
+    else:
+        copier = getattr(x, "__deepcopy__", None)
+        if copier is not None:
+            y = copier(memo)
+        else:
+            y = _reconstruct(x, memo)
+    if y is not x:
+        memo[d] = y
+        try:
+            memo[id(memo)].append(x)
+        except KeyError:
+            memo[id(memo)] = [x]
+    return y
+
+
+def _reconstruct(x, memo):
+    cls = type(x)
+    deep = memo is not None
+    if isinstance(x, tuple) and hasattr(x, "_fields"):
+        return cls(*[deepcopy(a, memo) if deep else a for a in x])
+    if cls.__name__ == "deque" and cls.__module__ == "collections":
+        y = cls([deepcopy(a, memo) if deep else a for a in x], x.maxlen)
+        if deep:
+            memo[id(x)] = y
+        return y
+    if isinstance(x, (list, dict, set)):
+        y = cls.__new__(cls)
+        if deep:
+            memo[id(x)] = y
+        if isinstance(x, list):
+            for item in x:
+                list.append(y, deepcopy(item, memo) if deep else item)
+        elif isinstance(x, dict):
+            for k, v in dict.items(x):
+                dict.__setitem__(y, deepcopy(k, memo) if deep else k, deepcopy(v, memo) if deep else v)
+        else:
+            for item in x:
+                set.add(y, deepcopy(item, memo) if deep else item)
+    else:
+        y = cls.__new__(cls)
+        if deep:
+            memo[id(x)] = y
+    state = None
+    getstate = getattr(type(x), "__getstate__", None)
+    if getstate is not None:
+        state = x.__getstate__()
+    else:
+        try:
+            state = x.__dict__
+        except AttributeError:
+            state = None
+    if state:
+        if deep:
+            state = deepcopy(state, memo)
+        if hasattr(y, "__setstate__"):
+            y.__setstate__(state)
+        else:
+            y.__dict__.update(state)
+    slots = []
+    for klass in cls.__mro__:
+        s = klass.__dict__.get("__slots__", ())
+        if isinstance(s, str):
+            s = (s,)
+        for name in s:
+            if name not in ("__dict__", "__weakref__") and name not in slots:
+                slots.append(name)
+    for name in slots:
+        try:
+            value = getattr(x, name)
+        except AttributeError:
+            continue
+        object.__setattr__(y, name, deepcopy(value, memo) if deep else value)
+    return y

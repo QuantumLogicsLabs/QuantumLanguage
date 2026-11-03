@@ -1,0 +1,2461 @@
+// quantum: cpp
+// Python front-end: strings. A str is UTF-8 with its length in code points;
+// ASCII strings index by byte, others through a code point array made on
+// first need. Also the format-spec mini-language, %-formatting and
+// str.format, and the bytes types.
+#include "PyRt.h.sa"
+#include "PyAst.h.sa"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace py
+{
+
+// ── UTF-8 ──────────────────────────────────────────────────────────────────
+
+std::string encodeUtf8(uint32_t c)
+{
+    std::string out;
+    if (c < 0x80)
+        out += (char)c;
+    else if (c < 0x800)
+    {
+        out += (char)(0xC0 | (c >> 6));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+    else if (c < 0x10000)
+    {
+        out += (char)(0xE0 | (c >> 12));
+        out += (char)(0x80 | ((c >> 6) & 0x3F));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+    else
+    {
+        out += (char)(0xF0 | (c >> 18));
+        out += (char)(0x80 | ((c >> 12) & 0x3F));
+        out += (char)(0x80 | ((c >> 6) & 0x3F));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+    return out;
+}
+
+std::vector<uint32_t> decodeUtf8(const std::string &s)
+{
+    std::vector<uint32_t> out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();)
+    {
+        unsigned char c = (unsigned char)s[i];
+        uint32_t cp;
+        int n;
+        if (c < 0x80)
+            cp = c, n = 1;
+        else if ((c >> 5) == 6)
+            cp = c & 0x1F, n = 2;
+        else if ((c >> 4) == 14)
+            cp = c & 0x0F, n = 3;
+        else if ((c >> 3) == 30)
+            cp = c & 0x07, n = 4;
+        else
+            cp = c, n = 1;
+        for (int k = 1; k < n && i + (size_t)k < s.size(); ++k)
+            cp = (cp << 6) | ((unsigned char)s[i + (size_t)k] & 0x3F);
+        out.push_back(cp);
+        i += (size_t)n;
+    }
+    return out;
+}
+
+int64_t utf8Length(const std::string &s, bool &ascii)
+{
+    ascii = true;
+    int64_t n = 0;
+    for (unsigned char c : s)
+    {
+        if (c >= 0x80)
+            ascii = false;
+        if ((c & 0xC0) != 0x80)
+            ++n;
+    }
+    return n;
+}
+
+static std::string fromCps(const std::vector<uint32_t> &cps, size_t a, size_t b)
+{
+    std::string out;
+    for (size_t i = a; i < b; ++i)
+        out += encodeUtf8(cps[i]);
+    return out;
+}
+
+static const std::vector<uint32_t> &cpsOf(Str *s)
+{
+    if (!s->cps)
+        s->cps = new std::vector<uint32_t>(decodeUtf8(s->s));
+    return *s->cps;
+}
+
+uint32_t strCharAt(Str *s, int64_t i)
+{
+    if (s->ascii)
+        return (unsigned char)s->s[(size_t)i];
+    return cpsOf(s)[(size_t)i];
+}
+
+static Str *charStr(uint32_t c)
+{
+    static Str *ascii[128];
+    if (c < 128)
+    {
+        if (!ascii[c])
+            ascii[c] = intern(std::string(1, (char)c));
+        return ascii[c];
+    }
+    return newStr(encodeUtf8(c));
+}
+
+Str *strSlice(Str *s, int64_t start, int64_t stop, int64_t step)
+{
+    if (step == 1)
+    {
+        if (stop <= start)
+            return newStrAscii("");
+        if (s->ascii)
+            return newStrAscii(s->s.substr((size_t)start, (size_t)(stop - start)));
+        return newStr(fromCps(cpsOf(s), (size_t)start, (size_t)stop));
+    }
+    std::string out;
+    if (s->ascii)
+    {
+        for (int64_t i = start; step > 0 ? i < stop : i > stop; i += step)
+            out += s->s[(size_t)i];
+        return newStrAscii(out);
+    }
+    const std::vector<uint32_t> &c = cpsOf(s);
+    for (int64_t i = start; step > 0 ? i < stop : i > stop; i += step)
+        out += encodeUtf8(c[(size_t)i]);
+    return newStr(out);
+}
+
+int64_t hashString(const std::string &s)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s)
+    {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    int64_t r = (int64_t)(h >> 1);
+    return r == -1 ? -2 : r;
+}
+
+// ── character classes (ASCII, Latin-1, Greek, Cyrillic) ─────────────────────
+
+bool isSpace(uint32_t c)
+{
+    return c == ' ' || (c >= 9 && c <= 13) || (c >= 0x1C && c <= 0x1F) || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+static bool isUpperC(uint32_t c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 0x2160 && c <= 0x216F) || (c >= 0xC0 && c <= 0xDE && c != 0xD7) || (c >= 0x391 && c <= 0x3A9) ||
+           (c >= 0x410 && c <= 0x42F) || (c >= 0x100 && c <= 0x17F && (c % 2) == 0);
+}
+
+static bool isLowerC(uint32_t c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 0x2170 && c <= 0x217F) || (c >= 0xDF && c <= 0xFF && c != 0xF7) || (c >= 0x3B1 && c <= 0x3C9) ||
+           (c >= 0x430 && c <= 0x44F) || (c >= 0x100 && c <= 0x17F && (c % 2) == 1) || c == 0xB5 || c == 0xAA || c == 0xBA;
+}
+
+bool isAlphaC(uint32_t c)
+{
+    if (c >= 0x2160 && c <= 0x217F)
+        return false;
+    return isUpperC(c) || isLowerC(c) || (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3040 && c <= 0x30FF) ||
+           (c >= 0x5D0 && c <= 0x5EA) || (c >= 0x620 && c <= 0x64A);
+}
+
+bool isDigitC(uint32_t c) { return c >= '0' && c <= '9'; }
+
+static bool isNumericC(uint32_t c)
+{
+    return isDigitC(c) || c == 0xB2 || c == 0xB3 || c == 0xB9 || (c >= 0xBC && c <= 0xBE) || (c >= 0x2150 && c <= 0x2189) ||
+           (c >= 0x2460 && c <= 0x249B) || (c >= 0x660 && c <= 0x669);
+}
+
+static bool isDigitUni(uint32_t c) { return isDigitC(c) || c == 0xB2 || c == 0xB3 || c == 0xB9 || (c >= 0x2460 && c <= 0x2468) || (c >= 0x660 && c <= 0x669); }
+static bool isDecimalUni(uint32_t c) { return isDigitC(c) || (c >= 0x660 && c <= 0x669); }
+
+uint32_t toUpperC(uint32_t c)
+{
+    if (c >= 'a' && c <= 'z')
+        return c - 32;
+    if (c < 128)
+        return c;
+    if (c == 0xB5)
+        return 0x39C;
+    if (c >= 0xE0 && c <= 0xFE && c != 0xF7)
+        return c - 32;
+    if (c == 0xFF)
+        return 0x178;
+    if (c >= 0x3B1 && c <= 0x3C9 && c != 0x3C2)
+        return c - 32;
+    if (c == 0x3C2)
+        return 0x3A3;
+    if (c >= 0x430 && c <= 0x44F)
+        return c - 32;
+    if (c >= 0x2170 && c <= 0x217F)
+        return c - 16;
+    if (c >= 0x100 && c <= 0x17F && (c % 2) == 1)
+        return c - 1;
+    return c;
+}
+
+uint32_t toLowerC(uint32_t c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c + 32;
+    if (c < 128)
+        return c;
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7)
+        return c + 32;
+    if (c >= 0x391 && c <= 0x3A9)
+        return c + 32;
+    if (c >= 0x410 && c <= 0x42F)
+        return c + 32;
+    if (c >= 0x2160 && c <= 0x216F)
+        return c + 16;
+    if (c >= 0x100 && c <= 0x17F && (c % 2) == 0)
+        return c + 1;
+    return c;
+}
+
+static bool isPrintableC(uint32_t c)
+{
+    if (c < 0x20 || c == 0x7F)
+        return false;
+    if (c >= 0x80 && c <= 0xA0)
+        return false;
+    if (c == 0xAD)
+        return false;
+    if (c >= 0x2028 && c <= 0x202F)
+        return false;
+    if (c >= 0x2000 && c <= 0x200F)
+        return false;
+    if (c >= 0xD800 && c <= 0xDFFF)
+        return false;
+    if (c == 0xFEFF)
+        return false;
+    return true;
+}
+
+std::string quoteStr(const std::string &s)
+{
+    bool hasSingle = s.find('\'') != std::string::npos, hasDouble = s.find('"') != std::string::npos;
+    char q = (hasSingle && !hasDouble) ? '"' : '\'';
+    std::string out(1, q);
+    std::vector<uint32_t> cps = decodeUtf8(s);
+    char buf[16];
+    for (uint32_t c : cps)
+    {
+        if (c == (uint32_t)q || c == '\\')
+        {
+            out += '\\';
+            out += (char)c;
+        }
+        else if (c == '\n')
+            out += "\\n";
+        else if (c == '\r')
+            out += "\\r";
+        else if (c == '\t')
+            out += "\\t";
+        else if (!isPrintableC(c))
+        {
+            if (c < 0x100)
+                snprintf(buf, sizeof buf, "\\x%02x", c);
+            else if (c < 0x10000)
+                snprintf(buf, sizeof buf, "\\u%04x", c);
+            else
+                snprintf(buf, sizeof buf, "\\U%08x", c);
+            out += buf;
+        }
+        else
+            out += encodeUtf8(c);
+    }
+    out += q;
+    return out;
+}
+
+static std::string asciiRepr(const std::string &r)
+{
+    std::string out;
+    char buf[16];
+    for (uint32_t c : decodeUtf8(r))
+    {
+        if (c < 128)
+            out += (char)c;
+        else if (c < 0x100)
+            snprintf(buf, sizeof buf, "\\x%02x", c), out += buf;
+        else if (c < 0x10000)
+            snprintf(buf, sizeof buf, "\\u%04x", c), out += buf;
+        else
+            snprintf(buf, sizeof buf, "\\U%08x", c), out += buf;
+    }
+    return out;
+}
+
+std::string asciiOf(V v) { return asciiRepr(reprOf(v)); }
+
+// ── the format-spec mini-language ──────────────────────────────────────────
+
+struct Spec
+{
+    uint32_t fill = ' ';
+    char align = 0;
+    char sign = 0;
+    bool alt = false, zero = false, zcoerce = false;
+    int64_t width = -1, precision = -1;
+    char grouping = 0;
+    char type = 0;
+};
+
+static Spec parseSpec(const std::string &spec)
+{
+    Spec s;
+    std::vector<uint32_t> c = decodeUtf8(spec);
+    size_t i = 0, n = c.size();
+    auto isAlign = [](uint32_t ch) { return ch == '<' || ch == '>' || ch == '^' || ch == '='; };
+    if (n >= 2 && isAlign(c[1]))
+    {
+        s.fill = c[0];
+        s.align = (char)c[1];
+        i = 2;
+    }
+    else if (n >= 1 && isAlign(c[0]))
+    {
+        s.align = (char)c[0];
+        i = 1;
+    }
+    if (i < n && (c[i] == '+' || c[i] == '-' || c[i] == ' '))
+        s.sign = (char)c[i++];
+    if (i < n && c[i] == 'z')
+    {
+        s.zcoerce = true;
+        ++i;
+    }
+    if (i < n && c[i] == '#')
+    {
+        s.alt = true;
+        ++i;
+    }
+    if (i < n && c[i] == '0')
+    {
+        s.zero = true;
+        ++i;
+    }
+    if (i < n && isDigitC(c[i]))
+    {
+        s.width = 0;
+        while (i < n && isDigitC(c[i]))
+            s.width = s.width * 10 + (c[i++] - '0');
+    }
+    if (i < n && (c[i] == ',' || c[i] == '_'))
+        s.grouping = (char)c[i++];
+    if (i < n && c[i] == '.')
+    {
+        ++i;
+        if (i >= n || !isDigitC(c[i]))
+            raise(tValueError, "Format specifier missing precision");
+        s.precision = 0;
+        while (i < n && isDigitC(c[i]))
+            s.precision = s.precision * 10 + (c[i++] - '0');
+    }
+    if (i < n)
+        s.type = (char)c[i++];
+    if (i < n)
+        raise(tValueError, "Invalid format specifier '" + spec + "' for object of type 'str'");
+    if (s.zero && !s.align)
+    {
+        s.fill = '0';
+        s.align = '=';
+    }
+    return s;
+}
+
+static std::string padTo(const std::string &body, int64_t bodyLen, const Spec &s, char defAlign, const std::string &prefix = "")
+{
+    int64_t total = bodyLen + (int64_t)prefix.size();
+    if (s.width <= total)
+        return prefix + body;
+    int64_t pad = s.width - total;
+    std::string f = encodeUtf8(s.fill);
+    auto rep = [&](int64_t k) {
+        std::string r;
+        for (int64_t i = 0; i < k; ++i)
+            r += f;
+        return r;
+    };
+    char align = s.align ? s.align : defAlign;
+    switch (align)
+    {
+    case '<': return prefix + body + rep(pad);
+    case '^': return rep(pad / 2) + prefix + body + rep(pad - pad / 2);
+    case '=': return prefix + rep(pad) + body;
+    default: return rep(pad) + prefix + body;
+    }
+}
+
+std::string formatStrSpec(const std::string &str, const std::string &spec)
+{
+    if (spec.empty())
+        return str;
+    Spec s = parseSpec(spec);
+    if (s.type && s.type != 's')
+        raise(tValueError, std::string("Unknown format code '") + s.type + "' for object of type 'str'");
+    if (s.sign)
+        raise(tValueError, "Sign not allowed in string format specifier");
+    if (s.align == '=')
+        raise(tValueError, "'=' alignment not allowed in string format specifier");
+    std::string body = str;
+    bool ascii;
+    int64_t len = utf8Length(body, ascii);
+    if (s.precision >= 0 && len > s.precision)
+    {
+        std::vector<uint32_t> c = decodeUtf8(body);
+        body = fromCps(c, 0, (size_t)s.precision);
+        len = s.precision;
+    }
+    return padTo(body, len, s, '<');
+}
+
+static std::string groupDigits(const std::string &digits, char sep, int every)
+{
+    std::string out;
+    int count = 0;
+    for (size_t i = digits.size(); i-- > 0;)
+    {
+        if (count && count % every == 0)
+            out += sep;
+        out += digits[i];
+        ++count;
+    }
+    return std::string(out.rbegin(), out.rend());
+}
+
+std::string formatIntSpec(V v, const std::string &spec)
+{
+    if (spec.empty())
+        return intToString(v);
+    Spec s = parseSpec(spec);
+    char t = s.type ? s.type : 'd';
+    if (t == 'e' || t == 'E' || t == 'f' || t == 'F' || t == 'g' || t == 'G' || t == '%')
+        return formatFloatSpec(intToDouble(v), spec, true);
+    if (s.precision >= 0)
+        raise(tValueError, "Precision not allowed in integer format specifier");
+    bool neg = intSign(v) < 0;
+    V mag = neg ? binaryOp(MKSMALL(0), v, OpSub) : v;
+    std::string digits, prefix;
+    switch (t)
+    {
+    case 'd':
+    case 'n': digits = intToString(mag, 10); break;
+    case 'b':
+        digits = intToString(mag, 2);
+        if (s.alt)
+            prefix = "0b";
+        break;
+    case 'o':
+        digits = intToString(mag, 8);
+        if (s.alt)
+            prefix = "0o";
+        break;
+    case 'x':
+        digits = intToString(mag, 16);
+        if (s.alt)
+            prefix = "0x";
+        break;
+    case 'X':
+    {
+        digits = intToString(mag, 16);
+        for (char &c : digits)
+            c = (char)toupper((unsigned char)c);
+        if (s.alt)
+            prefix = "0X";
+        break;
+    }
+    case 'c':
+    {
+        int64_t cp = indexOf(v);
+        return padTo(encodeUtf8((uint32_t)cp), 1, s, '<');
+    }
+    default:
+        raise(tValueError, std::string("Unknown format code '") + t + "' for object of type 'int'");
+    }
+    if (s.grouping)
+    {
+        int every = (t == 'd' || t == 'n') ? 3 : 4;
+        if (s.grouping == ',' && t != 'd' && t != 'n')
+            raise(tValueError, "Cannot specify ',' with '" + std::string(1, t) + "'.");
+        if (s.align == '=' && s.fill == '0' && s.width > 0)
+        {
+            // zero padding is grouped too
+            int64_t want = s.width - (int64_t)prefix.size() - ((neg || s.sign == '+' || s.sign == ' ') ? 1 : 0);
+            while ((int64_t)groupDigits(digits, s.grouping, every).size() < want)
+                digits = "0" + digits;
+            digits = groupDigits(digits, s.grouping, every);
+            std::string sign = neg ? "-" : s.sign == '+' ? "+" : s.sign == ' ' ? " " : "";
+            return sign + prefix + digits;
+        }
+        digits = groupDigits(digits, s.grouping, every);
+    }
+    std::string sign = neg ? "-" : s.sign == '+' ? "+" : s.sign == ' ' ? " " : "";
+    return padTo(digits, (int64_t)digits.size(), s, '>', sign + prefix);
+}
+
+std::string formatFloatSpec(double d, const std::string &spec, bool fromInt)
+{
+    if (spec.empty())
+        return floatRepr(d);
+    Spec s = parseSpec(spec);
+    char t = s.type;
+    if (t && !strchr("eEfFgGn%", t))
+        raise(tValueError, std::string("Unknown format code '") + t + "' for object of type 'float'");
+    bool neg = std::signbit(d);
+    double mag = fabs(d);
+    std::string body;
+    char buf[512];
+    if (std::isnan(d) || std::isinf(d))
+    {
+        body = std::isnan(d) ? "nan" : "inf";
+        if (t == 'E' || t == 'F' || t == 'G')
+            body = std::isnan(d) ? "NAN" : "INF";
+        if (t == '%')
+            body += "%";
+        if (std::isnan(d))
+            neg = false;
+    }
+    else if (t == 0 && s.precision < 0)
+    {
+        body = fromInt ? floatRepr(mag) : floatRepr(mag);
+        if (fromInt)
+        {
+            // format(int, '') never gets here; an int with a float type does
+        }
+    }
+    else
+    {
+        int64_t prec = s.precision < 0 ? 6 : s.precision;
+        switch (t)
+        {
+        case 'e':
+        case 'E':
+            snprintf(buf, sizeof buf, t == 'e' ? "%.*e" : "%.*E", (int)prec, mag);
+            body = buf;
+            if (s.alt && prec == 0)
+            {
+                size_t e = body.find_first_of("eE");
+                body.insert(e, ".");
+            }
+            break;
+        case 'f':
+        case 'F':
+            snprintf(buf, sizeof buf, "%.*f", (int)prec, mag);
+            body = buf;
+            if (s.alt && prec == 0)
+                body += ".";
+            break;
+        case '%':
+            snprintf(buf, sizeof buf, "%.*f", (int)prec, mag * 100.0);
+            body = std::string(buf) + "%";
+            break;
+        case 'g':
+        case 'G':
+        case 'n':
+        case 0:
+        {
+            if (prec == 0)
+                prec = 1;
+            if (s.alt)
+                snprintf(buf, sizeof buf, t == 'G' ? "%#.*G" : "%#.*g", (int)prec, mag);
+            else
+                snprintf(buf, sizeof buf, t == 'G' ? "%.*G" : "%.*g", (int)prec, mag);
+            body = buf;
+            if (t == 0 && body.find_first_of(".eE") == std::string::npos)
+                body += ".0";
+            if (t == 0)
+            {
+                // Python's '' type with a precision switches to exponent at exp >= precision
+                size_t e = body.find('e');
+                if (e != std::string::npos)
+                {
+                    // already exponent form; C agrees
+                }
+            }
+            break;
+        }
+        }
+    }
+    if (s.zcoerce && neg)
+    {
+        bool allZero = true;
+        for (char c : body)
+            if (c >= '1' && c <= '9')
+                allZero = false;
+        if (allZero)
+            neg = false;
+    }
+    if (s.grouping)
+    {
+        size_t end = body.find_first_of(".eE%");
+        if (end == std::string::npos)
+            end = body.size();
+        std::string ip = body.substr(0, end), rest = body.substr(end);
+        if (s.align == '=' && s.fill == '0' && s.width > 0)
+        {
+            int64_t want = s.width - (int64_t)rest.size() - ((neg || s.sign == '+' || s.sign == ' ') ? 1 : 0);
+            while ((int64_t)groupDigits(ip, s.grouping, 3).size() < want)
+                ip = "0" + ip;
+            std::string sign = neg ? "-" : s.sign == '+' ? "+" : s.sign == ' ' ? " " : "";
+            return sign + groupDigits(ip, s.grouping, 3) + rest;
+        }
+        body = groupDigits(ip, s.grouping, 3) + rest;
+    }
+    std::string sign = neg ? "-" : s.sign == '+' ? "+" : s.sign == ' ' ? " " : "";
+    return padTo(body, (int64_t)body.size(), s, '>', sign);
+}
+
+// ── %-formatting ───────────────────────────────────────────────────────────
+
+std::string percentFormat(Str *fmtStr, V args)
+{
+    const std::string &fmt = fmtStr->s;
+    std::vector<V> items;
+    bool isMapping = false;
+    if (!IS_SMALL(args) && args->type->layout == L::Tuple)
+        items = static_cast<Tuple *>(args)->items;
+    else
+    {
+        items.push_back(args);
+        isMapping = !IS_SMALL(args) && (args->type->layout == L::Dict || (!args->type->builtin && lookupMro(typeOf(args), intern("__getitem__")) && !isStr(args)));
+    }
+    size_t ai = 0;
+    std::string out;
+    auto next = [&]() -> V {
+        if (ai >= items.size())
+            raise(tTypeError, "not enough arguments for format string");
+        return items[ai++];
+    };
+    bool usedMapping = false;
+    for (size_t i = 0; i < fmt.size(); ++i)
+    {
+        char c = fmt[i];
+        if (c != '%')
+        {
+            out += c;
+            continue;
+        }
+        if (++i >= fmt.size())
+            raise(tValueError, "incomplete format");
+        if (fmt[i] == '%')
+        {
+            out += '%';
+            continue;
+        }
+        V mapped = nullptr;
+        if (fmt[i] == '(')
+        {
+            size_t close = fmt.find(')', i);
+            if (close == std::string::npos)
+                raise(tValueError, "incomplete format key");
+            std::string key = fmt.substr(i + 1, close - i - 1);
+            mapped = getitem(args, newStr(key));
+            usedMapping = true;
+            i = close + 1;
+        }
+        std::string flags;
+        while (i < fmt.size() && strchr("-+ #0", fmt[i]))
+            flags += fmt[i++];
+        int64_t width = -1, prec = -1;
+        if (i < fmt.size() && fmt[i] == '*')
+        {
+            width = indexOf(next());
+            ++i;
+        }
+        else
+            while (i < fmt.size() && isdigit((unsigned char)fmt[i]))
+                width = (width < 0 ? 0 : width) * 10 + (fmt[i++] - '0');
+        if (i < fmt.size() && fmt[i] == '.')
+        {
+            ++i;
+            prec = 0;
+            if (i < fmt.size() && fmt[i] == '*')
+            {
+                prec = indexOf(next());
+                ++i;
+            }
+            else
+                while (i < fmt.size() && isdigit((unsigned char)fmt[i]))
+                    prec = prec * 10 + (fmt[i++] - '0');
+        }
+        while (i < fmt.size() && strchr("hlL", fmt[i]))
+            ++i;
+        if (i >= fmt.size())
+            raise(tValueError, "incomplete format");
+        char t = fmt[i];
+        V v = mapped ? mapped : next();
+        bool left = flags.find('-') != std::string::npos, zero = flags.find('0') != std::string::npos;
+        bool plus = flags.find('+') != std::string::npos, space = flags.find(' ') != std::string::npos;
+        bool alt = flags.find('#') != std::string::npos;
+        std::string body;
+        bool numeric = false;
+        switch (t)
+        {
+        case 's': body = strOf(v); break;
+        case 'r': body = reprOf(v); break;
+        case 'a': body = asciiOf(v); break;
+        case 'c':
+            if (isStr(v))
+                body = asStr(v)->s;
+            else
+                body = encodeUtf8((uint32_t)indexOf(v));
+            break;
+        case 'd':
+        case 'i':
+        case 'u':
+        {
+            numeric = true;
+            V iv;
+            if (isIntLike(v))
+                iv = v;
+            else if (!IS_SMALL(v) && v->type->layout == L::Float)
+                iv = intFromDouble(static_cast<FloatObj *>(v)->v);
+            else
+            {
+                bool found;
+                iv = callSpecial(v, intern("__int__"), nullptr, 0, found);
+                if (!found)
+                    raise(tTypeError, "%" + std::string(1, t) + " format: a real number is required, not " + typeName(v));
+            }
+            body = intToString(iv);
+            if (prec >= 0)
+            {
+                bool neg = body[0] == '-';
+                std::string digits = neg ? body.substr(1) : body;
+                while ((int64_t)digits.size() < prec)
+                    digits = "0" + digits;
+                body = (neg ? "-" : "") + digits;
+            }
+            break;
+        }
+        case 'x':
+        case 'X':
+        case 'o':
+        {
+            numeric = true;
+            if (!isIntLike(v))
+                raise(tTypeError, "%" + std::string(1, t) + " format: an integer is required, not " + typeName(v));
+            bool neg = intSign(v) < 0;
+            V mag = neg ? binaryOp(MKSMALL(0), v, OpSub) : v;
+            std::string digits = intToString(mag, t == 'o' ? 8 : 16);
+            if (t == 'X')
+                for (char &ch : digits)
+                    ch = (char)toupper((unsigned char)ch);
+            if (alt)
+                digits = (t == 'o' ? "0o" : t == 'x' ? "0x" : "0X") + digits;
+            body = (neg ? "-" : "") + digits;
+            break;
+        }
+        case 'e':
+        case 'E':
+        case 'f':
+        case 'F':
+        case 'g':
+        case 'G':
+        {
+            numeric = true;
+            double d = toDouble(v);
+            char spec[64];
+            snprintf(spec, sizeof spec, "%s.%lld%c", alt ? "#" : "", (long long)(prec < 0 ? 6 : prec), t);
+            body = formatFloatSpec(d, spec, false);
+            break;
+        }
+        default:
+            raise(tValueError, std::string("unsupported format character '") + t + "' (0x" + std::to_string((int)t) + ")");
+        }
+        if (numeric && body[0] != '-')
+        {
+            if (plus)
+                body = "+" + body;
+            else if (space)
+                body = " " + body;
+        }
+        bool ascii;
+        int64_t len = utf8Length(body, ascii);
+        if (t == 's' || t == 'r' || t == 'a')
+        {
+            if (prec >= 0 && len > prec)
+            {
+                body = fromCps(decodeUtf8(body), 0, (size_t)prec);
+                len = prec;
+            }
+        }
+        if (width > len)
+        {
+            if (left)
+                body += std::string((size_t)(width - len), ' ');
+            else if (zero && numeric)
+            {
+                size_t signLen = (body[0] == '-' || body[0] == '+' || body[0] == ' ') ? 1 : 0;
+                if (body.compare(signLen, 2, "0x") == 0 || body.compare(signLen, 2, "0X") == 0 || body.compare(signLen, 2, "0o") == 0)
+                    signLen += 2;
+                body.insert(signLen, std::string((size_t)(width - len), '0'));
+            }
+            else
+                body = std::string((size_t)(width - len), ' ') + body;
+        }
+        out += body;
+    }
+    if (!isMapping && !usedMapping && ai < items.size())
+        raise(tTypeError, "not all arguments converted during string formatting");
+    return out;
+}
+
+// ── str.format ─────────────────────────────────────────────────────────────
+
+static V resolveField(const std::string &field, V *args, int n, Kw *kw, int &autoIdx)
+{
+    size_t i = 0;
+    while (i < field.size() && field[i] != '.' && field[i] != '[')
+        ++i;
+    std::string head = field.substr(0, i);
+    V obj;
+    if (head.empty())
+    {
+        if (autoIdx < 0)
+            raise(tValueError, "cannot switch from manual field specification to automatic field numbering");
+        if (autoIdx >= n)
+            raise(tIndexError, "Replacement index " + std::to_string(autoIdx) + " out of range for positional args tuple");
+        obj = args[autoIdx++];
+    }
+    else if (isdigit((unsigned char)head[0]))
+    {
+        int idx = atoi(head.c_str());
+        if (autoIdx > 0)
+            raise(tValueError, "cannot switch from automatic field numbering to manual field specification");
+        autoIdx = -1;
+        if (idx >= n)
+            raise(tIndexError, "Replacement index " + std::to_string(idx) + " out of range for positional args tuple");
+        obj = args[idx];
+    }
+    else
+    {
+        V v = kwArg(kw, head.c_str());
+        if (!v)
+            raiseArgs(tKeyError, newStr(head));
+        obj = v;
+    }
+    while (i < field.size())
+    {
+        if (field[i] == '.')
+        {
+            size_t j = i + 1;
+            while (j < field.size() && field[j] != '.' && field[j] != '[')
+                ++j;
+            obj = getattr(obj, intern(field.substr(i + 1, j - i - 1)));
+            i = j;
+        }
+        else
+        {
+            size_t close = field.find(']', i);
+            std::string key = field.substr(i + 1, close - i - 1);
+            bool num = !key.empty();
+            for (char c : key)
+                if (!isdigit((unsigned char)c))
+                    num = false;
+            obj = getitem(obj, num ? mkint(atoll(key.c_str())) : (V)newStr(key));
+            i = close + 1;
+        }
+    }
+    return obj;
+}
+
+static std::string formatWith(const std::string &fmt, V *args, int n, Kw *kw, int &autoIdx);
+
+std::string strFormatMethod(const std::string &fmt, V *args, int n, Kw *kw)
+{
+    int autoIdx = 0;
+    return formatWith(fmt, args, n, kw, autoIdx);
+}
+
+static std::string formatWith(const std::string &fmt, V *args, int n, Kw *kw, int &autoIdx)
+{
+    std::string out;
+    for (size_t i = 0; i < fmt.size(); ++i)
+    {
+        char c = fmt[i];
+        if (c == '{')
+        {
+            if (i + 1 < fmt.size() && fmt[i + 1] == '{')
+            {
+                out += '{';
+                ++i;
+                continue;
+            }
+            int depth = 1;
+            size_t j = i + 1;
+            while (j < fmt.size() && depth)
+            {
+                if (fmt[j] == '{')
+                    ++depth;
+                else if (fmt[j] == '}')
+                    --depth;
+                if (depth)
+                    ++j;
+            }
+            if (j >= fmt.size())
+                raise(tValueError, "Single '{' encountered in format string");
+            std::string inner = fmt.substr(i + 1, j - i - 1);
+            i = j;
+            // field[!conv][:spec]
+            size_t k = 0;
+            int br = 0;
+            while (k < inner.size())
+            {
+                if (inner[k] == '[')
+                    ++br;
+                else if (inner[k] == ']')
+                    --br;
+                else if (br == 0 && (inner[k] == '!' || inner[k] == ':'))
+                    break;
+                ++k;
+            }
+            std::string field = inner.substr(0, k);
+            char conv = 0;
+            std::string spec;
+            if (k < inner.size() && inner[k] == '!')
+            {
+                conv = inner[k + 1];
+                k += 2;
+            }
+            if (k < inner.size() && inner[k] == ':')
+                spec = inner.substr(k + 1);
+            if (spec.find('{') != std::string::npos)
+                spec = formatWith(spec, args, n, kw, autoIdx);
+            V v = resolveField(field, args, n, kw, autoIdx);
+            if (conv == 'r')
+                v = newStr(reprOf(v));
+            else if (conv == 's')
+                v = strV(v);
+            else if (conv == 'a')
+                v = newStr(asciiOf(v));
+            out += formatValue(v, spec);
+            continue;
+        }
+        if (c == '}')
+        {
+            if (i + 1 < fmt.size() && fmt[i + 1] == '}')
+            {
+                out += '}';
+                ++i;
+                continue;
+            }
+            raise(tValueError, "Single '}' encountered in format string");
+        }
+        out += c;
+    }
+    return out;
+}
+
+// ── str methods ────────────────────────────────────────────────────────────
+
+static Str *S(V v)
+{
+    if (!isStr(v))
+        raise(tTypeError, std::string("descriptor requires a 'str' object but received a '") + typeName(v) + "'");
+    return asStr(v);
+}
+
+static Str *argStr(V v, const char *fn)
+{
+    if (!isStr(v))
+        raise(tTypeError, std::string(fn) + "() argument must be str, not " + typeName(v));
+    return asStr(v);
+}
+
+static V mapChars(Str *s, uint32_t (*f)(uint32_t))
+{
+    if (s->ascii)
+    {
+        std::string out = s->s;
+        for (char &c : out)
+            c = (char)f((unsigned char)c);
+        return newStrAscii(out);
+    }
+    std::string out;
+    for (uint32_t c : cpsOf(s))
+        out += encodeUtf8(f(c));
+    return newStr(out);
+}
+
+static V str_upper(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    if (!s->ascii)
+    {
+        std::string out;
+        for (uint32_t c : cpsOf(s))
+        {
+            if (c == 0xDF)
+                out += "SS";
+            else
+                out += encodeUtf8(toUpperC(c));
+        }
+        return newStr(out);
+    }
+    return mapChars(s, toUpperC);
+}
+static V str_lower(V *a, int, Kw *) { return mapChars(S(a[0]), toLowerC); }
+static V str_casefold(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    std::string out;
+    for (uint32_t c : cpsOf(s))
+    {
+        if (c == 0xDF)
+            out += "ss";
+        else
+            out += encodeUtf8(toLowerC(c));
+    }
+    return newStr(out);
+}
+static uint32_t swapC(uint32_t c) { return isUpperC(c) ? toLowerC(c) : isLowerC(c) ? toUpperC(c) : c; }
+static V str_swapcase(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    if (s->ascii)
+        return mapChars(s, swapC);
+    std::string out;
+    for (uint32_t c : cpsOf(s))
+        out += c == 0xDF ? std::string("SS") : encodeUtf8(swapC(c));
+    return newStr(out);
+}
+
+static V str_capitalize(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    std::string out;
+    bool first = true;
+    for (uint32_t c : cpsOf(s))
+    {
+        out += encodeUtf8(first ? toUpperC(c) : toLowerC(c));
+        first = false;
+    }
+    return newStr(out);
+}
+
+static V str_title(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    std::string out;
+    bool prevCased = false;
+    for (uint32_t c : cpsOf(s))
+    {
+        bool cased = isUpperC(c) || isLowerC(c);
+        if (cased)
+            out += encodeUtf8(prevCased ? toLowerC(c) : toUpperC(c));
+        else
+            out += encodeUtf8(c);
+        prevCased = cased || (isAlphaC(c) && !cased);
+    }
+    return newStr(out);
+}
+
+static bool allChars(Str *s, bool (*pred)(uint32_t))
+{
+    if (s->len == 0)
+        return false;
+    for (uint32_t c : cpsOf(s))
+        if (!pred(c))
+            return false;
+    return true;
+}
+
+static bool alnumC(uint32_t c) { return isAlphaC(c) || isNumericC(c); }
+static bool asciiC(uint32_t c) { return c < 128; }
+
+static V str_isalpha(V *a, int, Kw *) { return mkbool(allChars(S(a[0]), isAlphaC)); }
+static V str_isdigit(V *a, int, Kw *) { return mkbool(allChars(S(a[0]), isDigitUni)); }
+static V str_isdecimal(V *a, int, Kw *) { return mkbool(allChars(S(a[0]), isDecimalUni)); }
+static V str_isnumeric(V *a, int, Kw *) { return mkbool(allChars(S(a[0]), isNumericC)); }
+static V str_isalnum(V *a, int, Kw *) { return mkbool(allChars(S(a[0]), alnumC)); }
+static V str_isspace(V *a, int, Kw *) { return mkbool(allChars(S(a[0]), isSpace)); }
+static V str_isascii(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    return mkbool(s->len == 0 || allChars(s, asciiC));
+}
+static V str_isprintable(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    for (uint32_t c : cpsOf(s))
+        if (!isPrintableC(c))
+            return False;
+    return True;
+}
+static V str_isupper(V *a, int, Kw *)
+{
+    bool cased = false;
+    for (uint32_t c : cpsOf(S(a[0])))
+    {
+        if (isLowerC(c))
+            return False;
+        if (isUpperC(c))
+            cased = true;
+    }
+    return mkbool(cased);
+}
+static V str_islower(V *a, int, Kw *)
+{
+    bool cased = false;
+    for (uint32_t c : cpsOf(S(a[0])))
+    {
+        if (isUpperC(c))
+            return False;
+        if (isLowerC(c))
+            cased = true;
+    }
+    return mkbool(cased);
+}
+static V str_istitle(V *a, int, Kw *)
+{
+    bool cased = false, prevCased = false;
+    for (uint32_t c : cpsOf(S(a[0])))
+    {
+        if (isUpperC(c))
+        {
+            if (prevCased)
+                return False;
+            prevCased = cased = true;
+        }
+        else if (isLowerC(c))
+        {
+            if (!prevCased)
+                return False;
+            prevCased = cased = true;
+        }
+        else
+            prevCased = false;
+    }
+    return mkbool(cased);
+}
+static V str_isidentifier(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    const std::vector<uint32_t> &c = cpsOf(s);
+    if (c.empty())
+        return False;
+    auto letterNumber = [](uint32_t ch) { return ch >= 0x2160 && ch <= 0x2188; };
+    if (!(isAlphaC(c[0]) || c[0] == '_' || letterNumber(c[0])))
+        return False;
+    for (uint32_t ch : c)
+        if (!(isAlphaC(ch) || isDigitC(ch) || ch == '_' || letterNumber(ch)))
+            return False;
+    return True;
+}
+
+// strip helpers working on code points
+static V stripImpl(V *a, int n, bool left, bool right)
+{
+    Str *s = S(a[0]);
+    std::vector<uint32_t> chars;
+    bool ws = n < 2 || a[1] == None;
+    if (!ws)
+        chars = cpsOf(argStr(a[1], "strip"));
+    auto strip = [&](uint32_t c) {
+        if (ws)
+            return isSpace(c);
+        for (uint32_t x : chars)
+            if (x == c)
+                return true;
+        return false;
+    };
+    if (s->ascii)
+    {
+        size_t b = 0, e = s->s.size();
+        if (left)
+            while (b < e && strip((unsigned char)s->s[b]))
+                ++b;
+        if (right)
+            while (e > b && strip((unsigned char)s->s[e - 1]))
+                --e;
+        if (b == 0 && e == s->s.size())
+            return s;
+        return newStrAscii(s->s.substr(b, e - b));
+    }
+    const std::vector<uint32_t> &c = cpsOf(s);
+    size_t b = 0, e = c.size();
+    if (left)
+        while (b < e && strip(c[b]))
+            ++b;
+    if (right)
+        while (e > b && strip(c[e - 1]))
+            --e;
+    return newStr(fromCps(c, b, e));
+}
+
+static V str_strip(V *a, int n, Kw *) { return stripImpl(a, n, true, true); }
+static V str_lstrip(V *a, int n, Kw *) { return stripImpl(a, n, true, false); }
+static V str_rstrip(V *a, int n, Kw *) { return stripImpl(a, n, false, true); }
+
+static V str_split(V *a, int n, Kw *kw)
+{
+    Str *s = S(a[0]);
+    V sepV = n > 1 ? a[1] : kwArg(kw, "sep");
+    V maxV = n > 2 ? a[2] : kwArg(kw, "maxsplit");
+    int64_t maxsplit = maxV ? indexOf(maxV) : -1;
+    List *out = newList();
+    const std::string &str = s->s;
+    if (!sepV || sepV == None)
+    {
+        size_t i = 0, len = str.size();
+        int64_t splits = 0;
+        // whitespace split (ASCII whitespace plus a few common ones)
+        auto wsAt = [&](size_t k, size_t &w) -> bool {
+            unsigned char c = (unsigned char)str[k];
+            if (c < 128)
+            {
+                w = 1;
+                return isSpace(c);
+            }
+            if (c == 0xC2 && k + 1 < len && ((unsigned char)str[k + 1] == 0xA0 || (unsigned char)str[k + 1] == 0x85))
+            {
+                w = 2;
+                return true;
+            }
+            w = 1;
+            return false;
+        };
+        size_t w;
+        while (i < len)
+        {
+            while (i < len && wsAt(i, w))
+                i += w;
+            if (i >= len)
+                break;
+            if (maxsplit >= 0 && splits >= maxsplit)
+            {
+                size_t e = len;
+                while (e > i && wsAt(e - 1, w))
+                    --e;
+                out->items.push_back(newStr(str.substr(i, e - i)));
+                return out;
+            }
+            size_t j = i;
+            while (j < len && !wsAt(j, w))
+                ++j;
+            out->items.push_back(newStr(str.substr(i, j - i)));
+            ++splits;
+            i = j;
+        }
+        return out;
+    }
+    const std::string &sep = argStr(sepV, "split")->s;
+    if (sep.empty())
+        raise(tValueError, "empty separator");
+    size_t start = 0;
+    int64_t splits = 0;
+    for (;;)
+    {
+        if (maxsplit >= 0 && splits >= maxsplit)
+            break;
+        size_t pos = str.find(sep, start);
+        if (pos == std::string::npos)
+            break;
+        out->items.push_back(newStr(str.substr(start, pos - start)));
+        start = pos + sep.size();
+        ++splits;
+    }
+    out->items.push_back(newStr(str.substr(start)));
+    return out;
+}
+
+static V str_rsplit(V *a, int n, Kw *kw)
+{
+    Str *s = S(a[0]);
+    V sepV = n > 1 ? a[1] : kwArg(kw, "sep");
+    V maxV = n > 2 ? a[2] : kwArg(kw, "maxsplit");
+    int64_t maxsplit = maxV ? indexOf(maxV) : -1;
+    if (maxsplit < 0)
+        return str_split(a, n, kw);
+    const std::string &str = s->s;
+    std::vector<V> parts;
+    if (!sepV || sepV == None)
+    {
+        int64_t end = (int64_t)str.size();
+        int64_t splits = 0;
+        while (end > 0)
+        {
+            while (end > 0 && isSpace((unsigned char)str[(size_t)end - 1]))
+                --end;
+            if (end <= 0)
+                break;
+            if (splits >= maxsplit)
+            {
+                int64_t b = 0;
+                while (b < end && isSpace((unsigned char)str[(size_t)b]))
+                    ++b;
+                parts.push_back(newStr(str.substr((size_t)b, (size_t)(end - b))));
+                end = 0;
+                break;
+            }
+            int64_t j = end;
+            while (j > 0 && !isSpace((unsigned char)str[(size_t)j - 1]))
+                --j;
+            parts.push_back(newStr(str.substr((size_t)j, (size_t)(end - j))));
+            ++splits;
+            end = j;
+        }
+    }
+    else
+    {
+        const std::string &sep = argStr(sepV, "rsplit")->s;
+        if (sep.empty())
+            raise(tValueError, "empty separator");
+        size_t end = str.size();
+        int64_t splits = 0;
+        for (;;)
+        {
+            if (splits >= maxsplit || end < sep.size())
+                break;
+            size_t pos = str.rfind(sep, end - sep.size());
+            if (pos == std::string::npos)
+                break;
+            parts.push_back(newStr(str.substr(pos + sep.size(), end - pos - sep.size())));
+            end = pos;
+            ++splits;
+        }
+        parts.push_back(newStr(str.substr(0, end)));
+    }
+    List *out = newList();
+    out->items.assign(parts.rbegin(), parts.rend());
+    return out;
+}
+
+static V str_splitlines(V *a, int n, Kw *kw)
+{
+    Str *s = S(a[0]);
+    V keepV = n > 1 ? a[1] : kwArg(kw, "keepends");
+    bool keep = keepV && truthy(keepV);
+    List *out = newList();
+    const std::string &str = s->s;
+    size_t i = 0, start = 0;
+    while (i < str.size())
+    {
+        char c = str[i];
+        size_t eol = 0;
+        if (c == '\n' || c == '\v' || c == '\f' || c == '\x1c' || c == '\x1d' || c == '\x1e')
+            eol = 1;
+        else if (c == '\r')
+            eol = (i + 1 < str.size() && str[i + 1] == '\n') ? 2 : 1;
+        if (eol)
+        {
+            out->items.push_back(newStr(str.substr(start, (keep ? i + eol : i) - start)));
+            i += eol;
+            start = i;
+        }
+        else
+            ++i;
+    }
+    if (start < str.size())
+        out->items.push_back(newStr(str.substr(start)));
+    return out;
+}
+
+static V str_join(V *a, int n, Kw *)
+{
+    checkArgs("join", n - 1, 1, 1);
+    Str *sep = S(a[0]);
+    std::string out;
+    bool first = true;
+    bool ascii = sep->ascii;
+    int64_t len = 0;
+    V it = getiter(a[1]);
+    V x;
+    int64_t idx = 0;
+    while (iterNext(it, x))
+    {
+        if (!isStr(x))
+            raise(tTypeError, "sequence item " + std::to_string(idx) + ": expected str instance, " + typeName(x) + " found");
+        if (!first)
+        {
+            out += sep->s;
+            len += sep->len;
+        }
+        first = false;
+        Str *xs = asStr(x);
+        out += xs->s;
+        len += xs->len;
+        ascii = ascii && xs->ascii;
+        ++idx;
+    }
+    Str *r = new Str(tStr);
+    r->s = out;
+    r->len = len;
+    r->ascii = ascii;
+    return r;
+}
+
+static V str_replace(V *a, int n, Kw *kw)
+{
+    checkArgs("replace", n - 1, 2, 3);
+    Str *s = S(a[0]);
+    const std::string &from = argStr(a[1], "replace")->s, &to = argStr(a[2], "replace")->s;
+    V cntV = n > 3 ? a[3] : kwArg(kw, "count");
+    int64_t count = cntV ? indexOf(cntV) : -1;
+    std::string out;
+    if (from.empty())
+    {
+        // insert `to` between every character
+        const std::vector<uint32_t> &c = cpsOf(s);
+        int64_t done = 0;
+        for (size_t i = 0; i <= c.size(); ++i)
+        {
+            if (count < 0 || done < count)
+            {
+                out += to;
+                ++done;
+            }
+            if (i < c.size())
+                out += encodeUtf8(c[i]);
+        }
+        return newStr(out);
+    }
+    size_t start = 0;
+    int64_t done = 0;
+    for (;;)
+    {
+        if (count >= 0 && done >= count)
+            break;
+        size_t pos = s->s.find(from, start);
+        if (pos == std::string::npos)
+            break;
+        out.append(s->s, start, pos - start);
+        out += to;
+        start = pos + from.size();
+        ++done;
+    }
+    out.append(s->s, start, std::string::npos);
+    return newStr(out);
+}
+
+// Byte offsets of code point range [start, end) for find and friends
+static void cpRange(Str *s, V *a, int n, int first, size_t &b, size_t &e, int64_t &cpStart)
+{
+    int64_t len = s->len;
+    int64_t start = (n > first && a[first] != None) ? indexOf(a[first]) : 0;
+    int64_t end = (n > first + 1 && a[first + 1] != None) ? indexOf(a[first + 1]) : len;
+    if (start < 0)
+        start = start + len < 0 ? 0 : start + len;
+    if (end < 0)
+        end = end + len < 0 ? 0 : end + len;
+    if (start > len)
+        start = len + 1;
+    if (end > len)
+        end = len;
+    cpStart = start;
+    if (s->ascii)
+    {
+        b = (size_t)start;
+        e = (size_t)(end < start ? start : end);
+        return;
+    }
+    // map code point offsets to byte offsets
+    size_t byte = 0;
+    int64_t cp = 0;
+    b = e = s->s.size();
+    bool fb = false;
+    for (size_t i = 0; i <= s->s.size(); ++i)
+    {
+        if (i == s->s.size() || ((unsigned char)s->s[i] & 0xC0) != 0x80)
+        {
+            if (cp == start && !fb)
+            {
+                b = i;
+                fb = true;
+            }
+            if (cp == end)
+            {
+                e = i;
+                break;
+            }
+            ++cp;
+        }
+        (void)byte;
+    }
+    if (e < b)
+        e = b;
+}
+
+static int64_t byteToCp(Str *s, size_t byte)
+{
+    if (s->ascii)
+        return (int64_t)byte;
+    int64_t cp = 0;
+    for (size_t i = 0; i < byte && i < s->s.size(); ++i)
+        if (((unsigned char)s->s[i] & 0xC0) != 0x80)
+            ++cp;
+    return cp;
+}
+
+static int64_t findImpl(V *a, int n, bool reverse)
+{
+    Str *s = S(a[0]);
+    const std::string &sub = argStr(a[1], "find")->s;
+    size_t b, e;
+    int64_t cps;
+    cpRange(s, a, n, 2, b, e, cps);
+    if (cps > s->len)
+        return -1;
+    if (sub.size() > e - b)
+        return -1;
+    size_t pos;
+    if (reverse)
+        pos = s->s.rfind(sub, e - sub.size());
+    else
+        pos = s->s.find(sub, b);
+    if (pos == std::string::npos || pos < b || pos + sub.size() > e)
+        return -1;
+    return byteToCp(s, pos);
+}
+
+static V str_find(V *a, int n, Kw *) { return mkint(findImpl(a, n, false)); }
+static V str_rfind(V *a, int n, Kw *) { return mkint(findImpl(a, n, true)); }
+static V str_index(V *a, int n, Kw *)
+{
+    int64_t r = findImpl(a, n, false);
+    if (r < 0)
+        raise(tValueError, "substring not found");
+    return mkint(r);
+}
+static V str_rindex(V *a, int n, Kw *)
+{
+    int64_t r = findImpl(a, n, true);
+    if (r < 0)
+        raise(tValueError, "substring not found");
+    return mkint(r);
+}
+
+static V str_count(V *a, int n, Kw *)
+{
+    Str *s = S(a[0]);
+    const std::string &sub = argStr(a[1], "count")->s;
+    size_t b, e;
+    int64_t cps;
+    cpRange(s, a, n, 2, b, e, cps);
+    if (cps > s->len)
+        return MKSMALL(0);
+    if (sub.empty())
+        return mkint(byteToCp(s, e) - byteToCp(s, b) + 1);
+    int64_t c = 0;
+    size_t pos = b;
+    while ((pos = s->s.find(sub, pos)) != std::string::npos && pos + sub.size() <= e)
+    {
+        ++c;
+        pos += sub.size();
+    }
+    return mkint(c);
+}
+
+static bool matchAffix(Str *s, V affix, size_t b, size_t e, bool prefix)
+{
+    const std::string &x = argStr(affix, prefix ? "startswith" : "endswith")->s;
+    if (x.size() > e - b)
+        return false;
+    if (prefix)
+        return s->s.compare(b, x.size(), x) == 0;
+    return s->s.compare(e - x.size(), x.size(), x) == 0;
+}
+
+static V affixImpl(V *a, int n, bool prefix)
+{
+    checkArgs(prefix ? "startswith" : "endswith", n - 1, 1, 3);
+    Str *s = S(a[0]);
+    size_t b, e;
+    int64_t cps;
+    cpRange(s, a, n, 2, b, e, cps);
+    if (cps > s->len)
+        return False;
+    if (!IS_SMALL(a[1]) && a[1]->type->layout == L::Tuple)
+    {
+        for (V x : static_cast<Tuple *>(a[1])->items)
+            if (matchAffix(s, x, b, e, prefix))
+                return True;
+        return False;
+    }
+    if (!isStr(a[1]))
+        raise(tTypeError, std::string(prefix ? "startswith" : "endswith") + " first arg must be str or a tuple of str, not " + typeName(a[1]));
+    return mkbool(matchAffix(s, a[1], b, e, prefix));
+}
+
+static V str_startswith(V *a, int n, Kw *) { return affixImpl(a, n, true); }
+static V str_endswith(V *a, int n, Kw *) { return affixImpl(a, n, false); }
+
+static V justify(V *a, int n, char how)
+{
+    checkArgs("justify", n - 1, 1, 2);
+    Str *s = S(a[0]);
+    int64_t width = indexOf(a[1]);
+    std::string fill = " ";
+    if (n > 2)
+    {
+        Str *f = argStr(a[2], "justify");
+        if (f->len != 1)
+            raise(tTypeError, "The fill character must be exactly one character long");
+        fill = f->s;
+    }
+    if (width <= s->len)
+        return s;
+    int64_t pad = width - s->len;
+    auto rep = [&](int64_t k) {
+        std::string r;
+        for (int64_t i = 0; i < k; ++i)
+            r += fill;
+        return r;
+    };
+    std::string out;
+    if (how == 'l')
+        out = s->s + rep(pad);
+    else if (how == 'r')
+        out = rep(pad) + s->s;
+    else
+    {
+        // CPython centers with the extra space on the right when the width is odd... unless the length is odd
+        int64_t left = pad / 2 + (pad & width & 1);
+        out = rep(left) + s->s + rep(pad - left);
+    }
+    return newStr(out);
+}
+
+static V str_ljust(V *a, int n, Kw *) { return justify(a, n, 'l'); }
+static V str_rjust(V *a, int n, Kw *) { return justify(a, n, 'r'); }
+static V str_center(V *a, int n, Kw *) { return justify(a, n, 'c'); }
+
+static V str_zfill(V *a, int n, Kw *)
+{
+    checkArgs("zfill", n - 1, 1, 1);
+    Str *s = S(a[0]);
+    int64_t width = indexOf(a[1]);
+    if (width <= s->len)
+        return s;
+    std::string str = s->s;
+    size_t signLen = (!str.empty() && (str[0] == '-' || str[0] == '+')) ? 1 : 0;
+    str.insert(signLen, std::string((size_t)(width - s->len), '0'));
+    return newStr(str);
+}
+
+static V str_expandtabs(V *a, int n, Kw *kw)
+{
+    Str *s = S(a[0]);
+    V tsV = n > 1 ? a[1] : kwArg(kw, "tabsize");
+    int64_t ts = tsV ? indexOf(tsV) : 8;
+    std::string out;
+    int64_t col = 0;
+    for (uint32_t c : cpsOf(s))
+    {
+        if (c == '\t')
+        {
+            if (ts > 0)
+            {
+                int64_t sp = ts - col % ts;
+                out += std::string((size_t)sp, ' ');
+                col += sp;
+            }
+        }
+        else if (c == '\n' || c == '\r')
+        {
+            out += (char)c;
+            col = 0;
+        }
+        else
+        {
+            out += encodeUtf8(c);
+            ++col;
+        }
+    }
+    return newStr(out);
+}
+
+static V partitionImpl(V *a, int n, bool reverse)
+{
+    checkArgs("partition", n - 1, 1, 1);
+    Str *s = S(a[0]);
+    const std::string &sep = argStr(a[1], "partition")->s;
+    if (sep.empty())
+        raise(tValueError, "empty separator");
+    size_t pos = reverse ? s->s.rfind(sep) : s->s.find(sep);
+    Tuple *t = newTuple(3);
+    if (pos == std::string::npos)
+    {
+        if (reverse)
+        {
+            t->items[0] = newStrAscii("");
+            t->items[1] = newStrAscii("");
+            t->items[2] = s;
+        }
+        else
+        {
+            t->items[0] = s;
+            t->items[1] = newStrAscii("");
+            t->items[2] = newStrAscii("");
+        }
+        return t;
+    }
+    t->items[0] = newStr(s->s.substr(0, pos));
+    t->items[1] = a[1];
+    t->items[2] = newStr(s->s.substr(pos + sep.size()));
+    return t;
+}
+
+static V str_partition(V *a, int n, Kw *) { return partitionImpl(a, n, false); }
+static V str_rpartition(V *a, int n, Kw *) { return partitionImpl(a, n, true); }
+
+static V str_removeprefix(V *a, int n, Kw *)
+{
+    checkArgs("removeprefix", n - 1, 1, 1);
+    Str *s = S(a[0]);
+    const std::string &p = argStr(a[1], "removeprefix")->s;
+    if (s->s.compare(0, p.size(), p) == 0 && s->s.size() >= p.size())
+        return newStr(s->s.substr(p.size()));
+    return s;
+}
+
+static V str_removesuffix(V *a, int n, Kw *)
+{
+    checkArgs("removesuffix", n - 1, 1, 1);
+    Str *s = S(a[0]);
+    const std::string &p = argStr(a[1], "removesuffix")->s;
+    if (!p.empty() && s->s.size() >= p.size() && s->s.compare(s->s.size() - p.size(), p.size(), p) == 0)
+        return newStr(s->s.substr(0, s->s.size() - p.size()));
+    return s;
+}
+
+static V str_format(V *a, int n, Kw *kw) { return newStr(strFormatMethod(S(a[0])->s, a + 1, n - 1, kw)); }
+
+static V str_format_map(V *a, int n, Kw *)
+{
+    checkArgs("format_map", n - 1, 1, 1);
+    // fields name keys of the mapping
+    Kw kw;
+    V mapping = a[1];
+    std::string fmt = S(a[0])->s;
+    for (size_t i = 0; i < fmt.size(); ++i)
+        if (fmt[i] == '{' && i + 1 < fmt.size() && fmt[i + 1] != '{')
+        {
+            size_t j = i + 1;
+            while (j < fmt.size() && fmt[j] != '}' && fmt[j] != '!' && fmt[j] != ':' && fmt[j] != '.' && fmt[j] != '[')
+                ++j;
+            std::string name = fmt.substr(i + 1, j - i - 1);
+            if (!name.empty() && !isdigit((unsigned char)name[0]))
+            {
+                kw.names.push_back(intern(name));
+                kw.vals.push_back(getitem(mapping, newStr(name)));
+            }
+        }
+        else if (fmt[i] == '{')
+            ++i;
+    return newStr(strFormatMethod(fmt, nullptr, 0, &kw));
+}
+
+static V str_encode(V *a, int n, Kw *kw)
+{
+    Str *s = S(a[0]);
+    V encV = n > 1 ? a[1] : kwArg(kw, "encoding");
+    std::string enc = encV ? strOf(encV) : "utf-8";
+    for (char &c : enc)
+        c = (char)tolower((unsigned char)c);
+    BytesObj *b = new BytesObj(tBytes);
+    for (char &c : enc)
+        if (c == '_')
+            c = '-';
+    if (enc == "utf-16-le" || enc == "utf-16-be" || enc == "utf-16" || enc == "utf16" || enc == "utf-32" ||
+        enc == "utf-32-le" || enc == "utf-32-be")
+    {
+        bool be = enc.size() > 3 && enc.compare(enc.size() - 3, 3, "-be") == 0;
+        bool wide = enc.find("32") != std::string::npos;
+        auto put = [&](uint32_t u, int bytes) {
+            for (int k = 0; k < bytes; ++k)
+                b->s += (char)(be ? (u >> (8 * (bytes - 1 - k))) : (u >> (8 * k)));
+        };
+        if (enc == "utf-16" || enc == "utf16" || enc == "utf-32")
+            put(0xFEFF, wide ? 4 : 2);
+        for (uint32_t c : cpsOf(s))
+        {
+            if (wide)
+                put(c, 4);
+            else if (c >= 0x10000)
+            {
+                put(0xD800 | ((c - 0x10000) >> 10), 2);
+                put(0xDC00 | ((c - 0x10000) & 0x3FF), 2);
+            }
+            else
+                put(c, 2);
+        }
+        return b;
+    }
+    if (enc == "ascii" || enc == "latin-1" || enc == "latin1" || enc == "iso-8859-1" || enc == "us-ascii")
+    {
+        V errV = n > 2 ? a[2] : kwArg(kw, "errors");
+        std::string errors = errV ? strOf(errV) : "strict";
+        uint32_t limit = (enc == "ascii" || enc == "us-ascii") ? 128 : 256;
+        int64_t pos = 0;
+        for (uint32_t c : cpsOf(s))
+        {
+            if (c < limit)
+                b->s += (char)c;
+            else if (errors == "ignore")
+                ;
+            else if (errors == "replace")
+                b->s += '?';
+            else if (errors == "xmlcharrefreplace")
+                b->s += "&#" + std::to_string(c) + ";";
+            else if (errors == "backslashreplace")
+            {
+                char buf[16];
+                if (c < 0x100)
+                    snprintf(buf, sizeof buf, "\\x%02x", c);
+                else if (c < 0x10000)
+                    snprintf(buf, sizeof buf, "\\u%04x", c);
+                else
+                    snprintf(buf, sizeof buf, "\\U%08x", c);
+                b->s += buf;
+            }
+            else
+            {
+                extern V makeUnicodeError(Type *t, const std::string &enc, V object, int64_t start, int64_t end, const std::string &reason);
+                raiseV(makeUnicodeError(tUnicodeEncodeError, limit == 128 ? "ascii" : "latin-1", s, pos, pos + 1,
+                                        "ordinal not in range(" + std::to_string(limit) + ")"));
+            }
+            ++pos;
+        }
+        return b;
+    }
+    b->s = s->s;
+    return b;
+}
+
+static V str_maketrans(V *a, int n, Kw *)
+{
+    Dict *d = newDict();
+    if (n == 1)
+    {
+        for (const DEntry &e : static_cast<Dict *>(a[0])->entries)
+        {
+            if (!e.key)
+                continue;
+            V k = isStr(e.key) ? mkint(strCharAt(asStr(e.key), 0)) : e.key;
+            V v = e.val;
+            dictSet(d, k, v);
+        }
+        return d;
+    }
+    Str *x = argStr(a[0], "maketrans"), *y = argStr(a[1], "maketrans");
+    if (x->len != y->len)
+        raise(tValueError, "the first two maketrans arguments must have equal length");
+    const std::vector<uint32_t> &xc = cpsOf(x), &yc = cpsOf(y);
+    for (size_t i = 0; i < xc.size(); ++i)
+        dictSet(d, mkint(xc[i]), mkint(yc[i]));
+    if (n > 2)
+        for (uint32_t c : cpsOf(argStr(a[2], "maketrans")))
+            dictSet(d, mkint(c), None);
+    return d;
+}
+
+static V str_translate(V *a, int n, Kw *)
+{
+    checkArgs("translate", n - 1, 1, 1);
+    Str *s = S(a[0]);
+    std::string out;
+    for (uint32_t c : cpsOf(s))
+    {
+        V r;
+        try
+        {
+            r = getitem(a[1], mkint(c));
+        }
+        catch (PyThrow &e)
+        {
+            if (!isinst(e.exc, tLookupError))
+                throw;
+            out += encodeUtf8(c);
+            continue;
+        }
+        if (r == None)
+            continue;
+        if (isStr(r))
+            out += asStr(r)->s;
+        else
+            out += encodeUtf8((uint32_t)indexOf(r));
+    }
+    return newStr(out);
+}
+
+static V str_getitem(V *a, int n, Kw *)
+{
+    checkArgs("__getitem__", n, 2, 2);
+    Str *s = S(a[0]);
+    if (!IS_SMALL(a[1]) && a[1]->type->layout == L::Slice)
+    {
+        int64_t count;
+        std::vector<int64_t> ix = sliceIndices(static_cast<SliceObj *>(a[1]), s->len, count);
+        if (count <= 0)
+            return newStrAscii("");
+        if (ix[2] == 1)
+            return strSlice(s, ix[0], ix[0] + count, 1);
+        return strSlice(s, ix[0], ix[0] + count * ix[2], ix[2]);
+    }
+    if (!isIntLike(a[1]) && !lookupMro(typeOf(a[1]), intern("__index__")))
+        raise(tTypeError, "string indices must be integers, not '" + std::string(typeName(a[1])) + "'");
+    int64_t i = indexOf(a[1]);
+    if (i < 0)
+        i += s->len;
+    if (i < 0 || i >= s->len)
+        raise(tIndexError, "string index out of range");
+    return charStr(strCharAt(s, i));
+}
+
+static V str_len(V *a, int, Kw *) { return mkint(S(a[0])->len); }
+
+static V str_iter(V *a, int, Kw *)
+{
+    Str *s = S(a[0]);
+    int64_t *pos = new int64_t(0);
+    return makeIter([s, pos](V &out) -> bool {
+        if (*pos >= s->len)
+            return false;
+        out = charStr(strCharAt(s, (*pos)++));
+        return true;
+    });
+}
+
+static V str_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    if (!isStr(a[1]))
+        raise(tTypeError, "'in <string>' requires string as left operand, not " + std::string(typeName(a[1])));
+    return mkbool(S(a[0])->s.find(asStr(a[1])->s) != std::string::npos);
+}
+
+static V str_str(V *a, int, Kw *)
+{
+    if (typeOf(a[0]) == tStr)
+        return a[0];
+    return newStr(S(a[0])->s);
+}
+
+static V str_format_dunder(V *a, int n, Kw *)
+{
+    checkArgs("__format__", n, 2, 2);
+    return newStr(formatStrSpec(S(a[0])->s, strOf(a[1])));
+}
+
+static V str_hash(V *a, int, Kw *) { return mkint(hashOf(newStr(S(a[0])->s))); }
+
+static V str_getnewargs(V *a, int, Kw *)
+{
+    Tuple *t = newTuple(1);
+    t->items[0] = newStr(S(a[0])->s);
+    return t;
+}
+
+static std::string decodeBytes(const std::string &s, const std::string &encIn, const std::string &errors)
+{
+    std::string enc = encIn;
+    for (char &c : enc)
+        c = (char)tolower((unsigned char)c);
+    if (enc == "latin-1" || enc == "latin1" || enc == "iso-8859-1")
+    {
+        std::string out;
+        for (unsigned char c : s)
+            out += encodeUtf8(c);
+        return out;
+    }
+    if (enc == "ascii")
+    {
+        std::string out;
+        for (size_t i = 0; i < s.size(); ++i)
+        {
+            unsigned char c = (unsigned char)s[i];
+            if (c < 128)
+                out += (char)c;
+            else if (errors == "ignore")
+                ;
+            else if (errors == "replace")
+                out += encodeUtf8(0xFFFD);
+            else
+            {
+                extern V makeUnicodeError(Type *t, const std::string &enc, V object, int64_t start, int64_t end, const std::string &reason);
+                BytesObj *bo = new BytesObj(tBytes);
+                bo->s = s;
+                raiseV(makeUnicodeError(tUnicodeDecodeError, "ascii", bo, (int64_t)i, (int64_t)i + 1, "ordinal not in range(128)"));
+            }
+        }
+        return out;
+    }
+    // utf-8: validate
+    for (size_t i = 0; i < s.size();)
+    {
+        unsigned char c = (unsigned char)s[i];
+        int n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        bool ok = n > 0 && i + (size_t)n <= s.size();
+        for (int k = 1; ok && k < n; ++k)
+            if (((unsigned char)s[i + (size_t)k] & 0xC0) != 0x80)
+                ok = false;
+        if (!ok)
+        {
+            if (errors == "strict")
+            {
+                extern V makeUnicodeError(Type *t, const std::string &enc, V object, int64_t start, int64_t end, const std::string &reason);
+                BytesObj *bo = new BytesObj(tBytes);
+                bo->s = s;
+                bool cont = (c & 0xC0) == 0x80 || n == 0;
+                raiseV(makeUnicodeError(tUnicodeDecodeError, "utf-8", bo, (int64_t)i, (int64_t)i + 1,
+                                        cont ? "invalid start byte" : "invalid continuation byte"));
+            }
+            std::string fixed = s.substr(0, i) + (errors == "replace" ? encodeUtf8(0xFFFD) : "") + s.substr(i + 1);
+            return decodeBytes(fixed, enc, errors);
+        }
+        i += (size_t)n;
+    }
+    return s;
+}
+
+static V str_new(V *a, int n, Kw *kw)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    V obj = n > 1 ? a[1] : kwArg(kw, "object");
+    std::string val;
+    if (!obj)
+        val = "";
+    else
+    {
+        V encV = n > 2 ? a[2] : kwArg(kw, "encoding");
+        V errV = n > 3 ? a[3] : kwArg(kw, "errors");
+        if ((encV || errV) && !IS_SMALL(obj) && obj->type->layout == L::Bytes)
+            val = decodeBytes(static_cast<BytesObj *>(obj)->s, encV ? strOf(encV) : "utf-8", errV ? strOf(errV) : "strict");
+        else
+            val = strOf(obj);
+    }
+    if (t == tStr)
+        return newStr(val);
+    Str *s = static_cast<Str *>(newObject(t));
+    s->s = val;
+    bool ascii;
+    s->len = utf8Length(val, ascii);
+    s->ascii = ascii;
+    return s;
+}
+
+// ── bytes ──────────────────────────────────────────────────────────────────
+
+static BytesObj *B(V v)
+{
+    if (IS_SMALL(v) || v->type->layout != L::Bytes)
+        raise(tTypeError, "descriptor requires a 'bytes' object");
+    return static_cast<BytesObj *>(v);
+}
+
+static V bytes_new(V *a, int n, Kw *kw)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    BytesObj *b = static_cast<BytesObj *>(newObject(t));
+    b->mutableBytes = issub(t, tByteArray);
+    V src = n > 1 ? a[1] : kwArg(kw, "source");
+    if (!src)
+        return b;
+    if (isStr(src))
+    {
+        V encV = n > 2 ? a[2] : kwArg(kw, "encoding");
+        if (!encV)
+            raise(tTypeError, "string argument without an encoding");
+        V args[2] = {src, encV};
+        b->s = static_cast<BytesObj *>(str_encode(args, 2, nullptr))->s;
+        return b;
+    }
+    if (isIntLike(src))
+    {
+        b->s.assign((size_t)indexOf(src), '\0');
+        return b;
+    }
+    if (!IS_SMALL(src) && src->type->layout == L::Bytes)
+    {
+        b->s = static_cast<BytesObj *>(src)->s;
+        return b;
+    }
+    for (V x : toVector(src))
+    {
+        int64_t v = indexOf(x);
+        if (v < 0 || v > 255)
+            raise(tValueError, "bytes must be in range(0, 256)");
+        b->s += (char)v;
+    }
+    return b;
+}
+
+static V bytes_init(V *, int, Kw *) { return None; }
+
+static V bytes_decode(V *a, int n, Kw *kw)
+{
+    BytesObj *b = B(a[0]);
+    V encV = n > 1 ? a[1] : kwArg(kw, "encoding");
+    V errV = n > 2 ? a[2] : kwArg(kw, "errors");
+    return newStr(decodeBytes(b->s, encV ? strOf(encV) : "utf-8", errV ? strOf(errV) : "strict"));
+}
+
+static V bytes_hex(V *a, int n, Kw *)
+{
+    BytesObj *b = B(a[0]);
+    std::string sep = n > 1 ? strOf(a[1]) : "";
+    std::string out;
+    char buf[4];
+    for (size_t i = 0; i < b->s.size(); ++i)
+    {
+        if (i && !sep.empty())
+            out += sep;
+        snprintf(buf, sizeof buf, "%02x", (unsigned char)b->s[i]);
+        out += buf;
+    }
+    return newStrAscii(out);
+}
+
+static V bytes_fromhex(V *a, int n, Kw *)
+{
+    checkArgs("fromhex", n - 1, 1, 1);
+    std::string h = strOf(a[1]), out;
+    std::string digits;
+    for (char c : h)
+        if (!isspace((unsigned char)c))
+            digits += c;
+    for (size_t i = 0; i + 1 < digits.size(); i += 2)
+        out += (char)strtol(digits.substr(i, 2).c_str(), nullptr, 16);
+    BytesObj *b = static_cast<BytesObj *>(newObject(static_cast<Type *>(a[0])));
+    b->mutableBytes = issub(static_cast<Type *>(a[0]), tByteArray);
+    b->s = out;
+    return b;
+}
+
+static V bytes_len(V *a, int, Kw *) { return mkint((int64_t)B(a[0])->s.size()); }
+
+static V bytes_getitem(V *a, int n, Kw *)
+{
+    checkArgs("__getitem__", n, 2, 2);
+    BytesObj *b = B(a[0]);
+    if (!IS_SMALL(a[1]) && a[1]->type->layout == L::Slice)
+    {
+        int64_t count;
+        std::vector<int64_t> ix = sliceIndices(static_cast<SliceObj *>(a[1]), (int64_t)b->s.size(), count);
+        BytesObj *r = new BytesObj(b->mutableBytes ? tByteArray : tBytes);
+        r->mutableBytes = b->mutableBytes;
+        for (int64_t k = 0, i = ix[0]; k < count; ++k, i += ix[2])
+            r->s += b->s[(size_t)i];
+        return r;
+    }
+    int64_t i = indexOf(a[1]), len = (int64_t)b->s.size();
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "index out of range");
+    return mkint((unsigned char)b->s[(size_t)i]);
+}
+
+static V bytes_setitem(V *a, int n, Kw *)
+{
+    checkArgs("__setitem__", n, 3, 3);
+    BytesObj *b = B(a[0]);
+    if (!b->mutableBytes)
+        raise(tTypeError, "'bytes' object does not support item assignment");
+    if (!IS_SMALL(a[1]) && a[1]->type->layout == L::Slice)
+    {
+        std::string vals;
+        if (!IS_SMALL(a[2]) && a[2]->type->layout == L::Bytes)
+            vals = static_cast<BytesObj *>(a[2])->s;
+        else
+            for (V x : toVector(a[2]))
+                vals += (char)indexOf(x);
+        int64_t count;
+        std::vector<int64_t> ix = sliceIndices(static_cast<SliceObj *>(a[1]), (int64_t)b->s.size(), count);
+        if (ix[2] == 1)
+        {
+            int64_t start = ix[0], stop = ix[1] < start ? start : ix[1];
+            b->s.replace((size_t)start, (size_t)(stop - start), vals);
+            return None;
+        }
+        if ((int64_t)vals.size() != count)
+            raise(tValueError, "attempt to assign bytes of size " + std::to_string(vals.size()) +
+                                   " to extended slice of size " + std::to_string(count));
+        for (int64_t k = 0, i = ix[0]; k < count; ++k, i += ix[2])
+            b->s[(size_t)i] = vals[(size_t)k];
+        return None;
+    }
+    int64_t i = indexOf(a[1]), len = (int64_t)b->s.size();
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "bytearray index out of range");
+    b->s[(size_t)i] = (char)indexOf(a[2]);
+    return None;
+}
+
+static V bytes_iter(V *a, int, Kw *)
+{
+    BytesObj *b = B(a[0]);
+    size_t *pos = new size_t(0);
+    return makeIter([b, pos](V &out) -> bool {
+        if (*pos >= b->s.size())
+            return false;
+        out = mkint((unsigned char)b->s[(*pos)++]);
+        return true;
+    });
+}
+
+static V bytes_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    BytesObj *b = B(a[0]);
+    if (isIntLike(a[1]))
+        return mkbool(b->s.find((char)indexOf(a[1])) != std::string::npos);
+    return mkbool(b->s.find(B(a[1])->s) != std::string::npos);
+}
+
+static V bytearray_append(V *a, int n, Kw *)
+{
+    checkArgs("append", n - 1, 1, 1);
+    B(a[0])->s += (char)indexOf(a[1]);
+    return None;
+}
+
+static V bytearray_extend(V *a, int n, Kw *)
+{
+    checkArgs("extend", n - 1, 1, 1);
+    for (V x : toVector(a[1]))
+        B(a[0])->s += (char)indexOf(x);
+    return None;
+}
+
+static V bytes_join(V *a, int n, Kw *)
+{
+    checkArgs("join", n - 1, 1, 1);
+    BytesObj *sep = B(a[0]);
+    BytesObj *r = new BytesObj(tBytes);
+    bool first = true;
+    for (V x : toVector(a[1]))
+    {
+        if (!first)
+            r->s += sep->s;
+        first = false;
+        r->s += B(x)->s;
+    }
+    return r;
+}
+
+static V bytes_upper(V *a, int, Kw *)
+{
+    BytesObj *r = new BytesObj(tBytes);
+    r->s = B(a[0])->s;
+    for (char &c : r->s)
+        c = (char)toupper((unsigned char)c);
+    return r;
+}
+
+static V bytes_lower(V *a, int, Kw *)
+{
+    BytesObj *r = new BytesObj(tBytes);
+    r->s = B(a[0])->s;
+    for (char &c : r->s)
+        c = (char)tolower((unsigned char)c);
+    return r;
+}
+
+static V bytes_count(V *a, int n, Kw *)
+{
+    checkArgs("count", n - 1, 1, 1);
+    BytesObj *b = B(a[0]);
+    std::string sub = isIntLike(a[1]) ? std::string(1, (char)indexOf(a[1])) : B(a[1])->s;
+    int64_t c = 0;
+    size_t pos = 0;
+    if (sub.empty())
+        return mkint((int64_t)b->s.size() + 1);
+    while ((pos = b->s.find(sub, pos)) != std::string::npos)
+    {
+        ++c;
+        pos += sub.size();
+    }
+    return mkint(c);
+}
+
+static V bytes_startswith(V *a, int n, Kw *)
+{
+    checkArgs("startswith", n - 1, 1, 1);
+    const std::string &s = B(a[0])->s, &p = B(a[1])->s;
+    return mkbool(s.compare(0, p.size(), p) == 0 && s.size() >= p.size());
+}
+
+// A bytes method borrowed from str: bytes go in and out as latin-1 text
+static V bytesToLatin1(V v)
+{
+    if (!IS_SMALL(v) && v->type->layout == L::Bytes)
+    {
+        std::string out;
+        for (unsigned char c : static_cast<BytesObj *>(v)->s)
+            out += encodeUtf8(c);
+        return newStr(out);
+    }
+    if (!IS_SMALL(v) && v->type->layout == L::Tuple)
+    {
+        std::vector<V> items;
+        for (V x : static_cast<Tuple *>(v)->items)
+            items.push_back(bytesToLatin1(x));
+        return tupleOf(items);
+    }
+    return v;
+}
+
+static V latin1ToBytes(V v, bool mut)
+{
+    if (isStr(v))
+    {
+        BytesObj *b = new BytesObj(mut ? tByteArray : tBytes);
+        b->mutableBytes = mut;
+        for (uint32_t c : decodeUtf8(asStr(v)->s))
+            b->s += (char)c;
+        return b;
+    }
+    if (!IS_SMALL(v) && v->type->layout == L::List)
+    {
+        List *l = newList();
+        for (V x : static_cast<List *>(v)->items)
+            l->items.push_back(latin1ToBytes(x, mut));
+        return l;
+    }
+    if (!IS_SMALL(v) && v->type->layout == L::Tuple)
+    {
+        std::vector<V> items;
+        for (V x : static_cast<Tuple *>(v)->items)
+            items.push_back(latin1ToBytes(x, mut));
+        return tupleOf(items);
+    }
+    return v;
+}
+
+static void defBytesFromStr(Type *t, const char *name)
+{
+    V strMethod = dictGetC(tStr->dict, name);
+    if (!strMethod)
+        return;
+    NativeObj *f = static_cast<NativeObj *>(makeNativeClosure(name, [strMethod](V *a, int n, Kw *kw) -> V {
+        bool mut = static_cast<BytesObj *>(a[0])->mutableBytes;
+        std::vector<V> args;
+        for (int i = 0; i < n; ++i)
+            args.push_back(bytesToLatin1(a[i]));
+        V r = call(strMethod, args.data(), n, kw);
+        return latin1ToBytes(r, mut);
+    }));
+    f->method = true;
+    if (!dictGetC(t->dict, name))
+        setAttrStr(t->dict, name, f);
+}
+
+void initStrings()
+{
+    dictSet(tStr->dict, intern("__new__"), makeNative("__new__", str_new, false));
+    defMethod(tStr, "upper", str_upper);
+    defMethod(tStr, "lower", str_lower);
+    defMethod(tStr, "casefold", str_casefold);
+    defMethod(tStr, "swapcase", str_swapcase);
+    defMethod(tStr, "capitalize", str_capitalize);
+    defMethod(tStr, "title", str_title);
+    defMethod(tStr, "isalpha", str_isalpha);
+    defMethod(tStr, "isdigit", str_isdigit);
+    defMethod(tStr, "isdecimal", str_isdecimal);
+    defMethod(tStr, "isnumeric", str_isnumeric);
+    defMethod(tStr, "isalnum", str_isalnum);
+    defMethod(tStr, "isspace", str_isspace);
+    defMethod(tStr, "isascii", str_isascii);
+    defMethod(tStr, "isprintable", str_isprintable);
+    defMethod(tStr, "isupper", str_isupper);
+    defMethod(tStr, "islower", str_islower);
+    defMethod(tStr, "istitle", str_istitle);
+    defMethod(tStr, "isidentifier", str_isidentifier);
+    defMethod(tStr, "strip", str_strip);
+    defMethod(tStr, "lstrip", str_lstrip);
+    defMethod(tStr, "rstrip", str_rstrip);
+    defMethod(tStr, "split", str_split);
+    defMethod(tStr, "rsplit", str_rsplit);
+    defMethod(tStr, "splitlines", str_splitlines);
+    defMethod(tStr, "join", str_join);
+    defMethod(tStr, "replace", str_replace);
+    defMethod(tStr, "find", str_find);
+    defMethod(tStr, "rfind", str_rfind);
+    defMethod(tStr, "index", str_index);
+    defMethod(tStr, "rindex", str_rindex);
+    defMethod(tStr, "count", str_count);
+    defMethod(tStr, "startswith", str_startswith);
+    defMethod(tStr, "endswith", str_endswith);
+    defMethod(tStr, "ljust", str_ljust);
+    defMethod(tStr, "rjust", str_rjust);
+    defMethod(tStr, "center", str_center);
+    defMethod(tStr, "zfill", str_zfill);
+    defMethod(tStr, "expandtabs", str_expandtabs);
+    defMethod(tStr, "partition", str_partition);
+    defMethod(tStr, "rpartition", str_rpartition);
+    defMethod(tStr, "removeprefix", str_removeprefix);
+    defMethod(tStr, "removesuffix", str_removesuffix);
+    defMethod(tStr, "format", str_format);
+    defMethod(tStr, "format_map", str_format_map);
+    defMethod(tStr, "encode", str_encode);
+    defStatic(tStr, "maketrans", str_maketrans);
+    defMethod(tStr, "translate", str_translate);
+    defMethod(tStr, "__getitem__", str_getitem);
+    defMethod(tStr, "__len__", str_len);
+    defMethod(tStr, "__iter__", str_iter);
+    defMethod(tStr, "__contains__", str_contains);
+    defMethod(tStr, "__str__", str_str);
+    defMethod(tStr, "__format__", str_format_dunder);
+    defMethod(tStr, "__hash__", str_hash);
+    defMethod(tStr, "__getnewargs__", str_getnewargs);
+
+    for (Type *t : {tBytes, tByteArray})
+    {
+        dictSet(t->dict, intern("__new__"), makeNative("__new__", bytes_new, false));
+        defMethod(t, "__init__", bytes_init);
+        defMethod(t, "decode", bytes_decode);
+        defMethod(t, "hex", bytes_hex);
+        defClassMethod(t, "fromhex", bytes_fromhex);
+        defMethod(t, "__len__", bytes_len);
+        defMethod(t, "__getitem__", bytes_getitem);
+        defMethod(t, "__iter__", bytes_iter);
+        defMethod(t, "__contains__", bytes_contains);
+        defMethod(t, "join", bytes_join);
+        defMethod(t, "upper", bytes_upper);
+        defMethod(t, "lower", bytes_lower);
+        defMethod(t, "count", bytes_count);
+        defMethod(t, "startswith", bytes_startswith);
+    }
+    defMethod(tByteArray, "__setitem__", bytes_setitem);
+    static const char *borrowed[] = {"ljust", "rjust", "center", "strip", "lstrip", "rstrip", "split", "rsplit",
+                                     "replace", "find", "rfind", "index", "rindex", "endswith", "partition",
+                                     "rpartition", "zfill", "title", "capitalize", "swapcase", "isalpha", "isdigit",
+                                     "isalnum", "isspace", "isupper", "islower", "istitle", "isascii", "splitlines",
+                                     "expandtabs", "removeprefix", "removesuffix", "translate", nullptr};
+    for (Type *t : {tBytes, tByteArray})
+        for (int i = 0; borrowed[i]; ++i)
+            defBytesFromStr(t, borrowed[i]);
+    defMethod(tByteArray, "append", bytearray_append);
+    defMethod(tByteArray, "extend", bytearray_extend);
+}
+
+} // namespace py

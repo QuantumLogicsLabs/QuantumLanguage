@@ -1,0 +1,780 @@
+"""Container datatypes."""
+
+from _collections import deque
+import sys as _sys
+
+__all__ = ["ChainMap", "Counter", "OrderedDict", "UserDict", "UserList", "UserString", "defaultdict", "deque", "namedtuple"]
+
+
+def _recursive_guard(fn):
+    running = set()
+
+    def wrapper(self):
+        key = id(self)
+        if key in running:
+            return "..."
+        running.add(key)
+        try:
+            return fn(self)
+        finally:
+            running.discard(key)
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__qualname__ = fn.__qualname__
+    return wrapper
+
+
+# ── namedtuple ──────────────────────────────────────────────────────────────
+
+class _tuplegetter:
+    __slots__ = ("_index", "__doc__")
+
+    def __init__(self, index, doc):
+        self._index = index
+        self.__doc__ = doc
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        return instance[self._index]
+
+    def __set__(self, instance, value):
+        raise AttributeError("can't set attribute")
+
+    def __delete__(self, instance):
+        raise AttributeError("can't delete attribute")
+
+
+def namedtuple(typename, field_names, *, rename=False, defaults=None, module=None):
+    if isinstance(field_names, str):
+        field_names = field_names.replace(",", " ").split()
+    field_names = list(map(str, field_names))
+    typename = str(typename)
+    if rename:
+        seen = set()
+        for index, name in enumerate(field_names):
+            if (not name.isidentifier() or name.startswith("_") or name in seen
+                    or name in ("and", "or", "not", "if", "else", "for", "while", "def", "class", "return", "import", "from", "in", "is", "None", "True", "False")):
+                field_names[index] = f"_{index}"
+            seen.add(name)
+    for name in [typename] + field_names:
+        if type(name) is not str:
+            raise TypeError("Type names and field names must be strings")
+        if not name.isidentifier():
+            raise ValueError(f"Type names and field names must be valid identifiers: {name!r}")
+    seen = set()
+    for name in field_names:
+        if name.startswith("_") and not rename:
+            raise ValueError(f"Field names cannot start with an underscore: {name!r}")
+        if name in seen:
+            raise ValueError(f"Encountered duplicate field name: {name!r}")
+        seen.add(name)
+    field_names = tuple(field_names)
+    field_defaults = {}
+    if defaults is not None:
+        defaults = tuple(defaults)
+        if len(defaults) > len(field_names):
+            raise TypeError("Got more default values than field names")
+        field_defaults = dict(reversed(list(zip(reversed(field_names), reversed(defaults)))))
+    num_fields = len(field_names)
+    arg_list = ", ".join(field_names)
+
+    def __new__(_cls, *args, **kwargs):
+        if len(args) > num_fields:
+            raise TypeError(f"{typename}.__new__() takes {num_fields + 1} positional arguments but {len(args) + 1} were given")
+        values = list(args)
+        missing = []
+        for name in field_names[len(args):]:
+            if name in kwargs:
+                values.append(kwargs.pop(name))
+            elif name in field_defaults:
+                values.append(field_defaults[name])
+            else:
+                missing.append(name)
+        for name in field_names[:len(args)]:
+            if name in kwargs:
+                raise TypeError(f"{typename}.__new__() got multiple values for argument '{name}'")
+        if kwargs:
+            raise TypeError(f"{typename}.__new__() got an unexpected keyword argument '{next(iter(kwargs))}'")
+        if missing:
+            if len(missing) == 1:
+                names = f"'{missing[0]}'"
+            elif len(missing) == 2:
+                names = f"'{missing[0]}' and '{missing[1]}'"
+            else:
+                names = ", ".join(f"'{m}'" for m in missing[:-1]) + f", and '{missing[-1]}'"
+            s = "" if len(missing) == 1 else "s"
+            raise TypeError(f"{typename}.__new__() missing {len(missing)} required positional argument{s}: {names}")
+        return tuple.__new__(_cls, values)
+
+    __new__.__qualname__ = f"{typename}.__new__"
+
+    @classmethod
+    def _make(cls, iterable):
+        result = tuple.__new__(cls, iterable)
+        if len(result) != num_fields:
+            raise TypeError(f"Expected {num_fields} arguments, got {len(result)}")
+        return result
+
+    def _replace(self, /, **kwds):
+        result = self._make([kwds.pop(name) if name in kwds else getattr(self, name) for name in field_names])
+        if kwds:
+            raise TypeError(f"Got unexpected field names: {list(kwds)!r}")
+        return result
+
+    def __repr__(self):
+        return self.__class__.__name__ + "(" + ", ".join(f"{n}={v!r}" for n, v in zip(field_names, self)) + ")"
+
+    def _asdict(self):
+        return dict(zip(self._fields, self))
+
+    def __getnewargs__(self):
+        return tuple(self)
+
+    namespace = {
+        "__doc__": f"{typename}({arg_list})",
+        "__slots__": (),
+        "_fields": field_names,
+        "_field_defaults": field_defaults,
+        "__new__": __new__,
+        "_make": _make,
+        "_replace": _replace,
+        "__repr__": __repr__,
+        "_asdict": _asdict,
+        "__getnewargs__": __getnewargs__,
+        "__match_args__": field_names,
+    }
+    for index, name in enumerate(field_names):
+        namespace[name] = _tuplegetter(index, f"Alias for field number {index}")
+    result = type(typename, (tuple,), namespace)
+    if module is None:
+        module = "__main__"
+    result.__module__ = module
+    if defaults is not None:
+        __new__.__defaults__ = None
+    return result
+
+
+# ── defaultdict ─────────────────────────────────────────────────────────────
+
+class defaultdict(dict):
+    def __init__(self, default_factory=None, *args, **kwargs):
+        if default_factory is not None and not callable(default_factory):
+            raise TypeError("first argument must be callable or None")
+        super().__init__(*args, **kwargs)
+        self.default_factory = default_factory
+
+    def __missing__(self, key):
+        if self.default_factory is None:
+            raise KeyError(key)
+        self[key] = value = self.default_factory()
+        return value
+
+    @_recursive_guard
+    def __repr__(self):
+        return f"{type(self).__name__}({self.default_factory!r}, {dict.__repr__(self)})"
+
+    def copy(self):
+        return type(self)(self.default_factory, self)
+
+    __copy__ = copy
+
+    def __reduce__(self):
+        return (type(self), (self.default_factory,), None, None, iter(self.items()))
+
+    def __or__(self, other):
+        if not isinstance(other, dict):
+            return NotImplemented
+        new = self.copy()
+        new.update(other)
+        return new
+
+    def __ror__(self, other):
+        if not isinstance(other, dict):
+            return NotImplemented
+        new = type(self)(self.default_factory, other)
+        new.update(self)
+        return new
+
+
+# ── OrderedDict ─────────────────────────────────────────────────────────────
+
+class OrderedDict(dict):
+    def move_to_end(self, key, last=True):
+        value = self[key]
+        if last:
+            dict.__delitem__(self, key)
+            dict.__setitem__(self, key, value)
+        else:
+            items = [(k, v) for k, v in dict.items(self) if k != key]
+            dict.clear(self)
+            dict.__setitem__(self, key, value)
+            for k, v in items:
+                dict.__setitem__(self, k, v)
+
+    def popitem(self, last=True):
+        if not self:
+            raise KeyError("dictionary is empty")
+        key = next(reversed(self)) if last else next(iter(self))
+        value = dict.pop(self, key)
+        return key, value
+
+    @_recursive_guard
+    def __repr__(self):
+        if not self:
+            return f"{self.__class__.__name__}()"
+        return f"{self.__class__.__name__}({dict(self.items())!r})"
+
+    def __eq__(self, other):
+        if isinstance(other, OrderedDict):
+            return dict.__eq__(self, other) and list(self) == list(other)
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self == other
+
+    __hash__ = None
+
+    def copy(self):
+        return self.__class__(self)
+
+    __copy__ = copy
+
+    @classmethod
+    def fromkeys(cls, iterable, value=None):
+        self = cls()
+        for key in iterable:
+            self[key] = value
+        return self
+
+    def __or__(self, other):
+        if not isinstance(other, dict):
+            return NotImplemented
+        new = self.__class__(self)
+        new.update(other)
+        return new
+
+    def __ror__(self, other):
+        if not isinstance(other, dict):
+            return NotImplemented
+        new = self.__class__(other)
+        new.update(self)
+        return new
+
+    def __reversed__(self):
+        return reversed(list(dict.keys(self)))
+
+
+# ── Counter ─────────────────────────────────────────────────────────────────
+
+class Counter(dict):
+    def __init__(self, iterable=None, /, **kwds):
+        super().__init__()
+        self.update(iterable, **kwds)
+
+    def __missing__(self, key):
+        return 0
+
+    def total(self):
+        return sum(self.values())
+
+    def most_common(self, n=None):
+        items = sorted(self.items(), key=lambda kv: kv[1], reverse=True)
+        if n is None:
+            return items
+        return items[:max(n, 0)]
+
+    def elements(self):
+        for elem, count in self.items():
+            for _ in range(count):
+                yield elem
+
+    @classmethod
+    def fromkeys(cls, iterable, v=None):
+        raise NotImplementedError("Counter.fromkeys() is undefined.  Use Counter(iterable) instead.")
+
+    def update(self, iterable=None, /, **kwds):
+        if iterable is not None:
+            if isinstance(iterable, dict):
+                if self:
+                    for elem, count in iterable.items():
+                        self[elem] = count + self.get(elem, 0)
+                else:
+                    dict.update(self, iterable)
+            else:
+                get = self.get
+                for elem in iterable:
+                    self[elem] = get(elem, 0) + 1
+        if kwds:
+            self.update(kwds)
+
+    def subtract(self, iterable=None, /, **kwds):
+        if iterable is not None:
+            if isinstance(iterable, dict):
+                for elem, count in iterable.items():
+                    self[elem] = self.get(elem, 0) - count
+            else:
+                for elem in iterable:
+                    self[elem] = self.get(elem, 0) - 1
+        if kwds:
+            self.subtract(kwds)
+
+    def copy(self):
+        return self.__class__(self)
+
+    __copy__ = copy
+
+    def __delitem__(self, elem):
+        if elem in self:
+            super().__delitem__(elem)
+
+    def __repr__(self):
+        if not self:
+            return f"{self.__class__.__name__}()"
+        try:
+            d = dict(self.most_common())
+        except TypeError:
+            d = dict(self)
+        return f"{self.__class__.__name__}({d!r})"
+
+    def __eq__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return all(self[e] == other[e] for c in (self, other) for e in c)
+
+    def __ne__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return not self == other
+
+    def __le__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return all(self[e] <= other[e] for c in (self, other) for e in c)
+
+    def __lt__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return self <= other and self != other
+
+    def __ge__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return all(self[e] >= other[e] for c in (self, other) for e in c)
+
+    def __gt__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return self >= other and self != other
+
+    __hash__ = None
+
+    def __add__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for elem, count in self.items():
+            newcount = count + other[elem]
+            if newcount > 0:
+                result[elem] = newcount
+        for elem, count in other.items():
+            if elem not in self and count > 0:
+                result[elem] = count
+        return result
+
+    def __sub__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for elem, count in self.items():
+            newcount = count - other[elem]
+            if newcount > 0:
+                result[elem] = newcount
+        for elem, count in other.items():
+            if elem not in self and count < 0:
+                result[elem] = 0 - count
+        return result
+
+    def __or__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for elem, count in self.items():
+            other_count = other[elem]
+            newcount = other_count if count < other_count else count
+            if newcount > 0:
+                result[elem] = newcount
+        for elem, count in other.items():
+            if elem not in self and count > 0:
+                result[elem] = count
+        return result
+
+    def __and__(self, other):
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for elem, count in self.items():
+            other_count = other[elem]
+            newcount = count if count < other_count else other_count
+            if newcount > 0:
+                result[elem] = newcount
+        return result
+
+    def __pos__(self):
+        result = Counter()
+        for elem, count in self.items():
+            if count > 0:
+                result[elem] = count
+        return result
+
+    def __neg__(self):
+        result = Counter()
+        for elem, count in self.items():
+            if count < 0:
+                result[elem] = 0 - count
+        return result
+
+    def _keep_positive(self):
+        nonpositive = [elem for elem, count in self.items() if not count > 0]
+        for elem in nonpositive:
+            del self[elem]
+        return self
+
+    def __iadd__(self, other):
+        for elem, count in other.items():
+            self[elem] += count
+        return self._keep_positive()
+
+    def __isub__(self, other):
+        for elem, count in other.items():
+            self[elem] -= count
+        return self._keep_positive()
+
+    def __ior__(self, other):
+        for elem, other_count in other.items():
+            count = self[elem]
+            if other_count > count:
+                self[elem] = other_count
+        return self._keep_positive()
+
+    def __iand__(self, other):
+        for elem, count in self.items():
+            other_count = other[elem]
+            if other_count < count:
+                self[elem] = other_count
+        return self._keep_positive()
+
+
+# ── ChainMap ────────────────────────────────────────────────────────────────
+
+class ChainMap:
+    def __init__(self, *maps):
+        self.maps = list(maps) or [{}]
+
+    def __missing__(self, key):
+        raise KeyError(key)
+
+    def __getitem__(self, key):
+        for mapping in self.maps:
+            if key in mapping:
+                return mapping[key]
+        return self.__missing__(key)
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+    def __len__(self):
+        return len(set().union(*self.maps))
+
+    def __iter__(self):
+        d = {}
+        for mapping in reversed(self.maps):
+            d.update(dict.fromkeys(mapping))
+        return iter(d)
+
+    def __contains__(self, key):
+        return any(key in m for m in self.maps)
+
+    def __bool__(self):
+        return any(self.maps)
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({", ".join(map(repr, self.maps))})'
+
+    def keys(self):
+        return list(self)
+
+    def values(self):
+        return [self[k] for k in self]
+
+    def items(self):
+        return [(k, self[k]) for k in self]
+
+    def copy(self):
+        return self.__class__(self.maps[0].copy(), *self.maps[1:])
+
+    __copy__ = copy
+
+    def new_child(self, m=None, **kwargs):
+        if m is None:
+            m = kwargs
+        elif kwargs:
+            m.update(kwargs)
+        return self.__class__(m, *self.maps)
+
+    @property
+    def parents(self):
+        return self.__class__(*self.maps[1:])
+
+    def __setitem__(self, key, value):
+        self.maps[0][key] = value
+
+    def __delitem__(self, key):
+        try:
+            del self.maps[0][key]
+        except KeyError:
+            raise KeyError(f"Key not found in the first mapping: {key!r}")
+
+    def pop(self, key, *args):
+        try:
+            return self.maps[0].pop(key, *args)
+        except KeyError:
+            raise KeyError(f"Key not found in the first mapping: {key!r}")
+
+    def popitem(self):
+        try:
+            return self.maps[0].popitem()
+        except KeyError:
+            raise KeyError("No keys found in the first mapping.")
+
+    def clear(self):
+        self.maps[0].clear()
+
+    def update(self, other=(), /, **kwds):
+        self.maps[0].update(other, **kwds)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def __eq__(self, other):
+        if isinstance(other, ChainMap):
+            other = dict(other.items())
+        return dict(self.items()) == other
+
+    def __or__(self, other):
+        m = self.copy()
+        m.maps[0].update(other)
+        return m
+
+
+# ── UserDict, UserList, UserString ──────────────────────────────────────────
+
+class UserDict:
+    def __init__(self, dict=None, /, **kwargs):
+        self.data = {}
+        if dict is not None:
+            self.update(dict)
+        if kwargs:
+            self.update(kwargs)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, key):
+        if key in self.data:
+            return self.data[key]
+        if hasattr(self.__class__, "__missing__"):
+            return self.__class__.__missing__(self, key)
+        raise KeyError(key)
+
+    def __setitem__(self, key, item):
+        self.data[key] = item
+
+    def __delitem__(self, key):
+        del self.data[key]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __contains__(self, key):
+        return key in self.data
+
+    def __repr__(self):
+        return repr(self.data)
+
+    def __eq__(self, other):
+        return self.data == (other.data if isinstance(other, UserDict) else other)
+
+    def keys(self):
+        return self.data.keys()
+
+    def values(self):
+        return self.data.values()
+
+    def items(self):
+        return self.data.items()
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+    def pop(self, key, *default):
+        return self.data.pop(key, *default)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def update(self, other=(), /, **kwds):
+        if isinstance(other, (dict, UserDict)):
+            for key in other.keys():
+                self[key] = other[key]
+        elif hasattr(other, "keys"):
+            for key in other.keys():
+                self[key] = other[key]
+        else:
+            for key, value in other:
+                self[key] = value
+        for key, value in kwds.items():
+            self[key] = value
+
+    def clear(self):
+        self.data.clear()
+
+    def copy(self):
+        inst = self.__class__.__new__(self.__class__)
+        inst.__dict__.update(self.__dict__)
+        inst.data = self.data.copy()
+        return inst
+
+
+class UserList:
+    def __init__(self, initlist=None):
+        self.data = []
+        if initlist is not None:
+            self.data = list(initlist.data if isinstance(initlist, UserList) else initlist)
+
+    def __repr__(self):
+        return repr(self.data)
+
+    def __lt__(self, other):
+        return self.data < self.__cast(other)
+
+    def __le__(self, other):
+        return self.data <= self.__cast(other)
+
+    def __eq__(self, other):
+        return self.data == self.__cast(other)
+
+    def __gt__(self, other):
+        return self.data > self.__cast(other)
+
+    def __ge__(self, other):
+        return self.data >= self.__cast(other)
+
+    def __cast(self, other):
+        return other.data if isinstance(other, UserList) else other
+
+    def __contains__(self, item):
+        return item in self.data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return self.__class__(self.data[i])
+        return self.data[i]
+
+    def __setitem__(self, i, item):
+        self.data[i] = item
+
+    def __delitem__(self, i):
+        del self.data[i]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __add__(self, other):
+        if isinstance(other, UserList):
+            return self.__class__(self.data + other.data)
+        return self.__class__(self.data + list(other))
+
+    def __iadd__(self, other):
+        self.data += other.data if isinstance(other, UserList) else list(other)
+        return self
+
+    def __mul__(self, n):
+        return self.__class__(self.data * n)
+
+    def append(self, item):
+        self.data.append(item)
+
+    def insert(self, i, item):
+        self.data.insert(i, item)
+
+    def pop(self, i=-1):
+        return self.data.pop(i)
+
+    def remove(self, item):
+        self.data.remove(item)
+
+    def clear(self):
+        self.data.clear()
+
+    def copy(self):
+        return self.__class__(self)
+
+    def count(self, item):
+        return self.data.count(item)
+
+    def index(self, item, *args):
+        return self.data.index(item, *args)
+
+    def reverse(self):
+        self.data.reverse()
+
+    def sort(self, /, *args, **kwds):
+        self.data.sort(*args, **kwds)
+
+    def extend(self, other):
+        self.data.extend(other.data if isinstance(other, UserList) else other)
+
+
+class UserString:
+    def __init__(self, seq):
+        self.data = seq.data[:] if isinstance(seq, UserString) else str(seq)
+
+    def __str__(self):
+        return str(self.data)
+
+    def __repr__(self):
+        return repr(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        return self.__class__(self.data[index])
+
+    def __eq__(self, other):
+        return self.data == (other.data if isinstance(other, UserString) else other)
+
+    def __hash__(self):
+        return hash(self.data)
+
+    def __add__(self, other):
+        return self.__class__(self.data + (other.data if isinstance(other, UserString) else str(other)))
+
+    def __getattr__(self, name):
+        attr = getattr(self.data, name)
+        if callable(attr):
+            def method(*args, **kwargs):
+                r = attr(*args, **kwargs)
+                return self.__class__(r) if isinstance(r, str) else r
+            return method
+        return attr

@@ -1,0 +1,1781 @@
+// quantum: cpp
+// Python front-end: the interpreter. Each call of a Python function runs
+// its own frame (on the C++ stack, unless it is a generator's, which lives
+// on the heap and is resumed at each next()). Exceptions are C++ throws of
+// PyThrow; a frame catches them, unwinds to its innermost try block, or
+// lets them go to its caller.
+#include "PyRt.h.sa"
+#include "PyAst.h.sa"
+
+#include <cstdio>
+#include <cstring>
+
+namespace py
+{
+
+int g_depth = 0;
+static Frame *g_frame = nullptr;
+static std::vector<V> g_handled; // exceptions being handled, innermost last
+static const int RECURSION_LIMIT = 1000;
+
+Frame *currentFrame() { return g_frame; }
+
+int currentLine()
+{
+    if (!g_frame || g_frame->ip <= 0)
+        return 0;
+    return g_frame->code->ins[(size_t)g_frame->ip - 1].line;
+}
+
+static Str *s_enter, *s_exit, *s_name, *s_match_args, *s_prepare, *s_mro_entries, *s_metaclass, *s_annotations,
+    *s_all, *s_send, *s_throw, *s_close;
+
+// ── argument binding ───────────────────────────────────────────────────────
+
+static std::string fnName(Func *fn) { return strOf(fn->qualname); }
+
+static std::string nameList(const std::vector<std::string> &names)
+{
+    std::string s;
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        if (i)
+            s += names.size() == 2 ? " and " : (i + 1 == names.size() ? ", and " : ", ");
+        s += "'" + names[i] + "'";
+    }
+    return s;
+}
+
+static void bindArgs(Func *fn, std::vector<V> &fast, V *args, int n, Kw *kw)
+{
+    Code *c = fn->code;
+    int argc = c->argcount, kwonly = c->kwonly;
+    int total = argc + kwonly;
+    bool varargs = (c->flags & CF_VARARGS) != 0, varkw = (c->flags & CF_VARKW) != 0;
+    int vaIdx = total, kwIdx = total + (varargs ? 1 : 0);
+    int np = n < argc ? n : argc;
+    for (int i = 0; i < np; ++i)
+        fast[(size_t)i] = args[i];
+    if (n > argc)
+    {
+        if (!varargs)
+        {
+            int ndef = (int)fn->defaults.size();
+            int kwGiven = 0;
+            if (kw)
+                for (Str *k : kw->names)
+                    for (int j = argc; j < total; ++j)
+                        if (c->varnames[(size_t)j]->s == k->s)
+                            ++kwGiven;
+            char buf[300];
+            std::string takes;
+            if (ndef && ndef < argc + 1)
+                takes = "from " + std::to_string(argc - ndef) + " to " + std::to_string(argc);
+            else
+                takes = std::to_string(argc);
+            if (kwGiven)
+                snprintf(buf, sizeof buf, "%s() takes %s positional argument%s but %d positional argument%s (and %d keyword-only argument%s) were given",
+                         fnName(fn).c_str(), takes.c_str(), argc == 1 && !ndef ? "" : "s", n, n == 1 ? "" : "s", kwGiven, kwGiven == 1 ? "" : "s");
+            else
+                snprintf(buf, sizeof buf, "%s() takes %s positional argument%s but %d %s given", fnName(fn).c_str(),
+                         takes.c_str(), (argc == 1 && !(ndef && ndef < argc + 1)) ? "" : "s", n, n == 1 ? "was" : "were");
+            raise(tTypeError, buf);
+        }
+        Tuple *t = newTuple((size_t)(n - argc));
+        for (int i = argc; i < n; ++i)
+            t->items[(size_t)(i - argc)] = args[i];
+        fast[(size_t)vaIdx] = t;
+    }
+    else if (varargs)
+        fast[(size_t)vaIdx] = newTuple(0);
+    Dict *kwd = nullptr;
+    if (varkw)
+    {
+        kwd = newDict();
+        fast[(size_t)kwIdx] = kwd;
+    }
+    std::vector<std::string> posonlyByKw;
+    if (kw)
+    {
+        for (size_t k = 0; k < kw->names.size(); ++k)
+        {
+            Str *name = kw->names[k];
+            int found = -1;
+            for (int j = c->posonly; j < total; ++j)
+                if (c->varnames[(size_t)j] == name || c->varnames[(size_t)j]->s == name->s)
+                {
+                    found = j;
+                    break;
+                }
+            if (found >= 0)
+            {
+                if (fast[(size_t)found])
+                    raise(tTypeError, fnName(fn) + "() got multiple values for argument '" + name->s + "'");
+                fast[(size_t)found] = kw->vals[k];
+                continue;
+            }
+            if (kwd)
+            {
+                dictSet(kwd, name, kw->vals[k]);
+                continue;
+            }
+            bool posonly = false;
+            for (int j = 0; j < c->posonly; ++j)
+                if (c->varnames[(size_t)j]->s == name->s)
+                    posonly = true;
+            if (posonly)
+            {
+                posonlyByKw.push_back(name->s);
+                continue;
+            }
+            raise(tTypeError, fnName(fn) + "() got an unexpected keyword argument '" + name->s + "'");
+        }
+        if (!posonlyByKw.empty())
+        {
+            std::string names;
+            for (size_t k = 0; k < posonlyByKw.size(); ++k)
+                names += (k ? ", " : "") + posonlyByKw[k];
+            raise(tTypeError, fnName(fn) + "() got some positional-only arguments passed as keyword arguments: '" + names + "'");
+        }
+    }
+    int ndef = (int)fn->defaults.size();
+    std::vector<std::string> missing;
+    for (int i = 0; i < argc; ++i)
+        if (!fast[(size_t)i])
+        {
+            if (i >= argc - ndef)
+                fast[(size_t)i] = fn->defaults[(size_t)(i - (argc - ndef))];
+            else
+                missing.push_back(c->varnames[(size_t)i]->s);
+        }
+    if (!missing.empty())
+        raise(tTypeError, fnName(fn) + "() missing " + std::to_string(missing.size()) + " required positional argument" +
+                              (missing.size() == 1 ? "" : "s") + ": " + nameList(missing));
+    for (int i = argc; i < total; ++i)
+        if (!fast[(size_t)i])
+        {
+            V d = fn->kwdefaults ? dictGetStr(fn->kwdefaults, c->varnames[(size_t)i]) : nullptr;
+            if (d)
+                fast[(size_t)i] = d;
+            else
+                missing.push_back(c->varnames[(size_t)i]->s);
+        }
+    if (!missing.empty())
+        raise(tTypeError, fnName(fn) + "() missing " + std::to_string(missing.size()) + " required keyword-only argument" +
+                              (missing.size() == 1 ? "" : "s") + ": " + nameList(missing));
+}
+
+static void setupCells(Frame &f, Func *fn)
+{
+    Code *c = f.code;
+    size_t ncell = c->cellvars.size(), nfree = c->freevars.size();
+    if (ncell + nfree == 0)
+        return;
+    f.cells.resize(ncell + nfree);
+    for (size_t i = 0; i < ncell; ++i)
+    {
+        CellObj *cell = new CellObj(tCell);
+        if (i < c->cell2arg.size() && c->cell2arg[i] >= 0)
+            cell->v = f.fast[(size_t)c->cell2arg[i]];
+        f.cells[i] = cell;
+    }
+    for (size_t i = 0; i < nfree; ++i)
+        f.cells[ncell + i] = fn && i < fn->closure.size() ? fn->closure[i] : new CellObj(tCell);
+}
+
+V callFunc(Func *fn, V *args, int n, Kw *kw)
+{
+    Code *c = fn->code;
+    if (c->flags & CF_GENERATOR)
+    {
+        Frame *f = new Frame();
+        f->code = c;
+        f->func = fn;
+        f->globals = fn->globals;
+        f->fast.assign((size_t)c->nlocals, nullptr);
+        bindArgs(fn, f->fast, args, n, kw);
+        setupCells(*f, fn);
+        GenObj *g = new GenObj(tGen);
+        g->frame = f;
+        g->name = fn->name;
+        g->qualname = fn->qualname;
+        f->gen = g;
+        return g;
+    }
+    if (g_depth >= RECURSION_LIMIT)
+        raise(tRecursionError, "maximum recursion depth exceeded");
+    Frame f;
+    f.code = c;
+    f.func = fn;
+    f.globals = fn->globals;
+    f.fast.assign((size_t)c->nlocals, nullptr);
+    bindArgs(fn, f.fast, args, n, kw);
+    setupCells(f, fn);
+    ++g_depth;
+    V r;
+    try
+    {
+        r = runFrame(&f);
+    }
+    catch (...)
+    {
+        --g_depth;
+        throw;
+    }
+    --g_depth;
+    return r;
+}
+
+V execModuleCode(Code *code, Dict *globals)
+{
+    Frame f;
+    f.code = code;
+    f.globals = globals;
+    f.locals = globals;
+    f.fast.assign((size_t)code->nlocals, nullptr);
+    setupCells(f, nullptr);
+    return runFrame(&f);
+}
+
+// ── classes ────────────────────────────────────────────────────────────────
+
+V buildClass(V funcV, V nameV, std::vector<V> &bases, Kw *kw)
+{
+    Func *func = static_cast<Func *>(funcV);
+    V meta = nullptr;
+    Kw rest;
+    if (kw)
+        for (size_t i = 0; i < kw->names.size(); ++i)
+        {
+            if (kw->names[i]->s == "metaclass")
+                meta = kw->vals[i];
+            else
+            {
+                rest.names.push_back(kw->names[i]);
+                rest.vals.push_back(kw->vals[i]);
+            }
+        }
+    // __mro_entries__ (typing.Generic[T] and friends)
+    std::vector<V> resolved;
+    bool changed = false;
+    for (V b : bases)
+    {
+        if (typeOf(b)->layout != L::Type)
+        {
+            V me;
+            if (getattrOpt(b, s_mro_entries, me))
+            {
+                V r = call1(me, tupleOf(bases));
+                for (V x : toVector(r))
+                    resolved.push_back(x);
+                changed = true;
+                continue;
+            }
+        }
+        resolved.push_back(b);
+    }
+    std::vector<V> origBases = bases;
+    if (changed)
+        bases = resolved;
+    if (!meta)
+    {
+        Type *winner = tType;
+        for (V b : bases)
+        {
+            Type *mt = typeOf(b);
+            if (issub(winner, mt))
+                continue;
+            if (issub(mt, winner))
+                winner = mt;
+            else
+                raise(tTypeError, "metaclass conflict: the metaclass of a derived class must be a (non-strict) subclass of the metaclasses of all its bases");
+        }
+        meta = winner;
+    }
+    else if (typeOf(meta)->layout == L::Type && issub(typeOf(meta), tType))
+    {
+        Type *winner = static_cast<Type *>(meta);
+        for (V b : bases)
+        {
+            Type *mt = typeOf(b);
+            if (issub(winner, mt))
+                continue;
+            if (issub(mt, winner))
+                winner = mt;
+        }
+        meta = winner;
+    }
+    Tuple *basesT = tupleOf(bases);
+    V ns;
+    V prep;
+    if (getattrOpt(meta, s_prepare, prep))
+    {
+        V args[2] = {nameV, basesT};
+        ns = call(prep, args, 2, rest.names.empty() ? nullptr : &rest);
+    }
+    else
+        ns = newDict();
+    if (typeOf(ns)->layout != L::Dict)
+        raise(tTypeError, "__prepare__() must return a mapping");
+    // run the body with the namespace as its locals
+    Frame f;
+    f.code = func->code;
+    f.func = func;
+    f.globals = func->globals;
+    f.locals = static_cast<Dict *>(ns);
+    f.fast.assign((size_t)func->code->nlocals, nullptr);
+    setupCells(f, func);
+    runFrame(&f);
+    if (changed)
+        setitem(ns, intern("__orig_bases__"), tupleOf(origBases));
+    V args[3] = {nameV, basesT, ns};
+    return call(meta, args, 3, rest.names.empty() ? nullptr : &rest);
+}
+
+// ── generators ─────────────────────────────────────────────────────────────
+
+static V resumeGen(GenObj *g, V value, bool push, bool &done)
+{
+    Frame *f = g->frame;
+    if (push)
+        f->stack.push_back(value);
+    g->running = true;
+    V r;
+    ++g_depth;
+    try
+    {
+        r = runFrame(f);
+    }
+    catch (PyThrow &e)
+    {
+        --g_depth;
+        g->running = false;
+        g->finished = true;
+        if (isinst(e.exc, tStopIteration))
+        {
+            V err = makeExc(tRuntimeError, "generator raised StopIteration");
+            static_cast<ExcObj *>(err)->cause = e.exc;
+            static_cast<ExcObj *>(err)->suppressContext = true;
+            raiseV(err);
+        }
+        throw;
+    }
+    --g_depth;
+    g->running = false;
+    if (f->yielded)
+    {
+        f->yielded = false;
+        done = false;
+        return r;
+    }
+    g->finished = true;
+    done = true;
+    return r;
+}
+
+V genSend(GenObj *g, V value, bool &done)
+{
+    if (g->finished)
+    {
+        done = true;
+        return None;
+    }
+    if (g->running)
+        raise(tValueError, "generator already executing");
+    if (!g->started)
+    {
+        if (value != None)
+            raise(tTypeError, "can't send non-None value to a just-started generator");
+        g->started = true;
+        return resumeGen(g, None, false, done);
+    }
+    return resumeGen(g, value, true, done);
+}
+
+V genThrow(GenObj *g, V exc, bool &done)
+{
+    if (g->running)
+        raise(tValueError, "generator already executing");
+    if (g->finished || !g->started)
+    {
+        g->finished = true;
+        raiseV(exc);
+    }
+    Frame *f = g->frame;
+    // delegating through `yield from`: the subiterator gets it first
+    if (f->ip < (int)f->code->ins.size() && f->code->ins[(size_t)f->ip].op == O_YIELD_FROM && !f->stack.empty())
+    {
+        V sub = f->stack.back();
+        bool isGen = !IS_SMALL(sub) && sub->type->layout == L::Gen;
+        V meth = nullptr;
+        if (isGen || getattrOpt(sub, isinst(exc, tGeneratorExit) ? s_close : s_throw, meth))
+        {
+            try
+            {
+                V r;
+                bool subDone;
+                if (isGen && isinst(exc, tGeneratorExit))
+                {
+                    genClose(static_cast<GenObj *>(sub));
+                    throw PyThrow{exc};
+                }
+                if (isGen)
+                    r = genThrow(static_cast<GenObj *>(sub), exc, subDone);
+                else
+                {
+                    if (isinst(exc, tGeneratorExit))
+                    {
+                        call0(meth);
+                        throw PyThrow{exc};
+                    }
+                    r = call1(meth, exc);
+                    subDone = false;
+                }
+                if (!subDone)
+                {
+                    done = false;
+                    return r;
+                }
+                f->stack.pop_back();
+                f->stack.push_back(r);
+                f->ip++;
+                return resumeGen(g, None, false, done);
+            }
+            catch (PyThrow &e)
+            {
+                f->stack.pop_back();
+                f->ip++;
+                if (isinst(e.exc, tStopIteration))
+                {
+                    V val;
+                    getattrOpt(e.exc, intern("value"), val);
+                    f->stack.push_back(val ? val : None);
+                    return resumeGen(g, None, false, done);
+                }
+                exc = e.exc;
+            }
+        }
+    }
+    f->pendingThrow = exc;
+    return resumeGen(g, None, false, done);
+}
+
+void genClose(GenObj *g)
+{
+    if (g->finished)
+        return;
+    if (!g->started)
+    {
+        g->finished = true;
+        return;
+    }
+    try
+    {
+        bool done;
+        genThrow(g, makeExc(tGeneratorExit, ""), done);
+        if (!done)
+            raise(tRuntimeError, "generator ignored GeneratorExit");
+    }
+    catch (PyThrow &e)
+    {
+        if (isinst(e.exc, tGeneratorExit) || isinst(e.exc, tStopIteration))
+        {
+            g->finished = true;
+            return;
+        }
+        throw;
+    }
+}
+
+static GenObj *asGen(V v)
+{
+    if (IS_SMALL(v) || v->type->layout != L::Gen)
+        raise(tTypeError, "descriptor requires a 'generator' object");
+    return static_cast<GenObj *>(v);
+}
+
+V makeStopIteration(V value)
+{
+    V e = makeExc(tStopIteration, "");
+    ExcObj *x = static_cast<ExcObj *>(e);
+    x->args = value == None ? newTuple(0) : tupleOf(std::vector<V>{value});
+    if (!x->dict)
+        x->dict = newDict();
+    setAttrStr(x->dict, "value", value);
+    return e;
+}
+
+static V gen_next(V *a, int, Kw *)
+{
+    bool done;
+    V r = genSend(asGen(a[0]), None, done);
+    if (done)
+        raiseV(makeStopIteration(r));
+    return r;
+}
+
+static V gen_send(V *a, int n, Kw *)
+{
+    checkArgs("send", n - 1, 1, 1);
+    bool done;
+    V r = genSend(asGen(a[0]), a[1], done);
+    if (done)
+        raiseV(makeStopIteration(r));
+    return r;
+}
+
+static V gen_throw(V *a, int n, Kw *)
+{
+    checkArgs("throw", n - 1, 1, 3);
+    V exc = a[1];
+    if (typeOf(exc)->layout == L::Type)
+    {
+        if (n > 2 && a[2] != None)
+            exc = call1(exc, a[2]);
+        else
+            exc = call0(exc);
+    }
+    if (!isinst(exc, tBaseException))
+        raise(tTypeError, "exceptions must be classes or instances deriving from BaseException, not " + std::string(typeName(exc)));
+    bool done;
+    V r = genThrow(asGen(a[0]), exc, done);
+    if (done)
+        raiseV(makeStopIteration(r));
+    return r;
+}
+
+static V gen_close(V *a, int, Kw *)
+{
+    genClose(asGen(a[0]));
+    return None;
+}
+
+static V gen_iter(V *a, int, Kw *) { return a[0]; }
+static V gen_name(V *a, int, Kw *) { return asGen(a[0])->name; }
+static V gen_qualname(V *a, int, Kw *) { return asGen(a[0])->qualname; }
+static V gen_running(V *a, int, Kw *) { return mkbool(asGen(a[0])->running); }
+static V gen_frame(V *a, int, Kw *)
+{
+    GenObj *g = asGen(a[0]);
+    return g->finished ? None : True;
+}
+static V gen_suspended(V *a, int, Kw *)
+{
+    GenObj *g = asGen(a[0]);
+    return mkbool(g->started && !g->finished && !g->running);
+}
+static V gen_code(V *a, int, Kw *) { return asGen(a[0])->frame->code; }
+
+// ── helpers for the instructions ───────────────────────────────────────────
+
+[[noreturn]] static void nameError(Str *name)
+{
+    V e = makeExc(tNameError, "name '" + name->s + "' is not defined");
+    ExcObj *x = static_cast<ExcObj *>(e);
+    x->dict = newDict();
+    setAttrStr(x->dict, "name", name);
+    raiseV(e);
+}
+
+static Kw *kwFromDict(V d, Kw &out)
+{
+    if (typeOf(d)->layout != L::Dict)
+        raise(tTypeError, "argument after ** must be a mapping, not " + std::string(typeName(d)));
+    for (const DEntry &e : static_cast<Dict *>(d)->entries)
+    {
+        if (!e.key)
+            continue;
+        if (!isStr(e.key))
+            raise(tTypeError, "keywords must be strings");
+        out.names.push_back(intern(asStr(e.key)->s));
+        out.vals.push_back(e.val);
+    }
+    return &out;
+}
+
+static bool excMatches(V exc, V types)
+{
+    if (!IS_SMALL(types) && types->type->layout == L::Tuple)
+    {
+        for (V t : static_cast<Tuple *>(types)->items)
+            if (excMatches(exc, t))
+                return true;
+        return false;
+    }
+    if (typeOf(types)->layout != L::Type || !issub(static_cast<Type *>(types), tBaseException))
+        raise(tTypeError, "catching classes that do not inherit from BaseException is not allowed");
+    return isinst(exc, static_cast<Type *>(types));
+}
+
+static void importStar(V mod, Dict *target)
+{
+    V all;
+    if (getattrOpt(mod, s_all, all))
+    {
+        for (V nm : toVector(all))
+            dictSet(target, intern(strOf(nm)), getattr(mod, intern(strOf(nm))));
+        return;
+    }
+    if (!mod->dict)
+        return;
+    for (const DEntry &e : mod->dict->entries)
+        if (e.key && isStr(e.key) && asStr(e.key)->s[0] != '_')
+            dictSet(target, e.key, e.val);
+}
+
+static bool isSequenceForMatch(V v)
+{
+    if (IS_SMALL(v))
+        return false;
+    Type *t = v->type;
+    switch (t->layout)
+    {
+    case L::List:
+    case L::Tuple:
+    case L::Range:
+        return true;
+    case L::Str:
+    case L::Bytes:
+    case L::Dict:
+        return false;
+    default:
+        break;
+    }
+    for (Type *m : t->mro)
+        if (m->name == "deque" || m->name == "Sequence" || m->name == "UserList")
+            return true;
+    return false;
+}
+
+static bool isMappingForMatch(V v)
+{
+    if (IS_SMALL(v))
+        return false;
+    if (v->type->layout == L::Dict)
+        return true;
+    for (Type *m : v->type->mro)
+        if (m->name == "Mapping" || m->name == "MutableMapping" || m->name == "UserDict")
+            return true;
+    return false;
+}
+
+static V matchClass(V subj, V cls, Tuple *kwnames, int npos)
+{
+    if (typeOf(cls)->layout != L::Type)
+        raise(tTypeError, "called match pattern must be a class");
+    if (!isinst(subj, static_cast<Type *>(cls)))
+        return None;
+    Type *ct = static_cast<Type *>(cls);
+    std::vector<V> out;
+    if (npos > 0)
+    {
+        bool selfMatch = ct->builtin && (ct == tBool || ct == tByteArray || ct == tBytes || ct == tDict ||
+                                         ct == tFloat || ct == tFrozenSet || ct == tInt || ct == tList ||
+                                         ct == tSet || ct == tStr || ct == tTuple);
+        if (selfMatch)
+        {
+            if (npos > 1)
+                raise(tTypeError, ct->name + "() accepts 1 positional sub-pattern (" + std::to_string(npos) + " given)");
+            out.push_back(subj);
+        }
+        else
+        {
+            V ma;
+            if (!getattrOpt(cls, s_match_args, ma))
+                raise(tTypeError, ct->name + "() accepts 0 positional sub-patterns (" + std::to_string(npos) + " given)");
+            std::vector<V> names = toVector(ma);
+            if ((int)names.size() < npos)
+                raise(tTypeError, ct->name + "() accepts " + std::to_string(names.size()) + " positional sub-patterns (" + std::to_string(npos) + " given)");
+            for (int i = 0; i < npos; ++i)
+            {
+                V v;
+                if (!getattrOpt(subj, intern(strOf(names[(size_t)i])), v))
+                    return None;
+                out.push_back(v);
+            }
+        }
+    }
+    for (V nm : kwnames->items)
+    {
+        V v;
+        if (!getattrOpt(subj, asStr(nm), v))
+            return None;
+        out.push_back(v);
+    }
+    return tupleOf(out);
+}
+
+static V matchKeys(V subj, Tuple *keys)
+{
+    std::vector<V> out;
+    for (V k : keys->items)
+    {
+        if (!IS_SMALL(subj) && subj->type->layout == L::Dict && subj->type->builtin)
+        {
+            V v = dictGet(static_cast<Dict *>(subj), k);
+            if (!v)
+                return None;
+            out.push_back(v);
+        }
+        else
+        {
+            if (!contains(subj, k))
+                return None;
+            out.push_back(getitem(subj, k));
+        }
+    }
+    return tupleOf(out);
+}
+
+// ── the loop ───────────────────────────────────────────────────────────────
+
+static bool handleException(Frame *f, V exc)
+{
+    if (!IS_SMALL(exc) && exc->type->layout == L::Exc)
+    {
+        ExcObj *e = static_cast<ExcObj *>(exc);
+        int line = f->ip > 0 ? f->code->ins[(size_t)f->ip - 1].line : 0;
+        if (e->tbLines.empty() && !g_handled.empty() && g_handled.back() != exc && !e->context)
+        {
+            // the exception being handled when this one was raised
+            V ctx = g_handled.back();
+            if (ctx != exc)
+                e->context = ctx;
+        }
+        e->tbLines.push_back(line);
+    }
+    while (!f->blocks.empty())
+    {
+        Block b = f->blocks.back();
+        f->blocks.pop_back();
+        f->stack.resize((size_t)b.level);
+        if ((int)g_handled.size() > b.excDepth)
+            g_handled.resize((size_t)b.excDepth);
+        g_handled.push_back(exc);
+        f->stack.push_back(exc);
+        f->ip = b.handler;
+        return true;
+    }
+    return false;
+}
+
+#define POP() (v = st.back(), st.pop_back(), v)
+#define TOP() (st.back())
+
+V runFrame(Frame *f)
+{
+    Frame *saved = g_frame;
+    f->back = saved;
+    g_frame = f;
+    size_t handledBase = g_handled.size();
+    Code *c = f->code;
+    std::vector<V> &st = f->stack;
+    V v;
+    for (;;)
+    {
+        try
+        {
+            if (f->pendingThrow)
+            {
+                V e = f->pendingThrow;
+                f->pendingThrow = nullptr;
+                throw PyThrow{e};
+            }
+            for (;;)
+            {
+                const Ins &I = c->ins[(size_t)f->ip++];
+                switch (I.op)
+                {
+                case O_NOP:
+                    break;
+                case O_POP:
+                    st.pop_back();
+                    break;
+                case O_DUP:
+                    st.push_back(st.back());
+                    break;
+                case O_DUP2:
+                {
+                    V a = st[st.size() - 2], b = st[st.size() - 1];
+                    st.push_back(a);
+                    st.push_back(b);
+                    break;
+                }
+                case O_ROT2:
+                {
+                    size_t n = st.size();
+                    V t = st[n - 1];
+                    st[n - 1] = st[n - 2];
+                    st[n - 2] = t;
+                    break;
+                }
+                case O_ROT3:
+                {
+                    // a b c -> c a b
+                    size_t n = st.size();
+                    V t = st[n - 1];
+                    st[n - 1] = st[n - 2];
+                    st[n - 2] = st[n - 3];
+                    st[n - 3] = t;
+                    break;
+                }
+                case O_ROT4:
+                {
+                    size_t n = st.size();
+                    V t = st[n - 1];
+                    st[n - 1] = st[n - 2];
+                    st[n - 2] = st[n - 3];
+                    st[n - 3] = st[n - 4];
+                    st[n - 4] = t;
+                    break;
+                }
+                case O_CONST:
+                    st.push_back(c->consts[(size_t)I.arg]);
+                    break;
+                case O_LOAD_FAST:
+                {
+                    V x = f->fast[(size_t)I.arg];
+                    if (!x)
+                        raise(tUnboundLocalError, "cannot access local variable '" + c->varnames[(size_t)I.arg]->s +
+                                                      "' where it is not associated with a value");
+                    st.push_back(x);
+                    break;
+                }
+                case O_STORE_FAST:
+                    f->fast[(size_t)I.arg] = POP();
+                    break;
+                case O_DEL_FAST:
+                    if (!f->fast[(size_t)I.arg])
+                        raise(tUnboundLocalError, "cannot access local variable '" + c->varnames[(size_t)I.arg]->s +
+                                                      "' where it is not associated with a value");
+                    f->fast[(size_t)I.arg] = nullptr;
+                    break;
+                case O_DEL_FAST_OPT:
+                    f->fast[(size_t)I.arg] = nullptr;
+                    break;
+                case O_LOAD_DEREF:
+                {
+                    V x = f->cells[(size_t)I.arg]->v;
+                    if (!x)
+                    {
+                        size_t ncell = c->cellvars.size();
+                        std::string nm = (size_t)I.arg < ncell ? c->cellvars[(size_t)I.arg]->s : c->freevars[(size_t)I.arg - ncell]->s;
+                        if ((size_t)I.arg < ncell)
+                            raise(tUnboundLocalError, "cannot access local variable '" + nm + "' where it is not associated with a value");
+                        raise(tNameError, "cannot access free variable '" + nm + "' where it is not associated with a value in enclosing scope");
+                    }
+                    st.push_back(x);
+                    break;
+                }
+                case O_STORE_DEREF:
+                    f->cells[(size_t)I.arg]->v = POP();
+                    break;
+                case O_DEL_DEREF:
+                case O_DEL_DEREF_OPT:
+                    f->cells[(size_t)I.arg]->v = nullptr;
+                    break;
+                case O_LOAD_CLASSDEREF:
+                {
+                    int cell = I.arg & 0xFFFF, nm = I.arg >> 16;
+                    V x = f->locals ? dictGetStr(f->locals, c->names[(size_t)nm]) : nullptr;
+                    if (!x)
+                        x = f->cells[(size_t)cell]->v;
+                    if (!x)
+                        raise(tNameError, "cannot access free variable '" + c->names[(size_t)nm]->s + "' where it is not associated with a value in enclosing scope");
+                    st.push_back(x);
+                    break;
+                }
+                case O_LOAD_CLOSURE:
+                    st.push_back(f->cells[(size_t)I.arg]);
+                    break;
+                case O_LOAD_GLOBAL:
+                {
+                    Str *name = c->names[(size_t)I.arg];
+                    V x = dictGetStr(f->globals, name);
+                    if (!x)
+                        x = dictGetStr(builtinsDict, name);
+                    if (!x)
+                        nameError(name);
+                    st.push_back(x);
+                    break;
+                }
+                case O_STORE_GLOBAL:
+                    dictSet(f->globals, c->names[(size_t)I.arg], POP());
+                    break;
+                case O_DEL_GLOBAL:
+                    if (!dictDel(f->globals, c->names[(size_t)I.arg]))
+                        nameError(c->names[(size_t)I.arg]);
+                    break;
+                case O_LOAD_NAME:
+                {
+                    Str *name = c->names[(size_t)I.arg];
+                    V x = nullptr;
+                    if (f->locals)
+                    {
+                        if (f->locals->type == tDict)
+                            x = dictGetStr(f->locals, name);
+                        else
+                        {
+                            try
+                            {
+                                x = getitem(f->locals, name);
+                            }
+                            catch (PyThrow &e)
+                            {
+                                if (!isinst(e.exc, tKeyError))
+                                    throw;
+                            }
+                        }
+                    }
+                    if (!x)
+                        x = dictGetStr(f->globals, name);
+                    if (!x)
+                        x = dictGetStr(builtinsDict, name);
+                    if (!x)
+                        nameError(name);
+                    st.push_back(x);
+                    break;
+                }
+                case O_STORE_NAME:
+                {
+                    V val = POP();
+                    Dict *ns = f->locals ? f->locals : f->globals;
+                    if (ns->type == tDict)
+                        dictSet(ns, c->names[(size_t)I.arg], val);
+                    else
+                        setitem(ns, c->names[(size_t)I.arg], val);
+                    break;
+                }
+                case O_DEL_NAME:
+                case O_DEL_NAME_OPT:
+                {
+                    Dict *ns = f->locals ? f->locals : f->globals;
+                    if (!dictDel(ns, c->names[(size_t)I.arg]) && I.op == O_DEL_NAME)
+                        nameError(c->names[(size_t)I.arg]);
+                    break;
+                }
+                case O_LOAD_ATTR:
+                    st.back() = getattr(st.back(), c->names[(size_t)I.arg]);
+                    break;
+                case O_STORE_ATTR:
+                {
+                    V obj = POP();
+                    V val = POP();
+                    setattr(obj, c->names[(size_t)I.arg], val);
+                    break;
+                }
+                case O_DEL_ATTR:
+                    delattr(POP(), c->names[(size_t)I.arg]);
+                    break;
+                case O_LOAD_METHOD:
+                {
+                    V obj = st.back();
+                    Str *name = c->names[(size_t)I.arg];
+                    Type *t = typeOf(obj);
+                    if (t->layout != L::Type && t->layout != L::Super && t->layout != L::Module)
+                    {
+                        V attr = lookupMro(t, name);
+                        bool plain = attr && !IS_SMALL(attr) &&
+                                     (attr->type->layout == L::Func ||
+                                      (attr->type->layout == L::Native && static_cast<NativeObj *>(attr)->method &&
+                                       !static_cast<NativeObj *>(attr)->classMethod && !static_cast<NativeObj *>(attr)->self));
+                        if (plain && (t->builtin || !lookupMro(t, intern("__getattribute__")) ||
+                                      lookupMro(t, intern("__getattribute__")) == dictGetC(tObject->dict, "__getattribute__")))
+                        {
+                            bool shadow = !IS_SMALL(obj) && obj->dict && dictGetStr(obj->dict, name);
+                            if (!shadow)
+                            {
+                                st.back() = attr;
+                                st.push_back(obj);
+                                break;
+                            }
+                        }
+                    }
+                    st.back() = getattr(obj, name);
+                    st.push_back(nullptr);
+                    break;
+                }
+                case O_CALL_METHOD:
+                {
+                    int n = I.arg;
+                    size_t base = st.size() - (size_t)n - 2;
+                    V fn = st[base];
+                    V self = st[base + 1];
+                    V r;
+                    if (self)
+                    {
+                        if (fn->type->layout == L::Func)
+                            r = callFunc(static_cast<Func *>(fn), &st[base + 1], n + 1, nullptr);
+                        else
+                        {
+                            NativeObj *nf = static_cast<NativeObj *>(fn);
+                            r = nf->closure ? (*nf->closure)(&st[base + 1], n + 1, nullptr) : nf->fn(&st[base + 1], n + 1, nullptr);
+                        }
+                    }
+                    else
+                        r = call(fn, n ? &st[base + 2] : nullptr, n);
+                    st.resize(base);
+                    st.push_back(r);
+                    break;
+                }
+                case O_CALL:
+                {
+                    int n = I.arg;
+                    size_t base = st.size() - (size_t)n - 1;
+                    V fn = st[base];
+                    V r;
+                    if (!IS_SMALL(fn) && fn->type->layout == L::Func)
+                        r = callFunc(static_cast<Func *>(fn), n ? &st[base + 1] : nullptr, n, nullptr);
+                    else
+                        r = call(fn, n ? &st[base + 1] : nullptr, n);
+                    st.resize(base);
+                    st.push_back(r);
+                    break;
+                }
+                case O_CALL_KW:
+                {
+                    Tuple *names = static_cast<Tuple *>(POP());
+                    int n = I.arg;
+                    int nkw = (int)names->items.size();
+                    int npos = n - nkw;
+                    size_t base = st.size() - (size_t)n - 1;
+                    Kw kw;
+                    for (int i = 0; i < nkw; ++i)
+                    {
+                        kw.names.push_back(static_cast<Str *>(names->items[(size_t)i]));
+                        kw.vals.push_back(st[base + 1 + (size_t)npos + (size_t)i]);
+                    }
+                    V fn = st[base];
+                    V r = call(fn, npos ? &st[base + 1] : nullptr, npos, &kw);
+                    st.resize(base);
+                    st.push_back(r);
+                    break;
+                }
+                case O_CALL_EX:
+                {
+                    Kw kw;
+                    Kw *kwp = nullptr;
+                    if (I.arg & 1)
+                        kwp = kwFromDict(POP(), kw);
+                    Tuple *args = static_cast<Tuple *>(POP());
+                    V fn = POP();
+                    std::vector<V> items = args->items;
+                    st.push_back(call(fn, items.empty() ? nullptr : items.data(), (int)items.size(), kwp));
+                    break;
+                }
+                case O_BINARY:
+                {
+                    V b = POP();
+                    V a = st.back();
+                    if (IS_SMALL(a) && IS_SMALL(b))
+                    {
+                        int64_t x = SMALLV(a), y = SMALLV(b);
+                        if (I.arg == OpAdd)
+                        {
+                            st.back() = mkint(x + y);
+                            break;
+                        }
+                        if (I.arg == OpSub)
+                        {
+                            st.back() = mkint(x - y);
+                            break;
+                        }
+                    }
+                    st.back() = binaryOp(a, b, (Op)I.arg);
+                    break;
+                }
+                case O_INPLACE:
+                {
+                    V b = POP();
+                    V a = st.back();
+                    if (IS_SMALL(a) && IS_SMALL(b) && I.arg == OpAdd)
+                    {
+                        st.back() = mkint(SMALLV(a) + SMALLV(b));
+                        break;
+                    }
+                    st.back() = inplaceOp(a, b, (Op)I.arg);
+                    break;
+                }
+                case O_UNARY:
+                    st.back() = unaryOp(st.back(), (Op)I.arg);
+                    break;
+                case O_COMPARE:
+                {
+                    V b = POP();
+                    V a = st.back();
+                    Op op = (Op)I.arg;
+                    bool fast = false;
+                    if (IS_SMALL(a) && IS_SMALL(b))
+                    {
+                        int64_t x = SMALLV(a), y = SMALLV(b);
+                        fast = true;
+                        bool r = false;
+                        switch (op)
+                        {
+                        case OpLt: r = x < y; break;
+                        case OpLe: r = x <= y; break;
+                        case OpGt: r = x > y; break;
+                        case OpGe: r = x >= y; break;
+                        case OpEq:
+                        case OpIs: r = x == y; break;
+                        case OpNe:
+                        case OpIsNot: r = x != y; break;
+                        default: fast = false; break;
+                        }
+                        if (fast)
+                        {
+                            st.back() = mkbool(r);
+                            break;
+                        }
+                    }
+                    switch (op)
+                    {
+                    case OpIs: st.back() = mkbool(a == b); break;
+                    case OpIsNot: st.back() = mkbool(a != b); break;
+                    case OpIn: st.back() = mkbool(contains(b, a)); break;
+                    case OpNotIn: st.back() = mkbool(!contains(b, a)); break;
+                    default: st.back() = richCompare(a, b, op); break;
+                    }
+                    break;
+                }
+                case O_SUBSCR:
+                {
+                    V key = POP();
+                    st.back() = getitem(st.back(), key);
+                    break;
+                }
+                case O_STORE_SUBSCR:
+                {
+                    V key = POP();
+                    V obj = POP();
+                    V val = POP();
+                    setitem(obj, key, val);
+                    break;
+                }
+                case O_DEL_SUBSCR:
+                {
+                    V key = POP();
+                    V obj = POP();
+                    delitem(obj, key);
+                    break;
+                }
+                case O_BUILD_TUPLE:
+                {
+                    Tuple *t = newTuple((size_t)I.arg);
+                    for (int i = I.arg - 1; i >= 0; --i)
+                        t->items[(size_t)i] = POP();
+                    st.push_back(t);
+                    break;
+                }
+                case O_BUILD_LIST:
+                {
+                    List *l = newList((size_t)I.arg);
+                    for (int i = I.arg - 1; i >= 0; --i)
+                        l->items[(size_t)i] = POP();
+                    st.push_back(l);
+                    break;
+                }
+                case O_BUILD_SET:
+                {
+                    Set *s = newSet();
+                    size_t base = st.size() - (size_t)I.arg;
+                    for (size_t i = base; i < st.size(); ++i)
+                        setAdd(s, st[i]);
+                    st.resize(base);
+                    st.push_back(s);
+                    break;
+                }
+                case O_BUILD_MAP:
+                {
+                    Dict *d = newDict();
+                    size_t base = st.size() - (size_t)I.arg * 2;
+                    for (size_t i = base; i < st.size(); i += 2)
+                        dictSet(d, st[i], st[i + 1]);
+                    st.resize(base);
+                    st.push_back(d);
+                    break;
+                }
+                case O_BUILD_SLICE:
+                {
+                    SliceObj *s = new SliceObj(tSlice);
+                    s->step = I.arg == 3 ? POP() : None;
+                    s->stop = POP();
+                    s->start = POP();
+                    st.push_back(s);
+                    break;
+                }
+                case O_BUILD_STRING:
+                {
+                    size_t base = st.size() - (size_t)I.arg;
+                    std::string out;
+                    bool ascii = true;
+                    int64_t len = 0;
+                    for (size_t i = base; i < st.size(); ++i)
+                    {
+                        Str *s = static_cast<Str *>(st[i]);
+                        out += s->s;
+                        ascii = ascii && s->ascii;
+                        len += s->len;
+                    }
+                    st.resize(base);
+                    Str *r = new Str(tStr);
+                    r->s = out;
+                    r->ascii = ascii;
+                    r->len = len;
+                    st.push_back(r);
+                    break;
+                }
+                case O_FORMAT:
+                {
+                    std::string spec;
+                    if (I.arg & 0x100)
+                        spec = static_cast<Str *>(POP())->s;
+                    V x = st.back();
+                    int conv = I.arg & 0xFF;
+                    if (conv == 'r')
+                        x = newStr(reprOf(x));
+                    else if (conv == 's')
+                        x = strV(x);
+                    else if (conv == 'a')
+                    {
+                        extern std::string asciiOf(V v);
+                        x = newStr(asciiOf(x));
+                    }
+                    if (spec.empty() && !IS_SMALL(x) && x->type == tStr)
+                        st.back() = x;
+                    else if (spec.empty() && IS_SMALL(x))
+                        st.back() = newStrAscii(std::to_string(SMALLV(x)));
+                    else
+                        st.back() = newStr(formatValue(x, spec));
+                    break;
+                }
+                case O_LIST_APPEND:
+                {
+                    V x = POP();
+                    static_cast<List *>(st[st.size() - (size_t)I.arg])->items.push_back(x);
+                    break;
+                }
+                case O_SET_ADD:
+                {
+                    V x = POP();
+                    setAdd(static_cast<Set *>(st[st.size() - (size_t)I.arg]), x);
+                    break;
+                }
+                case O_MAP_ADD:
+                {
+                    V val = POP();
+                    V key = POP();
+                    dictSet(static_cast<Dict *>(st[st.size() - (size_t)I.arg]), key, val);
+                    break;
+                }
+                case O_LIST_EXTEND:
+                {
+                    V it = POP();
+                    List *l = static_cast<List *>(st[st.size() - (size_t)I.arg]);
+                    std::vector<V> items = toVector(it);
+                    l->items.insert(l->items.end(), items.begin(), items.end());
+                    break;
+                }
+                case O_LIST_TO_TUPLE:
+                    st.back() = tupleOf(static_cast<List *>(st.back())->items);
+                    break;
+                case O_SET_UPDATE:
+                {
+                    V it = POP();
+                    setUpdate(static_cast<Set *>(st[st.size() - (size_t)I.arg]), it);
+                    break;
+                }
+                case O_DICT_UPDATE:
+                case O_DICT_MERGE:
+                {
+                    V src = POP();
+                    Dict *d = static_cast<Dict *>(st[st.size() - (size_t)I.arg]);
+                    if (typeOf(src)->layout == L::Dict)
+                    {
+                        for (const DEntry &e : static_cast<Dict *>(src)->entries)
+                        {
+                            if (!e.key)
+                                continue;
+                            if (I.op == O_DICT_MERGE && dictGet(d, e.key))
+                                raise(tTypeError, "got multiple values for keyword argument '" + strOf(e.key) + "'");
+                            dictSet(d, e.key, e.val);
+                        }
+                    }
+                    else
+                    {
+                        V keys;
+                        if (!getattrOpt(src, intern("keys"), keys))
+                            raise(tTypeError, std::string(I.op == O_DICT_MERGE ? "argument after ** must be a mapping, not " : "'") +
+                                                  typeName(src) + (I.op == O_DICT_MERGE ? "" : "' object is not a mapping"));
+                        for (V k : toVector(call0(keys)))
+                            dictSet(d, k, getitem(src, k));
+                    }
+                    break;
+                }
+                case O_UNPACK:
+                {
+                    V seq = POP();
+                    std::vector<V> items;
+                    const std::vector<V> *ip;
+                    if (!IS_SMALL(seq) && seq->type == tTuple)
+                        ip = &static_cast<Tuple *>(seq)->items;
+                    else if (!IS_SMALL(seq) && seq->type == tList)
+                        ip = &static_cast<List *>(seq)->items;
+                    else
+                    {
+                        // stop one past the expected count, as CPython does
+                        V it = getiter(seq);
+                        V x;
+                        while ((int)items.size() <= I.arg && iterNext(it, x))
+                            items.push_back(x);
+                        ip = &items;
+                        if ((int)items.size() > I.arg)
+                            raise(tValueError, "too many values to unpack (expected " + std::to_string(I.arg) + ")" );
+                    }
+                    if ((int)ip->size() != I.arg)
+                    {
+                        if ((int)ip->size() > I.arg)
+                            raise(tValueError, "too many values to unpack (expected " + std::to_string(I.arg) + ")");
+                        raise(tValueError, "not enough values to unpack (expected " + std::to_string(I.arg) + ", got " + std::to_string(ip->size()) + ")");
+                    }
+                    for (size_t i = ip->size(); i-- > 0;)
+                        st.push_back((*ip)[i]);
+                    break;
+                }
+                case O_UNPACK_EX:
+                {
+                    int before = I.arg & 0xFF, after = I.arg >> 8;
+                    std::vector<V> items = toVector(POP());
+                    if ((int)items.size() < before + after)
+                        raise(tValueError, "not enough values to unpack (expected at least " + std::to_string(before + after) + ", got " + std::to_string(items.size()) + ")");
+                    for (int i = 0; i < after; ++i)
+                        st.push_back(items[items.size() - 1 - (size_t)i]);
+                    List *mid = newList();
+                    mid->items.assign(items.begin() + before, items.end() - after);
+                    st.push_back(mid);
+                    for (int i = before - 1; i >= 0; --i)
+                        st.push_back(items[(size_t)i]);
+                    break;
+                }
+                case O_JUMP:
+                    f->ip = I.arg;
+                    break;
+                case O_JUMP_IF_FALSE:
+                {
+                    V x = POP();
+                    if (x == False || (x != True && !truthy(x)))
+                        f->ip = I.arg;
+                    break;
+                }
+                case O_JUMP_IF_TRUE:
+                {
+                    V x = POP();
+                    if (x == True || (x != False && truthy(x)))
+                        f->ip = I.arg;
+                    break;
+                }
+                case O_JUMP_IF_FALSE_OR_POP:
+                    if (!truthy(st.back()))
+                        f->ip = I.arg;
+                    else
+                        st.pop_back();
+                    break;
+                case O_JUMP_IF_TRUE_OR_POP:
+                    if (truthy(st.back()))
+                        f->ip = I.arg;
+                    else
+                        st.pop_back();
+                    break;
+                case O_JUMP_IF_NOT_NONE:
+                    if (POP() != None)
+                        f->ip = I.arg;
+                    break;
+                case O_GET_ITER:
+                    st.back() = getiter(st.back());
+                    break;
+                case O_FOR_ITER:
+                {
+                    V it = st.back();
+                    V x;
+                    if (iterNext(it, x))
+                        st.push_back(x);
+                    else
+                    {
+                        st.pop_back();
+                        f->ip = I.arg;
+                    }
+                    break;
+                }
+                case O_RETURN:
+                {
+                    V r = POP();
+                    g_frame = saved;
+                    if (g_handled.size() > handledBase)
+                        g_handled.resize(handledBase);
+                    f->ip = (int)c->ins.size() - 1;
+                    return r;
+                }
+                case O_YIELD:
+                {
+                    V r = POP();
+                    g_frame = saved;
+                    if (g_handled.size() > handledBase)
+                        g_handled.resize(handledBase);
+                    f->yielded = true;
+                    return r;
+                }
+                case O_YIELD_FROM:
+                {
+                    V sent = POP();
+                    V sub = st.back();
+                    V r;
+                    bool done;
+                    if (!IS_SMALL(sub) && sub->type->layout == L::Gen)
+                        r = genSend(static_cast<GenObj *>(sub), sent, done);
+                    else
+                    {
+                        try
+                        {
+                            if (sent == None)
+                            {
+                                V x;
+                                done = !iterNext(sub, x);
+                                r = done ? None : x;
+                            }
+                            else
+                            {
+                                r = callMethodName(sub, s_send, &sent, 1);
+                                done = false;
+                            }
+                        }
+                        catch (PyThrow &e)
+                        {
+                            if (!isinst(e.exc, tStopIteration))
+                                throw;
+                            V val;
+                            getattrOpt(e.exc, intern("value"), val);
+                            r = val ? val : None;
+                            done = true;
+                        }
+                    }
+                    if (done)
+                    {
+                        st.back() = r;
+                        break;
+                    }
+                    // stay on this instruction: the next send resumes the delegation
+                    f->ip--;
+                    g_frame = saved;
+                    if (g_handled.size() > handledBase)
+                        g_handled.resize(handledBase);
+                    f->yielded = true;
+                    return r;
+                }
+                case O_SETUP_EXCEPT:
+                case O_SETUP_FINALLY:
+                {
+                    Block b;
+                    b.kind = I.op;
+                    b.handler = I.arg;
+                    b.level = (int)st.size();
+                    b.excDepth = (int)g_handled.size();
+                    f->blocks.push_back(b);
+                    break;
+                }
+                case O_POP_BLOCK:
+                    f->blocks.pop_back();
+                    break;
+                case O_POP_EXCEPT:
+                    if (!g_handled.empty())
+                        g_handled.pop_back();
+                    break;
+                case O_RERAISE:
+                {
+                    V e = POP();
+                    if (!g_handled.empty())
+                        g_handled.pop_back();
+                    throw PyThrow{e};
+                }
+                case O_RAISE:
+                {
+                    if (I.arg == 0)
+                    {
+                        if (g_handled.empty())
+                            raise(tRuntimeError, "No active exception to reraise");
+                        throw PyThrow{g_handled.back()};
+                    }
+                    V cause = I.arg == 2 ? POP() : nullptr;
+                    V exc = excFromTypeOrInstance(POP());
+                    if (I.arg == 2)
+                    {
+                        ExcObj *e = static_cast<ExcObj *>(exc);
+                        if (cause == None)
+                            e->cause = nullptr;
+                        else
+                            e->cause = excFromTypeOrInstance(cause);
+                        e->suppressContext = true;
+                    }
+                    throw PyThrow{exc};
+                }
+                case O_EXC_MATCH:
+                {
+                    V types = POP();
+                    V exc = POP();
+                    st.push_back(mkbool(excMatches(exc, types)));
+                    break;
+                }
+                case O_MAKE_FUNCTION:
+                {
+                    Code *code = static_cast<Code *>(POP());
+                    Func *fn = new Func(tFunc);
+                    fn->code = code;
+                    fn->globals = f->globals;
+                    if (I.arg & 8)
+                    {
+                        Tuple *cl = static_cast<Tuple *>(POP());
+                        for (V x : cl->items)
+                            fn->closure.push_back(static_cast<CellObj *>(x));
+                    }
+                    if (I.arg & 4)
+                        fn->annotations = static_cast<Dict *>(POP());
+                    if (I.arg & 2)
+                        fn->kwdefaults = static_cast<Dict *>(POP());
+                    if (I.arg & 1)
+                        fn->defaults = static_cast<Tuple *>(POP())->items;
+                    fn->name = intern(code->name);
+                    fn->qualname = newStr(code->qualname);
+                    fn->doc = code->doc ? code->doc : None;
+                    V mod = dictGetC(f->globals, "__name__");
+                    fn->module = mod ? mod : None;
+                    st.push_back(fn);
+                    break;
+                }
+                case O_BUILD_CLASS:
+                {
+                    int nbases = I.arg & 0xFFFF, nkw = I.arg >> 16;
+                    Tuple *kwnames = static_cast<Tuple *>(POP());
+                    size_t base = st.size() - (size_t)(nbases + nkw) - 2;
+                    V func = st[base], name = st[base + 1];
+                    std::vector<V> bases(st.begin() + (long)base + 2, st.begin() + (long)base + 2 + nbases);
+                    Kw kw;
+                    for (int i = 0; i < nkw; ++i)
+                    {
+                        kw.names.push_back(static_cast<Str *>(kwnames->items[(size_t)i]));
+                        kw.vals.push_back(st[base + 2 + (size_t)nbases + (size_t)i]);
+                    }
+                    V cls = buildClass(func, name, bases, nkw ? &kw : nullptr);
+                    st.resize(base);
+                    st.push_back(cls);
+                    break;
+                }
+                case O_IMPORT_NAME:
+                {
+                    V fromlist = POP();
+                    POP(); // level
+                    std::string name = c->names[(size_t)I.arg]->s;
+                    V mod = importModule(name, I.line);
+                    if (fromlist == None && name.find('.') != std::string::npos)
+                        mod = importModule(name.substr(0, name.find('.')), I.line);
+                    st.push_back(mod);
+                    break;
+                }
+                case O_IMPORT_FROM:
+                {
+                    V mod = st.back();
+                    Str *name = c->names[(size_t)I.arg];
+                    V x;
+                    if (!getattrOpt(mod, name, x))
+                    {
+                        std::string modName = typeOf(mod)->layout == L::Module ? static_cast<ModuleObj *>(mod)->name : "?";
+                        try
+                        {
+                            x = importModule(modName + "." + name->s, I.line);
+                        }
+                        catch (PyThrow &)
+                        {
+                            raise(tImportError, "cannot import name '" + name->s + "' from '" + modName + "'");
+                        }
+                    }
+                    st.push_back(x);
+                    break;
+                }
+                case O_IMPORT_STAR:
+                    importStar(POP(), f->locals ? f->locals : f->globals);
+                    break;
+                case O_WITH_ENTER:
+                {
+                    V ctx = POP();
+                    Type *t = typeOf(ctx);
+                    V enter = lookupMro(t, s_enter), exit = lookupMro(t, s_exit);
+                    if (!enter || !exit)
+                        raise(tTypeError, "'" + t->name + "' object does not support the context manager protocol");
+                    st.push_back(bindDescriptor(exit, ctx, t));
+                    Block b;
+                    b.kind = O_SETUP_FINALLY;
+                    b.handler = I.arg;
+                    b.level = (int)st.size();
+                    b.excDepth = (int)g_handled.size();
+                    f->blocks.push_back(b);
+                    st.push_back(call0(bindDescriptor(enter, ctx, t)));
+                    break;
+                }
+                case O_WITH_EXIT:
+                {
+                    V x = POP();
+                    V exit = POP();
+                    if (x == None)
+                    {
+                        V args[3] = {None, None, None};
+                        call(exit, args, 3);
+                    }
+                    else
+                    {
+                        V args[3] = {typeOf(x), x, None};
+                        V r = call(exit, args, 3);
+                        if (!g_handled.empty())
+                            g_handled.pop_back();
+                        if (!truthy(r))
+                            throw PyThrow{x};
+                    }
+                    break;
+                }
+                case O_ASSERT_FAIL:
+                {
+                    if (I.arg)
+                    {
+                        V msg = POP();
+                        V e = call1(tAssertionError, msg);
+                        throw PyThrow{e};
+                    }
+                    throw PyThrow{call0(tAssertionError)};
+                }
+                case O_SETUP_ANNOTATIONS:
+                {
+                    Dict *ns = f->locals ? f->locals : f->globals;
+                    if (!dictGetStr(ns, s_annotations))
+                    {
+                        if (ns->type == tDict)
+                            dictSet(ns, s_annotations, newDict());
+                        else
+                            setitem(ns, s_annotations, newDict());
+                    }
+                    break;
+                }
+                case O_STORE_ANNOTATION:
+                {
+                    V ann = POP();
+                    Dict *ns = f->locals ? f->locals : f->globals;
+                    V d = dictGetStr(ns, s_annotations);
+                    if (!d)
+                    {
+                        d = newDict();
+                        dictSet(ns, s_annotations, d);
+                    }
+                    setitem(d, c->names[(size_t)I.arg], ann);
+                    break;
+                }
+                case O_MATCH_CLASS:
+                {
+                    Tuple *kwnames = static_cast<Tuple *>(POP());
+                    V cls = POP();
+                    V subj = POP();
+                    st.push_back(matchClass(subj, cls, kwnames, I.arg));
+                    break;
+                }
+                case O_MATCH_MAPPING:
+                    st.back() = mkbool(isMappingForMatch(st.back()));
+                    break;
+                case O_MATCH_SEQUENCE:
+                    st.back() = mkbool(isSequenceForMatch(st.back()));
+                    break;
+                case O_MATCH_KEYS:
+                {
+                    Tuple *keys = static_cast<Tuple *>(POP());
+                    V subj = POP();
+                    st.push_back(matchKeys(subj, keys));
+                    break;
+                }
+                case O_GET_LEN:
+                    st.back() = mkint(lenOf(st.back()));
+                    break;
+                case O_COPY_DICT_WITHOUT_KEYS:
+                {
+                    Tuple *keys = static_cast<Tuple *>(POP());
+                    V subj = POP();
+                    Dict *d = newDict();
+                    if (typeOf(subj)->layout == L::Dict)
+                    {
+                        for (const DEntry &e : static_cast<Dict *>(subj)->entries)
+                            if (e.key)
+                                dictSet(d, e.key, e.val);
+                    }
+                    else
+                        for (V k : toVector(subj))
+                            dictSet(d, k, getitem(subj, k));
+                    for (V k : keys->items)
+                        dictDel(d, k);
+                    st.push_back(d);
+                    break;
+                }
+                case O_SEQ_SLICE_LIST:
+                {
+                    int before = I.arg & 0xFFFF, after = I.arg >> 16;
+                    std::vector<V> items = toVector(POP());
+                    List *l = newList();
+                    if ((int)items.size() >= before + after)
+                        l->items.assign(items.begin() + before, items.end() - after);
+                    st.push_back(l);
+                    break;
+                }
+                default:
+                {
+                    char buf[64];
+                    snprintf(buf, sizeof buf, "bad opcode %d", I.op);
+                    raise(tSystemError, buf);
+                }
+                }
+            }
+        }
+        catch (PyThrow &e)
+        {
+            if (handleException(f, e.exc))
+                continue;
+            g_frame = saved;
+            if (g_handled.size() > handledBase)
+                g_handled.resize(handledBase);
+            throw;
+        }
+    }
+}
+
+#undef POP
+#undef TOP
+
+void initVm()
+{
+    s_enter = intern("__enter__");
+    s_exit = intern("__exit__");
+    s_name = intern("__name__");
+    s_match_args = intern("__match_args__");
+    s_prepare = intern("__prepare__");
+    s_mro_entries = intern("__mro_entries__");
+    s_metaclass = intern("metaclass");
+    s_annotations = intern("__annotations__");
+    s_all = intern("__all__");
+    s_send = intern("send");
+    s_throw = intern("throw");
+    s_close = intern("close");
+    defMethod(tGen, "__next__", gen_next);
+    defMethod(tGen, "__iter__", gen_iter);
+    defMethod(tGen, "send", gen_send);
+    defMethod(tGen, "throw", gen_throw);
+    defMethod(tGen, "close", gen_close);
+    defProperty(tGen, "__name__", gen_name);
+    defProperty(tGen, "__qualname__", gen_qualname);
+    defProperty(tGen, "gi_running", gen_running);
+    defProperty(tGen, "gi_frame", gen_frame);
+    defProperty(tGen, "gi_suspended", gen_suspended);
+    defProperty(tGen, "gi_code", gen_code);
+}
+
+} // namespace py

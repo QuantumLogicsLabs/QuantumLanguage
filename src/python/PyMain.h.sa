@@ -1,0 +1,23 @@
+// quantum: cpp
+#pragma once
+// Python front-end: what the rest of the compiler sees of it.
+#include <string>
+
+namespace py
+{
+
+// An uncaught exception, for the caller to report
+struct RunFailure
+{
+    bool failed = false;
+    std::string kind, message;
+    int line = 0;
+};
+
+// Runs a Python program to its end; the result is the exit status
+int runProgram(const std::string &source, const std::string &path, RunFailure &failure);
+
+// Whether this front-end can parse the source (`why`: the syntax error if not)
+bool canRun(const std::string &source, const std::string &path, std::string &why);
+
+} // namespace py

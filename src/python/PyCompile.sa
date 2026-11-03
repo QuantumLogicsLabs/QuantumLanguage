@@ -1,0 +1,2469 @@
+// quantum: cpp
+// Python front-end: the compiler. A symbol-table pass decides where each
+// name lives (fast local, cell, free variable, global, or a namespace dict
+// for module and class bodies), the way CPython's symtable.c does; then each
+// scope becomes a Code object of stack-machine instructions.
+//
+// try/finally and `with` are compiled with blocks set up at run time
+// (SETUP_EXCEPT / SETUP_FINALLY); a `return`, `break` or `continue` that
+// leaves such a block runs its cleanup inline first, as CPython does.
+#include "PyRt.h.sa"
+#include "PyAst.h.sa"
+#include "PyParse.h.sa"
+
+#include <algorithm>
+#include <set>
+
+namespace py
+{
+
+namespace
+{
+
+enum ScopeKind
+{
+    SK_MODULE,
+    SK_FUNCTION,
+    SK_CLASS,
+    SK_COMP
+};
+
+enum
+{
+    F_LOCAL = 1,
+    F_PARAM = 2,
+    F_GLOBAL = 4,
+    F_NONLOCAL = 8,
+    F_USE = 16,
+};
+
+enum Res
+{
+    R_LOCAL,
+    R_CELL,
+    R_FREE,
+    R_GLOBAL_EXPLICIT,
+    R_GLOBAL_IMPLICIT,
+    R_NAME
+};
+
+struct Scope
+{
+    ScopeKind kind;
+    Scope *parent = nullptr;
+    std::string name, qualname;
+    std::unordered_map<std::string, int> flags;
+    std::vector<std::string> order; // names in first-seen order
+    std::vector<std::string> params;
+    std::vector<Scope *> children;
+    bool generator = false;
+    bool usesClassCell = false;
+    std::unordered_map<std::string, int> res;
+    std::vector<std::string> cellvars, freevars;
+    std::set<std::string> childFree; // free variables of the children
+};
+
+[[noreturn]] void compileErr(const std::string &msg, int line)
+{
+    SyntaxErr e;
+    e.message = msg;
+    e.line = line;
+    throw e;
+}
+
+class SymTable
+{
+public:
+    std::unordered_map<const Node *, Scope *> scopes;
+    Scope *top = nullptr;
+
+    void add(Scope *s, const std::string &name, int flag)
+    {
+        auto it = s->flags.find(name);
+        if (it == s->flags.end())
+        {
+            s->flags[name] = flag;
+            s->order.push_back(name);
+        }
+        else
+            it->second |= flag;
+    }
+
+    Scope *newScope(ScopeKind k, Scope *parent, const std::string &name, const Node *node)
+    {
+        Scope *s = new Scope();
+        s->kind = k;
+        s->parent = parent;
+        s->name = name;
+        if (parent)
+        {
+            parent->children.push_back(s);
+            if (parent->kind == SK_MODULE)
+                s->qualname = name;
+            else if (parent->kind == SK_CLASS)
+                s->qualname = parent->qualname + "." + name;
+            else
+                s->qualname = parent->qualname + ".<locals>." + name;
+        }
+        else
+            s->qualname = name;
+        if (node)
+            scopes[node] = s;
+        return s;
+    }
+
+    void build(const std::vector<Node *> &body)
+    {
+        top = newScope(SK_MODULE, nullptr, "<module>", nullptr);
+        for (Node *n : body)
+            stmt(top, n);
+        resolve(top, std::unordered_map<std::string, Scope *>());
+    }
+
+    void stmts(Scope *s, const std::vector<Node *> &v)
+    {
+        for (Node *n : v)
+            stmt(s, n);
+    }
+
+    void params(Scope *outer, Scope *f, Params *p)
+    {
+        for (Node *d : p->defaults)
+            expr(outer, d);
+        for (Node *d : p->kwDefaults)
+            if (d)
+                expr(outer, d);
+        auto param = [&](const Arg &a) {
+            add(f, a.name, F_PARAM);
+            f->params.push_back(a.name);
+        };
+        for (const Arg &a : p->posonly)
+            param(a);
+        for (const Arg &a : p->args)
+            param(a);
+        for (const Arg &a : p->kwonly)
+            param(a);
+        if (p->vararg)
+            param(*p->vararg);
+        if (p->kwarg)
+            param(*p->kwarg);
+    }
+
+    void annotations(Scope *outer, Params *p, Node *ret)
+    {
+        auto ann = [&](const Arg &a) {
+            if (a.annotation)
+                expr(outer, a.annotation);
+        };
+        for (const Arg &a : p->posonly)
+            ann(a);
+        for (const Arg &a : p->args)
+            ann(a);
+        for (const Arg &a : p->kwonly)
+            ann(a);
+        if (p->vararg)
+            ann(*p->vararg);
+        if (p->kwarg)
+            ann(*p->kwarg);
+        if (ret)
+            expr(outer, ret);
+    }
+
+    void target(Scope *s, Node *t)
+    {
+        switch (t->kind)
+        {
+        case NK::Name:
+            add(s, t->name, F_LOCAL);
+            break;
+        case NK::Tuple:
+        case NK::List:
+            for (Node *e : t->list)
+                target(s, e);
+            break;
+        case NK::Starred:
+            target(s, t->a);
+            break;
+        case NK::Attribute:
+            expr(s, t->a);
+            break;
+        case NK::Subscript:
+            expr(s, t->a);
+            expr(s, t->b);
+            break;
+        default:
+            expr(s, t);
+        }
+    }
+
+    void pattern(Scope *s, Node *p)
+    {
+        if (!p)
+            return;
+        switch (p->kind)
+        {
+        case NK::PValue:
+        case NK::PSingleton:
+            expr(s, p->a);
+            break;
+        case NK::PSequence:
+        case NK::POr:
+            for (Node *x : p->list)
+                pattern(s, x);
+            break;
+        case NK::PStar:
+            if (!p->name.empty())
+                add(s, p->name, F_LOCAL);
+            break;
+        case NK::PMapping:
+            for (Node *k : p->list)
+                expr(s, k);
+            for (Node *x : p->list2)
+                pattern(s, x);
+            if (!p->name.empty())
+                add(s, p->name, F_LOCAL);
+            break;
+        case NK::PClass:
+            expr(s, p->a);
+            for (Node *x : p->list)
+                pattern(s, x);
+            for (Node *x : p->list2)
+                pattern(s, x);
+            break;
+        case NK::PAs:
+            pattern(s, p->b);
+            if (!p->name.empty())
+                add(s, p->name, F_LOCAL);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void stmt(Scope *s, Node *n)
+    {
+        switch (n->kind)
+        {
+        case NK::FunctionDef:
+        {
+            for (Node *d : n->decorators)
+                expr(s, d);
+            add(s, n->name, F_LOCAL);
+            Scope *f = newScope(SK_FUNCTION, s, n->name, n);
+            params(s, f, n->args);
+            annotations(s, n->args, n->a);
+            stmts(f, n->body);
+            break;
+        }
+        case NK::ClassDef:
+        {
+            for (Node *d : n->decorators)
+                expr(s, d);
+            for (Node *b : n->list)
+                expr(s, b);
+            for (Node *k : n->list2)
+                expr(s, k);
+            add(s, n->name, F_LOCAL);
+            Scope *c = newScope(SK_CLASS, s, n->name, n);
+            stmts(c, n->body);
+            break;
+        }
+        case NK::Return:
+            if (n->a)
+                expr(s, n->a);
+            break;
+        case NK::Delete:
+            for (Node *t : n->list)
+                target(s, t);
+            break;
+        case NK::Assign:
+            expr(s, n->a);
+            for (Node *t : n->list)
+                target(s, t);
+            break;
+        case NK::AugAssign:
+            expr(s, n->b);
+            if (n->a->kind == NK::Name)
+                add(s, n->a->name, F_LOCAL | F_USE);
+            else
+                target(s, n->a);
+            break;
+        case NK::AnnAssign:
+            if (s->kind != SK_FUNCTION)
+                expr(s, n->b);
+            if (n->c)
+                expr(s, n->c);
+            if (n->c || n->a->kind != NK::Name)
+                target(s, n->a);
+            else
+                add(s, n->a->name, F_LOCAL);
+            break;
+        case NK::For:
+            expr(s, n->b);
+            target(s, n->a);
+            stmts(s, n->body);
+            stmts(s, n->orelse);
+            break;
+        case NK::While:
+        case NK::If:
+            expr(s, n->a);
+            stmts(s, n->body);
+            stmts(s, n->orelse);
+            break;
+        case NK::With:
+            for (size_t i = 0; i < n->list.size(); ++i)
+            {
+                expr(s, n->list[i]);
+                if (n->list2[i])
+                    target(s, n->list2[i]);
+            }
+            stmts(s, n->body);
+            break;
+        case NK::Match:
+            expr(s, n->a);
+            for (MatchCase &mc : n->cases)
+            {
+                pattern(s, mc.pattern);
+                if (mc.guard)
+                    expr(s, mc.guard);
+                stmts(s, mc.body);
+            }
+            break;
+        case NK::Raise:
+            if (n->a)
+                expr(s, n->a);
+            if (n->b)
+                expr(s, n->b);
+            break;
+        case NK::Try:
+            stmts(s, n->body);
+            for (Handler &h : n->handlers)
+            {
+                if (h.type)
+                    expr(s, h.type);
+                if (!h.name.empty())
+                    add(s, h.name, F_LOCAL);
+                stmts(s, h.body);
+            }
+            stmts(s, n->orelse);
+            stmts(s, n->finalbody);
+            break;
+        case NK::Assert:
+            expr(s, n->a);
+            if (n->b)
+                expr(s, n->b);
+            break;
+        case NK::Import:
+            for (size_t i = 0; i < n->names.size(); ++i)
+            {
+                std::string bound = n->names2[i].empty() ? n->names[i].substr(0, n->names[i].find('.')) : n->names2[i];
+                add(s, bound, F_LOCAL);
+            }
+            break;
+        case NK::ImportFrom:
+            for (size_t i = 0; i < n->names.size(); ++i)
+                if (n->names[i] != "*")
+                    add(s, n->names2[i].empty() ? n->names[i] : n->names2[i], F_LOCAL);
+            break;
+        case NK::Global:
+            for (const std::string &nm : n->names)
+            {
+                auto it = s->flags.find(nm);
+                if (it != s->flags.end() && (it->second & (F_LOCAL | F_USE)) && s->kind != SK_MODULE)
+                {
+                    if (it->second & F_PARAM)
+                        compileErr("name '" + nm + "' is parameter and global", n->line);
+                }
+                add(s, nm, F_GLOBAL);
+            }
+            break;
+        case NK::Nonlocal:
+            if (s->kind == SK_MODULE)
+                compileErr("nonlocal declaration not allowed at module level", n->line);
+            for (const std::string &nm : n->names)
+                add(s, nm, F_NONLOCAL);
+            break;
+        case NK::ExprStmt:
+            expr(s, n->a);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void comprehension(Scope *s, Node *n, const char *name)
+    {
+        expr(s, n->comps[0].iter);
+        Scope *c = newScope(SK_COMP, s, name, n);
+        add(c, ".0", F_PARAM);
+        c->params.push_back(".0");
+        if (n->kind == NK::GenExp)
+            c->generator = true;
+        for (size_t i = 0; i < n->comps.size(); ++i)
+        {
+            if (i > 0)
+                expr(c, n->comps[i].iter);
+            target(c, n->comps[i].target);
+            for (Node *f : n->comps[i].ifs)
+                expr(c, f);
+        }
+        if (n->kind == NK::DictComp)
+        {
+            expr(c, n->a);
+            expr(c, n->b);
+        }
+        else
+            expr(c, n->a);
+    }
+
+    void expr(Scope *s, Node *n)
+    {
+        if (!n)
+            return;
+        switch (n->kind)
+        {
+        case NK::Name:
+            add(s, n->name, F_USE);
+            if (n->name == "super" && (s->kind == SK_FUNCTION))
+                s->usesClassCell = true;
+            if (n->name == "__class__" && s->kind == SK_FUNCTION)
+                s->usesClassCell = true;
+            break;
+        case NK::FStr:
+            for (Node *p : n->list)
+                expr(s, p);
+            break;
+        case NK::FValue:
+            expr(s, n->a);
+            expr(s, n->b);
+            break;
+        case NK::BinOp:
+            expr(s, n->a);
+            expr(s, n->b);
+            break;
+        case NK::UnaryOp:
+        case NK::Starred:
+        case NK::Await:
+            expr(s, n->a);
+            break;
+        case NK::BoolOp:
+        case NK::List:
+        case NK::Tuple:
+        case NK::Set:
+            for (Node *e : n->list)
+                expr(s, e);
+            break;
+        case NK::Compare:
+            expr(s, n->a);
+            for (Node *e : n->list2)
+                expr(s, e);
+            break;
+        case NK::Call:
+            expr(s, n->a);
+            for (Node *e : n->list)
+                expr(s, e);
+            for (Node *e : n->list2)
+                expr(s, e);
+            break;
+        case NK::Attribute:
+            expr(s, n->a);
+            break;
+        case NK::Subscript:
+            expr(s, n->a);
+            expr(s, n->b);
+            break;
+        case NK::Slice:
+        case NK::IfExp:
+            expr(s, n->a);
+            expr(s, n->b);
+            expr(s, n->c);
+            break;
+        case NK::Dict:
+            for (Node *e : n->list)
+                expr(s, e);
+            for (Node *e : n->list2)
+                expr(s, e);
+            break;
+        case NK::ListComp:
+            comprehension(s, n, "<listcomp>");
+            break;
+        case NK::SetComp:
+            comprehension(s, n, "<setcomp>");
+            break;
+        case NK::DictComp:
+            comprehension(s, n, "<dictcomp>");
+            break;
+        case NK::GenExp:
+            comprehension(s, n, "<genexpr>");
+            break;
+        case NK::Lambda:
+        {
+            Scope *f = newScope(SK_FUNCTION, s, "<lambda>", n);
+            params(s, f, n->args);
+            expr(f, n->a);
+            break;
+        }
+        case NK::NamedExpr:
+        {
+            expr(s, n->a);
+            // inside a comprehension the name binds in the enclosing function / module
+            Scope *t = s;
+            while (t->kind == SK_COMP)
+            {
+                add(t, n->name, t->parent->kind == SK_MODULE ? F_GLOBAL : F_NONLOCAL);
+                t = t->parent;
+            }
+            if (t != s && t->kind == SK_CLASS)
+                compileErr("assignment expression within a comprehension cannot be used in a class body", n->line);
+            add(t, n->name, F_LOCAL);
+            break;
+        }
+        case NK::Yield:
+        case NK::YieldFrom:
+            if (s->kind == SK_FUNCTION || s->kind == SK_COMP)
+                s->generator = true;
+            else
+                compileErr("'yield' outside function", n->line);
+            expr(s, n->a);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Decides where each name of `s` lives; `visible` maps the names bound in
+    // enclosing function scopes to the scope binding them
+    void resolve(Scope *s, const std::unordered_map<std::string, Scope *> &visible)
+    {
+        if (s->usesClassCell)
+            add(s, "__class__", F_USE);
+        for (const std::string &name : s->order)
+        {
+            int f = s->flags[name];
+            int r;
+            if (s->kind == SK_MODULE)
+                r = (f & F_GLOBAL) ? R_GLOBAL_EXPLICIT : R_NAME;
+            else if (f & F_GLOBAL)
+                r = R_GLOBAL_EXPLICIT;
+            else if (f & F_NONLOCAL)
+            {
+                if (!visible.count(name))
+                    compileErr("no binding for nonlocal '" + name + "' found", 0);
+                r = R_FREE;
+            }
+            else if (f & (F_LOCAL | F_PARAM))
+                r = s->kind == SK_CLASS ? R_NAME : R_LOCAL;
+            else if (visible.count(name))
+                r = R_FREE;
+            else
+                r = s->kind == SK_CLASS ? R_NAME : R_GLOBAL_IMPLICIT;
+            s->res[name] = r;
+        }
+        std::unordered_map<std::string, Scope *> inner = visible;
+        if (s->kind == SK_FUNCTION || s->kind == SK_COMP)
+        {
+            for (const std::string &name : s->order)
+                if (s->res[name] == R_LOCAL)
+                    inner[name] = s;
+        }
+        else if (s->kind == SK_CLASS)
+            inner["__class__"] = s;
+        else
+            inner.clear();
+        for (Scope *c : s->children)
+            resolve(c, inner);
+        // cells: locals that children use freely; free: own free names and
+        // the children's that pass through
+        std::set<std::string> free;
+        for (const std::string &name : s->order)
+            if (s->res[name] == R_FREE)
+                free.insert(name);
+        std::set<std::string> cells;
+        for (Scope *c : s->children)
+            for (const std::string &fv : c->freevars)
+            {
+                auto it = s->res.find(fv);
+                bool boundHere = it != s->res.end() && (it->second == R_LOCAL || it->second == R_CELL) &&
+                                 (s->kind == SK_FUNCTION || s->kind == SK_COMP);
+                if (fv == "__class__" && s->kind == SK_CLASS)
+                {
+                    cells.insert(fv);
+                    continue;
+                }
+                if (boundHere)
+                    cells.insert(fv);
+                else if (s->kind != SK_MODULE)
+                {
+                    free.insert(fv);
+                    if (it == s->res.end())
+                    {
+                        s->res[fv] = R_FREE;
+                        s->flags[fv] = F_USE;
+                    }
+                    else if (s->kind == SK_CLASS && it->second == R_NAME && !(s->flags[fv] & (F_LOCAL | F_PARAM)))
+                        it->second = R_FREE;
+                }
+            }
+        for (const std::string &c : cells)
+            if (s->kind != SK_CLASS || c == "__class__")
+                s->res[c] = R_CELL;
+        s->cellvars.assign(cells.begin(), cells.end());
+        s->freevars.assign(free.begin(), free.end());
+    }
+};
+
+enum FBKind
+{
+    FB_WHILE,
+    FB_FOR,
+    FB_TRY_EXCEPT,
+    FB_FINALLY_TRY,
+    FB_FINALLY_END,
+    FB_HANDLER,
+    FB_WITH
+};
+
+struct FBlock
+{
+    FBKind kind;
+    int breakLabel = -1, continueLabel = -1;
+    const std::vector<Node *> *finalbody = nullptr;
+    std::string handlerName;
+};
+
+class CodeGen
+{
+public:
+    SymTable &st;
+    Scope *sc;
+    Code *code;
+    std::vector<FBlock> fblocks;
+    std::vector<int> labels;
+    std::unordered_map<std::string, int> varIndex;
+    std::unordered_map<std::string, int> nameIndex;
+    std::unordered_map<std::string, int> strConsts;
+    int line = 0;
+    int tempCounter = 0;
+    std::string filename;
+
+    CodeGen(SymTable &s, Scope *scope, const std::string &file) : st(s), sc(scope), filename(file)
+    {
+        code = new Code(tCode);
+        code->filename = file;
+        code->name = scope->name;
+        code->qualname = scope->qualname;
+        for (const std::string &p : scope->params)
+            addVar(p);
+        for (const std::string &c : scope->cellvars)
+            code->cellvars.push_back(intern(c));
+        for (const std::string &f : scope->freevars)
+            code->freevars.push_back(intern(f));
+        for (const std::string &c : scope->cellvars)
+        {
+            int arg = -1;
+            for (size_t i = 0; i < scope->params.size(); ++i)
+                if (scope->params[i] == c)
+                    arg = (int)i;
+            code->cell2arg.push_back(arg);
+        }
+        if (scope->kind == SK_FUNCTION || scope->kind == SK_COMP)
+            for (const std::string &name : scope->order)
+                if (scope->res[name] == R_LOCAL)
+                    addVar(name);
+    }
+
+    int addVar(const std::string &name)
+    {
+        auto it = varIndex.find(name);
+        if (it != varIndex.end())
+            return it->second;
+        int ix = (int)code->varnames.size();
+        code->varnames.push_back(intern(name));
+        varIndex[name] = ix;
+        code->nlocals = (int)code->varnames.size();
+        return ix;
+    }
+
+    int nameIdx(const std::string &name)
+    {
+        auto it = nameIndex.find(name);
+        if (it != nameIndex.end())
+            return it->second;
+        int ix = (int)code->names.size();
+        code->names.push_back(intern(name));
+        nameIndex[name] = ix;
+        return ix;
+    }
+
+    int cellIdx(const std::string &name)
+    {
+        for (size_t i = 0; i < sc->cellvars.size(); ++i)
+            if (sc->cellvars[i] == name)
+                return (int)i;
+        for (size_t i = 0; i < sc->freevars.size(); ++i)
+            if (sc->freevars[i] == name)
+                return (int)(sc->cellvars.size() + i);
+        compileErr("internal: no cell for '" + name + "'", line);
+    }
+
+    int constIdx(V v)
+    {
+        code->consts.push_back(v);
+        return (int)code->consts.size() - 1;
+    }
+
+    int strConst(const std::string &s)
+    {
+        auto it = strConsts.find(s);
+        if (it != strConsts.end())
+            return it->second;
+        int ix = constIdx(s.size() <= 40 ? intern(s) : newStr(s));
+        strConsts[s] = ix;
+        return ix;
+    }
+
+    void emit(OpCode op, int arg = 0)
+    {
+        Ins i;
+        i.op = (uint8_t)op;
+        i.arg = arg;
+        i.line = line;
+        code->ins.push_back(i);
+    }
+
+    int newLabel()
+    {
+        labels.push_back(-1);
+        return (int)labels.size() - 1;
+    }
+
+    void bind(int label) { labels[(size_t)label] = (int)code->ins.size(); }
+
+    void emitJump(OpCode op, int label) { emit(op, label); }
+
+    void finish()
+    {
+        // ensure a final return, then patch jump targets
+        if (code->ins.empty() || code->ins.back().op != O_RETURN)
+        {
+            emit(O_CONST, constIdx(None));
+            emit(O_RETURN);
+        }
+        for (Ins &i : code->ins)
+        {
+            switch (i.op)
+            {
+            case O_JUMP:
+            case O_JUMP_IF_FALSE:
+            case O_JUMP_IF_TRUE:
+            case O_JUMP_IF_FALSE_OR_POP:
+            case O_JUMP_IF_TRUE_OR_POP:
+            case O_JUMP_IF_NOT_NONE:
+            case O_FOR_ITER:
+            case O_SETUP_EXCEPT:
+            case O_SETUP_FINALLY:
+            case O_WITH_ENTER:
+                i.arg = labels[(size_t)i.arg];
+                break;
+            default:
+                break;
+            }
+        }
+        if (sc->generator)
+            code->flags |= CF_GENERATOR;
+        if (sc->kind == SK_CLASS)
+            code->flags |= CF_CLASS;
+        if (sc->kind == SK_MODULE)
+            code->flags |= CF_MODULE;
+        if (sc->kind == SK_COMP)
+            code->flags |= CF_COMPREHENSION;
+    }
+
+    // ── names ──
+
+    int resOf(const std::string &name)
+    {
+        auto it = sc->res.find(name);
+        if (it == sc->res.end())
+            return sc->kind == SK_MODULE || sc->kind == SK_CLASS ? R_NAME : R_GLOBAL_IMPLICIT;
+        return it->second;
+    }
+
+    void loadName(const std::string &name)
+    {
+        int r = resOf(name);
+        switch (r)
+        {
+        case R_LOCAL:
+            emit(O_LOAD_FAST, addVar(name));
+            break;
+        case R_CELL:
+        case R_FREE:
+            if (sc->kind == SK_CLASS)
+            {
+                // a class body checks its namespace before the enclosing function's cell
+                emit(O_LOAD_CLASSDEREF, cellIdx(name) | (nameIdx(name) << 16));
+            }
+            else
+                emit(O_LOAD_DEREF, cellIdx(name));
+            break;
+        case R_GLOBAL_EXPLICIT:
+        case R_GLOBAL_IMPLICIT:
+            emit(O_LOAD_GLOBAL, nameIdx(name));
+            break;
+        default:
+            emit(O_LOAD_NAME, nameIdx(name));
+        }
+    }
+
+    void storeName(const std::string &name)
+    {
+        int r = resOf(name);
+        switch (r)
+        {
+        case R_LOCAL:
+            emit(O_STORE_FAST, addVar(name));
+            break;
+        case R_CELL:
+        case R_FREE:
+            if (sc->kind == SK_CLASS && r == R_CELL && name != "__class__")
+                emit(O_STORE_NAME, nameIdx(name));
+            else
+                emit(O_STORE_DEREF, cellIdx(name));
+            break;
+        case R_GLOBAL_EXPLICIT:
+            emit(O_STORE_GLOBAL, nameIdx(name));
+            break;
+        case R_GLOBAL_IMPLICIT:
+            emit(O_STORE_FAST, addVar(name));
+            break;
+        default:
+            emit(O_STORE_NAME, nameIdx(name));
+        }
+    }
+
+    void delName(const std::string &name, bool optional = false)
+    {
+        int r = resOf(name);
+        switch (r)
+        {
+        case R_LOCAL:
+            emit(optional ? O_DEL_FAST_OPT : O_DEL_FAST, addVar(name));
+            break;
+        case R_CELL:
+        case R_FREE:
+            emit(optional ? O_DEL_DEREF_OPT : O_DEL_DEREF, cellIdx(name));
+            break;
+        case R_GLOBAL_EXPLICIT:
+            emit(O_DEL_GLOBAL, nameIdx(name));
+            break;
+        default:
+            emit(optional ? O_DEL_NAME_OPT : O_DEL_NAME, nameIdx(name));
+        }
+    }
+
+    // a hidden variable for match subjects and return values
+    std::string newTemp()
+    {
+        std::string name = "$t" + std::to_string(tempCounter++);
+        if (sc->kind == SK_FUNCTION || sc->kind == SK_COMP)
+        {
+            sc->res[name] = R_LOCAL;
+            addVar(name);
+        }
+        else
+            sc->res[name] = R_NAME;
+        return name;
+    }
+
+    // ── module / function bodies ──
+
+    static bool isDocstring(const std::vector<Node *> &body)
+    {
+        return !body.empty() && body[0]->kind == NK::ExprStmt && body[0]->a->kind == NK::Str;
+    }
+
+    static bool hasAnnotations(const std::vector<Node *> &body)
+    {
+        for (Node *n : body)
+            if (n->kind == NK::AnnAssign && n->flag)
+                return true;
+        return false;
+    }
+
+    void body(const std::vector<Node *> &stmts)
+    {
+        for (Node *n : stmts)
+            stmt(n);
+    }
+
+    // ── statements ──
+
+    void stmt(Node *n)
+    {
+        line = n->line;
+        switch (n->kind)
+        {
+        case NK::ExprStmt:
+            if (n->a->kind == NK::Str || n->a->kind == NK::Int || n->a->kind == NK::Ellipsis)
+                return; // a docstring or a bare literal
+            expr(n->a);
+            emit(O_POP);
+            break;
+        case NK::Assign:
+            expr(n->a);
+            for (size_t i = 0; i < n->list.size(); ++i)
+            {
+                if (i + 1 < n->list.size())
+                    emit(O_DUP);
+                store(n->list[i]);
+            }
+            break;
+        case NK::AugAssign:
+            augAssign(n);
+            break;
+        case NK::AnnAssign:
+            if (n->flag && (sc->kind == SK_MODULE || sc->kind == SK_CLASS))
+            {
+                expr(n->b);
+                emit(O_STORE_ANNOTATION, nameIdx(n->a->name));
+            }
+            else if (!n->flag && (sc->kind == SK_MODULE || sc->kind == SK_CLASS))
+            {
+                // the annotation is evaluated but not stored
+            }
+            if (n->c)
+            {
+                expr(n->c);
+                store(n->a);
+            }
+            break;
+        case NK::Delete:
+            for (Node *t : n->list)
+                del(t);
+            break;
+        case NK::Pass:
+            break;
+        case NK::If:
+            ifStmt(n);
+            break;
+        case NK::While:
+            whileStmt(n);
+            break;
+        case NK::For:
+            forStmt(n);
+            break;
+        case NK::Break:
+            breakStmt(n);
+            break;
+        case NK::Continue:
+            continueStmt(n);
+            break;
+        case NK::Return:
+            returnStmt(n);
+            break;
+        case NK::Raise:
+            if (n->a)
+                expr(n->a);
+            if (n->b)
+                expr(n->b);
+            emit(O_RAISE, n->a ? (n->b ? 2 : 1) : 0);
+            break;
+        case NK::Try:
+            tryStmt(n);
+            break;
+        case NK::With:
+            withStmt(n, 0);
+            break;
+        case NK::Assert:
+        {
+            int end = newLabel();
+            expr(n->a);
+            emitJump(O_JUMP_IF_TRUE, end);
+            if (n->b)
+                expr(n->b);
+            emit(O_ASSERT_FAIL, n->b ? 1 : 0);
+            bind(end);
+            break;
+        }
+        case NK::Import:
+            for (size_t i = 0; i < n->names.size(); ++i)
+            {
+                emit(O_CONST, constIdx(MKSMALL(0)));
+                emit(O_CONST, constIdx(None));
+                emit(O_IMPORT_NAME, nameIdx(n->names[i]));
+                if (!n->names2[i].empty())
+                {
+                    // import a.b.c as d binds the innermost module
+                    std::string full = n->names[i];
+                    size_t dot = full.find('.');
+                    while (dot != std::string::npos)
+                    {
+                        size_t next = full.find('.', dot + 1);
+                        emit(O_IMPORT_FROM, nameIdx(full.substr(dot + 1, next == std::string::npos ? std::string::npos : next - dot - 1)));
+                        emit(O_ROT2);
+                        emit(O_POP);
+                        dot = next;
+                    }
+                    storeName(n->names2[i]);
+                }
+                else
+                    storeName(n->names[i].substr(0, n->names[i].find('.')));
+            }
+            break;
+        case NK::ImportFrom:
+        {
+            emit(O_CONST, constIdx(MKSMALL(n->ival)));
+            std::vector<V> names;
+            for (const std::string &nm : n->names)
+                names.push_back(intern(nm));
+            emit(O_CONST, constIdx(tupleOf(names)));
+            emit(O_IMPORT_NAME, nameIdx(n->name));
+            if (n->names.size() == 1 && n->names[0] == "*")
+            {
+                emit(O_IMPORT_STAR);
+                break;
+            }
+            for (size_t i = 0; i < n->names.size(); ++i)
+            {
+                emit(O_IMPORT_FROM, nameIdx(n->names[i]));
+                storeName(n->names2[i].empty() ? n->names[i] : n->names2[i]);
+            }
+            emit(O_POP);
+            break;
+        }
+        case NK::Global:
+        case NK::Nonlocal:
+            break;
+        case NK::FunctionDef:
+            functionDef(n);
+            break;
+        case NK::ClassDef:
+            classDef(n);
+            break;
+        case NK::Match:
+            matchStmt(n);
+            break;
+        default:
+            compileErr("unsupported statement", n->line);
+        }
+    }
+
+    void store(Node *t)
+    {
+        switch (t->kind)
+        {
+        case NK::Name:
+            storeName(t->name);
+            break;
+        case NK::Attribute:
+            expr(t->a);
+            emit(O_STORE_ATTR, nameIdx(t->name));
+            break;
+        case NK::Subscript:
+            expr(t->a);
+            subscriptKey(t->b);
+            emit(O_STORE_SUBSCR);
+            break;
+        case NK::Tuple:
+        case NK::List:
+        {
+            int star = -1;
+            for (size_t i = 0; i < t->list.size(); ++i)
+                if (t->list[i]->kind == NK::Starred)
+                {
+                    if (star >= 0)
+                        compileErr("multiple starred expressions in assignment", t->line);
+                    star = (int)i;
+                }
+            if (star < 0)
+                emit(O_UNPACK, (int)t->list.size());
+            else
+                emit(O_UNPACK_EX, star | ((int)(t->list.size() - (size_t)star - 1) << 8));
+            for (Node *e : t->list)
+                store(e->kind == NK::Starred ? e->a : e);
+            break;
+        }
+        case NK::Starred:
+            compileErr("starred assignment target must be in a list or tuple", t->line);
+        default:
+            compileErr("cannot assign to expression", t->line);
+        }
+    }
+
+    void del(Node *t)
+    {
+        switch (t->kind)
+        {
+        case NK::Name:
+            delName(t->name);
+            break;
+        case NK::Attribute:
+            expr(t->a);
+            emit(O_DEL_ATTR, nameIdx(t->name));
+            break;
+        case NK::Subscript:
+            expr(t->a);
+            subscriptKey(t->b);
+            emit(O_DEL_SUBSCR);
+            break;
+        case NK::Tuple:
+        case NK::List:
+            for (Node *e : t->list)
+                del(e);
+            break;
+        default:
+            compileErr("cannot delete expression", t->line);
+        }
+    }
+
+    void augAssign(Node *n)
+    {
+        Node *t = n->a;
+        switch (t->kind)
+        {
+        case NK::Name:
+            loadName(t->name);
+            expr(n->b);
+            emit(O_INPLACE, n->op);
+            storeName(t->name);
+            break;
+        case NK::Attribute:
+            expr(t->a);
+            emit(O_DUP);
+            emit(O_LOAD_ATTR, nameIdx(t->name));
+            expr(n->b);
+            emit(O_INPLACE, n->op);
+            emit(O_ROT2);
+            emit(O_STORE_ATTR, nameIdx(t->name));
+            break;
+        case NK::Subscript:
+            expr(t->a);
+            subscriptKey(t->b);
+            emit(O_DUP2);
+            emit(O_SUBSCR);
+            expr(n->b);
+            emit(O_INPLACE, n->op);
+            emit(O_ROT3);
+            emit(O_STORE_SUBSCR);
+            break;
+        default:
+            compileErr("illegal expression for augmented assignment", n->line);
+        }
+    }
+
+    void ifStmt(Node *n)
+    {
+        int elseL = newLabel(), end = newLabel();
+        condJump(n->a, false, elseL);
+        body(n->body);
+        if (!n->orelse.empty())
+            emitJump(O_JUMP, end);
+        bind(elseL);
+        body(n->orelse);
+        bind(end);
+    }
+
+    // Jumps to `label` when the condition's truth equals `when`
+    void condJump(Node *c, bool when, int label)
+    {
+        if (c->kind == NK::UnaryOp && c->op == OpNot)
+        {
+            condJump(c->a, !when, label);
+            return;
+        }
+        if (c->kind == NK::BoolOp)
+        {
+            bool isAnd = c->op == OpAnd;
+            if (isAnd != when)
+            {
+                // and→false / or→true: any operand decides
+                for (Node *e : c->list)
+                    condJump(e, when, label);
+                return;
+            }
+            int skip = newLabel();
+            for (size_t i = 0; i + 1 < c->list.size(); ++i)
+                condJump(c->list[i], !when, skip);
+            condJump(c->list.back(), when, label);
+            bind(skip);
+            return;
+        }
+        expr(c);
+        emitJump(when ? O_JUMP_IF_TRUE : O_JUMP_IF_FALSE, label);
+    }
+
+    void whileStmt(Node *n)
+    {
+        int top = newLabel(), elseL = newLabel(), end = newLabel();
+        bind(top);
+        condJump(n->a, false, elseL);
+        FBlock fb;
+        fb.kind = FB_WHILE;
+        fb.breakLabel = end;
+        fb.continueLabel = top;
+        fblocks.push_back(fb);
+        body(n->body);
+        fblocks.pop_back();
+        emitJump(O_JUMP, top);
+        bind(elseL);
+        body(n->orelse);
+        bind(end);
+    }
+
+    void forStmt(Node *n)
+    {
+        int top = newLabel(), elseL = newLabel(), end = newLabel();
+        expr(n->b);
+        emit(O_GET_ITER);
+        bind(top);
+        line = n->line;
+        emitJump(O_FOR_ITER, elseL);
+        store(n->a);
+        FBlock fb;
+        fb.kind = FB_FOR;
+        fb.breakLabel = end;
+        fb.continueLabel = top;
+        fblocks.push_back(fb);
+        body(n->body);
+        fblocks.pop_back();
+        emitJump(O_JUMP, top);
+        bind(elseL);
+        body(n->orelse);
+        bind(end);
+    }
+
+    // Emits the cleanup of fblocks[from..] (innermost first) for leaving them
+    void unwind(size_t downTo, bool forReturn)
+    {
+        for (size_t k = fblocks.size(); k-- > downTo;)
+        {
+            FBlock fb = fblocks[k];
+            switch (fb.kind)
+            {
+            case FB_WHILE:
+                break;
+            case FB_FOR:
+                if (forReturn)
+                    emit(O_POP);
+                break;
+            case FB_TRY_EXCEPT:
+                emit(O_POP_BLOCK);
+                break;
+            case FB_FINALLY_TRY:
+            {
+                emit(O_POP_BLOCK);
+                std::vector<FBlock> saved = fblocks;
+                fblocks.resize(k);
+                body(*fb.finalbody);
+                fblocks = saved;
+                break;
+            }
+            case FB_FINALLY_END:
+                emit(O_POP_EXCEPT);
+                emit(O_POP);
+                break;
+            case FB_HANDLER:
+                emit(O_POP_EXCEPT);
+                if (!fb.handlerName.empty())
+                    delName(fb.handlerName, true);
+                break;
+            case FB_WITH:
+                emit(O_POP_BLOCK);
+                emit(O_CONST, constIdx(None));
+                emit(O_WITH_EXIT);
+                break;
+            }
+        }
+    }
+
+    size_t loopIndex(Node *n, const char *what)
+    {
+        for (size_t k = fblocks.size(); k-- > 0;)
+            if (fblocks[k].kind == FB_WHILE || fblocks[k].kind == FB_FOR)
+                return k;
+        compileErr(std::string("'") + what + "' outside loop", n->line);
+    }
+
+    void breakStmt(Node *n)
+    {
+        size_t k = loopIndex(n, "break");
+        unwind(k + 1, false);
+        if (fblocks[k].kind == FB_FOR)
+            emit(O_POP);
+        emitJump(O_JUMP, fblocks[k].breakLabel);
+    }
+
+    void continueStmt(Node *n)
+    {
+        size_t k = loopIndex(n, "continue");
+        unwind(k + 1, false);
+        emitJump(O_JUMP, fblocks[k].continueLabel);
+    }
+
+    void returnStmt(Node *n)
+    {
+        if (sc->kind != SK_FUNCTION && sc->kind != SK_COMP)
+            compileErr("'return' outside function", n->line);
+        if (n->a)
+            expr(n->a);
+        else
+            emit(O_CONST, constIdx(None));
+        bool needCleanup = false;
+        for (const FBlock &fb : fblocks)
+            if (fb.kind != FB_WHILE && fb.kind != FB_FOR)
+                needCleanup = true;
+        if (!needCleanup)
+        {
+            emit(O_RETURN);
+            return;
+        }
+        std::string tmp = newTemp();
+        storeName(tmp);
+        unwind(0, true);
+        loadName(tmp);
+        emit(O_RETURN);
+    }
+
+    void tryStmt(Node *n)
+    {
+        if (!n->finalbody.empty())
+        {
+            int fin = newLabel(), end = newLabel();
+            emitJump(O_SETUP_FINALLY, fin);
+            FBlock fb;
+            fb.kind = FB_FINALLY_TRY;
+            fb.finalbody = &n->finalbody;
+            fblocks.push_back(fb);
+            if (!n->handlers.empty())
+                tryExcept(n);
+            else
+                body(n->body);
+            fblocks.pop_back();
+            emit(O_POP_BLOCK);
+            body(n->finalbody);
+            emitJump(O_JUMP, end);
+            bind(fin);
+            FBlock fe;
+            fe.kind = FB_FINALLY_END;
+            fblocks.push_back(fe);
+            body(n->finalbody);
+            fblocks.pop_back();
+            emit(O_RERAISE);
+            bind(end);
+            return;
+        }
+        tryExcept(n);
+    }
+
+    void tryExcept(Node *n)
+    {
+        int handlers = newLabel(), end = newLabel();
+        emitJump(O_SETUP_EXCEPT, handlers);
+        FBlock fb;
+        fb.kind = FB_TRY_EXCEPT;
+        fblocks.push_back(fb);
+        body(n->body);
+        fblocks.pop_back();
+        emit(O_POP_BLOCK);
+        body(n->orelse);
+        emitJump(O_JUMP, end);
+        bind(handlers);
+        for (Handler &h : n->handlers)
+        {
+            line = h.line;
+            int next = newLabel();
+            if (h.type)
+            {
+                emit(O_DUP);
+                expr(h.type);
+                emit(O_EXC_MATCH);
+                emitJump(O_JUMP_IF_FALSE, next);
+            }
+            if (!h.name.empty())
+                storeName(h.name);
+            else
+                emit(O_POP);
+            FBlock hb;
+            hb.kind = FB_HANDLER;
+            hb.handlerName = h.name;
+            fblocks.push_back(hb);
+            body(h.body);
+            fblocks.pop_back();
+            emit(O_POP_EXCEPT);
+            if (!h.name.empty())
+                delName(h.name, true);
+            emitJump(O_JUMP, end);
+            bind(next);
+        }
+        emit(O_RERAISE);
+        bind(end);
+    }
+
+    void withStmt(Node *n, size_t item)
+    {
+        if (item >= n->list.size())
+        {
+            body(n->body);
+            return;
+        }
+        int cleanup = newLabel(), end = newLabel();
+        line = n->line;
+        expr(n->list[item]);
+        emitJump(O_WITH_ENTER, cleanup);
+        if (n->list2[item])
+            store(n->list2[item]);
+        else
+            emit(O_POP);
+        FBlock fb;
+        fb.kind = FB_WITH;
+        fblocks.push_back(fb);
+        withStmt(n, item + 1);
+        fblocks.pop_back();
+        emit(O_POP_BLOCK);
+        emit(O_CONST, constIdx(None));
+        emit(O_WITH_EXIT);
+        emitJump(O_JUMP, end);
+        bind(cleanup);
+        emit(O_WITH_EXIT);
+        bind(end);
+    }
+
+    // ── functions and classes ──
+
+    Code *compileFunctionBody(Scope *fs, Node *n, bool isLambda)
+    {
+        CodeGen g(st, fs, filename);
+        g.line = n->line;
+        g.code->firstline = n->line;
+        Params *p = n->args;
+        g.code->argcount = (int)(p->posonly.size() + p->args.size());
+        g.code->posonly = (int)p->posonly.size();
+        g.code->kwonly = (int)p->kwonly.size();
+        if (p->vararg)
+            g.code->flags |= CF_VARARGS;
+        if (p->kwarg)
+            g.code->flags |= CF_VARKW;
+        if (isLambda)
+        {
+            g.expr(n->a);
+            if (fs->generator)
+                g.emit(O_POP), g.emit(O_CONST, g.constIdx(None));
+            g.emit(O_RETURN);
+        }
+        else
+        {
+            if (isDocstring(n->body))
+                g.code->doc = newStr(n->body[0]->a->name);
+            g.body(n->body);
+        }
+        g.finish();
+        return g.code;
+    }
+
+    // Pushes the closure tuple for a child scope; returns whether it has one
+    bool closureFor(Scope *child)
+    {
+        if (child->freevars.empty())
+            return false;
+        for (const std::string &fv : child->freevars)
+            emit(O_LOAD_CLOSURE, cellIdx(fv));
+        emit(O_BUILD_TUPLE, (int)child->freevars.size());
+        return true;
+    }
+
+    void makeFunction(Scope *fs, Node *n, Code *c, bool isLambda)
+    {
+        int flags = 0;
+        Params *p = n->args;
+        if (!p->defaults.empty())
+        {
+            for (Node *d : p->defaults)
+                expr(d);
+            emit(O_BUILD_TUPLE, (int)p->defaults.size());
+            flags |= 1;
+        }
+        bool anyKw = false;
+        for (Node *d : p->kwDefaults)
+            if (d)
+                anyKw = true;
+        if (anyKw)
+        {
+            int count = 0;
+            for (size_t i = 0; i < p->kwonly.size(); ++i)
+                if (p->kwDefaults[i])
+                {
+                    emit(O_CONST, strConst(p->kwonly[i].name));
+                    expr(p->kwDefaults[i]);
+                    ++count;
+                }
+            emit(O_BUILD_MAP, count);
+            flags |= 2;
+        }
+        if (!isLambda)
+        {
+            int count = 0;
+            auto ann = [&](const Arg &a) {
+                if (a.annotation)
+                {
+                    emit(O_CONST, strConst(a.name));
+                    expr(a.annotation);
+                    ++count;
+                }
+            };
+            for (const Arg &a : p->posonly)
+                ann(a);
+            for (const Arg &a : p->args)
+                ann(a);
+            if (p->vararg)
+                ann(*p->vararg);
+            for (const Arg &a : p->kwonly)
+                ann(a);
+            if (p->kwarg)
+                ann(*p->kwarg);
+            if (n->a)
+            {
+                emit(O_CONST, strConst("return"));
+                expr(n->a);
+                ++count;
+            }
+            if (count)
+            {
+                emit(O_BUILD_MAP, count);
+                flags |= 4;
+            }
+        }
+        if (closureFor(fs))
+            flags |= 8;
+        emit(O_CONST, constIdx(c));
+        emit(O_MAKE_FUNCTION, flags);
+    }
+
+    void functionDef(Node *n)
+    {
+        Scope *fs = st.scopes[n];
+        for (Node *d : n->decorators)
+            expr(d);
+        Code *c = compileFunctionBody(fs, n, false);
+        line = n->line;
+        makeFunction(fs, n, c, false);
+        for (size_t i = 0; i < n->decorators.size(); ++i)
+            emit(O_CALL, 1);
+        storeName(n->name);
+    }
+
+    void classDef(Node *n)
+    {
+        Scope *cs = st.scopes[n];
+        for (Node *d : n->decorators)
+            expr(d);
+        // the body as a function run with the namespace as its locals
+        CodeGen g(st, cs, filename);
+        g.line = n->line;
+        g.code->firstline = n->line;
+        g.emit(O_LOAD_NAME, g.nameIdx("__name__"));
+        g.emit(O_STORE_NAME, g.nameIdx("__module__"));
+        g.emit(O_CONST, g.strConst(cs->qualname));
+        g.emit(O_STORE_NAME, g.nameIdx("__qualname__"));
+        if (isDocstring(n->body))
+        {
+            g.emit(O_CONST, g.strConst(n->body[0]->a->name));
+            g.emit(O_STORE_NAME, g.nameIdx("__doc__"));
+        }
+        if (hasAnnotations(n->body))
+            g.emit(O_SETUP_ANNOTATIONS);
+        g.body(n->body);
+        bool classCell = std::find(cs->cellvars.begin(), cs->cellvars.end(), "__class__") != cs->cellvars.end();
+        if (classCell)
+        {
+            g.emit(O_LOAD_CLOSURE, g.cellIdx("__class__"));
+            g.emit(O_STORE_NAME, g.nameIdx("__classcell__"));
+        }
+        g.emit(O_CONST, g.constIdx(None));
+        g.emit(O_RETURN);
+        g.finish();
+        line = n->line;
+        int flags = 0;
+        if (closureFor(cs))
+            flags |= 8;
+        emit(O_CONST, constIdx(g.code));
+        emit(O_MAKE_FUNCTION, flags);
+        emit(O_CONST, strConst(n->name));
+        bool star = false;
+        for (Node *b : n->list)
+            if (b->kind == NK::Starred)
+                star = true;
+        if (star)
+            compileErr("starred class bases are not supported", n->line);
+        for (Node *b : n->list)
+            expr(b);
+        std::vector<V> kwnames;
+        for (size_t i = 0; i < n->names.size(); ++i)
+        {
+            if (n->names[i].empty())
+                compileErr("**kwargs in class keywords are not supported", n->line);
+            expr(n->list2[i]);
+            kwnames.push_back(intern(n->names[i]));
+        }
+        emit(O_CONST, constIdx(tupleOf(kwnames)));
+        emit(O_BUILD_CLASS, (int)n->list.size() | ((int)kwnames.size() << 16));
+        for (size_t i = 0; i < n->decorators.size(); ++i)
+            emit(O_CALL, 1);
+        storeName(n->name);
+    }
+
+    // ── match ──
+
+    void matchStmt(Node *n)
+    {
+        std::string subj = newTemp();
+        expr(n->a);
+        storeName(subj);
+        int end = newLabel();
+        for (MatchCase &mc : n->cases)
+        {
+            int next = newLabel();
+            line = mc.pattern->line;
+            pattern(mc.pattern, subj, next);
+            if (mc.guard)
+                condJump(mc.guard, false, next);
+            body(mc.body);
+            emitJump(O_JUMP, end);
+            bind(next);
+        }
+        bind(end);
+    }
+
+    void pattern(Node *p, const std::string &subj, int fail)
+    {
+        switch (p->kind)
+        {
+        case NK::PValue:
+            loadName(subj);
+            expr(p->a);
+            emit(O_COMPARE, OpEq);
+            emitJump(O_JUMP_IF_FALSE, fail);
+            break;
+        case NK::PSingleton:
+            loadName(subj);
+            expr(p->a);
+            emit(O_COMPARE, OpIs);
+            emitJump(O_JUMP_IF_FALSE, fail);
+            break;
+        case NK::PAs:
+            if (p->b)
+                pattern(p->b, subj, fail);
+            if (!p->name.empty())
+            {
+                loadName(subj);
+                storeName(p->name);
+            }
+            break;
+        case NK::POr:
+        {
+            int ok = newLabel();
+            for (size_t i = 0; i < p->list.size(); ++i)
+            {
+                if (i + 1 < p->list.size())
+                {
+                    int nextAlt = newLabel();
+                    pattern(p->list[i], subj, nextAlt);
+                    emitJump(O_JUMP, ok);
+                    bind(nextAlt);
+                }
+                else
+                    pattern(p->list[i], subj, fail);
+            }
+            bind(ok);
+            break;
+        }
+        case NK::PSequence:
+        {
+            loadName(subj);
+            emit(O_MATCH_SEQUENCE);
+            emitJump(O_JUMP_IF_FALSE, fail);
+            int star = -1;
+            for (size_t i = 0; i < p->list.size(); ++i)
+                if (p->list[i]->kind == NK::PStar)
+                    star = (int)i;
+            int n = (int)p->list.size();
+            loadName(subj);
+            emit(O_GET_LEN);
+            emit(O_CONST, constIdx(mkint(star < 0 ? n : n - 1)));
+            emit(O_COMPARE, star < 0 ? OpEq : OpGe);
+            emitJump(O_JUMP_IF_FALSE, fail);
+            for (int i = 0; i < n; ++i)
+            {
+                Node *sp = p->list[(size_t)i];
+                if (sp->kind == NK::PStar)
+                {
+                    if (sp->name.empty())
+                        continue;
+                    loadName(subj);
+                    emit(O_SEQ_SLICE_LIST, i | ((n - i - 1) << 16));
+                    storeName(sp->name);
+                    continue;
+                }
+                if (sp->kind == NK::PAs && !sp->b && sp->name.empty())
+                    continue; // wildcard
+                std::string t = newTemp();
+                loadName(subj);
+                emit(O_CONST, constIdx(mkint(star >= 0 && i > star ? i - n : i)));
+                emit(O_SUBSCR);
+                storeName(t);
+                pattern(sp, t, fail);
+            }
+            break;
+        }
+        case NK::PMapping:
+        {
+            loadName(subj);
+            emit(O_MATCH_MAPPING);
+            emitJump(O_JUMP_IF_FALSE, fail);
+            std::string vals = newTemp();
+            if (!p->list.empty())
+            {
+                loadName(subj);
+                for (Node *k : p->list)
+                    expr(k);
+                emit(O_BUILD_TUPLE, (int)p->list.size());
+                emit(O_MATCH_KEYS);
+                emit(O_DUP);
+                storeName(vals);
+                jumpIfNone(fail);
+            }
+            for (size_t i = 0; i < p->list2.size(); ++i)
+            {
+                std::string t = newTemp();
+                loadName(vals);
+                emit(O_CONST, constIdx(mkint((int64_t)i)));
+                emit(O_SUBSCR);
+                storeName(t);
+                pattern(p->list2[i], t, fail);
+            }
+            if (!p->name.empty())
+            {
+                loadName(subj);
+                for (Node *k : p->list)
+                    expr(k);
+                emit(O_BUILD_TUPLE, (int)p->list.size());
+                emit(O_COPY_DICT_WITHOUT_KEYS);
+                storeName(p->name);
+            }
+            break;
+        }
+        case NK::PClass:
+        {
+            std::string attrs = newTemp();
+            loadName(subj);
+            expr(p->a);
+            std::vector<V> kw;
+            for (const std::string &k : p->names)
+                kw.push_back(intern(k));
+            emit(O_CONST, constIdx(tupleOf(kw)));
+            emit(O_MATCH_CLASS, (int)p->list.size());
+            emit(O_DUP);
+            storeName(attrs);
+            jumpIfNone(fail);
+            size_t idx = 0;
+            for (Node *sp : p->list)
+            {
+                std::string t = newTemp();
+                loadName(attrs);
+                emit(O_CONST, constIdx(mkint((int64_t)idx++)));
+                emit(O_SUBSCR);
+                storeName(t);
+                pattern(sp, t, fail);
+            }
+            for (Node *sp : p->list2)
+            {
+                std::string t = newTemp();
+                loadName(attrs);
+                emit(O_CONST, constIdx(mkint((int64_t)idx++)));
+                emit(O_SUBSCR);
+                storeName(t);
+                pattern(sp, t, fail);
+            }
+            break;
+        }
+        default:
+            compileErr("unsupported pattern", p->line);
+        }
+    }
+
+    // Pops TOS; jumps to `fail` when it is None
+    void jumpIfNone(int fail)
+    {
+        int ok = newLabel();
+        emitJump(O_JUMP_IF_NOT_NONE, ok);
+        emitJump(O_JUMP, fail);
+        bind(ok);
+    }
+
+    // ── expressions ──
+
+    void subscriptKey(Node *k)
+    {
+        if (k->kind == NK::Slice)
+            sliceExpr(k);
+        else if (k->kind == NK::Tuple)
+        {
+            bool anySlice = false;
+            for (Node *e : k->list)
+                if (e->kind == NK::Slice)
+                    anySlice = true;
+            if (anySlice)
+            {
+                for (Node *e : k->list)
+                    if (e->kind == NK::Slice)
+                        sliceExpr(e);
+                    else
+                        expr(e);
+                emit(O_BUILD_TUPLE, (int)k->list.size());
+            }
+            else
+                expr(k);
+        }
+        else
+            expr(k);
+    }
+
+    void sliceExpr(Node *s)
+    {
+        if (s->a)
+            expr(s->a);
+        else
+            emit(O_CONST, constIdx(None));
+        if (s->b)
+            expr(s->b);
+        else
+            emit(O_CONST, constIdx(None));
+        if (s->c)
+        {
+            expr(s->c);
+            emit(O_BUILD_SLICE, 3);
+        }
+        else
+            emit(O_BUILD_SLICE, 2);
+    }
+
+    static bool hasStar(const std::vector<Node *> &v)
+    {
+        for (Node *e : v)
+            if (e->kind == NK::Starred)
+                return true;
+        return false;
+    }
+
+    // Pushes a list built from elements that may be starred
+    void starredList(const std::vector<Node *> &v)
+    {
+        emit(O_BUILD_LIST, 0);
+        for (Node *e : v)
+        {
+            if (e->kind == NK::Starred)
+            {
+                expr(e->a);
+                emit(O_LIST_EXTEND, 1);
+            }
+            else
+            {
+                expr(e);
+                emit(O_LIST_APPEND, 1);
+            }
+        }
+    }
+
+    void call(Node *n)
+    {
+        bool starArgs = hasStar(n->list);
+        bool starKw = false;
+        for (const std::string &k : n->names)
+            if (k.empty())
+                starKw = true;
+        if (n->a->kind == NK::Attribute && !starArgs && !starKw && n->names.empty())
+        {
+            expr(n->a->a);
+            line = n->line;
+            emit(O_LOAD_METHOD, nameIdx(n->a->name));
+            for (Node *e : n->list)
+                expr(e);
+            line = n->line;
+            emit(O_CALL_METHOD, (int)n->list.size());
+            return;
+        }
+        expr(n->a);
+        if (starArgs || starKw)
+        {
+            starredList(n->list);
+            emit(O_LIST_TO_TUPLE);
+            int flags = 0;
+            if (!n->names.empty())
+            {
+                emit(O_BUILD_MAP, 0);
+                for (size_t i = 0; i < n->names.size(); ++i)
+                {
+                    if (n->names[i].empty())
+                    {
+                        expr(n->list2[i]);
+                        emit(O_DICT_MERGE, 1);
+                    }
+                    else
+                    {
+                        emit(O_CONST, strConst(n->names[i]));
+                        expr(n->list2[i]);
+                        emit(O_MAP_ADD, 1);
+                    }
+                }
+                flags = 1;
+            }
+            line = n->line;
+            emit(O_CALL_EX, flags);
+            return;
+        }
+        for (Node *e : n->list)
+            expr(e);
+        if (!n->names.empty())
+        {
+            std::vector<V> names;
+            for (size_t i = 0; i < n->names.size(); ++i)
+            {
+                expr(n->list2[i]);
+                names.push_back(intern(n->names[i]));
+            }
+            emit(O_CONST, constIdx(tupleOf(names)));
+            line = n->line;
+            emit(O_CALL_KW, (int)(n->list.size() + n->names.size()));
+            return;
+        }
+        line = n->line;
+        emit(O_CALL, (int)n->list.size());
+    }
+
+    void comprehension(Node *n)
+    {
+        Scope *cs = st.scopes[n];
+        CodeGen g(st, cs, filename);
+        g.line = n->line;
+        g.code->firstline = n->line;
+        g.code->argcount = 1;
+        int depth = (int)n->comps.size();
+        if (n->kind == NK::ListComp)
+            g.emit(O_BUILD_LIST, 0);
+        else if (n->kind == NK::SetComp)
+            g.emit(O_BUILD_SET, 0);
+        else if (n->kind == NK::DictComp)
+            g.emit(O_BUILD_MAP, 0);
+        g.compLevel(n, 0, depth);
+        if (n->kind == NK::GenExp)
+            g.emit(O_CONST, g.constIdx(None));
+        g.emit(O_RETURN);
+        g.finish();
+        line = n->line;
+        int flags = closureFor(cs) ? 8 : 0;
+        emit(O_CONST, constIdx(g.code));
+        emit(O_MAKE_FUNCTION, flags);
+        expr(n->comps[0].iter);
+        emit(O_GET_ITER);
+        emit(O_CALL, 1);
+    }
+
+    void compLevel(Node *n, size_t level, int depth)
+    {
+        const Comprehension &c = n->comps[level];
+        int top = newLabel(), end = newLabel();
+        if (level == 0)
+            emit(O_LOAD_FAST, addVar(".0"));
+        else
+        {
+            expr(c.iter);
+            emit(O_GET_ITER);
+        }
+        bind(top);
+        emitJump(O_FOR_ITER, end);
+        store(c.target);
+        for (Node *f : c.ifs)
+            condJump(f, false, top);
+        if (level + 1 < n->comps.size())
+            compLevel(n, level + 1, depth);
+        else
+        {
+            switch (n->kind)
+            {
+            case NK::ListComp:
+                expr(n->a);
+                emit(O_LIST_APPEND, depth + 1);
+                break;
+            case NK::SetComp:
+                expr(n->a);
+                emit(O_SET_ADD, depth + 1);
+                break;
+            case NK::DictComp:
+                expr(n->a);
+                expr(n->b);
+                emit(O_MAP_ADD, depth + 1);
+                break;
+            default:
+                expr(n->a);
+                emit(O_YIELD);
+                emit(O_POP);
+            }
+        }
+        emitJump(O_JUMP, top);
+        bind(end);
+    }
+
+    V intConst(Node *n)
+    {
+        if (!n->flag)
+            return mkint(n->ival);
+        std::string s = n->name;
+        int base = 10;
+        if (s.size() > 1 && s[0] == '0' && (s[1] == 'x' || s[1] == 'o' || s[1] == 'b'))
+        {
+            base = s[1] == 'x' ? 16 : s[1] == 'o' ? 8 : 2;
+            s = s.substr(2);
+        }
+        bool ok;
+        V v = intFromString(s, base, ok);
+        if (n->ival < 0)
+            v = binaryOp(MKSMALL(0), v, OpSub);
+        return v;
+    }
+
+    void expr(Node *n)
+    {
+        int saved = line;
+        line = n->line;
+        switch (n->kind)
+        {
+        case NK::Name:
+            loadName(n->name);
+            break;
+        case NK::Int:
+            emit(O_CONST, constIdx(intConst(n)));
+            break;
+        case NK::Float:
+            emit(O_CONST, constIdx(mkfloat(n->fval)));
+            break;
+        case NK::Imag:
+            emit(O_CONST, constIdx(new ComplexObj(tComplex, 0, n->fval)));
+            break;
+        case NK::Str:
+            emit(O_CONST, strConst(n->name));
+            break;
+        case NK::Bytes:
+        {
+            BytesObj *b = new BytesObj(tBytes);
+            b->s = n->name;
+            emit(O_CONST, constIdx(b));
+            break;
+        }
+        case NK::None:
+            emit(O_CONST, constIdx(None));
+            break;
+        case NK::True:
+            emit(O_CONST, constIdx(True));
+            break;
+        case NK::False:
+            emit(O_CONST, constIdx(False));
+            break;
+        case NK::Ellipsis:
+            emit(O_CONST, constIdx(EllipsisV));
+            break;
+        case NK::FStr:
+            fstring(n);
+            break;
+        case NK::BinOp:
+            expr(n->a);
+            expr(n->b);
+            line = n->line;
+            emit(O_BINARY, n->op);
+            break;
+        case NK::UnaryOp:
+            if (n->op == OpNeg && n->a->kind == NK::Float)
+            {
+                emit(O_CONST, constIdx(mkfloat(-n->a->fval)));
+                break;
+            }
+            expr(n->a);
+            emit(O_UNARY, n->op);
+            break;
+        case NK::BoolOp:
+        {
+            int end = newLabel();
+            for (size_t i = 0; i < n->list.size(); ++i)
+            {
+                expr(n->list[i]);
+                if (i + 1 < n->list.size())
+                    emitJump(n->op == OpAnd ? O_JUMP_IF_FALSE_OR_POP : O_JUMP_IF_TRUE_OR_POP, end);
+            }
+            bind(end);
+            break;
+        }
+        case NK::Compare:
+        {
+            expr(n->a);
+            if (n->ops.size() == 1)
+            {
+                expr(n->list2[0]);
+                line = n->line;
+                emit(O_COMPARE, n->ops[0]);
+                break;
+            }
+            int cleanup = newLabel(), end = newLabel();
+            for (size_t i = 0; i < n->ops.size(); ++i)
+            {
+                expr(n->list2[i]);
+                if (i + 1 < n->ops.size())
+                {
+                    emit(O_DUP);
+                    emit(O_ROT3);
+                    emit(O_COMPARE, n->ops[i]);
+                    emitJump(O_JUMP_IF_FALSE_OR_POP, cleanup);
+                }
+                else
+                    emit(O_COMPARE, n->ops[i]);
+            }
+            emitJump(O_JUMP, end);
+            bind(cleanup);
+            emit(O_ROT2);
+            emit(O_POP);
+            bind(end);
+            break;
+        }
+        case NK::Call:
+            call(n);
+            break;
+        case NK::Attribute:
+            expr(n->a);
+            line = n->line;
+            emit(O_LOAD_ATTR, nameIdx(n->name));
+            break;
+        case NK::Subscript:
+            expr(n->a);
+            subscriptKey(n->b);
+            line = n->line;
+            emit(O_SUBSCR);
+            break;
+        case NK::Slice:
+            sliceExpr(n);
+            break;
+        case NK::Starred:
+            compileErr("can't use starred expression here", n->line);
+        case NK::List:
+            if (hasStar(n->list))
+                starredList(n->list);
+            else
+            {
+                for (Node *e : n->list)
+                    expr(e);
+                emit(O_BUILD_LIST, (int)n->list.size());
+            }
+            break;
+        case NK::Tuple:
+            if (hasStar(n->list))
+            {
+                starredList(n->list);
+                emit(O_LIST_TO_TUPLE);
+            }
+            else
+            {
+                for (Node *e : n->list)
+                    expr(e);
+                emit(O_BUILD_TUPLE, (int)n->list.size());
+            }
+            break;
+        case NK::Set:
+            if (hasStar(n->list))
+            {
+                emit(O_BUILD_SET, 0);
+                for (Node *e : n->list)
+                {
+                    if (e->kind == NK::Starred)
+                    {
+                        expr(e->a);
+                        emit(O_SET_UPDATE, 1);
+                    }
+                    else
+                    {
+                        expr(e);
+                        emit(O_SET_ADD, 1);
+                    }
+                }
+            }
+            else
+            {
+                for (Node *e : n->list)
+                    expr(e);
+                emit(O_BUILD_SET, (int)n->list.size());
+            }
+            break;
+        case NK::Dict:
+        {
+            bool spread = false;
+            for (Node *k : n->list)
+                if (!k)
+                    spread = true;
+            if (!spread)
+            {
+                for (size_t i = 0; i < n->list.size(); ++i)
+                {
+                    expr(n->list[i]);
+                    expr(n->list2[i]);
+                }
+                emit(O_BUILD_MAP, (int)n->list.size());
+                break;
+            }
+            emit(O_BUILD_MAP, 0);
+            for (size_t i = 0; i < n->list.size(); ++i)
+            {
+                if (!n->list[i])
+                {
+                    expr(n->list2[i]);
+                    emit(O_DICT_UPDATE, 1);
+                }
+                else
+                {
+                    expr(n->list[i]);
+                    expr(n->list2[i]);
+                    emit(O_MAP_ADD, 1);
+                }
+            }
+            break;
+        }
+        case NK::ListComp:
+        case NK::SetComp:
+        case NK::DictComp:
+        case NK::GenExp:
+            comprehension(n);
+            break;
+        case NK::Lambda:
+        {
+            Scope *fs = st.scopes[n];
+            Code *c = compileFunctionBody(fs, n, true);
+            line = n->line;
+            makeFunction(fs, n, c, true);
+            break;
+        }
+        case NK::IfExp:
+        {
+            int elseL = newLabel(), end = newLabel();
+            condJump(n->a, false, elseL);
+            expr(n->b);
+            emitJump(O_JUMP, end);
+            bind(elseL);
+            expr(n->c);
+            bind(end);
+            break;
+        }
+        case NK::NamedExpr:
+        {
+            expr(n->a);
+            emit(O_DUP);
+            storeName(n->name);
+            break;
+        }
+        case NK::Yield:
+            if (n->a)
+                expr(n->a);
+            else
+                emit(O_CONST, constIdx(None));
+            emit(O_YIELD);
+            break;
+        case NK::YieldFrom:
+            expr(n->a);
+            emit(O_GET_ITER);
+            emit(O_CONST, constIdx(None));
+            emit(O_YIELD_FROM);
+            break;
+        case NK::Await:
+            compileErr("'await' is not supported", n->line);
+        default:
+            compileErr("unsupported expression", n->line);
+        }
+        line = saved;
+    }
+
+    void fstring(Node *n)
+    {
+        int parts = 0;
+        for (Node *p : n->list)
+        {
+            if (p->kind == NK::Str)
+            {
+                emit(O_CONST, strConst(p->name));
+            }
+            else
+            {
+                expr(p->a);
+                int arg = (int)p->ival;
+                if (p->b)
+                {
+                    fstring(p->b);
+                    arg |= 0x100;
+                }
+                emit(O_FORMAT, arg);
+            }
+            ++parts;
+        }
+        if (parts == 0)
+            emit(O_CONST, strConst(""));
+        else if (parts > 1)
+            emit(O_BUILD_STRING, parts);
+        else if (n->list[0]->kind == NK::Str)
+        {
+        }
+    }
+};
+
+// ── private name mangling ──────────────────────────────────────────────────
+// Inside a class, `__name` (not ending in `__`) becomes `_Class__name`, in
+// names, attributes and parameters alike; nested classes mangle with their
+// own name.
+
+std::string mangle(const std::string &cls, const std::string &name)
+{
+    if (cls.empty() || name.size() < 3 || name[0] != '_' || name[1] != '_')
+        return name;
+    if (name.size() >= 4 && name[name.size() - 1] == '_' && name[name.size() - 2] == '_')
+        return name;
+    if (name.find('.') != std::string::npos)
+        return name;
+    return "_" + cls + name;
+}
+
+void mangleNodes(std::vector<Node *> &v, const std::string &cls);
+
+void mangleParams(Params *p, const std::string &cls)
+{
+    if (!p)
+        return;
+    for (Arg &a : p->posonly)
+        a.name = mangle(cls, a.name);
+    for (Arg &a : p->args)
+        a.name = mangle(cls, a.name);
+    for (Arg &a : p->kwonly)
+        a.name = mangle(cls, a.name);
+    if (p->vararg)
+        p->vararg->name = mangle(cls, p->vararg->name);
+    if (p->kwarg)
+        p->kwarg->name = mangle(cls, p->kwarg->name);
+    void mangleNode(Node *n, const std::string &cls);
+    for (Node *d : p->defaults)
+        mangleNode(d, cls);
+    for (Node *d : p->kwDefaults)
+        mangleNode(d, cls);
+}
+
+void mangleNode(Node *n, const std::string &cls)
+{
+    if (!n)
+        return;
+    switch (n->kind)
+    {
+    case NK::Name:
+    case NK::NamedExpr:
+    case NK::PStar:
+    case NK::PAs:
+        n->name = mangle(cls, n->name);
+        break;
+    case NK::Attribute:
+        n->name = mangle(cls, n->name);
+        break;
+    case NK::FunctionDef:
+        n->name = mangle(cls, n->name);
+        break;
+    case NK::Global:
+    case NK::Nonlocal:
+        for (std::string &s : n->names)
+            s = mangle(cls, s);
+        break;
+    case NK::Call:
+        for (std::string &s : n->names)
+            if (!s.empty())
+                s = mangle(cls, s);
+        break;
+    case NK::Import:
+    case NK::ImportFrom:
+        for (std::string &s : n->names2)
+            if (!s.empty())
+                s = mangle(cls, s);
+        break;
+    default:
+        break;
+    }
+    if (n->kind == NK::ClassDef)
+    {
+        // bases, keywords and decorators belong to the enclosing scope
+        mangleNodes(n->list, cls);
+        mangleNodes(n->list2, cls);
+        mangleNodes(n->decorators, cls);
+        n->name = mangle(cls, n->name);
+        std::string inner = n->name;
+        size_t k = 0;
+        while (k < inner.size() && inner[k] == '_')
+            ++k;
+        mangleNodes(n->body, inner.substr(k));
+        return;
+    }
+    mangleNode(n->a, cls);
+    mangleNode(n->b, cls);
+    mangleNode(n->c, cls);
+    mangleNodes(n->list, cls);
+    mangleNodes(n->list2, cls);
+    mangleNodes(n->body, cls);
+    mangleNodes(n->orelse, cls);
+    mangleNodes(n->finalbody, cls);
+    mangleNodes(n->decorators, cls);
+    mangleParams(n->args, cls);
+    for (Comprehension &c : n->comps)
+    {
+        mangleNode(c.target, cls);
+        mangleNode(c.iter, cls);
+        mangleNodes(c.ifs, cls);
+    }
+    for (Handler &h : n->handlers)
+    {
+        mangleNode(h.type, cls);
+        h.name = mangle(cls, h.name);
+        mangleNodes(h.body, cls);
+    }
+    for (MatchCase &mc : n->cases)
+    {
+        mangleNode(mc.pattern, cls);
+        mangleNode(mc.guard, cls);
+        mangleNodes(mc.body, cls);
+    }
+}
+
+void mangleNodes(std::vector<Node *> &v, const std::string &cls)
+{
+    for (Node *n : v)
+        mangleNode(n, cls);
+}
+
+} // namespace
+
+Code *compileModule(const std::vector<Node *> &bodyIn, const std::string &filename, const std::string &name)
+{
+    std::vector<Node *> body = bodyIn;
+    mangleNodes(body, "");
+    SymTable st;
+    st.build(body);
+    CodeGen g(st, st.top, filename);
+    g.code->name = name;
+    g.code->firstline = 1;
+    if (CodeGen::hasAnnotations(body))
+        g.emit(O_SETUP_ANNOTATIONS);
+    if (CodeGen::isDocstring(body))
+    {
+        g.emit(O_CONST, g.strConst(body[0]->a->name));
+        g.emit(O_STORE_NAME, g.nameIdx("__doc__"));
+    }
+    g.body(body);
+    g.finish();
+    return g.code;
+}
+
+} // namespace py

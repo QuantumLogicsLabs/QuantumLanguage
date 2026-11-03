@@ -1,6 +1,7 @@
 // quantum: cpp
 #include "../js/JsMain.h.sa"
 #include "../ruby/RubyMain.h.sa"
+#include "../python/PyMain.h.sa"
 #include "Dialect.h.sa"
 
 #include <algorithm>
@@ -99,6 +100,15 @@ std::string applyDialect(std::string source, const std::string &path)
         source = applyJavaDialect(source);
         if (std::getenv("QUANTUM_DEBUG_JAVA"))
             std::cerr << "----- Java-style pass -----\n" << source << "----- end -----\n";
+    }
+
+    if (ext == ".py")
+    {
+        // A .py file runs on the Python front-end (src/python) when it can
+        // parse it; the program travels inside the chunk as a string
+        std::string why;
+        if (py::canRun(source, path, why))
+            return "__py_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
     }
 
     if (ext == ".js")

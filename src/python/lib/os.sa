@@ -1,0 +1,62 @@
+"""Operating system interfaces (the parts plain programs use)."""
+
+import _os
+
+name = "nt"
+sep = "\\"
+altsep = "/"
+extsep = "."
+pathsep = ";"
+linesep = "\r\n"
+curdir = "."
+pardir = ".."
+devnull = "nul"
+
+remove = _os.remove
+unlink = _os.remove
+getcwd = _os.getcwd
+listdir = _os.listdir
+mkdir = _os.mkdir
+makedirs = _os.makedirs
+rmdir = _os.rmdir
+rename = _os.rename
+replace = _os.rename
+
+
+def getenv(key, default=None):
+    return _os.getenv(key, default)
+
+
+class _Environ(dict):
+    def __missing__(self, key):
+        value = _os.getenv(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or _os.getenv(key) is not None
+
+
+environ = _Environ()
+
+
+def cpu_count():
+    return 1
+
+
+def getpid():
+    return 1
+
+
+def fspath(path):
+    return path
+
+
+import os.path as path

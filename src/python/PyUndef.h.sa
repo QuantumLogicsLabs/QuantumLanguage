@@ -1,0 +1,8 @@
+// quantum: cpp
+// After the last Python source of a unity build: PyRt.h.sa's macros end here.
+#undef IS_SMALL
+#undef SMALLV
+#undef MKSMALL
+#undef SMALL_MAX
+#undef SMALL_MIN
+#undef FITS_SMALL

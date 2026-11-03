@@ -1,0 +1,2523 @@
+// quantum: cpp
+// Python front-end: the lexer and the recursive-descent parser. The lexer
+// runs over the whole source first (Python's tokens never depend on the
+// parser), producing NEWLINE / INDENT / DEDENT the way CPython's tokenizer
+// does. An f-string stays one token holding its raw text; the parser splits
+// it and parses each replacement field with a parser of its own.
+#include "PyParse.h.sa"
+
+#include <cstdlib>
+#include <cstring>
+
+namespace py
+{
+
+namespace
+{
+
+enum TokT : uint8_t
+{
+    T_END,
+    T_NEWLINE,
+    T_INDENT,
+    T_DEDENT,
+    T_NAME,
+    T_NUMBER,
+    T_STRING,
+    T_OP
+};
+
+struct Tok
+{
+    TokT t = T_END;
+    std::string s; // name, operator, number text, or the string's value
+    int line = 0, col = 0;
+    // strings
+    bool bytes = false, fstr = false, raw = false;
+    int bodyLine = 0; // f-string: the line its raw text starts on
+};
+
+[[noreturn]] void synErr(const std::string &msg, int line, int col)
+{
+    SyntaxErr e;
+    e.message = msg;
+    e.line = line;
+    e.col = col;
+    throw e;
+}
+
+void putUtf8(std::string &out, uint32_t c)
+{
+    if (c < 0x80)
+        out += (char)c;
+    else if (c < 0x800)
+    {
+        out += (char)(0xC0 | (c >> 6));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+    else if (c < 0x10000)
+    {
+        out += (char)(0xE0 | (c >> 12));
+        out += (char)(0x80 | ((c >> 6) & 0x3F));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+    else
+    {
+        out += (char)(0xF0 | (c >> 18));
+        out += (char)(0x80 | ((c >> 12) & 0x3F));
+        out += (char)(0x80 | ((c >> 6) & 0x3F));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+}
+
+int hexVal(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+// A few \N{...} names programs use
+uint32_t namedChar(const std::string &n)
+{
+    static const char *names[] = {"BULLET", "EM DASH", "EN DASH", "DEGREE SIGN", "GREEK SMALL LETTER PI",
+                                  "RIGHTWARDS ARROW", "LEFTWARDS ARROW", "CHECK MARK", "MULTIPLICATION SIGN",
+                                  "HORIZONTAL ELLIPSIS", "SNOWMAN", "BLACK STAR", "WHITE STAR", "COPYRIGHT SIGN",
+                                  "NO-BREAK SPACE", "SPACE", "LATIN SMALL LETTER E WITH ACUTE", "EURO SIGN",
+                                  "GREEK CAPITAL LETTER DELTA", "GREEK SMALL LETTER ALPHA", "INFINITY", "HEAVY CHECK MARK",
+                                  "BALLOT X", "BOX DRAWINGS LIGHT HORIZONTAL", "BOX DRAWINGS LIGHT VERTICAL", nullptr};
+    static const uint32_t codes[] = {0x2022, 0x2014, 0x2013, 0xB0, 0x3C0, 0x2192, 0x2190, 0x2713, 0xD7, 0x2026,
+                                     0x2603, 0x2605, 0x2606, 0xA9, 0xA0, 0x20, 0xE9, 0x20AC, 0x394, 0x3B1, 0x221E,
+                                     0x2714, 0x2717, 0x2500, 0x2502};
+    for (int i = 0; names[i]; ++i)
+        if (n == names[i])
+            return codes[i];
+    static const char *greek[] = {"ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA", "THETA", "IOTA",
+                                  "KAPPA", "LAMDA", "MU", "NU", "XI", "OMICRON", "PI", "RHO", "FINAL SIGMA", "SIGMA",
+                                  "TAU", "UPSILON", "PHI", "CHI", "PSI", "OMEGA", nullptr};
+    for (int i = 0; greek[i]; ++i)
+    {
+        if (n == std::string("GREEK SMALL LETTER ") + greek[i])
+            return 0x3B1 + (uint32_t)i;
+        if (n == std::string("GREEK CAPITAL LETTER ") + greek[i] && i != 17)
+            return 0x391 + (uint32_t)i;
+    }
+    if (n == "GREEK SMALL LETTER LAMBDA")
+        return 0x3BB;
+    if (n == "GREEK CAPITAL LETTER LAMBDA")
+        return 0x39B;
+    if (n.compare(0, 19, "LATIN SMALL LETTER ") == 0 && n.size() == 20)
+        return (uint32_t)(n[19] - 'A' + 'a');
+    if (n.compare(0, 21, "LATIN CAPITAL LETTER ") == 0 && n.size() == 22)
+        return (uint32_t)n[21];
+    static const char *more[] = {"SECTION SIGN", "PILCROW SIGN", "MIDDLE DOT", "PLUS-MINUS SIGN", "MICRO SIGN",
+                                 "SUPERSCRIPT TWO", "SUPERSCRIPT THREE", "VULGAR FRACTION ONE HALF",
+                                 "LATIN SMALL LETTER SHARP S", "POUND SIGN", "YEN SIGN", "CENT SIGN",
+                                 "REGISTERED SIGN", "TRADE MARK SIGN", "DIVISION SIGN", "NOT EQUAL TO",
+                                 "LESS-THAN OR EQUAL TO", "GREATER-THAN OR EQUAL TO", "SQUARE ROOT",
+                                 "BLACK HEART SUIT", "WHITE SMILING FACE", "GRINNING FACE", "THUMBS UP SIGN",
+                                 "LEFT-POINTING DOUBLE ANGLE QUOTATION MARK", "RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK",
+                                 "LEFT DOUBLE QUOTATION MARK", "RIGHT DOUBLE QUOTATION MARK",
+                                 "LEFT SINGLE QUOTATION MARK", "RIGHT SINGLE QUOTATION MARK", "ZERO WIDTH SPACE",
+                                 "LATIN SMALL LETTER N WITH TILDE", "LATIN SMALL LETTER U WITH DIAERESIS",
+                                 "LATIN SMALL LETTER O WITH DIAERESIS", "LATIN SMALL LETTER A WITH DIAERESIS",
+                                 "LATIN SMALL LETTER C WITH CEDILLA", "LATIN SMALL LETTER A WITH GRAVE",
+                                 "LATIN SMALL LETTER E WITH GRAVE", "LATIN CAPITAL LETTER E WITH ACUTE", nullptr};
+    static const uint32_t moreCodes[] = {0xA7, 0xB6, 0xB7, 0xB1, 0xB5, 0xB2, 0xB3, 0xBD, 0xDF, 0xA3, 0xA5, 0xA2,
+                                         0xAE, 0x2122, 0xF7, 0x2260, 0x2264, 0x2265, 0x221A, 0x2665, 0x263A, 0x1F600,
+                                         0x1F44D, 0xAB, 0xBB, 0x201C, 0x201D, 0x2018, 0x2019, 0x200B, 0xF1, 0xFC,
+                                         0xF6, 0xE4, 0xE7, 0xE0, 0xE8, 0xC9};
+    for (int i = 0; more[i]; ++i)
+        if (n == more[i])
+            return moreCodes[i];
+    return 0xFFFD;
+}
+
+// The value of a string literal's body (escapes resolved unless raw)
+std::string decodeString(const std::string &body, bool raw, bool bytes, int line)
+{
+    if (raw)
+        return body;
+    std::string out;
+    size_t n = body.size();
+    for (size_t i = 0; i < n; ++i)
+    {
+        char c = body[i];
+        if (c != '\\' || i + 1 >= n)
+        {
+            out += c;
+            continue;
+        }
+        char e = body[++i];
+        switch (e)
+        {
+        case '\n':
+            break;
+        case '\r':
+            if (i + 1 < n && body[i + 1] == '\n')
+                ++i;
+            break;
+        case '\\': out += '\\'; break;
+        case '\'': out += '\''; break;
+        case '"': out += '"'; break;
+        case 'a': out += '\a'; break;
+        case 'b': out += '\b'; break;
+        case 'f': out += '\f'; break;
+        case 'n': out += '\n'; break;
+        case 'r': out += '\r'; break;
+        case 't': out += '\t'; break;
+        case 'v': out += '\v'; break;
+        case 'x':
+        {
+            int v = 0, k = 0;
+            while (k < 2 && i + 1 < n && hexVal(body[i + 1]) >= 0)
+                v = v * 16 + hexVal(body[++i]), ++k;
+            if (k < 2)
+                synErr("(unicode error) truncated \\xXX escape", line, 0);
+            if (bytes)
+                out += (char)v;
+            else
+                putUtf8(out, (uint32_t)v);
+            break;
+        }
+        case 'u':
+        case 'U':
+        {
+            if (bytes)
+            {
+                out += '\\';
+                out += e;
+                break;
+            }
+            int want = e == 'u' ? 4 : 8, k = 0;
+            uint32_t v = 0;
+            while (k < want && i + 1 < n && hexVal(body[i + 1]) >= 0)
+                v = v * 16 + (uint32_t)hexVal(body[++i]), ++k;
+            if (k < want)
+                synErr("(unicode error) truncated \\uXXXX escape", line, 0);
+            putUtf8(out, v);
+            break;
+        }
+        case 'N':
+        {
+            if (!bytes && i + 1 < n && body[i + 1] == '{')
+            {
+                size_t close = body.find('}', i);
+                if (close != std::string::npos)
+                {
+                    putUtf8(out, namedChar(body.substr(i + 2, close - i - 2)));
+                    i = close;
+                    break;
+                }
+            }
+            out += "\\N";
+            break;
+        }
+        default:
+            if (e >= '0' && e <= '7')
+            {
+                int v = e - '0', k = 1;
+                while (k < 3 && i + 1 < n && body[i + 1] >= '0' && body[i + 1] <= '7')
+                    v = v * 8 + (body[++i] - '0'), ++k;
+                if (bytes)
+                    out += (char)v;
+                else
+                    putUtf8(out, (uint32_t)v);
+            }
+            else
+            {
+                out += '\\';
+                out += e;
+            }
+        }
+    }
+    return out;
+}
+
+bool isIdStart(unsigned char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80;
+}
+
+bool isIdChar(unsigned char c)
+{
+    return isIdStart(c) || (c >= '0' && c <= '9');
+}
+
+class Lexer
+{
+public:
+    const std::string &src;
+    size_t i = 0;
+    int line = 1;
+    size_t lineStart = 0;
+    std::vector<Tok> toks;
+    std::vector<int> indents;
+    int depth = 0; // open brackets
+
+    Lexer(const std::string &s, int firstLine) : src(s), line(firstLine) { indents.push_back(0); }
+
+    void push(TokT t, const std::string &s, int ln, int col)
+    {
+        Tok k;
+        k.t = t;
+        k.s = s;
+        k.line = ln;
+        k.col = col;
+        toks.push_back(k);
+    }
+
+    // At the start of a line: measure its indentation, skipping blank and
+    // comment-only lines. Returns false at the end of the source.
+    bool lineStartIndent()
+    {
+        for (;;)
+        {
+            int col = 0;
+            size_t j = i;
+            while (j < src.size() && (src[j] == ' ' || src[j] == '\t' || src[j] == '\f'))
+            {
+                if (src[j] == '\t')
+                    col = (col / 8 + 1) * 8;
+                else if (src[j] == ' ')
+                    ++col;
+                ++j;
+            }
+            if (j >= src.size())
+            {
+                i = j;
+                return false;
+            }
+            char c = src[j];
+            if (c == '#' || c == '\n' || c == '\r')
+            {
+                while (j < src.size() && src[j] != '\n')
+                    ++j;
+                if (j < src.size())
+                    ++j;
+                i = j;
+                ++line;
+                lineStart = i;
+                continue;
+            }
+            if (c == '\\' && j + 1 < src.size() && (src[j + 1] == '\n' || src[j + 1] == '\r'))
+            {
+                // a continuation line on its own: keep reading
+                i = j;
+                return true;
+            }
+            i = j;
+            if (col > indents.back())
+            {
+                indents.push_back(col);
+                push(T_INDENT, "", line, col);
+            }
+            else
+            {
+                while (col < indents.back())
+                {
+                    indents.pop_back();
+                    push(T_DEDENT, "", line, col);
+                }
+                if (col != indents.back())
+                    synErr("unindent does not match any outer indentation level", line, col);
+            }
+            return true;
+        }
+    }
+
+    // Scans a string literal whose opening quote is at src[i]. An f-string's
+    // replacement fields may hold strings of their own, in any quotes (3.12+),
+    // so the scan tracks each open field: in its expression a quote starts a
+    // nested string; after its top-level ':' (the format spec) text is literal
+    // again and '{' opens a nested field.
+    void lexString(bool rawP, bool bytesP, bool fP, int tokLine, int tokCol)
+    {
+        char q = src[i];
+        bool triple = i + 2 < src.size() && src[i + 1] == q && src[i + 2] == q;
+        i += triple ? 3 : 1;
+        size_t start = i;
+        int startLine = line;
+        struct Field
+        {
+            int paren;
+            bool spec;
+        };
+        std::vector<Field> fields;
+        for (;;)
+        {
+            if (i >= src.size())
+                synErr(triple ? "unterminated triple-quoted string literal" : "unterminated string literal", tokLine, tokCol);
+            char c = src[i];
+            if (c == '\n')
+            {
+                if (!triple && fields.empty())
+                    synErr("unterminated string literal", tokLine, tokCol);
+                ++line;
+                ++i;
+                continue;
+            }
+            if (fields.empty() || fields.back().spec)
+            {
+                if (c == '\\')
+                {
+                    if (i + 1 < src.size() && src[i + 1] == '\n')
+                        ++line;
+                    i += 2;
+                    continue;
+                }
+                if (fP && c == '{')
+                {
+                    if (fields.empty() && i + 1 < src.size() && src[i + 1] == '{')
+                    {
+                        i += 2;
+                        continue;
+                    }
+                    Field f;
+                    f.paren = 0;
+                    f.spec = false;
+                    fields.push_back(f);
+                    ++i;
+                    continue;
+                }
+                if (fP && c == '}')
+                {
+                    if (!fields.empty())
+                        fields.pop_back();
+                    else if (i + 1 < src.size() && src[i + 1] == '}')
+                        ++i;
+                    ++i;
+                    continue;
+                }
+                if (fields.empty() && c == q && (!triple || (i + 2 < src.size() && src[i + 1] == q && src[i + 2] == q)))
+                    break;
+                ++i;
+                continue;
+            }
+            // inside a replacement field's expression
+            Field &f = fields.back();
+            if (c == '\'' || c == '"')
+            {
+                bool inTriple = i + 2 < src.size() && src[i + 1] == c && src[i + 2] == c;
+                size_t k = i + (inTriple ? 3 : 1);
+                for (;;)
+                {
+                    if (k >= src.size())
+                        synErr("unterminated string literal", tokLine, tokCol);
+                    if (src[k] == '\\')
+                    {
+                        k += 2;
+                        continue;
+                    }
+                    if (inTriple ? (src.compare(k, 3, std::string(3, c)) == 0) : src[k] == c)
+                        break;
+                    if (src[k] == '\n')
+                        ++line;
+                    ++k;
+                }
+                i = k + (inTriple ? 3 : 1);
+                continue;
+            }
+            if (c == '(' || c == '[' || c == '{')
+                ++f.paren;
+            else if (c == ')' || c == ']')
+                --f.paren;
+            else if (c == '}')
+            {
+                if (f.paren > 0)
+                    --f.paren;
+                else
+                    fields.pop_back();
+            }
+            else if (c == ':' && f.paren == 0)
+                f.spec = true;
+            else if (c == '!' && f.paren == 0 && i + 1 < src.size() && src[i + 1] != '=')
+            {
+                i += 2; // the conversion: !r !s !a
+                continue;
+            }
+            ++i;
+        }
+        std::string body = src.substr(start, i - start);
+        i += triple ? 3 : 1;
+        Tok k;
+        k.t = T_STRING;
+        k.line = tokLine;
+        k.col = tokCol;
+        k.bytes = bytesP;
+        k.fstr = fP;
+        k.raw = rawP;
+        k.bodyLine = startLine;
+        k.s = fP ? body : decodeString(body, rawP, bytesP, tokLine);
+        toks.push_back(k);
+    }
+
+    void lexNumber()
+    {
+        int col = (int)(i - lineStart);
+        size_t s = i;
+        std::string text;
+        bool isFloat = false;
+        if (src[i] == '0' && i + 1 < src.size() && strchr("xXoObB", src[i + 1]))
+        {
+            text += '0';
+            text += (char)tolower(src[i + 1]);
+            i += 2;
+            while (i < src.size() && (isalnum((unsigned char)src[i]) || src[i] == '_'))
+            {
+                if (src[i] != '_')
+                    text += src[i];
+                ++i;
+            }
+            push(T_NUMBER, text, line, col);
+            return;
+        }
+        while (i < src.size() && (isdigit((unsigned char)src[i]) || src[i] == '_'))
+        {
+            if (src[i] != '_')
+                text += src[i];
+            ++i;
+        }
+        if (i < src.size() && src[i] == '.' && !(i + 1 < src.size() && src[i + 1] == '.' && false))
+        {
+            isFloat = true;
+            text += '.';
+            ++i;
+            while (i < src.size() && (isdigit((unsigned char)src[i]) || src[i] == '_'))
+            {
+                if (src[i] != '_')
+                    text += src[i];
+                ++i;
+            }
+        }
+        if (i < src.size() && (src[i] == 'e' || src[i] == 'E'))
+        {
+            size_t save = i;
+            std::string ex = "e";
+            ++i;
+            if (i < src.size() && (src[i] == '+' || src[i] == '-'))
+                ex += src[i++];
+            if (i < src.size() && isdigit((unsigned char)src[i]))
+            {
+                while (i < src.size() && (isdigit((unsigned char)src[i]) || src[i] == '_'))
+                {
+                    if (src[i] != '_')
+                        ex += src[i];
+                    ++i;
+                }
+                text += ex;
+                isFloat = true;
+            }
+            else
+                i = save;
+        }
+        if (i < src.size() && (src[i] == 'j' || src[i] == 'J'))
+        {
+            text += 'j';
+            ++i;
+        }
+        (void)s;
+        (void)isFloat;
+        push(T_NUMBER, text, line, col);
+    }
+
+    void run()
+    {
+        bool atLineStart = true;
+        while (true)
+        {
+            if (atLineStart && depth == 0)
+            {
+                atLineStart = false;
+                if (!lineStartIndent())
+                    break;
+            }
+            if (i >= src.size())
+                break;
+            char c = src[i];
+            int col = (int)(i - lineStart);
+            if (c == ' ' || c == '\t' || c == '\f')
+            {
+                ++i;
+                continue;
+            }
+            if (c == '#')
+            {
+                while (i < src.size() && src[i] != '\n')
+                    ++i;
+                continue;
+            }
+            if (c == '\\' && i + 1 < src.size() && (src[i + 1] == '\n' || src[i + 1] == '\r'))
+            {
+                i += src[i + 1] == '\r' ? 3 : 2;
+                ++line;
+                lineStart = i;
+                continue;
+            }
+            if (c == '\r')
+            {
+                ++i;
+                continue;
+            }
+            if (c == '\n')
+            {
+                ++i;
+                if (depth == 0)
+                {
+                    if (!toks.empty() && toks.back().t != T_NEWLINE && toks.back().t != T_INDENT && toks.back().t != T_DEDENT)
+                        push(T_NEWLINE, "", line, col);
+                    atLineStart = true;
+                }
+                ++line;
+                lineStart = i;
+                continue;
+            }
+            if (isdigit((unsigned char)c) || (c == '.' && i + 1 < src.size() && isdigit((unsigned char)src[i + 1])))
+            {
+                lexNumber();
+                continue;
+            }
+            if (isIdStart((unsigned char)c))
+            {
+                // string prefixes
+                size_t j = i;
+                while (j < src.size() && isIdChar((unsigned char)src[j]))
+                    ++j;
+                std::string word = src.substr(i, j - i);
+                if (j < src.size() && (src[j] == '\'' || src[j] == '"') && word.size() <= 2)
+                {
+                    bool r = false, b = false, f = false, ok = true;
+                    for (char p : word)
+                    {
+                        char l = (char)tolower(p);
+                        if (l == 'r')
+                            r = true;
+                        else if (l == 'b')
+                            b = true;
+                        else if (l == 'f')
+                            f = true;
+                        else if (l == 'u')
+                            ;
+                        else
+                            ok = false;
+                    }
+                    if (ok)
+                    {
+                        i = j;
+                        lexString(r, b, f, line, col);
+                        continue;
+                    }
+                }
+                i = j;
+                push(T_NAME, word, line, col);
+                continue;
+            }
+            if (c == '\'' || c == '"')
+            {
+                lexString(false, false, false, line, col);
+                continue;
+            }
+            // operators
+            static const char *ops3[] = {"**=", "//=", ">>=", "<<=", "...", nullptr};
+            static const char *ops2[] = {"**", "//", "<<", ">>", "<=", ">=", "==", "!=", "+=", "-=", "*=", "/=",
+                                         "%=", "&=", "|=", "^=", "@=", "->", ":=", nullptr};
+            std::string op;
+            for (int k = 0; ops3[k] && op.empty(); ++k)
+                if (src.compare(i, 3, ops3[k]) == 0)
+                    op = ops3[k];
+            for (int k = 0; ops2[k] && op.empty(); ++k)
+                if (src.compare(i, 2, ops2[k]) == 0)
+                    op = ops2[k];
+            if (op.empty())
+            {
+                if (!strchr("()[]{},:;.+-*/%&|^~<>=@!", c))
+                    synErr(std::string("invalid character '") + c + "'", line, col);
+                op = std::string(1, c);
+            }
+            if (op == "(" || op == "[" || op == "{")
+                ++depth;
+            else if ((op == ")" || op == "]" || op == "}") && depth > 0)
+                --depth;
+            i += op.size();
+            push(T_OP, op, line, col);
+        }
+        if (!toks.empty() && toks.back().t != T_NEWLINE && toks.back().t != T_DEDENT)
+            push(T_NEWLINE, "", line, 0);
+        while (indents.size() > 1)
+        {
+            indents.pop_back();
+            push(T_DEDENT, "", line, 0);
+        }
+        push(T_END, "", line, 0);
+    }
+};
+
+const char *const keywords[] = {"False", "None", "True", "and", "as", "assert", "async", "await", "break",
+                                "class", "continue", "def", "del", "elif", "else", "except", "finally", "for",
+                                "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or",
+                                "pass", "raise", "return", "try", "while", "with", "yield", nullptr};
+
+bool isKeyword(const std::string &s)
+{
+    for (int k = 0; keywords[k]; ++k)
+        if (s == keywords[k])
+            return true;
+    return false;
+}
+
+class Parser
+{
+public:
+    std::vector<Tok> toks;
+    size_t p = 0;
+
+    Parser(const std::vector<Tok> &t) : toks(t) {}
+
+    const Tok &cur() { return toks[p]; }
+    const Tok &peekTok(int k) { return toks[p + k < toks.size() ? p + k : toks.size() - 1]; }
+    bool isOp(const char *s) { return toks[p].t == T_OP && toks[p].s == s; }
+    bool isOpAt(int k, const char *s)
+    {
+        const Tok &t = peekTok(k);
+        return t.t == T_OP && t.s == s;
+    }
+    bool isKw(const char *s) { return toks[p].t == T_NAME && toks[p].s == s; }
+    bool acceptOp(const char *s)
+    {
+        if (isOp(s))
+        {
+            ++p;
+            return true;
+        }
+        return false;
+    }
+    bool acceptKw(const char *s)
+    {
+        if (isKw(s))
+        {
+            ++p;
+            return true;
+        }
+        return false;
+    }
+
+    [[noreturn]] void fail(const std::string &msg)
+    {
+        synErr(msg, cur().line, cur().col);
+    }
+
+    [[noreturn]] void unexpected()
+    {
+        const Tok &t = cur();
+        if (t.t == T_INDENT)
+            fail("unexpected indent");
+        if (t.t == T_DEDENT)
+            fail("unindent does not match any outer indentation level");
+        if (t.t == T_NEWLINE || t.t == T_END)
+            fail("invalid syntax");
+        fail("invalid syntax near '" + t.s + "'");
+    }
+
+    void expectOp(const char *s)
+    {
+        if (!acceptOp(s))
+        {
+            if (cur().t == T_NEWLINE || cur().t == T_END)
+                fail(std::string("expected '") + s + "'");
+            fail(std::string("expected '") + s + "' (got '" + cur().s + "')");
+        }
+    }
+
+    void expectKw(const char *s)
+    {
+        if (!acceptKw(s))
+            fail(std::string("expected '") + s + "'");
+    }
+
+    std::string expectName()
+    {
+        if (cur().t != T_NAME || isKeyword(cur().s))
+            fail("expected a name");
+        return toks[p++].s;
+    }
+
+    Node *mk(NK k) { return new Node(k, cur().line); }
+    Node *mkAt(NK k, int line)
+    {
+        return new Node(k, line);
+    }
+
+    bool atExprStart()
+    {
+        const Tok &t = cur();
+        if (t.t == T_NAME)
+        {
+            static const char *starts[] = {"not", "lambda", "None", "True", "False", "await", "yield", nullptr};
+            if (!isKeyword(t.s))
+                return true;
+            for (int k = 0; starts[k]; ++k)
+                if (t.s == starts[k])
+                    return true;
+            return false;
+        }
+        if (t.t == T_NUMBER || t.t == T_STRING)
+            return true;
+        if (t.t == T_OP)
+            return t.s == "(" || t.s == "[" || t.s == "{" || t.s == "-" || t.s == "+" || t.s == "~" ||
+                   t.s == "..." || t.s == "*";
+        return false;
+    }
+
+    // ── statements ───────────────────────────────────────────────────────
+
+    std::vector<Node *> parseFile()
+    {
+        std::vector<Node *> out;
+        while (cur().t == T_NEWLINE)
+            ++p;
+        while (cur().t != T_END)
+        {
+            if (cur().t == T_INDENT)
+                fail("unexpected indent");
+            parseStatement(out);
+        }
+        return out;
+    }
+
+    std::vector<Node *> parseBlock()
+    {
+        std::vector<Node *> body;
+        expectOp(":");
+        if (cur().t != T_NEWLINE)
+        {
+            parseSimpleStatements(body);
+            return body;
+        }
+        ++p;
+        if (cur().t != T_INDENT)
+            fail("expected an indented block");
+        ++p;
+        while (cur().t != T_DEDENT && cur().t != T_END)
+            parseStatement(body);
+        if (cur().t == T_DEDENT)
+            ++p;
+        return body;
+    }
+
+    void parseStatement(std::vector<Node *> &out)
+    {
+        const Tok &t = cur();
+        if (t.t == T_NAME)
+        {
+            const std::string &w = t.s;
+            if (w == "def" || w == "class" || w == "if" || w == "while" || w == "for" || w == "try" || w == "with")
+            {
+                out.push_back(parseCompound());
+                return;
+            }
+            if (w == "async" && (peekTok(1).s == "def" || peekTok(1).s == "for" || peekTok(1).s == "with"))
+            {
+                ++p;
+                out.push_back(parseCompound());
+                return;
+            }
+            if (w == "match" && looksLikeMatch())
+            {
+                out.push_back(parseMatch());
+                return;
+            }
+        }
+        if (isOp("@"))
+        {
+            std::vector<Node *> decos;
+            while (acceptOp("@"))
+            {
+                decos.push_back(parseNamedExpr());
+                if (cur().t != T_NEWLINE)
+                    unexpected();
+                ++p;
+            }
+            acceptKw("async");
+            if (!isKw("def") && !isKw("class"))
+                fail("expected def or class after a decorator");
+            Node *d = parseCompound();
+            d->decorators = decos;
+            out.push_back(d);
+            return;
+        }
+        parseSimpleStatements(out);
+    }
+
+    void parseSimpleStatements(std::vector<Node *> &out)
+    {
+        for (;;)
+        {
+            out.push_back(parseSimple());
+            if (acceptOp(";"))
+            {
+                if (cur().t == T_NEWLINE)
+                    break;
+                continue;
+            }
+            break;
+        }
+        if (cur().t == T_NEWLINE)
+            ++p;
+        else if (cur().t != T_END && cur().t != T_DEDENT)
+            unexpected();
+    }
+
+    bool looksLikeMatch()
+    {
+        // `match <subject>:` NEWLINE INDENT `case`
+        const Tok &n = peekTok(1);
+        if (n.t == T_NEWLINE || n.t == T_END)
+            return false;
+        if (n.t == T_OP && (n.s == "=" || n.s == "." || n.s == ":" || n.s == "," || n.s == ")" || n.s == "+=" ||
+                            n.s == "-=" || n.s == "["))
+            return false;
+        size_t k = p + 1;
+        int d = 0;
+        while (k < toks.size() && toks[k].t != T_END)
+        {
+            const Tok &x = toks[k];
+            if (x.t == T_OP && (x.s == "(" || x.s == "[" || x.s == "{"))
+                ++d;
+            else if (x.t == T_OP && (x.s == ")" || x.s == "]" || x.s == "}"))
+                --d;
+            else if (x.t == T_NEWLINE && d == 0)
+                break;
+            ++k;
+        }
+        if (k + 2 >= toks.size())
+            return false;
+        return toks[k - 1].t == T_OP && toks[k - 1].s == ":" && toks[k + 1].t == T_INDENT &&
+               toks[k + 2].t == T_NAME && toks[k + 2].s == "case";
+    }
+
+    Node *parseCompound()
+    {
+        const std::string w = cur().s;
+        int line = cur().line;
+        if (w == "def")
+        {
+            ++p;
+            Node *n = mkAt(NK::FunctionDef, line);
+            n->name = expectName();
+            if (isOp("["))
+                skipTypeParams();
+            expectOp("(");
+            n->args = parseParams(")", true);
+            expectOp(")");
+            if (acceptOp("->"))
+                n->a = parseExpr();
+            n->body = parseBlock();
+            return n;
+        }
+        if (w == "class")
+        {
+            ++p;
+            Node *n = mkAt(NK::ClassDef, line);
+            n->name = expectName();
+            if (isOp("["))
+                skipTypeParams();
+            if (acceptOp("("))
+            {
+                parseCallArgs(n);
+                expectOp(")");
+            }
+            n->body = parseBlock();
+            return n;
+        }
+        if (w == "if")
+        {
+            ++p;
+            Node *n = mkAt(NK::If, line);
+            n->a = parseNamedExpr();
+            n->body = parseBlock();
+            if (isKw("elif"))
+            {
+                toks[p].s = "if";
+                n->orelse.push_back(parseCompound());
+            }
+            else if (acceptKw("else"))
+                n->orelse = parseBlock();
+            return n;
+        }
+        if (w == "while")
+        {
+            ++p;
+            Node *n = mkAt(NK::While, line);
+            n->a = parseNamedExpr();
+            n->body = parseBlock();
+            if (acceptKw("else"))
+                n->orelse = parseBlock();
+            return n;
+        }
+        if (w == "for")
+        {
+            ++p;
+            Node *n = mkAt(NK::For, line);
+            n->a = parseTargetList();
+            expectKw("in");
+            n->b = parseStarExprs();
+            n->body = parseBlock();
+            if (acceptKw("else"))
+                n->orelse = parseBlock();
+            return n;
+        }
+        if (w == "try")
+        {
+            ++p;
+            Node *n = mkAt(NK::Try, line);
+            n->body = parseBlock();
+            while (isKw("except"))
+            {
+                Handler h;
+                h.line = cur().line;
+                ++p;
+                acceptOp("*");
+                if (!isOp(":"))
+                {
+                    h.type = parseExpr();
+                    if (acceptOp(","))
+                    {
+                        Node *t = mkAt(NK::Tuple, h.type->line);
+                        t->list.push_back(h.type);
+                        do
+                            t->list.push_back(parseExpr());
+                        while (acceptOp(","));
+                        h.type = t;
+                    }
+                    if (acceptKw("as"))
+                        h.name = expectName();
+                }
+                h.body = parseBlock();
+                n->handlers.push_back(h);
+            }
+            if (acceptKw("else"))
+                n->orelse = parseBlock();
+            if (acceptKw("finally"))
+                n->finalbody = parseBlock();
+            if (n->handlers.empty() && n->finalbody.empty())
+                fail("expected 'except' or 'finally' block");
+            return n;
+        }
+        if (w == "with")
+        {
+            ++p;
+            Node *n = mkAt(NK::With, line);
+            bool paren = false;
+            // with (a as b, c as d):
+            if (isOp("("))
+            {
+                size_t save = p;
+                int d = 0;
+                size_t k = p;
+                for (; k < toks.size(); ++k)
+                {
+                    if (toks[k].t == T_OP && (toks[k].s == "(" || toks[k].s == "[" || toks[k].s == "{"))
+                        ++d;
+                    else if (toks[k].t == T_OP && (toks[k].s == ")" || toks[k].s == "]" || toks[k].s == "}"))
+                    {
+                        if (--d == 0)
+                            break;
+                    }
+                }
+                if (k + 1 < toks.size() && toks[k + 1].t == T_OP && toks[k + 1].s == ":")
+                {
+                    // parenthesized group only if it holds `as` or a top-level comma
+                    bool hasAs = false;
+                    int dd = 0;
+                    for (size_t j = save + 1; j < k; ++j)
+                    {
+                        if (toks[j].t == T_OP && (toks[j].s == "(" || toks[j].s == "[" || toks[j].s == "{"))
+                            ++dd;
+                        else if (toks[j].t == T_OP && (toks[j].s == ")" || toks[j].s == "]" || toks[j].s == "}"))
+                            --dd;
+                        else if (dd == 0 && ((toks[j].t == T_NAME && toks[j].s == "as") || (toks[j].t == T_OP && toks[j].s == ",")))
+                            hasAs = true;
+                    }
+                    if (hasAs)
+                    {
+                        paren = true;
+                        ++p;
+                    }
+                }
+            }
+            for (;;)
+            {
+                if (paren && isOp(")"))
+                    break;
+                n->list.push_back(parseExpr());
+                n->list2.push_back(acceptKw("as") ? parseTarget() : nullptr);
+                if (!acceptOp(","))
+                    break;
+            }
+            if (paren)
+                expectOp(")");
+            n->body = parseBlock();
+            return n;
+        }
+        unexpected();
+    }
+
+    void skipTypeParams()
+    {
+        int d = 0;
+        do
+        {
+            if (isOp("["))
+                ++d;
+            else if (isOp("]"))
+                --d;
+            ++p;
+        } while (d > 0 && cur().t != T_END);
+    }
+
+    Params *parseParams(const char *close, bool annotations)
+    {
+        Params *ps = new Params();
+        bool seenStar = false, seenDefault = false;
+        while (!isOp(close))
+        {
+            if (acceptOp("/"))
+            {
+                ps->posonly = ps->args;
+                ps->args.clear();
+            }
+            else if (acceptOp("**"))
+            {
+                ps->kwarg = new Arg();
+                ps->kwarg->name = expectName();
+                if (annotations && acceptOp(":"))
+                    ps->kwarg->annotation = parseExpr();
+            }
+            else if (acceptOp("*"))
+            {
+                seenStar = true;
+                if (cur().t == T_NAME)
+                {
+                    ps->vararg = new Arg();
+                    ps->vararg->name = expectName();
+                    if (annotations && acceptOp(":"))
+                        ps->vararg->annotation = parseStarOrExpr();
+                }
+            }
+            else
+            {
+                Arg a;
+                a.name = expectName();
+                if (annotations && acceptOp(":"))
+                    a.annotation = parseExpr();
+                Node *def = nullptr;
+                if (acceptOp("="))
+                    def = parseExpr();
+                if (seenStar)
+                {
+                    ps->kwonly.push_back(a);
+                    ps->kwDefaults.push_back(def);
+                }
+                else
+                {
+                    ps->args.push_back(a);
+                    if (def)
+                    {
+                        ps->defaults.push_back(def);
+                        seenDefault = true;
+                    }
+                    else if (seenDefault)
+                        fail("parameter without a default follows parameter with a default");
+                }
+            }
+            if (!acceptOp(","))
+                break;
+        }
+        return ps;
+    }
+
+    Node *parseSimple()
+    {
+        const Tok &t = cur();
+        int line = t.line;
+        if (t.t == T_NAME)
+        {
+            const std::string &w = t.s;
+            if (w == "pass")
+            {
+                ++p;
+                return mkAt(NK::Pass, line);
+            }
+            if (w == "break")
+            {
+                ++p;
+                return mkAt(NK::Break, line);
+            }
+            if (w == "continue")
+            {
+                ++p;
+                return mkAt(NK::Continue, line);
+            }
+            if (w == "return")
+            {
+                ++p;
+                Node *n = mkAt(NK::Return, line);
+                if (cur().t != T_NEWLINE && !isOp(";") && cur().t != T_END)
+                    n->a = parseStarExprs();
+                return n;
+            }
+            if (w == "raise")
+            {
+                ++p;
+                Node *n = mkAt(NK::Raise, line);
+                if (cur().t != T_NEWLINE && !isOp(";") && cur().t != T_END)
+                {
+                    n->a = parseExpr();
+                    if (acceptKw("from"))
+                        n->b = parseExpr();
+                }
+                return n;
+            }
+            if (w == "global" || w == "nonlocal")
+            {
+                ++p;
+                Node *n = mkAt(w == "global" ? NK::Global : NK::Nonlocal, line);
+                do
+                    n->names.push_back(expectName());
+                while (acceptOp(","));
+                return n;
+            }
+            if (w == "del")
+            {
+                ++p;
+                Node *n = mkAt(NK::Delete, line);
+                do
+                {
+                    if (cur().t == T_NEWLINE)
+                        break;
+                    n->list.push_back(parseBitOr());
+                } while (acceptOp(","));
+                return n;
+            }
+            if (w == "assert")
+            {
+                ++p;
+                Node *n = mkAt(NK::Assert, line);
+                n->a = parseExpr();
+                if (acceptOp(","))
+                    n->b = parseExpr();
+                return n;
+            }
+            if (w == "import")
+            {
+                ++p;
+                Node *n = mkAt(NK::Import, line);
+                do
+                {
+                    std::string m = expectName();
+                    while (acceptOp("."))
+                        m += "." + expectName();
+                    n->names.push_back(m);
+                    n->names2.push_back(acceptKw("as") ? expectName() : "");
+                } while (acceptOp(","));
+                return n;
+            }
+            if (w == "from")
+            {
+                ++p;
+                Node *n = mkAt(NK::ImportFrom, line);
+                int level = 0;
+                while (isOp(".") || isOp("..."))
+                {
+                    level += isOp(".") ? 1 : 3;
+                    ++p;
+                }
+                n->ival = level;
+                if (!isKw("import"))
+                {
+                    n->name = expectName();
+                    while (acceptOp("."))
+                        n->name += "." + expectName();
+                }
+                expectKw("import");
+                bool paren = acceptOp("(");
+                if (acceptOp("*"))
+                {
+                    n->names.push_back("*");
+                    n->names2.push_back("");
+                }
+                else
+                    do
+                    {
+                        if (paren && isOp(")"))
+                            break;
+                        n->names.push_back(expectName());
+                        n->names2.push_back(acceptKw("as") ? expectName() : "");
+                    } while (acceptOp(","));
+                if (paren)
+                    expectOp(")");
+                return n;
+            }
+            if (w == "type" && peekTok(1).t == T_NAME && (isOpAt(2, "=") || isOpAt(2, "[")))
+            {
+                // type alias: `type X = ...` evaluates to nothing useful here
+                ++p;
+                Node *n = mkAt(NK::Assign, line);
+                Node *target = mkAt(NK::Name, line);
+                target->name = expectName();
+                if (isOp("["))
+                    skipTypeParams();
+                expectOp("=");
+                n->list.push_back(target);
+                n->a = parseExpr();
+                return n;
+            }
+        }
+
+        // expression statement / assignment
+        Node *first = parseStarExprs(true);
+        if (isOp("="))
+        {
+            Node *n = mkAt(NK::Assign, line);
+            n->list.push_back(checkTarget(first));
+            while (acceptOp("="))
+            {
+                Node *v = isKw("yield") ? parseYield() : parseStarExprs(true);
+                if (isOp("="))
+                    n->list.push_back(checkTarget(v));
+                else
+                {
+                    n->a = v;
+                    break;
+                }
+            }
+            return n;
+        }
+        if (isOp(":") && first->kind != NK::Tuple)
+        {
+            ++p;
+            Node *n = mkAt(NK::AnnAssign, line);
+            n->a = checkTarget(first);
+            n->flag = first->kind == NK::Name;
+            n->b = parseExpr();
+            if (acceptOp("="))
+                n->c = isKw("yield") ? parseYield() : parseStarExprs();
+            return n;
+        }
+        static const char *aug[] = {"+=", "-=", "*=", "@=", "/=", "//=", "%=", "**=", "<<=", ">>=", "|=", "^=", "&=", nullptr};
+        static const Op augOps[] = {OpAdd, OpSub, OpMul, OpMatMul, OpDiv, OpFloorDiv, OpMod, OpPow, OpLShift, OpRShift, OpBitOr, OpBitXor, OpBitAnd};
+        for (int k = 0; aug[k]; ++k)
+            if (isOp(aug[k]))
+            {
+                ++p;
+                Node *n = mkAt(NK::AugAssign, line);
+                n->a = checkTarget(first);
+                n->op = augOps[k];
+                n->b = isKw("yield") ? parseYield() : parseStarExprs();
+                return n;
+            }
+        Node *n = mkAt(NK::ExprStmt, line);
+        n->a = first;
+        return n;
+    }
+
+    Node *checkTarget(Node *t)
+    {
+        switch (t->kind)
+        {
+        case NK::Name:
+        case NK::Attribute:
+        case NK::Subscript:
+            return t;
+        case NK::Tuple:
+        case NK::List:
+            for (Node *e : t->list)
+                checkTarget(e);
+            return t;
+        case NK::Starred:
+            checkTarget(t->a);
+            return t;
+        default:
+            synErr("cannot assign to expression", t->line, t->col);
+        }
+    }
+
+    // ── match ────────────────────────────────────────────────────────────
+
+    Node *parseMatch()
+    {
+        int line = cur().line;
+        ++p; // match
+        Node *n = mkAt(NK::Match, line);
+        n->a = parseStarExprs();
+        expectOp(":");
+        if (cur().t != T_NEWLINE)
+            unexpected();
+        ++p;
+        if (cur().t != T_INDENT)
+            fail("expected an indented block");
+        ++p;
+        while (isKw("case"))
+        {
+            ++p;
+            MatchCase mc;
+            mc.pattern = parsePatternTop();
+            if (acceptKw("if"))
+                mc.guard = parseNamedExpr();
+            mc.body = parseBlock();
+            n->cases.push_back(mc);
+        }
+        if (cur().t == T_DEDENT)
+            ++p;
+        else
+            unexpected();
+        return n;
+    }
+
+    Node *parsePatternTop()
+    {
+        int line = cur().line;
+        Node *first = parseAsPattern();
+        if (!isOp(","))
+            return first;
+        Node *seq = mkAt(NK::PSequence, line);
+        seq->list.push_back(first);
+        while (acceptOp(","))
+        {
+            if (isOp(":") || isKw("if"))
+                break;
+            seq->list.push_back(parseAsPattern());
+        }
+        return seq;
+    }
+
+    Node *parseAsPattern()
+    {
+        int line = cur().line;
+        Node *pat = parseOrPattern();
+        if (acceptKw("as"))
+        {
+            Node *as = mkAt(NK::PAs, line);
+            as->b = pat;
+            as->name = expectName();
+            return as;
+        }
+        return pat;
+    }
+
+    Node *parseOrPattern()
+    {
+        int line = cur().line;
+        Node *first = parseClosedPattern();
+        if (!isOp("|"))
+            return first;
+        Node *orp = mkAt(NK::POr, line);
+        orp->list.push_back(first);
+        while (acceptOp("|"))
+            orp->list.push_back(parseClosedPattern());
+        return orp;
+    }
+
+    Node *parseClosedPattern()
+    {
+        int line = cur().line;
+        const Tok &t = cur();
+        if (isOp("*"))
+        {
+            ++p;
+            Node *s = mkAt(NK::PStar, line);
+            std::string nm = expectName();
+            s->name = nm == "_" ? "" : nm;
+            return s;
+        }
+        if (isOp("(") || isOp("["))
+        {
+            bool paren = isOp("(");
+            const char *close = paren ? ")" : "]";
+            ++p;
+            Node *seq = mkAt(NK::PSequence, line);
+            bool comma = false;
+            while (!isOp(close))
+            {
+                seq->list.push_back(parseAsPattern());
+                if (!acceptOp(","))
+                    break;
+                comma = true;
+            }
+            expectOp(close);
+            if (paren && !comma && seq->list.size() == 1)
+                return seq->list[0];
+            return seq;
+        }
+        if (isOp("{"))
+        {
+            ++p;
+            Node *m = mkAt(NK::PMapping, line);
+            while (!isOp("}"))
+            {
+                if (acceptOp("**"))
+                {
+                    m->name = expectName();
+                    acceptOp(",");
+                    break;
+                }
+                m->list.push_back(parsePatternValue());
+                expectOp(":");
+                m->list2.push_back(parseAsPattern());
+                if (!acceptOp(","))
+                    break;
+            }
+            expectOp("}");
+            return m;
+        }
+        if (t.t == T_NAME && (t.s == "None" || t.s == "True" || t.s == "False"))
+        {
+            Node *s = mkAt(NK::PSingleton, line);
+            s->a = parseAtom();
+            return s;
+        }
+        if (t.t == T_NAME && !isKeyword(t.s))
+        {
+            // capture, wildcard, value (dotted) or class pattern
+            Node *e = mkAt(NK::Name, line);
+            e->name = t.s;
+            ++p;
+            bool dotted = false;
+            while (isOp("."))
+            {
+                ++p;
+                Node *at = mkAt(NK::Attribute, line);
+                at->a = e;
+                at->name = expectName();
+                e = at;
+                dotted = true;
+            }
+            if (acceptOp("("))
+            {
+                Node *c = mkAt(NK::PClass, line);
+                c->a = e;
+                while (!isOp(")"))
+                {
+                    if (cur().t == T_NAME && isOpAt(1, "="))
+                    {
+                        c->names.push_back(cur().s);
+                        p += 2;
+                        c->list2.push_back(parseAsPattern());
+                    }
+                    else
+                        c->list.push_back(parseAsPattern());
+                    if (!acceptOp(","))
+                        break;
+                }
+                expectOp(")");
+                return c;
+            }
+            if (dotted)
+            {
+                Node *v = mkAt(NK::PValue, line);
+                v->a = e;
+                return v;
+            }
+            Node *as = mkAt(NK::PAs, line);
+            as->name = e->name == "_" ? "" : e->name;
+            return as;
+        }
+        Node *v = mkAt(NK::PValue, line);
+        v->a = parsePatternValue();
+        return v;
+    }
+
+    // a literal in a pattern: number (maybe negative, maybe complex), string, dotted name
+    Node *parsePatternValue()
+    {
+        return parseSum();
+    }
+
+    // ── expressions ──────────────────────────────────────────────────────
+
+    // star_expressions: a, *b, c  → Tuple when there is a comma
+    Node *parseStarExprs(bool allowYield = false)
+    {
+        int line = cur().line;
+        if (allowYield && isKw("yield"))
+            return parseYield();
+        Node *first = parseStarOrNamed();
+        if (!isOp(","))
+            return first;
+        Node *t = mkAt(NK::Tuple, line);
+        t->list.push_back(first);
+        while (acceptOp(","))
+        {
+            if (!atExprStart())
+                break;
+            t->list.push_back(parseStarOrNamed());
+        }
+        return t;
+    }
+
+    Node *parseStarOrNamed()
+    {
+        if (isOp("*"))
+        {
+            Node *s = mk(NK::Starred);
+            ++p;
+            s->a = parseBitOr();
+            return s;
+        }
+        return parseNamedExpr();
+    }
+
+    Node *parseStarOrExpr()
+    {
+        if (isOp("*"))
+        {
+            Node *s = mk(NK::Starred);
+            ++p;
+            s->a = parseBitOr();
+            return s;
+        }
+        return parseExpr();
+    }
+
+    Node *parseYield()
+    {
+        int line = cur().line;
+        expectKw("yield");
+        if (acceptKw("from"))
+        {
+            Node *n = mkAt(NK::YieldFrom, line);
+            n->a = parseExpr();
+            return n;
+        }
+        Node *n = mkAt(NK::Yield, line);
+        if (atExprStart())
+            n->a = parseStarExprs();
+        return n;
+    }
+
+    // for-loop / comprehension targets: stop before `in`
+    Node *parseTargetList()
+    {
+        int line = cur().line;
+        Node *first = parseTarget();
+        if (!isOp(","))
+            return first;
+        Node *t = mkAt(NK::Tuple, line);
+        t->list.push_back(first);
+        while (acceptOp(","))
+        {
+            if (isKw("in") || isOp("=") || isOp(")"))
+                break;
+            t->list.push_back(parseTarget());
+        }
+        return t;
+    }
+
+    Node *parseTarget()
+    {
+        if (isOp("*"))
+        {
+            Node *s = mk(NK::Starred);
+            ++p;
+            s->a = parseBitOr();
+            return s;
+        }
+        return checkTarget(parseBitOr());
+    }
+
+    Node *parseNamedExpr()
+    {
+        if (cur().t == T_NAME && isOpAt(1, ":=") && !isKeyword(cur().s))
+        {
+            Node *n = mk(NK::NamedExpr);
+            n->name = cur().s;
+            p += 2;
+            n->a = parseExpr();
+            return n;
+        }
+        return parseExpr();
+    }
+
+    Node *parseExpr()
+    {
+        if (isKw("lambda"))
+            return parseLambda();
+        int line = cur().line;
+        Node *body = parseOr();
+        if (isKw("if"))
+        {
+            // conditional expression (not a comprehension's `if`: those come after `for`)
+            ++p;
+            Node *n = mkAt(NK::IfExp, line);
+            n->b = body;
+            n->a = parseOr();
+            expectKw("else");
+            n->c = parseExpr();
+            return n;
+        }
+        return body;
+    }
+
+    Node *parseExprNoCond()
+    {
+        if (isKw("lambda"))
+            return parseLambda(true);
+        return parseOr();
+    }
+
+    Node *parseLambda(bool noCond = false)
+    {
+        Node *n = mk(NK::Lambda);
+        ++p;
+        n->args = parseParams(":", false);
+        expectOp(":");
+        n->a = noCond ? parseExprNoCond() : parseExpr();
+        return n;
+    }
+
+    Node *parseOr()
+    {
+        int line = cur().line;
+        Node *first = parseAnd();
+        if (!isKw("or"))
+            return first;
+        Node *n = mkAt(NK::BoolOp, line);
+        n->op = OpOr;
+        n->list.push_back(first);
+        while (acceptKw("or"))
+            n->list.push_back(parseAnd());
+        return n;
+    }
+
+    Node *parseAnd()
+    {
+        int line = cur().line;
+        Node *first = parseNot();
+        if (!isKw("and"))
+            return first;
+        Node *n = mkAt(NK::BoolOp, line);
+        n->op = OpAnd;
+        n->list.push_back(first);
+        while (acceptKw("and"))
+            n->list.push_back(parseNot());
+        return n;
+    }
+
+    Node *parseNot()
+    {
+        if (isKw("not"))
+        {
+            Node *n = mk(NK::UnaryOp);
+            ++p;
+            n->op = OpNot;
+            n->a = parseNot();
+            return n;
+        }
+        return parseComparison();
+    }
+
+    bool compOp(Op &op)
+    {
+        const Tok &t = cur();
+        if (t.t == T_OP)
+        {
+            if (t.s == "==") op = OpEq;
+            else if (t.s == "!=") op = OpNe;
+            else if (t.s == "<") op = OpLt;
+            else if (t.s == "<=") op = OpLe;
+            else if (t.s == ">") op = OpGt;
+            else if (t.s == ">=") op = OpGe;
+            else
+                return false;
+            ++p;
+            return true;
+        }
+        if (t.t == T_NAME)
+        {
+            if (t.s == "in")
+            {
+                op = OpIn;
+                ++p;
+                return true;
+            }
+            if (t.s == "not" && peekTok(1).t == T_NAME && peekTok(1).s == "in")
+            {
+                op = OpNotIn;
+                p += 2;
+                return true;
+            }
+            if (t.s == "is")
+            {
+                ++p;
+                op = acceptKw("not") ? OpIsNot : OpIs;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Node *parseComparison()
+    {
+        int line = cur().line;
+        Node *first = parseBitOr();
+        Op op;
+        if (!compOp(op))
+            return first;
+        Node *n = mkAt(NK::Compare, line);
+        n->a = first;
+        do
+        {
+            n->ops.push_back(op);
+            n->list2.push_back(parseBitOr());
+        } while (compOp(op));
+        return n;
+    }
+
+    Node *bin(Op op, Node *l, Node *r, int line)
+    {
+        Node *n = mkAt(NK::BinOp, line);
+        n->op = op;
+        n->a = l;
+        n->b = r;
+        return n;
+    }
+
+    Node *parseBitOr()
+    {
+        int line = cur().line;
+        Node *l = parseBitXor();
+        while (isOp("|"))
+        {
+            ++p;
+            l = bin(OpBitOr, l, parseBitXor(), line);
+        }
+        return l;
+    }
+
+    Node *parseBitXor()
+    {
+        int line = cur().line;
+        Node *l = parseBitAnd();
+        while (isOp("^"))
+        {
+            ++p;
+            l = bin(OpBitXor, l, parseBitAnd(), line);
+        }
+        return l;
+    }
+
+    Node *parseBitAnd()
+    {
+        int line = cur().line;
+        Node *l = parseShift();
+        while (isOp("&"))
+        {
+            ++p;
+            l = bin(OpBitAnd, l, parseShift(), line);
+        }
+        return l;
+    }
+
+    Node *parseShift()
+    {
+        int line = cur().line;
+        Node *l = parseSum();
+        for (;;)
+        {
+            if (acceptOp("<<"))
+                l = bin(OpLShift, l, parseSum(), line);
+            else if (acceptOp(">>"))
+                l = bin(OpRShift, l, parseSum(), line);
+            else
+                return l;
+        }
+    }
+
+    Node *parseSum()
+    {
+        int line = cur().line;
+        Node *l = parseTerm();
+        for (;;)
+        {
+            if (acceptOp("+"))
+                l = bin(OpAdd, l, parseTerm(), line);
+            else if (acceptOp("-"))
+                l = bin(OpSub, l, parseTerm(), line);
+            else
+                return l;
+        }
+    }
+
+    Node *parseTerm()
+    {
+        int line = cur().line;
+        Node *l = parseFactor();
+        for (;;)
+        {
+            if (acceptOp("*"))
+                l = bin(OpMul, l, parseFactor(), line);
+            else if (acceptOp("/"))
+                l = bin(OpDiv, l, parseFactor(), line);
+            else if (acceptOp("//"))
+                l = bin(OpFloorDiv, l, parseFactor(), line);
+            else if (acceptOp("%"))
+                l = bin(OpMod, l, parseFactor(), line);
+            else if (acceptOp("@"))
+                l = bin(OpMatMul, l, parseFactor(), line);
+            else
+                return l;
+        }
+    }
+
+    Node *parseFactor()
+    {
+        int line = cur().line;
+        Op op;
+        if (isOp("-"))
+            op = OpNeg;
+        else if (isOp("+"))
+            op = OpPos;
+        else if (isOp("~"))
+            op = OpInvert;
+        else
+            return parsePower();
+        ++p;
+        Node *operand = parseFactor();
+        // fold -<number> into the literal so -9223372036854775808 and the like stay exact
+        if (op == OpNeg && operand->kind == NK::Int && !operand->flag && operand->ival > 0)
+        {
+            operand->ival = -operand->ival;
+            return operand;
+        }
+        if (op == OpNeg && operand->kind == NK::Float)
+        {
+            Node *n = mkAt(NK::UnaryOp, line);
+            n->op = op;
+            n->a = operand;
+            return n;
+        }
+        Node *n = mkAt(NK::UnaryOp, line);
+        n->op = op;
+        n->a = operand;
+        return n;
+    }
+
+    Node *parsePower()
+    {
+        int line = cur().line;
+        Node *base;
+        if (isKw("await"))
+        {
+            ++p;
+            base = mkAt(NK::Await, line);
+            base->a = parsePrimary();
+        }
+        else
+            base = parsePrimary();
+        if (acceptOp("**"))
+            return bin(OpPow, base, parseFactor(), line);
+        return base;
+    }
+
+    Node *parsePrimary()
+    {
+        Node *e = parseAtom();
+        for (;;)
+        {
+            int line = cur().line;
+            if (acceptOp("."))
+            {
+                Node *n = mkAt(NK::Attribute, line);
+                n->a = e;
+                if (cur().t != T_NAME)
+                    fail("expected an attribute name");
+                n->name = toks[p++].s;
+                e = n;
+            }
+            else if (acceptOp("("))
+            {
+                Node *n = mkAt(NK::Call, line);
+                n->a = e;
+                parseCallArgs(n);
+                expectOp(")");
+                e = n;
+            }
+            else if (acceptOp("["))
+            {
+                Node *n = mkAt(NK::Subscript, line);
+                n->a = e;
+                n->b = parseSubscriptList();
+                expectOp("]");
+                e = n;
+            }
+            else
+                return e;
+        }
+    }
+
+    void parseCallArgs(Node *call)
+    {
+        while (!isOp(")"))
+        {
+            int line = cur().line;
+            if (acceptOp("**"))
+            {
+                call->names.push_back("");
+                call->list2.push_back(parseExpr());
+            }
+            else if (acceptOp("*"))
+            {
+                Node *s = mkAt(NK::Starred, line);
+                s->a = parseExpr();
+                call->list.push_back(s);
+            }
+            else if (cur().t == T_NAME && isOpAt(1, "=") && !isKeyword(cur().s))
+            {
+                call->names.push_back(cur().s);
+                p += 2;
+                call->list2.push_back(parseExpr());
+            }
+            else
+            {
+                Node *a = parseNamedExpr();
+                if (isKw("for") || (isKw("async") && peekTok(1).s == "for"))
+                {
+                    Node *g = mkAt(NK::GenExp, line);
+                    g->a = a;
+                    parseComprehensions(g);
+                    a = g;
+                }
+                call->list.push_back(a);
+            }
+            if (!acceptOp(","))
+                break;
+        }
+    }
+
+    Node *parseSlice()
+    {
+        int line = cur().line;
+        Node *lo = nullptr;
+        if (!isOp(":"))
+        {
+            lo = parseStarOrNamed();
+            if (!isOp(":"))
+                return lo;
+        }
+        Node *s = mkAt(NK::Slice, line);
+        s->a = lo;
+        expectOp(":");
+        if (!isOp(":") && !isOp("]") && !isOp(","))
+            s->b = parseExpr();
+        if (acceptOp(":"))
+        {
+            if (!isOp("]") && !isOp(","))
+                s->c = parseExpr();
+        }
+        return s;
+    }
+
+    Node *parseSubscriptList()
+    {
+        int line = cur().line;
+        Node *first = parseSlice();
+        if (!isOp(","))
+            return first;
+        Node *t = mkAt(NK::Tuple, line);
+        t->list.push_back(first);
+        while (acceptOp(","))
+        {
+            if (isOp("]"))
+                break;
+            t->list.push_back(parseSlice());
+        }
+        return t;
+    }
+
+    void parseComprehensions(Node *n)
+    {
+        while (isKw("for") || (isKw("async") && peekTok(1).s == "for"))
+        {
+            acceptKw("async");
+            ++p; // for
+            Comprehension c;
+            c.target = parseTargetList();
+            expectKw("in");
+            c.iter = parseOr();
+            while (isKw("if"))
+            {
+                ++p;
+                c.ifs.push_back(parseExprNoCondNamed());
+            }
+            n->comps.push_back(c);
+        }
+    }
+
+    Node *parseExprNoCondNamed()
+    {
+        if (cur().t == T_NAME && isOpAt(1, ":=") && !isKeyword(cur().s))
+            return parseNamedExpr();
+        return parseExprNoCond();
+    }
+
+    Node *parseAtom()
+    {
+        const Tok &t = cur();
+        int line = t.line;
+        switch (t.t)
+        {
+        case T_NAME:
+        {
+            if (t.s == "None")
+            {
+                ++p;
+                return mkAt(NK::None, line);
+            }
+            if (t.s == "True")
+            {
+                ++p;
+                return mkAt(NK::True, line);
+            }
+            if (t.s == "False")
+            {
+                ++p;
+                return mkAt(NK::False, line);
+            }
+            if (t.s == "lambda")
+                return parseLambda();
+            if (t.s == "yield")
+                fail("'yield' outside parentheses");
+            if (isKeyword(t.s))
+                unexpected();
+            Node *n = mkAt(NK::Name, line);
+            n->col = t.col;
+            n->name = t.s;
+            ++p;
+            return n;
+        }
+        case T_NUMBER:
+        {
+            std::string s = t.s;
+            ++p;
+            if (!s.empty() && s.back() == 'j')
+            {
+                Node *n = mkAt(NK::Imag, line);
+                n->fval = strtod(s.substr(0, s.size() - 1).c_str(), nullptr);
+                return n;
+            }
+            bool isInt = s.find_first_of(".eE") == std::string::npos || (s.size() > 1 && s[0] == '0' && (s[1] == 'x'));
+            if (s.size() > 1 && s[0] == '0' && (s[1] == 'x' || s[1] == 'o' || s[1] == 'b'))
+                isInt = true;
+            if (!isInt)
+            {
+                Node *n = mkAt(NK::Float, line);
+                n->fval = strtod(s.c_str(), nullptr);
+                return n;
+            }
+            Node *n = mkAt(NK::Int, line);
+            n->name = s;
+            int base = 10;
+            std::string digits = s;
+            if (s.size() > 1 && s[0] == '0' && (s[1] == 'x' || s[1] == 'o' || s[1] == 'b'))
+            {
+                base = s[1] == 'x' ? 16 : s[1] == 'o' ? 8 : 2;
+                digits = s.substr(2);
+            }
+            // fits in 62 bits?
+            uint64_t v = 0;
+            bool big = false;
+            for (char ch : digits)
+            {
+                int d = hexVal(ch);
+                if (d < 0 || d >= base)
+                    synErr("invalid digit in numeric literal", line, t.col);
+                if (v > (((uint64_t)1 << 61) - 1 - (uint64_t)d) / (uint64_t)base)
+                {
+                    big = true;
+                    break;
+                }
+                v = v * (uint64_t)base + (uint64_t)d;
+            }
+            n->flag = big;
+            n->ival = (int64_t)v;
+            return n;
+        }
+        case T_STRING:
+            return parseStrings();
+        case T_OP:
+        {
+            if (t.s == "(")
+            {
+                ++p;
+                if (acceptOp(")"))
+                    return mkAt(NK::Tuple, line);
+                if (isKw("yield"))
+                {
+                    Node *y = parseYield();
+                    expectOp(")");
+                    return y;
+                }
+                Node *first = parseStarOrNamed();
+                if (isKw("for") || (isKw("async") && peekTok(1).s == "for"))
+                {
+                    Node *g = mkAt(NK::GenExp, line);
+                    g->a = first;
+                    parseComprehensions(g);
+                    expectOp(")");
+                    return g;
+                }
+                if (acceptOp(")"))
+                {
+                    if (first->kind == NK::Starred)
+                        fail("cannot use starred expression here");
+                    return first;
+                }
+                Node *tup = mkAt(NK::Tuple, line);
+                tup->list.push_back(first);
+                while (acceptOp(","))
+                {
+                    if (isOp(")"))
+                        break;
+                    tup->list.push_back(parseStarOrNamed());
+                }
+                expectOp(")");
+                return tup;
+            }
+            if (t.s == "[")
+            {
+                ++p;
+                Node *l = mkAt(NK::List, line);
+                if (acceptOp("]"))
+                    return l;
+                Node *first = parseStarOrNamed();
+                if (isKw("for") || (isKw("async") && peekTok(1).s == "for"))
+                {
+                    Node *c = mkAt(NK::ListComp, line);
+                    c->a = first;
+                    parseComprehensions(c);
+                    expectOp("]");
+                    return c;
+                }
+                l->list.push_back(first);
+                while (acceptOp(","))
+                {
+                    if (isOp("]"))
+                        break;
+                    l->list.push_back(parseStarOrNamed());
+                }
+                expectOp("]");
+                return l;
+            }
+            if (t.s == "{")
+            {
+                ++p;
+                if (acceptOp("}"))
+                    return mkAt(NK::Dict, line);
+                if (acceptOp("**"))
+                {
+                    Node *d = mkAt(NK::Dict, line);
+                    d->list.push_back(nullptr);
+                    d->list2.push_back(parseBitOr());
+                    return parseDictRest(d);
+                }
+                Node *first = parseStarOrNamed();
+                if (acceptOp(":"))
+                {
+                    Node *val = parseExpr();
+                    if (isKw("for") || (isKw("async") && peekTok(1).s == "for"))
+                    {
+                        Node *c = mkAt(NK::DictComp, line);
+                        c->a = first;
+                        c->b = val;
+                        parseComprehensions(c);
+                        expectOp("}");
+                        return c;
+                    }
+                    Node *d = mkAt(NK::Dict, line);
+                    d->list.push_back(first);
+                    d->list2.push_back(val);
+                    return parseDictRest(d);
+                }
+                if (isKw("for") || (isKw("async") && peekTok(1).s == "for"))
+                {
+                    Node *c = mkAt(NK::SetComp, line);
+                    c->a = first;
+                    parseComprehensions(c);
+                    expectOp("}");
+                    return c;
+                }
+                Node *s = mkAt(NK::Set, line);
+                s->list.push_back(first);
+                while (acceptOp(","))
+                {
+                    if (isOp("}"))
+                        break;
+                    s->list.push_back(parseStarOrNamed());
+                }
+                expectOp("}");
+                return s;
+            }
+            if (t.s == "...")
+            {
+                ++p;
+                return mkAt(NK::Ellipsis, line);
+            }
+            unexpected();
+        }
+        default:
+            unexpected();
+        }
+    }
+
+    Node *parseDictRest(Node *d)
+    {
+        while (acceptOp(","))
+        {
+            if (isOp("}"))
+                break;
+            if (acceptOp("**"))
+            {
+                d->list.push_back(nullptr);
+                d->list2.push_back(parseBitOr());
+                continue;
+            }
+            d->list.push_back(parseExpr());
+            expectOp(":");
+            d->list2.push_back(parseExpr());
+        }
+        expectOp("}");
+        return d;
+    }
+
+    // Adjacent literals concatenate; any f-string makes the whole an FStr
+    Node *parseStrings()
+    {
+        int line = cur().line;
+        bool anyF = false, bytes = cur().bytes;
+        std::vector<Tok> parts;
+        while (cur().t == T_STRING)
+        {
+            if (cur().bytes != bytes)
+                fail("cannot mix bytes and nonbytes literals");
+            anyF = anyF || cur().fstr;
+            parts.push_back(cur());
+            ++p;
+        }
+        if (bytes)
+        {
+            Node *n = mkAt(NK::Bytes, line);
+            for (const Tok &t : parts)
+                n->name += t.s;
+            return n;
+        }
+        if (!anyF)
+        {
+            Node *n = mkAt(NK::Str, line);
+            for (const Tok &t : parts)
+                n->name += t.s;
+            return n;
+        }
+        Node *f = mkAt(NK::FStr, line);
+        for (const Tok &t : parts)
+        {
+            if (t.fstr)
+                parseFStringBody(f->list, t.s, t.raw, t.bodyLine);
+            else
+                addLiteral(f->list, t.s, line);
+        }
+        return f;
+    }
+
+    void addLiteral(std::vector<Node *> &parts, const std::string &s, int line)
+    {
+        if (s.empty())
+            return;
+        if (!parts.empty() && parts.back()->kind == NK::Str)
+        {
+            parts.back()->name += s;
+            return;
+        }
+        Node *n = mkAt(NK::Str, line);
+        n->name = s;
+        parts.push_back(n);
+    }
+
+    // Index just past a string literal starting at body[i] (a quote)
+    static size_t skipQuoted(const std::string &body, size_t i)
+    {
+        char q = body[i];
+        bool triple = body.compare(i, 3, std::string(3, q)) == 0;
+        size_t k = i + (triple ? 3 : 1);
+        while (k < body.size())
+        {
+            if (body[k] == '\\')
+            {
+                k += 2;
+                continue;
+            }
+            if (triple ? body.compare(k, 3, std::string(3, q)) == 0 : body[k] == q)
+                return k + (triple ? 3 : 1);
+            ++k;
+        }
+        return k;
+    }
+
+    void parseFStringBody(std::vector<Node *> &parts, const std::string &body, bool raw, int line)
+    {
+        std::string lit;
+        size_t i = 0, n = body.size();
+        int curLine = line;
+        while (i < n)
+        {
+            char c = body[i];
+            if (c == '{' && i + 1 < n && body[i + 1] == '{')
+            {
+                lit += '{';
+                i += 2;
+                continue;
+            }
+            if (c == '}' && i + 1 < n && body[i + 1] == '}')
+            {
+                lit += '}';
+                i += 2;
+                continue;
+            }
+            if (c == '\n')
+                ++curLine;
+            if (c != '{')
+            {
+                if (c == '\\' && i + 1 < n)
+                {
+                    lit += body.substr(i, 2);
+                    i += 2;
+                    continue;
+                }
+                lit += c;
+                ++i;
+                continue;
+            }
+            addLiteral(parts, decodeString(lit, raw, false, curLine), curLine);
+            lit.clear();
+            // a replacement field: expression up to a top-level ! : = or }
+            ++i;
+            size_t start = i;
+            int d = 0;
+            size_t exprEnd = std::string::npos;
+            bool debug = false;
+            while (i < n)
+            {
+                char ch = body[i];
+                if (ch == '\'' || ch == '"')
+                {
+                    i = skipQuoted(body, i);
+                    continue;
+                }
+                if (ch == '(' || ch == '[' || ch == '{')
+                    ++d;
+                else if ((ch == ')' || ch == ']' || ch == '}') && d > 0)
+                    --d;
+                else if (d == 0)
+                {
+                    if (ch == '}' || ch == ':')
+                        break;
+                    if (ch == '!' && i + 1 < n && body[i + 1] != '=')
+                        break;
+                    if (ch == '=' && i + 1 < n && body[i + 1] != '=' && i > start &&
+                        !strchr("=!<>", body[i - 1]))
+                    {
+                        exprEnd = i;
+                        debug = true;
+                        ++i;
+                        break;
+                    }
+                }
+                ++i;
+            }
+            if (exprEnd == std::string::npos)
+                exprEnd = i;
+            std::string exprText = body.substr(start, exprEnd - start);
+            Node *fv = mkAt(NK::FValue, curLine);
+            fv->a = parseSubExpression(exprText, curLine);
+            if (debug)
+            {
+                addLiteral(parts, exprText + "=", curLine);
+                // whitespace after '=' is kept literally
+                size_t ws = i;
+                while (ws < n && body[ws] == ' ')
+                    ++ws;
+                if (ws > i)
+                {
+                    parts.back()->name += body.substr(i, ws - i);
+                    i = ws;
+                }
+                fv->ival = 'r';
+            }
+            if (i < n && body[i] == '!')
+            {
+                fv->ival = body[i + 1];
+                i += 2;
+            }
+            if (i < n && body[i] == ':')
+            {
+                ++i;
+                size_t specStart = i;
+                int dd = 0;
+                while (i < n)
+                {
+                    if (body[i] == '{')
+                        ++dd;
+                    else if (body[i] == '}')
+                    {
+                        if (dd == 0)
+                            break;
+                        --dd;
+                    }
+                    ++i;
+                }
+                Node *spec = mkAt(NK::FStr, curLine);
+                parseFStringBody(spec->list, body.substr(specStart, i - specStart), raw, curLine);
+                fv->b = spec;
+                if (debug && fv->ival == 'r')
+                    fv->ival = 0;
+            }
+            if (i >= n || body[i] != '}')
+                synErr("f-string: expecting '}'", curLine, 0);
+            ++i;
+            parts.push_back(fv);
+        }
+        addLiteral(parts, decodeString(lit, raw, false, curLine), curLine);
+    }
+
+    Node *parseSubExpression(const std::string &text, int line)
+    {
+        std::string wrapped = "(" + text + "\n)";
+        Lexer lx(wrapped, line);
+        lx.run();
+        Parser sub(lx.toks);
+        sub.expectOp("(");
+        Node *e = sub.parseStarExprs(true);
+        while (sub.cur().t == T_NEWLINE)
+            ++sub.p;
+        sub.expectOp(")");
+        return e;
+    }
+};
+
+} // namespace
+
+std::vector<Node *> parseModule(const std::string &source)
+{
+    std::string src = source;
+    if (src.size() >= 3 && (unsigned char)src[0] == 0xEF && (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF)
+        src.erase(0, 3);
+    Lexer lx(src, 1);
+    lx.run();
+    Parser ps(lx.toks);
+    return ps.parseFile();
+}
+
+} // namespace py

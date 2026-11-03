@@ -1,0 +1,2483 @@
+// quantum: cpp
+// Python front-end: the native library modules. `_re` is a backtracking
+// regular-expression engine with Python's syntax (groups, named groups,
+// backreferences, lazy quantifiers, lookaround, inline flags, verbose mode)
+// matching on code points; `re` (in Python, src/python/lib/re.sa) wraps
+// it. `_collections` holds deque.
+#include "PyRt.h.sa"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <deque>
+#include <filesystem>
+#include <thread>
+
+namespace py
+{
+
+bool testModeActive();
+V osErrorFor(int64_t errnoValue, const std::string &msg, const std::string &path);
+static bool g_testModeForPy() { return testModeActive(); }
+
+namespace
+{
+
+// ── regex syntax tree ──────────────────────────────────────────────────────
+
+enum RK : uint8_t
+{
+    RX_CHAR,     // c
+    RX_ANY,      // . (dotall: any; else not newline)
+    RX_CLASS,    // ranges, negated
+    RX_SEQ,      // kids
+    RX_ALT,      // kids
+    RX_GROUP,    // kid, group number (0: non-capturing)
+    RX_REPEAT,   // kid, min, max (-1 = inf), lazy, possessive
+    RX_BOL,      // ^
+    RX_EOL,      // $
+    RX_START,    // \A
+    RX_END,      // \Z
+    RX_WORDB,    // \b
+    RX_NWORDB,   // \B
+    RX_BACKREF,  // group
+    RX_LOOK,     // kid, ahead/behind, negated
+    RX_COND,     // (?(group)yes|no): group, kids[0], kids[1]
+    RX_EMPTY
+};
+
+struct ClassItem
+{
+    uint32_t lo, hi;
+    int cat; // 0 range; 'd' 'D' 'w' 'W' 's' 'S'
+};
+
+struct RNode
+{
+    RK kind;
+    uint32_t ch = 0;
+    bool icase = false, dotall = false, multiline = false, ascii = false;
+    std::vector<ClassItem> items;
+    bool negated = false;
+    std::vector<RNode *> kids;
+    int group = 0;
+    int min = 0, max = -1;
+    bool lazy = false, possessive = false;
+    bool behind = false;
+    int width = -1; // lookbehind width
+};
+
+struct Regex
+{
+    RNode *root;
+    int ngroups = 0;
+    std::vector<std::pair<std::string, int>> names;
+    int flags = 0;
+    std::string pattern;
+};
+
+enum
+{
+    F_IGNORECASE = 2,
+    F_LOCALE = 4,
+    F_MULTILINE = 8,
+    F_DOTALL = 16,
+    F_UNICODE = 32,
+    F_VERBOSE = 64,
+    F_ASCII = 256
+};
+
+Type *tPattern, *tMatch, *tReError, *tDeque, *tDequeIter;
+
+[[noreturn]] void reError(const std::string &msg, size_t pos)
+{
+    V e = makeExc(tReError, msg + " at position " + std::to_string(pos));
+    raiseV(e);
+}
+
+bool wordChar(uint32_t c, bool ascii)
+{
+    if (c < 128)
+        return isalnum((int)c) || c == '_';
+    return !ascii && (isAlphaC(c) || isDigitC(c));
+}
+
+bool classCat(int cat, uint32_t c, bool ascii)
+{
+    switch (cat)
+    {
+    case 'd': return c >= '0' && c <= '9';
+    case 'D': return !(c >= '0' && c <= '9');
+    case 'w': return wordChar(c, ascii);
+    case 'W': return !wordChar(c, ascii);
+    case 's': return c == ' ' || (c >= 9 && c <= 13) || (!ascii && isSpace(c));
+    case 'S': return !(c == ' ' || (c >= 9 && c <= 13) || (!ascii && isSpace(c)));
+    }
+    return false;
+}
+
+class RParser
+{
+public:
+    std::vector<uint32_t> p;
+    size_t i = 0;
+    int flags;
+    int ngroups = 0;
+    std::vector<std::pair<std::string, int>> names;
+
+    RParser(const std::string &pat, int f) : p(decodeUtf8(pat)), flags(f) {}
+
+    bool more() { return i < p.size(); }
+    uint32_t peek() { return p[i]; }
+
+    void skipVerbose()
+    {
+        if (!(flags & F_VERBOSE))
+            return;
+        while (i < p.size())
+        {
+            if (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' || p[i] == '\r' || p[i] == '\f' || p[i] == '\v')
+                ++i;
+            else if (p[i] == '#')
+            {
+                while (i < p.size() && p[i] != '\n')
+                    ++i;
+            }
+            else
+                break;
+        }
+    }
+
+    RNode *mk(RK k)
+    {
+        RNode *n = new RNode();
+        n->kind = k;
+        n->icase = (flags & F_IGNORECASE) != 0;
+        n->dotall = (flags & F_DOTALL) != 0;
+        n->multiline = (flags & F_MULTILINE) != 0;
+        n->ascii = (flags & F_ASCII) != 0;
+        return n;
+    }
+
+    RNode *parse()
+    {
+        // leading global inline flags (?aiLmsux)
+        RNode *r = alt();
+        if (more())
+        {
+            if (peek() == ')')
+                reError("unbalanced parenthesis", i);
+            reError("unexpected character", i);
+        }
+        return r;
+    }
+
+    RNode *alt()
+    {
+        RNode *first = seq();
+        if (!more() || peek() != '|')
+            return first;
+        RNode *a = mk(RX_ALT);
+        a->kids.push_back(first);
+        while (more() && peek() == '|')
+        {
+            ++i;
+            a->kids.push_back(seq());
+        }
+        return a;
+    }
+
+    RNode *seq()
+    {
+        RNode *s = mk(RX_SEQ);
+        for (;;)
+        {
+            skipVerbose();
+            if (!more() || peek() == '|' || peek() == ')')
+                break;
+            RNode *atomN = atom();
+            if (!atomN)
+                continue;
+            skipVerbose();
+            atomN = quantified(atomN);
+            s->kids.push_back(atomN);
+        }
+        return s;
+    }
+
+    bool readInt(int &out)
+    {
+        size_t s = i;
+        int v = 0;
+        while (more() && peek() >= '0' && peek() <= '9')
+            v = v * 10 + (int)(p[i++] - '0');
+        out = v;
+        return i > s;
+    }
+
+    RNode *quantified(RNode *a)
+    {
+        for (;;)
+        {
+            if (!more())
+                return a;
+            uint32_t c = peek();
+            int mn, mx;
+            if (c == '*')
+                mn = 0, mx = -1, ++i;
+            else if (c == '+')
+                mn = 1, mx = -1, ++i;
+            else if (c == '?')
+                mn = 0, mx = 1, ++i;
+            else if (c == '{')
+            {
+                size_t save = i;
+                ++i;
+                int a1 = 0, a2 = -1;
+                bool has1 = readInt(a1);
+                if (more() && peek() == ',')
+                {
+                    ++i;
+                    bool has2 = readInt(a2);
+                    if (!has2)
+                        a2 = -1;
+                    if (!has1)
+                        a1 = 0;
+                }
+                else
+                {
+                    if (!has1)
+                    {
+                        i = save;
+                        return a;
+                    }
+                    a2 = a1;
+                }
+                if (!more() || peek() != '}')
+                {
+                    i = save;
+                    return a;
+                }
+                ++i;
+                mn = a1;
+                mx = a2;
+                if (mx >= 0 && mx < mn)
+                    reError("min repeat greater than max repeat", save);
+            }
+            else
+                return a;
+            if (a->kind == RX_BOL || a->kind == RX_EOL || a->kind == RX_REPEAT)
+            {
+                if (a->kind == RX_REPEAT)
+                    reError("multiple repeat", i - 1);
+            }
+            RNode *r = mk(RX_REPEAT);
+            r->kids.push_back(a);
+            r->min = mn;
+            r->max = mx;
+            if (more() && peek() == '?')
+            {
+                r->lazy = true;
+                ++i;
+            }
+            else if (more() && peek() == '+')
+            {
+                r->possessive = true;
+                ++i;
+            }
+            a = r;
+        }
+    }
+
+    uint32_t parseEscapeChar(uint32_t c, bool inClass, bool &isCat, int &cat)
+    {
+        isCat = false;
+        switch (c)
+        {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case 'f': return '\f';
+        case 'v': return '\v';
+        case 'a': return 7;
+        case '0':
+        {
+            uint32_t v = 0;
+            int k = 0;
+            while (k < 2 && more() && peek() >= '0' && peek() <= '7')
+                v = v * 8 + (p[i++] - '0'), ++k;
+            return v;
+        }
+        case 'x':
+        {
+            uint32_t v = 0;
+            for (int k = 0; k < 2 && more(); ++k)
+            {
+                int h = hexOf(peek());
+                if (h < 0)
+                    reError("incomplete escape \\x", i);
+                v = v * 16 + (uint32_t)h;
+                ++i;
+            }
+            return v;
+        }
+        case 'u':
+        case 'U':
+        {
+            int want = c == 'u' ? 4 : 8;
+            uint32_t v = 0;
+            for (int k = 0; k < want && more(); ++k)
+            {
+                int h = hexOf(peek());
+                if (h < 0)
+                    reError("incomplete escape", i);
+                v = v * 16 + (uint32_t)h;
+                ++i;
+            }
+            return v;
+        }
+        case 'd':
+        case 'D':
+        case 'w':
+        case 'W':
+        case 's':
+        case 'S':
+            isCat = true;
+            cat = (int)c;
+            return 0;
+        case 'b':
+            if (inClass)
+                return 8;
+            break;
+        default:
+            break;
+        }
+        return c;
+    }
+
+    static int hexOf(uint32_t c)
+    {
+        if (c >= '0' && c <= '9')
+            return (int)(c - '0');
+        if (c >= 'a' && c <= 'f')
+            return (int)(c - 'a' + 10);
+        if (c >= 'A' && c <= 'F')
+            return (int)(c - 'A' + 10);
+        return -1;
+    }
+
+    RNode *charClass()
+    {
+        size_t start = i - 1;
+        RNode *n = mk(RX_CLASS);
+        if (more() && peek() == '^')
+        {
+            n->negated = true;
+            ++i;
+        }
+        bool first = true;
+        for (;;)
+        {
+            if (!more())
+                reError("unterminated character set", start);
+            uint32_t c = p[i++];
+            if (c == ']' && !first)
+                break;
+            first = false;
+            uint32_t lo;
+            if (c == '\\')
+            {
+                if (!more())
+                    reError("bad escape (end of pattern)", i);
+                uint32_t e = p[i++];
+                bool isCat;
+                int cat = 0;
+                lo = parseEscapeChar(e, true, isCat, cat);
+                if (isCat)
+                {
+                    n->items.push_back(ClassItem{0, 0, cat});
+                    continue;
+                }
+            }
+            else
+                lo = c;
+            uint32_t hi = lo;
+            if (more() && peek() == '-' && i + 1 < p.size() && p[i + 1] != ']')
+            {
+                ++i;
+                uint32_t c2 = p[i++];
+                if (c2 == '\\')
+                {
+                    bool isCat;
+                    int cat = 0;
+                    uint32_t e = p[i++];
+                    hi = parseEscapeChar(e, true, isCat, cat);
+                    if (isCat)
+                        reError("bad character range", i);
+                }
+                else
+                    hi = c2;
+                if (hi < lo)
+                    reError("bad character range", i);
+            }
+            n->items.push_back(ClassItem{lo, hi, 0});
+        }
+        return n;
+    }
+
+    RNode *atom()
+    {
+        size_t start = i;
+        uint32_t c = p[i++];
+        switch (c)
+        {
+        case '.':
+            return mk(RX_ANY);
+        case '^':
+            return mk(RX_BOL);
+        case '$':
+            return mk(RX_EOL);
+        case '[':
+            return charClass();
+        case '*':
+        case '+':
+        case '?':
+            reError("nothing to repeat", start);
+        case '{':
+        {
+            // a literal brace unless it is a valid quantifier (which needs an atom)
+            RNode *n = mk(RX_CHAR);
+            n->ch = '{';
+            return n;
+        }
+        case '(':
+            return group(start);
+        case '\\':
+        {
+            if (!more())
+                reError("bad escape (end of pattern)", start);
+            uint32_t e = p[i++];
+            switch (e)
+            {
+            case 'A': return mk(RX_START);
+            case 'Z': return mk(RX_END);
+            case 'b': return mk(RX_WORDB);
+            case 'B': return mk(RX_NWORDB);
+            default: break;
+            }
+            if (e >= '1' && e <= '9')
+            {
+                int g = (int)(e - '0');
+                while (more() && peek() >= '0' && peek() <= '9' && g * 10 + (int)(peek() - '0') <= ngroups)
+                    g = g * 10 + (int)(p[i++] - '0');
+                RNode *n = mk(RX_BACKREF);
+                n->group = g;
+                return n;
+            }
+            bool isCat;
+            int cat = 0;
+            uint32_t ch = parseEscapeChar(e, false, isCat, cat);
+            if (isCat)
+            {
+                RNode *n = mk(RX_CLASS);
+                n->items.push_back(ClassItem{0, 0, cat});
+                return n;
+            }
+            RNode *n = mk(RX_CHAR);
+            n->ch = ch;
+            return n;
+        }
+        default:
+        {
+            RNode *n = mk(RX_CHAR);
+            n->ch = c;
+            return n;
+        }
+        }
+    }
+
+    RNode *group(size_t start)
+    {
+        if (more() && peek() == '?')
+        {
+            ++i;
+            if (!more())
+                reError("unexpected end of pattern", i);
+            uint32_t c = p[i++];
+            if (c == ':')
+            {
+                RNode *g = mk(RX_GROUP);
+                g->kids.push_back(alt());
+                expectClose(start);
+                return g;
+            }
+            if (c == 'P' && more() && peek() == '<')
+            {
+                ++i;
+                return namedGroup(start);
+            }
+            if (c == '<' && more() && peek() != '=' && peek() != '!')
+                return namedGroup(start);
+            if (c == 'P' && more() && peek() == '=')
+            {
+                ++i;
+                std::string name;
+                while (more() && peek() != ')')
+                    name += encodeUtf8(p[i++]);
+                ++i;
+                for (auto &nm : names)
+                    if (nm.first == name)
+                    {
+                        RNode *n = mk(RX_BACKREF);
+                        n->group = nm.second;
+                        return n;
+                    }
+                reError("unknown group name '" + name + "'", start);
+            }
+            if (c == '=' || c == '!')
+            {
+                RNode *n = mk(RX_LOOK);
+                n->negated = c == '!';
+                n->kids.push_back(alt());
+                expectClose(start);
+                return n;
+            }
+            if (c == '<' && more() && (peek() == '=' || peek() == '!'))
+            {
+                bool neg = p[i++] == '!';
+                RNode *n = mk(RX_LOOK);
+                n->negated = neg;
+                n->behind = true;
+                n->kids.push_back(alt());
+                expectClose(start);
+                n->width = fixedWidth(n->kids[0]);
+                if (n->width < 0)
+                    reError("look-behind requires fixed-width pattern", start);
+                return n;
+            }
+            if (c == '#')
+            {
+                while (more() && peek() != ')')
+                    ++i;
+                ++i;
+                return nullptr;
+            }
+            if (c == '(')
+            {
+                // conditional on a group
+                std::string ref;
+                while (more() && peek() != ')')
+                    ref += encodeUtf8(p[i++]);
+                ++i;
+                int g = atoi(ref.c_str());
+                for (auto &nm : names)
+                    if (nm.first == ref)
+                        g = nm.second;
+                RNode *n = mk(RX_COND);
+                n->group = g;
+                RNode *yes = seq();
+                RNode *no = mk(RX_EMPTY);
+                if (more() && peek() == '|')
+                {
+                    ++i;
+                    no = seq();
+                }
+                n->kids.push_back(yes);
+                n->kids.push_back(no);
+                expectClose(start);
+                return n;
+            }
+            if (c == '>')
+            {
+                // atomic group: treated as a plain group
+                RNode *g = mk(RX_GROUP);
+                g->kids.push_back(alt());
+                expectClose(start);
+                return g;
+            }
+            // inline flags: (?aiLmsux) or (?aiLmsux-imsx:...)
+            --i;
+            int on = 0, off = 0;
+            bool minus = false;
+            while (more() && peek() != ')' && peek() != ':')
+            {
+                uint32_t f = p[i++];
+                int bit = f == 'i' ? F_IGNORECASE : f == 'm' ? F_MULTILINE : f == 's' ? F_DOTALL : f == 'x' ? F_VERBOSE : f == 'a' ? F_ASCII : f == 'u' ? F_UNICODE : f == 'L' ? F_LOCALE : -1;
+                if (f == '-')
+                {
+                    minus = true;
+                    continue;
+                }
+                if (bit < 0)
+                    reError("unknown extension ?" + encodeUtf8(f), start + 1);
+                if (minus)
+                    off |= bit;
+                else
+                    on |= bit;
+            }
+            if (!more())
+                reError("missing -, : or )", i);
+            if (p[i] == ')')
+            {
+                ++i;
+                flags = (flags | on) & ~off;
+                return nullptr;
+            }
+            ++i; // ':'
+            int saved = flags;
+            flags = (flags | on) & ~off;
+            RNode *g = mk(RX_GROUP);
+            g->kids.push_back(alt());
+            flags = saved;
+            expectClose(start);
+            return g;
+        }
+        RNode *g = mk(RX_GROUP);
+        g->group = ++ngroups;
+        g->kids.push_back(alt());
+        expectClose(start);
+        return g;
+    }
+
+    RNode *namedGroup(size_t start)
+    {
+        std::string name;
+        while (more() && peek() != '>')
+            name += encodeUtf8(p[i++]);
+        if (!more())
+            reError("missing >, unterminated name", start);
+        ++i;
+        for (auto &nm : names)
+            if (nm.first == name)
+                reError("redefinition of group name '" + name + "'", start);
+        RNode *g = mk(RX_GROUP);
+        g->group = ++ngroups;
+        names.push_back(std::make_pair(name, g->group));
+        g->kids.push_back(alt());
+        expectClose(start);
+        return g;
+    }
+
+    void expectClose(size_t start)
+    {
+        skipVerbose();
+        if (!more() || peek() != ')')
+            reError("missing ), unterminated subpattern", start);
+        ++i;
+    }
+
+    int fixedWidth(RNode *n)
+    {
+        switch (n->kind)
+        {
+        case RX_CHAR:
+        case RX_ANY:
+        case RX_CLASS:
+            return 1;
+        case RX_SEQ:
+        {
+            int w = 0;
+            for (RNode *k : n->kids)
+            {
+                int x = fixedWidth(k);
+                if (x < 0)
+                    return -1;
+                w += x;
+            }
+            return w;
+        }
+        case RX_ALT:
+        {
+            int w = -2;
+            for (RNode *k : n->kids)
+            {
+                int x = fixedWidth(k);
+                if (x < 0 || (w != -2 && x != w))
+                    return -1;
+                w = x;
+            }
+            return w < 0 ? 0 : w;
+        }
+        case RX_GROUP:
+            return fixedWidth(n->kids[0]);
+        case RX_REPEAT:
+        {
+            if (n->min != n->max)
+                return -1;
+            int x = fixedWidth(n->kids[0]);
+            return x < 0 ? -1 : x * n->min;
+        }
+        case RX_BACKREF:
+            return -1;
+        default:
+            return 0;
+        }
+    }
+};
+
+// ── matching ───────────────────────────────────────────────────────────────
+
+struct Matcher
+{
+    const std::vector<uint32_t> &s;
+    size_t end; // matching stops at endpos
+    std::vector<int64_t> caps; // 2 per group: start, end (-1 unset)
+    int64_t steps = 0;
+
+    Matcher(const std::vector<uint32_t> &str, size_t e, int ngroups) : s(str), end(e), caps((size_t)(ngroups + 1) * 2, -1) {}
+
+    static uint32_t fold(uint32_t c) { return toLowerC(c); }
+
+    bool charEq(const RNode *n, uint32_t c) const
+    {
+        if (n->ch == c)
+            return true;
+        return n->icase && fold(n->ch) == fold(c);
+    }
+
+    bool classHas(const RNode *n, uint32_t c) const
+    {
+        bool hit = false;
+        for (const ClassItem &it : n->items)
+        {
+            if (it.cat)
+            {
+                if (classCat(it.cat, c, n->ascii))
+                {
+                    hit = true;
+                    break;
+                }
+                continue;
+            }
+            if (c >= it.lo && c <= it.hi)
+            {
+                hit = true;
+                break;
+            }
+            if (n->icase)
+            {
+                uint32_t l = fold(c), u = toUpperC(c);
+                if ((l >= it.lo && l <= it.hi) || (u >= it.lo && u <= it.hi))
+                {
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        return hit != n->negated;
+    }
+
+    // Matches a single-character node at i
+    bool single(const RNode *n, size_t i) const
+    {
+        if (i >= end)
+            return false;
+        uint32_t c = s[i];
+        switch (n->kind)
+        {
+        case RX_CHAR: return charEq(n, c);
+        case RX_ANY: return n->dotall || c != '\n';
+        case RX_CLASS: return classHas(n, c);
+        default: return false;
+        }
+    }
+
+    bool isWordAt(size_t i, bool ascii) const { return i < end && i < s.size() && wordChar(s[i], ascii); }
+
+    typedef std::function<bool(size_t)> Cont;
+
+    // Matches node n at i, then the continuation
+    bool m(const RNode *n, size_t i, const Cont &k)
+    {
+        if (++steps > 50000000)
+            raise(tRecursionError, "regular expression too complex");
+        switch (n->kind)
+        {
+        case RX_EMPTY:
+            return k(i);
+        case RX_CHAR:
+        case RX_ANY:
+        case RX_CLASS:
+            return single(n, i) && k(i + 1);
+        case RX_SEQ:
+            return seq(n, 0, i, k);
+        case RX_ALT:
+            for (const RNode *a : n->kids)
+                if (m(a, i, k))
+                    return true;
+            return false;
+        case RX_GROUP:
+        {
+            if (n->group == 0)
+                return m(n->kids[0], i, k);
+            size_t g = (size_t)n->group * 2;
+            int64_t os = caps[g], oe = caps[g + 1];
+            bool ok = m(n->kids[0], i, [&](size_t j) -> bool {
+                int64_t ps = caps[g], pe = caps[g + 1];
+                caps[g] = (int64_t)i;
+                caps[g + 1] = (int64_t)j;
+                if (k(j))
+                    return true;
+                caps[g] = ps;
+                caps[g + 1] = pe;
+                return false;
+            });
+            if (!ok)
+            {
+                caps[g] = os;
+                caps[g + 1] = oe;
+            }
+            return ok;
+        }
+        case RX_REPEAT:
+            return repeat(n, i, 0, k, SIZE_MAX);
+        case RX_BOL:
+            if (i == 0)
+                return k(i);
+            return n->multiline && s[i - 1] == '\n' && k(i);
+        case RX_EOL:
+            if (i == end || (i + 1 == end && s[i] == '\n'))
+                return k(i);
+            return n->multiline && i < end && s[i] == '\n' && k(i);
+        case RX_START:
+            return i == 0 && k(i);
+        case RX_END:
+            return i == end && k(i);
+        case RX_WORDB:
+        case RX_NWORDB:
+        {
+            bool a = i > 0 && wordChar(s[i - 1], n->ascii);
+            bool b = isWordAt(i, n->ascii);
+            bool at = a != b;
+            return (n->kind == RX_WORDB ? at : !at) && k(i);
+        }
+        case RX_BACKREF:
+        {
+            size_t g = (size_t)n->group * 2;
+            if (g + 1 >= caps.size() || caps[g] < 0)
+                return false;
+            size_t len = (size_t)(caps[g + 1] - caps[g]);
+            if (i + len > end)
+                return false;
+            for (size_t t = 0; t < len; ++t)
+            {
+                uint32_t x = s[(size_t)caps[g] + t], y = s[i + t];
+                if (x != y && !(n->icase && fold(x) == fold(y)))
+                    return false;
+            }
+            return k(i + len);
+        }
+        case RX_LOOK:
+        {
+            bool hit;
+            std::vector<int64_t> saved = caps;
+            if (n->behind)
+            {
+                if ((int)i < n->width)
+                    hit = false;
+                else
+                {
+                    size_t from = i - (size_t)n->width;
+                    hit = m(n->kids[0], from, [&](size_t j) { return j == i; });
+                }
+            }
+            else
+                hit = m(n->kids[0], i, [](size_t) { return true; });
+            if (n->negated)
+            {
+                caps = saved;
+                return !hit && k(i);
+            }
+            if (!hit)
+            {
+                caps = saved;
+                return false;
+            }
+            if (k(i))
+                return true;
+            caps = saved;
+            return false;
+        }
+        case RX_COND:
+        {
+            size_t g = (size_t)n->group * 2;
+            bool set = g + 1 < caps.size() && caps[g] >= 0;
+            return m(set ? n->kids[0] : n->kids[1], i, k);
+        }
+        }
+        return false;
+    }
+
+    bool seq(const RNode *n, size_t idx, size_t i, const Cont &k)
+    {
+        if (idx == n->kids.size())
+            return k(i);
+        const RNode *c = n->kids[idx];
+        // runs of single characters without the closure machinery
+        if (c->kind == RX_CHAR || c->kind == RX_ANY || c->kind == RX_CLASS)
+        {
+            if (!single(c, i))
+                return false;
+            return seq(n, idx + 1, i + 1, k);
+        }
+        return m(c, i, [&](size_t j) { return seq(n, idx + 1, j, k); });
+    }
+
+    bool repeat(const RNode *n, size_t i, int count, const Cont &k, size_t lastPos)
+    {
+        const RNode *kid = n->kids[0];
+        bool simple = kid->kind == RX_CHAR || kid->kind == RX_ANY || kid->kind == RX_CLASS;
+        if (simple)
+        {
+            // count how far it can go, then back off
+            size_t j = i;
+            int c = 0;
+            int maxc = n->max < 0 ? INT32_MAX : n->max;
+            if (n->lazy)
+            {
+                while (c < n->min)
+                {
+                    if (!single(kid, j))
+                        return false;
+                    ++j;
+                    ++c;
+                }
+                for (;;)
+                {
+                    if (k(j))
+                        return true;
+                    if (c >= maxc || !single(kid, j))
+                        return false;
+                    ++j;
+                    ++c;
+                }
+            }
+            while (c < maxc && single(kid, j))
+            {
+                ++j;
+                ++c;
+            }
+            if (c < n->min)
+                return false;
+            if (n->possessive)
+                return k(j);
+            for (;;)
+            {
+                if (k(j))
+                    return true;
+                if (c == n->min)
+                    return false;
+                --j;
+                --c;
+            }
+        }
+        int maxc = n->max < 0 ? INT32_MAX : n->max;
+        if (count < n->min)
+            return m(kid, i, [&](size_t j) {
+                if (j == i && count + 1 >= n->min && n->max < 0)
+                    return repeatDone(n, j, k);
+                return repeat(n, j, count + 1, k, i);
+            });
+        if (n->lazy)
+        {
+            if (k(i))
+                return true;
+            if (count >= maxc)
+                return false;
+            return m(kid, i, [&](size_t j) { return j != i && repeat(n, j, count + 1, k, i); });
+        }
+        if (count < maxc)
+        {
+            // an empty iteration ends the loop
+            if (m(kid, i, [&](size_t j) { return j != i && repeat(n, j, count + 1, k, i); }))
+                return true;
+        }
+        (void)lastPos;
+        return k(i);
+    }
+
+    bool repeatDone(const RNode *, size_t j, const Cont &k) { return k(j); }
+};
+
+struct RegexData
+{
+    Regex *rx;
+};
+
+struct MatchData
+{
+    V string;
+    V pattern;
+    std::vector<int64_t> caps;
+    int64_t pos, endpos;
+    Regex *rx;
+    std::vector<uint32_t> *cps;
+};
+
+Regex *compileRegex(const std::string &pat, int flags)
+{
+    RParser ps(pat, flags);
+    // global flags at the very start, e.g. (?i)
+    Regex *rx = new Regex();
+    rx->root = ps.parse();
+    rx->ngroups = ps.ngroups;
+    rx->names = ps.names;
+    rx->flags = ps.flags;
+    rx->pattern = pat;
+    return rx;
+}
+
+Regex *patternOf(V p)
+{
+    if (typeOf(p) != tPattern)
+        raise(tTypeError, "expected a compiled pattern");
+    return static_cast<RegexData *>(static_cast<DataObj *>(p)->data)->rx;
+}
+
+const std::vector<uint32_t> *subjectOf(V s, std::vector<uint32_t> &store)
+{
+    if (!isStr(s))
+        raise(tTypeError, "expected string or bytes-like object, got '" + std::string(typeName(s)) + "'");
+    store = decodeUtf8(asStr(s)->s);
+    return &store;
+}
+
+V makeMatch(V pattern, Regex *rx, V string, const std::vector<uint32_t> &cps, const std::vector<int64_t> &caps, int64_t pos, int64_t endpos)
+{
+    DataObj *o = new DataObj(tMatch);
+    MatchData *md = new MatchData();
+    md->string = string;
+    md->pattern = pattern;
+    md->caps = caps;
+    md->pos = pos;
+    md->endpos = endpos;
+    md->rx = rx;
+    md->cps = new std::vector<uint32_t>(cps);
+    o->data = md;
+    return o;
+}
+
+// Tries to match at each position from pos (search) or only at pos
+bool runMatch(Regex *rx, const std::vector<uint32_t> &cps, int64_t pos, int64_t endpos, int mode, std::vector<int64_t> &caps)
+{
+    // mode 0: match, 1: search, 2: fullmatch
+    size_t end = (size_t)endpos;
+    for (int64_t start = pos; start <= endpos; ++start)
+    {
+        Matcher mt(cps, end, rx->ngroups);
+        bool ok = mt.m(rx->root, (size_t)start, [&](size_t j) {
+            if (mode == 2 && j != end)
+                return false;
+            mt.caps[0] = start;
+            mt.caps[1] = (int64_t)j;
+            return true;
+        });
+        if (ok)
+        {
+            caps = mt.caps;
+            return true;
+        }
+        if (mode != 1)
+            return false;
+    }
+    return false;
+}
+
+void posArgs(V *a, int n, Kw *kw, int first, int64_t len, int64_t &pos, int64_t &endpos)
+{
+    V p = n > first ? a[first] : kwArg(kw, "pos");
+    V e = n > first + 1 ? a[first + 1] : kwArg(kw, "endpos");
+    pos = p ? indexOf(p) : 0;
+    endpos = e ? indexOf(e) : len;
+    if (pos < 0)
+        pos = 0;
+    if (pos > len)
+        pos = len;
+    if (endpos > len)
+        endpos = len;
+    if (endpos < pos)
+        endpos = pos;
+}
+
+V doMatch(V *a, int n, Kw *kw, int mode)
+{
+    Regex *rx = patternOf(a[0]);
+    V str = n > 1 ? a[1] : kwArg(kw, "string");
+    std::vector<uint32_t> store;
+    const std::vector<uint32_t> *cps = subjectOf(str, store);
+    int64_t pos, endpos;
+    posArgs(a, n, kw, 2, (int64_t)cps->size(), pos, endpos);
+    std::vector<int64_t> caps;
+    if (!runMatch(rx, *cps, pos, endpos, mode, caps))
+        return None;
+    return makeMatch(a[0], rx, str, *cps, caps, pos, endpos);
+}
+
+V pat_match(V *a, int n, Kw *kw) { return doMatch(a, n, kw, 0); }
+V pat_search(V *a, int n, Kw *kw) { return doMatch(a, n, kw, 1); }
+V pat_fullmatch(V *a, int n, Kw *kw) { return doMatch(a, n, kw, 2); }
+
+// All non-overlapping matches as (caps) lists
+std::vector<std::vector<int64_t>> allMatches(Regex *rx, const std::vector<uint32_t> &cps, int64_t pos, int64_t endpos)
+{
+    std::vector<std::vector<int64_t>> out;
+    int64_t at = pos;
+    while (at <= endpos)
+    {
+        std::vector<int64_t> caps;
+        if (!runMatch(rx, cps, at, endpos, 1, caps))
+            break;
+        out.push_back(caps);
+        if (caps[1] == caps[0])
+        {
+            // an empty match: the next search starts one further on, but a
+            // non-empty match right here is still allowed (as CPython does)
+            at = caps[1] + 1;
+            if (caps[1] < endpos)
+            {
+                std::vector<int64_t> c2;
+                Matcher mt(cps, (size_t)endpos, rx->ngroups);
+                (void)mt;
+            }
+        }
+        else
+            at = caps[1];
+    }
+    return out;
+}
+
+V capStr(const std::vector<uint32_t> &cps, const std::vector<int64_t> &caps, int g)
+{
+    int64_t s = caps[(size_t)g * 2], e = caps[(size_t)g * 2 + 1];
+    if (s < 0)
+        return None;
+    std::string out;
+    for (int64_t i = s; i < e; ++i)
+        out += encodeUtf8(cps[(size_t)i]);
+    return newStr(out);
+}
+
+V pat_findall(V *a, int n, Kw *kw)
+{
+    Regex *rx = patternOf(a[0]);
+    V str = n > 1 ? a[1] : kwArg(kw, "string");
+    std::vector<uint32_t> store;
+    const std::vector<uint32_t> *cps = subjectOf(str, store);
+    int64_t pos, endpos;
+    posArgs(a, n, kw, 2, (int64_t)cps->size(), pos, endpos);
+    List *out = newList();
+    for (const std::vector<int64_t> &caps : allMatches(rx, *cps, pos, endpos))
+    {
+        if (rx->ngroups == 0)
+            out->items.push_back(capStr(*cps, caps, 0));
+        else if (rx->ngroups == 1)
+        {
+            V g = capStr(*cps, caps, 1);
+            out->items.push_back(g == None ? newStrAscii("") : g);
+        }
+        else
+        {
+            Tuple *t = newTuple((size_t)rx->ngroups);
+            for (int g = 1; g <= rx->ngroups; ++g)
+            {
+                V x = capStr(*cps, caps, g);
+                t->items[(size_t)g - 1] = x == None ? newStrAscii("") : x;
+            }
+            out->items.push_back(t);
+        }
+    }
+    return out;
+}
+
+V pat_finditer(V *a, int n, Kw *kw)
+{
+    Regex *rx = patternOf(a[0]);
+    V str = n > 1 ? a[1] : kwArg(kw, "string");
+    std::vector<uint32_t> store;
+    const std::vector<uint32_t> *cps = subjectOf(str, store);
+    int64_t pos, endpos;
+    posArgs(a, n, kw, 2, (int64_t)cps->size(), pos, endpos);
+    std::vector<std::vector<int64_t>> *all = new std::vector<std::vector<int64_t>>(allMatches(rx, *cps, pos, endpos));
+    std::vector<uint32_t> *keep = new std::vector<uint32_t>(*cps);
+    size_t *k = new size_t(0);
+    V pat = a[0];
+    return makeIter([all, keep, k, pat, rx, str, pos, endpos](V &out) -> bool {
+        if (*k >= all->size())
+            return false;
+        out = makeMatch(pat, rx, str, *keep, (*all)[(*k)++], pos, endpos);
+        return true;
+    });
+}
+
+// Expands a replacement template: \1, \g<1>, \g<name>, \n and friends
+std::string expandTemplate(const std::string &repl, Regex *rx, const std::vector<uint32_t> &cps, const std::vector<int64_t> &caps)
+{
+    std::string out;
+    for (size_t i = 0; i < repl.size(); ++i)
+    {
+        char c = repl[i];
+        if (c != '\\' || i + 1 >= repl.size())
+        {
+            out += c;
+            continue;
+        }
+        char e = repl[++i];
+        int g = -1;
+        if (e == 'g' && i + 1 < repl.size() && repl[i + 1] == '<')
+        {
+            size_t close = repl.find('>', i);
+            std::string name = repl.substr(i + 2, close - i - 2);
+            i = close;
+            bool digits = !name.empty();
+            for (char ch : name)
+                if (!isdigit((unsigned char)ch))
+                    digits = false;
+            if (digits)
+                g = atoi(name.c_str());
+            else
+            {
+                for (auto &nm : rx->names)
+                    if (nm.first == name)
+                        g = nm.second;
+                if (g < 0)
+                    raise(tIndexError, "unknown group name '" + name + "'");
+            }
+        }
+        else if (e >= '0' && e <= '9')
+        {
+            g = e - '0';
+            if (i + 1 < repl.size() && isdigit((unsigned char)repl[i + 1]) && g * 10 + (repl[i + 1] - '0') <= rx->ngroups)
+                g = g * 10 + (repl[++i] - '0');
+        }
+        else
+        {
+            switch (e)
+            {
+            case 'n': out += '\n'; break;
+            case 't': out += '\t'; break;
+            case 'r': out += '\r'; break;
+            case '\\': out += '\\'; break;
+            case 'f': out += '\f'; break;
+            case 'v': out += '\v'; break;
+            case 'a': out += '\a'; break;
+            default:
+                if (isalpha((unsigned char)e))
+                    reError(std::string("bad escape \\") + e, i - 1);
+                out += '\\';
+                out += e;
+            }
+            continue;
+        }
+        if (g > rx->ngroups)
+            reError("invalid group reference " + std::to_string(g), i);
+        V s = capStr(cps, caps, g);
+        if (s != None)
+            out += asStr(s)->s;
+    }
+    return out;
+}
+
+V subImpl(V *a, int n, Kw *kw, bool withCount)
+{
+    Regex *rx = patternOf(a[0]);
+    V repl = n > 1 ? a[1] : kwArg(kw, "repl");
+    V str = n > 2 ? a[2] : kwArg(kw, "string");
+    V countV = n > 3 ? a[3] : kwArg(kw, "count");
+    int64_t count = countV ? indexOf(countV) : 0;
+    std::vector<uint32_t> store;
+    const std::vector<uint32_t> *cps = subjectOf(str, store);
+    std::string out;
+    int64_t last = 0, done = 0;
+    bool callable = !isStr(repl);
+    for (const std::vector<int64_t> &caps : allMatches(rx, *cps, 0, (int64_t)cps->size()))
+    {
+        if (count > 0 && done >= count)
+            break;
+        for (int64_t i = last; i < caps[0]; ++i)
+            out += encodeUtf8((*cps)[(size_t)i]);
+        if (callable)
+        {
+            V m = makeMatch(a[0], rx, str, *cps, caps, 0, (int64_t)cps->size());
+            V r = call1(repl, m);
+            if (!isStr(r))
+                raise(tTypeError, "expected str instance, " + std::string(typeName(r)) + " found");
+            out += asStr(r)->s;
+        }
+        else
+            out += expandTemplate(asStr(repl)->s, rx, *cps, caps);
+        last = caps[1];
+        ++done;
+    }
+    for (int64_t i = last; i < (int64_t)cps->size(); ++i)
+        out += encodeUtf8((*cps)[(size_t)i]);
+    if (withCount)
+    {
+        Tuple *t = newTuple(2);
+        t->items[0] = newStr(out);
+        t->items[1] = mkint(done);
+        return t;
+    }
+    return newStr(out);
+}
+
+V pat_sub(V *a, int n, Kw *kw) { return subImpl(a, n, kw, false); }
+V pat_subn(V *a, int n, Kw *kw) { return subImpl(a, n, kw, true); }
+
+V pat_split(V *a, int n, Kw *kw)
+{
+    Regex *rx = patternOf(a[0]);
+    V str = n > 1 ? a[1] : kwArg(kw, "string");
+    V maxV = n > 2 ? a[2] : kwArg(kw, "maxsplit");
+    int64_t maxsplit = maxV ? indexOf(maxV) : 0;
+    std::vector<uint32_t> store;
+    const std::vector<uint32_t> *cps = subjectOf(str, store);
+    List *out = newList();
+    int64_t last = 0, done = 0;
+    auto piece = [&](int64_t s, int64_t e) {
+        std::string t;
+        for (int64_t i = s; i < e; ++i)
+            t += encodeUtf8((*cps)[(size_t)i]);
+        return newStr(t);
+    };
+    for (const std::vector<int64_t> &caps : allMatches(rx, *cps, 0, (int64_t)cps->size()))
+    {
+        if (maxsplit > 0 && done >= maxsplit)
+            break;
+        out->items.push_back(piece(last, caps[0]));
+        for (int g = 1; g <= rx->ngroups; ++g)
+            out->items.push_back(capStr(*cps, caps, g));
+        last = caps[1];
+        ++done;
+    }
+    out->items.push_back(piece(last, (int64_t)cps->size()));
+    return out;
+}
+
+V pat_pattern(V *a, int, Kw *) { return newStr(patternOf(a[0])->pattern); }
+V pat_flags(V *a, int, Kw *) { return mkint(patternOf(a[0])->flags | F_UNICODE); }
+V pat_groups(V *a, int, Kw *) { return mkint(patternOf(a[0])->ngroups); }
+V pat_groupindex(V *a, int, Kw *)
+{
+    Dict *d = newDict();
+    for (auto &nm : patternOf(a[0])->names)
+        dictSet(d, newStr(nm.first), mkint(nm.second));
+    return d;
+}
+V pat_repr(V *a, int, Kw *)
+{
+    Regex *rx = patternOf(a[0]);
+    std::string s = "re.compile(" + quoteStr(rx->pattern);
+    std::vector<std::string> fl;
+    if (rx->flags & F_IGNORECASE)
+        fl.push_back("re.IGNORECASE");
+    if (rx->flags & F_MULTILINE)
+        fl.push_back("re.MULTILINE");
+    if (rx->flags & F_DOTALL)
+        fl.push_back("re.DOTALL");
+    if (rx->flags & F_VERBOSE)
+        fl.push_back("re.VERBOSE");
+    if (rx->flags & F_ASCII)
+        fl.push_back("re.ASCII");
+    if (!fl.empty())
+    {
+        s += ", ";
+        for (size_t i = 0; i < fl.size(); ++i)
+            s += (i ? "|" : "") + fl[i];
+    }
+    return newStr(s + ")");
+}
+
+V re_compile(V *a, int n, Kw *kw)
+{
+    checkArgs("compile", n, 1, 2);
+    V flagsV = n > 1 ? a[1] : kwArg(kw, "flags");
+    int flags = flagsV ? (int)indexOf(flagsV) : 0;
+    if (!isStr(a[0]))
+        raise(tTypeError, "first argument must be string or compiled pattern");
+    Regex *rx = compileRegex(asStr(a[0])->s, flags);
+    DataObj *o = new DataObj(tPattern);
+    RegexData *rd = new RegexData();
+    rd->rx = rx;
+    o->data = rd;
+    return o;
+}
+
+MatchData *md(V m)
+{
+    if (typeOf(m) != tMatch)
+        raise(tTypeError, "expected a match object");
+    return static_cast<MatchData *>(static_cast<DataObj *>(m)->data);
+}
+
+int groupIndex(MatchData *d, V g)
+{
+    if (isStr(g))
+    {
+        for (auto &nm : d->rx->names)
+            if (nm.first == asStr(g)->s)
+                return nm.second;
+        raise(tIndexError, "no such group");
+    }
+    int64_t i = indexOf(g);
+    if (i < 0 || i > d->rx->ngroups)
+        raise(tIndexError, "no such group");
+    return (int)i;
+}
+
+V m_group(V *a, int n, Kw *)
+{
+    MatchData *d = md(a[0]);
+    if (n <= 1)
+        return capStr(*d->cps, d->caps, 0);
+    if (n == 2)
+        return capStr(*d->cps, d->caps, groupIndex(d, a[1]));
+    Tuple *t = newTuple((size_t)n - 1);
+    for (int i = 1; i < n; ++i)
+        t->items[(size_t)i - 1] = capStr(*d->cps, d->caps, groupIndex(d, a[i]));
+    return t;
+}
+
+V m_getitem(V *a, int n, Kw *)
+{
+    checkArgs("__getitem__", n, 2, 2);
+    MatchData *d = md(a[0]);
+    return capStr(*d->cps, d->caps, groupIndex(d, a[1]));
+}
+
+V m_groups(V *a, int n, Kw *kw)
+{
+    MatchData *d = md(a[0]);
+    V def = n > 1 ? a[1] : kwArg(kw, "default");
+    if (!def)
+        def = None;
+    Tuple *t = newTuple((size_t)d->rx->ngroups);
+    for (int g = 1; g <= d->rx->ngroups; ++g)
+    {
+        V x = capStr(*d->cps, d->caps, g);
+        t->items[(size_t)g - 1] = x == None ? def : x;
+    }
+    return t;
+}
+
+V m_groupdict(V *a, int n, Kw *kw)
+{
+    MatchData *d = md(a[0]);
+    V def = n > 1 ? a[1] : kwArg(kw, "default");
+    if (!def)
+        def = None;
+    Dict *out = newDict();
+    for (auto &nm : d->rx->names)
+    {
+        V x = capStr(*d->cps, d->caps, nm.second);
+        dictSet(out, newStr(nm.first), x == None ? def : x);
+    }
+    return out;
+}
+
+V m_start(V *a, int n, Kw *)
+{
+    MatchData *d = md(a[0]);
+    int g = n > 1 ? groupIndex(d, a[1]) : 0;
+    return mkint(d->caps[(size_t)g * 2]);
+}
+
+V m_end(V *a, int n, Kw *)
+{
+    MatchData *d = md(a[0]);
+    int g = n > 1 ? groupIndex(d, a[1]) : 0;
+    return mkint(d->caps[(size_t)g * 2 + 1]);
+}
+
+V m_span(V *a, int n, Kw *)
+{
+    MatchData *d = md(a[0]);
+    int g = n > 1 ? groupIndex(d, a[1]) : 0;
+    Tuple *t = newTuple(2);
+    t->items[0] = mkint(d->caps[(size_t)g * 2]);
+    t->items[1] = mkint(d->caps[(size_t)g * 2 + 1]);
+    return t;
+}
+
+V m_expand(V *a, int n, Kw *)
+{
+    checkArgs("expand", n, 2, 2);
+    MatchData *d = md(a[0]);
+    return newStr(expandTemplate(strOf(a[1]), d->rx, *d->cps, d->caps));
+}
+
+V m_string(V *a, int, Kw *) { return md(a[0])->string; }
+V m_re(V *a, int, Kw *) { return md(a[0])->pattern; }
+V m_pos(V *a, int, Kw *) { return mkint(md(a[0])->pos); }
+V m_endpos(V *a, int, Kw *) { return mkint(md(a[0])->endpos); }
+V m_lastindex(V *a, int, Kw *)
+{
+    MatchData *d = md(a[0]);
+    // the group that closed last: the highest-ending, outermost
+    int best = -1;
+    int64_t bestEnd = -1;
+    for (int g = 1; g <= d->rx->ngroups; ++g)
+        if (d->caps[(size_t)g * 2] >= 0 && d->caps[(size_t)g * 2 + 1] > bestEnd)
+        {
+            bestEnd = d->caps[(size_t)g * 2 + 1];
+            best = g;
+        }
+        else if (d->caps[(size_t)g * 2] >= 0 && d->caps[(size_t)g * 2 + 1] == bestEnd && best > 0 &&
+                 d->caps[(size_t)g * 2] < d->caps[(size_t)best * 2])
+            best = g;
+    return best < 0 ? None : mkint(best);
+}
+V m_lastgroup(V *a, int, Kw *)
+{
+    MatchData *d = md(a[0]);
+    V li = m_lastindex(a, 1, nullptr);
+    if (li == None)
+        return None;
+    for (auto &nm : d->rx->names)
+        if (nm.second == SMALLV(li))
+            return newStr(nm.first);
+    return None;
+}
+V m_bool(V *, int, Kw *) { return True; }
+V m_repr(V *a, int, Kw *)
+{
+    MatchData *d = md(a[0]);
+    return newStr("<re.Match object; span=(" + std::to_string(d->caps[0]) + ", " + std::to_string(d->caps[1]) +
+                  "), match=" + reprOf(capStr(*d->cps, d->caps, 0)) + ">");
+}
+
+V re_escape(V *a, int n, Kw *)
+{
+    checkArgs("escape", n, 1, 1);
+    std::string s = strOf(a[0]), out;
+    for (char c : s)
+    {
+        if (strchr("()[]{}?*+-|^$\\.&~# \t\n\r\v\f", c) && c != '\0')
+            out += '\\';
+        out += c;
+    }
+    return newStr(out);
+}
+
+V patternModule()
+{
+    ModuleObj *m = new ModuleObj(tModule);
+    m->name = "_re";
+    m->dict = newDict();
+    setAttrStr(m->dict, "__name__", newStr("_re"));
+    setAttrStr(m->dict, "compile", makeNative("compile", re_compile));
+    setAttrStr(m->dict, "escape", makeNative("escape", re_escape));
+    setAttrStr(m->dict, "Pattern", tPattern);
+    setAttrStr(m->dict, "Match", tMatch);
+    setAttrStr(m->dict, "error", tReError);
+    return m;
+}
+
+// ── deque ──────────────────────────────────────────────────────────────────
+
+struct DequeData
+{
+    std::deque<V> items;
+    int64_t maxlen = -1;
+    uint64_t version = 0;
+};
+
+DequeData *dq(V v)
+{
+    if (IS_SMALL(v) || !issub(v->type, tDeque))
+        raise(tTypeError, "descriptor requires a 'collections.deque' object");
+    DataObj *o = static_cast<DataObj *>(v);
+    if (!o->data)
+        o->data = new DequeData();
+    return static_cast<DequeData *>(o->data);
+}
+
+V deque_new(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    DataObj *o = new DataObj(t);
+    o->data = new DequeData();
+    if (!t->builtin)
+        o->dict = newDict();
+    return o;
+}
+
+void trimLeft(DequeData *d)
+{
+    while (d->maxlen >= 0 && (int64_t)d->items.size() > d->maxlen)
+        d->items.pop_front();
+}
+
+void trimRight(DequeData *d)
+{
+    while (d->maxlen >= 0 && (int64_t)d->items.size() > d->maxlen)
+        d->items.pop_back();
+}
+
+V deque_init(V *a, int n, Kw *kw)
+{
+    DequeData *d = dq(a[0]);
+    V it = n > 1 ? a[1] : kwArg(kw, "iterable");
+    V ml = n > 2 ? a[2] : kwArg(kw, "maxlen");
+    d->items.clear();
+    d->maxlen = (ml && ml != None) ? indexOf(ml) : -1;
+    if (d->maxlen < -1)
+        raise(tValueError, "maxlen must be non-negative");
+    if (it && it != None)
+        for (V x : toVector(it))
+        {
+            d->items.push_back(x);
+            trimLeft(d);
+        }
+    return None;
+}
+
+V deque_append(V *a, int n, Kw *)
+{
+    checkArgs("append", n - 1, 1, 1);
+    DequeData *d = dq(a[0]);
+    d->items.push_back(a[1]);
+    trimLeft(d);
+    ++d->version;
+    return None;
+}
+
+V deque_appendleft(V *a, int n, Kw *)
+{
+    checkArgs("appendleft", n - 1, 1, 1);
+    DequeData *d = dq(a[0]);
+    d->items.push_front(a[1]);
+    trimRight(d);
+    ++d->version;
+    return None;
+}
+
+V deque_pop(V *a, int, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    if (d->items.empty())
+        raise(tIndexError, "pop from an empty deque");
+    V v = d->items.back();
+    d->items.pop_back();
+    ++d->version;
+    return v;
+}
+
+V deque_popleft(V *a, int, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    if (d->items.empty())
+        raise(tIndexError, "pop from an empty deque");
+    V v = d->items.front();
+    d->items.pop_front();
+    ++d->version;
+    return v;
+}
+
+V deque_extend(V *a, int n, Kw *)
+{
+    checkArgs("extend", n - 1, 1, 1);
+    DequeData *d = dq(a[0]);
+    for (V x : toVector(a[1]))
+    {
+        d->items.push_back(x);
+        trimLeft(d);
+    }
+    ++d->version;
+    return None;
+}
+
+V deque_extendleft(V *a, int n, Kw *)
+{
+    checkArgs("extendleft", n - 1, 1, 1);
+    DequeData *d = dq(a[0]);
+    for (V x : toVector(a[1]))
+    {
+        d->items.push_front(x);
+        trimRight(d);
+    }
+    ++d->version;
+    return None;
+}
+
+V deque_rotate(V *a, int n, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    int64_t k = n > 1 ? indexOf(a[1]) : 1;
+    int64_t len = (int64_t)d->items.size();
+    if (len == 0)
+        return None;
+    k %= len;
+    if (k < 0)
+        k += len;
+    for (int64_t i = 0; i < k; ++i)
+    {
+        V v = d->items.back();
+        d->items.pop_back();
+        d->items.push_front(v);
+    }
+    ++d->version;
+    return None;
+}
+
+V deque_clear(V *a, int, Kw *)
+{
+    dq(a[0])->items.clear();
+    return None;
+}
+
+V deque_len(V *a, int, Kw *) { return mkint((int64_t)dq(a[0])->items.size()); }
+
+V deque_getitem(V *a, int n, Kw *)
+{
+    checkArgs("__getitem__", n, 2, 2);
+    DequeData *d = dq(a[0]);
+    int64_t i = indexOf(a[1]), len = (int64_t)d->items.size();
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "deque index out of range");
+    return d->items[(size_t)i];
+}
+
+V deque_setitem(V *a, int n, Kw *)
+{
+    checkArgs("__setitem__", n, 3, 3);
+    DequeData *d = dq(a[0]);
+    int64_t i = indexOf(a[1]), len = (int64_t)d->items.size();
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "deque index out of range");
+    d->items[(size_t)i] = a[2];
+    return None;
+}
+
+V deque_delitem(V *a, int n, Kw *)
+{
+    checkArgs("__delitem__", n, 2, 2);
+    DequeData *d = dq(a[0]);
+    int64_t i = indexOf(a[1]), len = (int64_t)d->items.size();
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "deque index out of range");
+    d->items.erase(d->items.begin() + i);
+    return None;
+}
+
+V deque_iter(V *a, int, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    size_t *pos = new size_t(0);
+    uint64_t ver = d->version;
+    size_t size = d->items.size();
+    return makeIter([d, pos, ver, size](V &out) -> bool {
+        if (d->version != ver || d->items.size() != size)
+            raise(tRuntimeError, "deque mutated during iteration");
+        if (*pos >= d->items.size())
+            return false;
+        out = d->items[(*pos)++];
+        return true;
+    });
+}
+
+V deque_reversed(V *a, int, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    size_t *pos = new size_t(d->items.size());
+    return makeIter([d, pos](V &out) -> bool {
+        if (*pos == 0 || *pos > d->items.size())
+            return false;
+        out = d->items[--*pos];
+        return true;
+    });
+}
+
+V deque_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    for (V x : dq(a[0])->items)
+        if (eq(x, a[1]))
+            return True;
+    return False;
+}
+
+V deque_count(V *a, int n, Kw *)
+{
+    checkArgs("count", n - 1, 1, 1);
+    int64_t c = 0;
+    for (V x : dq(a[0])->items)
+        if (eq(x, a[1]))
+            ++c;
+    return mkint(c);
+}
+
+V deque_index(V *a, int n, Kw *)
+{
+    checkArgs("index", n - 1, 1, 3);
+    DequeData *d = dq(a[0]);
+    for (size_t i = 0; i < d->items.size(); ++i)
+        if (eq(d->items[i], a[1]))
+            return mkint((int64_t)i);
+    raise(tValueError, reprOf(a[1]) + " is not in deque");
+}
+
+V deque_remove(V *a, int n, Kw *)
+{
+    checkArgs("remove", n - 1, 1, 1);
+    DequeData *d = dq(a[0]);
+    for (size_t i = 0; i < d->items.size(); ++i)
+        if (eq(d->items[i], a[1]))
+        {
+            d->items.erase(d->items.begin() + (long)i);
+            ++d->version;
+            return None;
+        }
+    raise(tValueError, reprOf(a[1]) + " is not in deque");
+}
+
+V deque_insert(V *a, int n, Kw *)
+{
+    checkArgs("insert", n - 1, 2, 2);
+    DequeData *d = dq(a[0]);
+    if (d->maxlen >= 0 && (int64_t)d->items.size() >= d->maxlen)
+        raise(tIndexError, "deque already at its maximum size");
+    int64_t i = indexOf(a[1]), len = (int64_t)d->items.size();
+    if (i < 0)
+        i = i + len < 0 ? 0 : i + len;
+    if (i > len)
+        i = len;
+    d->items.insert(d->items.begin() + i, a[2]);
+    ++d->version;
+    return None;
+}
+
+V deque_reverse(V *a, int, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    for (size_t i = 0, j = d->items.size(); i + 1 < j; ++i, --j)
+    {
+        V t = d->items[i];
+        d->items[i] = d->items[j - 1];
+        d->items[j - 1] = t;
+    }
+    ++d->version;
+    return None;
+}
+
+V deque_copy(V *a, int, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    DataObj *o = new DataObj(typeOf(a[0]));
+    DequeData *nd = new DequeData();
+    nd->items = d->items;
+    nd->maxlen = d->maxlen;
+    o->data = nd;
+    if (!typeOf(a[0])->builtin)
+        o->dict = newDict();
+    return o;
+}
+
+V deque_maxlen(V *a, int, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    return d->maxlen < 0 ? None : mkint(d->maxlen);
+}
+
+V deque_repr(V *a, int, Kw *)
+{
+    DequeData *d = dq(a[0]);
+    std::vector<V> items;
+    for (V x : d->items)
+        items.push_back(x);
+    std::string name = typeOf(a[0])->name;
+    std::string s = name + "(" + reprSeq(items, "[", "]", false);
+    if (d->maxlen >= 0)
+        s += ", maxlen=" + std::to_string(d->maxlen);
+    return newStr(s + ")");
+}
+
+V deque_bool(V *a, int, Kw *) { return mkbool(!dq(a[0])->items.empty()); }
+
+V deque_eq(V *a, int n, Kw *)
+{
+    checkArgs("__eq__", n, 2, 2);
+    if (IS_SMALL(a[1]) || !issub(a[1]->type, tDeque))
+        return NotImpl;
+    DequeData *x = dq(a[0]), *y = dq(a[1]);
+    if (x->items.size() != y->items.size())
+        return False;
+    for (size_t i = 0; i < x->items.size(); ++i)
+        if (!eq(x->items[i], y->items[i]))
+            return False;
+    return True;
+}
+
+V deque_iadd(V *a, int n, Kw *)
+{
+    deque_extend(a, n, nullptr);
+    return a[0];
+}
+
+V deque_add(V *a, int n, Kw *)
+{
+    checkArgs("__add__", n, 2, 2);
+    if (IS_SMALL(a[1]) || !issub(a[1]->type, tDeque))
+        return NotImpl;
+    V c = deque_copy(a, 1, nullptr);
+    for (V x : dq(a[1])->items)
+        dq(c)->items.push_back(x);
+    trimLeft(dq(c));
+    return c;
+}
+
+V collectionsModule()
+{
+    ModuleObj *m = new ModuleObj(tModule);
+    m->name = "_collections";
+    m->dict = newDict();
+    setAttrStr(m->dict, "__name__", newStr("_collections"));
+    setAttrStr(m->dict, "deque", tDeque);
+    return m;
+}
+
+// ── files ──────────────────────────────────────────────────────────────────
+
+Type *tFile;
+
+struct FileData
+{
+    std::string path, mode;
+    std::string buf; // whole contents for reading; pending text for writing
+    size_t pos = 0;
+    bool reading = false, writing = false, binary = false, closed = false, appending = false;
+};
+
+FileData *fd(V v)
+{
+    if (IS_SMALL(v) || v->type != tFile)
+        raise(tTypeError, "expected a file object");
+    return static_cast<FileData *>(static_cast<DataObj *>(v)->data);
+}
+
+void flushFile(FileData *f)
+{
+    if (!f->writing)
+        return;
+    FILE *fp = fopen(f->path.c_str(), f->appending ? "ab" : "wb");
+    if (!fp)
+        raise(tOSError, "cannot write " + f->path);
+    fwrite(f->buf.data(), 1, f->buf.size(), fp);
+    fclose(fp);
+    f->buf.clear();
+    f->appending = true; // later flushes add to what is there
+}
+
+void checkOpen(FileData *f)
+{
+    if (f->closed)
+        raise(tValueError, "I/O operation on closed file.");
+}
+
+V fileText(FileData *f, const std::string &s)
+{
+    if (f->binary)
+    {
+        BytesObj *b = new BytesObj(tBytes);
+        b->s = s;
+        return b;
+    }
+    std::string t;
+    for (size_t i = 0; i < s.size(); ++i)
+        if (!(s[i] == '\r' && i + 1 < s.size() && s[i + 1] == '\n'))
+            t += s[i];
+    return newStr(t);
+}
+
+V file_read(V *a, int n, Kw *)
+{
+    FileData *f = fd(a[0]);
+    checkOpen(f);
+    if (!f->reading)
+        raise(tOSError, "not readable");
+    int64_t size = n > 1 && a[1] != None ? indexOf(a[1]) : -1;
+    size_t take = size < 0 ? f->buf.size() - f->pos : (size_t)size;
+    if (f->pos + take > f->buf.size())
+        take = f->buf.size() - f->pos;
+    std::string s = f->buf.substr(f->pos, take);
+    f->pos += take;
+    return fileText(f, s);
+}
+
+V file_readline(V *a, int, Kw *)
+{
+    FileData *f = fd(a[0]);
+    checkOpen(f);
+    size_t e = f->buf.find('\n', f->pos);
+    e = e == std::string::npos ? f->buf.size() : e + 1;
+    std::string s = f->buf.substr(f->pos, e - f->pos);
+    f->pos = e;
+    return fileText(f, s);
+}
+
+V file_readlines(V *a, int, Kw *)
+{
+    List *l = newList();
+    for (;;)
+    {
+        V line = file_readline(a, 1, nullptr);
+        if (lenOf(line) == 0)
+            break;
+        l->items.push_back(line);
+    }
+    return l;
+}
+
+V file_write(V *a, int n, Kw *)
+{
+    checkArgs("write", n, 2, 2);
+    FileData *f = fd(a[0]);
+    checkOpen(f);
+    if (!f->writing)
+        raise(tOSError, "not writable");
+    if (f->binary)
+    {
+        f->buf += static_cast<BytesObj *>(a[1])->s;
+        return mkint((int64_t)static_cast<BytesObj *>(a[1])->s.size());
+    }
+    if (!isStr(a[1]))
+        raise(tTypeError, "write() argument must be str, not " + std::string(typeName(a[1])));
+    // text mode on Windows writes "\n" as "\r\n", as CPython does there
+    for (char c : asStr(a[1])->s)
+    {
+        if (c == '\n')
+            f->buf += '\r';
+        f->buf += c;
+    }
+    return mkint(asStr(a[1])->len);
+}
+
+V file_writelines(V *a, int n, Kw *)
+{
+    checkArgs("writelines", n, 2, 2);
+    for (V x : toVector(a[1]))
+    {
+        V args[2] = {a[0], x};
+        file_write(args, 2, nullptr);
+    }
+    return None;
+}
+
+V file_close(V *a, int, Kw *)
+{
+    FileData *f = fd(a[0]);
+    if (!f->closed)
+    {
+        flushFile(f);
+        f->closed = true;
+    }
+    return None;
+}
+
+V file_flush(V *a, int, Kw *)
+{
+    flushFile(fd(a[0]));
+    return None;
+}
+
+V file_enter(V *a, int, Kw *) { return a[0]; }
+V file_exit(V *a, int, Kw *) { return file_close(a, 1, nullptr); }
+
+V file_iter(V *a, int, Kw *)
+{
+    V self = a[0];
+    return makeIter([self](V &out) -> bool {
+        V args[1] = {self};
+        V line = file_readline(args, 1, nullptr);
+        if (lenOf(line) == 0)
+            return false;
+        out = line;
+        return true;
+    });
+}
+
+V file_closed(V *a, int, Kw *) { return mkbool(fd(a[0])->closed); }
+V file_name(V *a, int, Kw *) { return newStr(fd(a[0])->path); }
+V file_mode(V *a, int, Kw *) { return newStr(fd(a[0])->mode); }
+V file_seek(V *a, int n, Kw *)
+{
+    checkArgs("seek", n, 2, 3);
+    FileData *f = fd(a[0]);
+    f->pos = (size_t)indexOf(a[1]);
+    return mkint((int64_t)f->pos);
+}
+V file_tell(V *a, int, Kw *) { return mkint((int64_t)fd(a[0])->pos); }
+
+// ── time ───────────────────────────────────────────────────────────────────
+
+double nowSeconds()
+{
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count() / 1e9;
+}
+
+V time_time(V *, int, Kw *) { return mkfloat(nowSeconds()); }
+V time_time_ns(V *, int, Kw *)
+{
+    return mkint((int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+V time_perf_counter(V *, int, Kw *)
+{
+    return mkfloat((double)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1e9);
+}
+V time_perf_counter_ns(V *, int, Kw *)
+{
+    return mkint((int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+V time_sleep(V *a, int n, Kw *)
+{
+    checkArgs("sleep", n, 1, 1);
+    flushOut();
+    double s = toDouble(a[0]);
+    if (s < 0)
+        raise(tValueError, "sleep length must be non-negative");
+    if (!g_testModeForPy())
+        std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(s * 1e6)));
+    return None;
+}
+V timeModule()
+{
+    ModuleObj *m = new ModuleObj(tModule);
+    m->name = "time";
+    m->dict = newDict();
+    setAttrStr(m->dict, "__name__", newStr("time"));
+    setAttrStr(m->dict, "time", makeNative("time", time_time));
+    setAttrStr(m->dict, "time_ns", makeNative("time_ns", time_time_ns));
+    setAttrStr(m->dict, "perf_counter", makeNative("perf_counter", time_perf_counter));
+    setAttrStr(m->dict, "perf_counter_ns", makeNative("perf_counter_ns", time_perf_counter_ns));
+    setAttrStr(m->dict, "monotonic", makeNative("monotonic", time_perf_counter));
+    setAttrStr(m->dict, "monotonic_ns", makeNative("monotonic_ns", time_perf_counter_ns));
+    setAttrStr(m->dict, "process_time", makeNative("process_time", time_perf_counter));
+    setAttrStr(m->dict, "sleep", makeNative("sleep", time_sleep));
+    return m;
+}
+
+// ── _os: what os.sa builds on ──────────────────────────────────────────────
+
+[[noreturn]] void osError(int err, const std::string &what, const std::string &path)
+{
+    raiseV(osErrorFor(err, what, path));
+}
+
+V os_remove(V *a, int n, Kw *)
+{
+    checkArgs("remove", n, 1, 1);
+    std::string p = strOf(a[0]);
+    std::error_code ec;
+    if (!std::filesystem::exists(std::filesystem::path(p), ec))
+        osError(2, "No such file or directory", p);
+    if (std::filesystem::is_directory(std::filesystem::path(p), ec))
+        osError(13, "Permission denied", p);
+    std::filesystem::remove(std::filesystem::path(p), ec);
+    if (ec)
+        osError(13, "Permission denied", p);
+    return None;
+}
+
+V os_exists(V *a, int n, Kw *)
+{
+    checkArgs("exists", n, 1, 1);
+    std::error_code ec;
+    return mkbool(std::filesystem::exists(std::filesystem::path(strOf(a[0])), ec));
+}
+
+V os_isfile(V *a, int n, Kw *)
+{
+    checkArgs("isfile", n, 1, 1);
+    std::error_code ec;
+    return mkbool(std::filesystem::is_regular_file(std::filesystem::path(strOf(a[0])), ec));
+}
+
+V os_isdir(V *a, int n, Kw *)
+{
+    checkArgs("isdir", n, 1, 1);
+    std::error_code ec;
+    return mkbool(std::filesystem::is_directory(std::filesystem::path(strOf(a[0])), ec));
+}
+
+V os_getsize(V *a, int n, Kw *)
+{
+    checkArgs("getsize", n, 1, 1);
+    std::string p = strOf(a[0]);
+    std::error_code ec;
+    if (!std::filesystem::exists(std::filesystem::path(p), ec))
+        osError(2, "No such file or directory", p);
+    return mkint((int64_t)std::filesystem::file_size(std::filesystem::path(p)));
+}
+
+V os_getcwd(V *, int, Kw *)
+{
+    std::error_code ec;
+    return newStr(std::filesystem::current_path(ec).string());
+}
+
+V os_listdir(V *a, int n, Kw *)
+{
+    std::string p = n > 0 ? strOf(a[0]) : ".";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(std::filesystem::path(p), ec))
+        osError(2, "No such file or directory", p);
+    List *l = newList();
+    for (const auto &e : std::filesystem::directory_iterator(std::filesystem::path(p), ec))
+        l->items.push_back(newStr(e.path().filename().string()));
+    return l;
+}
+
+V os_mkdir(V *a, int n, Kw *)
+{
+    checkArgs("mkdir", n, 1, 2);
+    std::string p = strOf(a[0]);
+    std::error_code ec;
+    if (std::filesystem::exists(std::filesystem::path(p), ec))
+        osError(17, "File exists", p);
+    std::filesystem::create_directory(std::filesystem::path(p), ec);
+    return None;
+}
+
+V os_makedirs(V *a, int n, Kw *kw)
+{
+    checkArgs("makedirs", n, 1, 3);
+    std::string p = strOf(a[0]);
+    V ok = n > 2 ? a[2] : kwArg(kw, "exist_ok");
+    std::error_code ec;
+    if (std::filesystem::exists(std::filesystem::path(p), ec) && !(ok && truthy(ok)))
+        osError(17, "File exists", p);
+    std::filesystem::create_directories(std::filesystem::path(p), ec);
+    return None;
+}
+
+V os_rmdir(V *a, int n, Kw *)
+{
+    checkArgs("rmdir", n, 1, 1);
+    std::string p = strOf(a[0]);
+    std::error_code ec;
+    if (!std::filesystem::exists(std::filesystem::path(p), ec))
+        osError(2, "No such file or directory", p);
+    std::filesystem::remove(std::filesystem::path(p), ec);
+    return None;
+}
+
+V os_rename(V *a, int n, Kw *)
+{
+    checkArgs("rename", n, 2, 2);
+    std::error_code ec;
+    std::string from = strOf(a[0]);
+    if (!std::filesystem::exists(std::filesystem::path(from), ec))
+        osError(2, "No such file or directory", from);
+    std::filesystem::rename(std::filesystem::path(from), std::filesystem::path(strOf(a[1])));
+    return None;
+}
+
+V os_getenv(V *a, int n, Kw *)
+{
+    checkArgs("getenv", n, 1, 2);
+    const char *v = std::getenv(strOf(a[0]).c_str());
+    if (v)
+        return newStr(v);
+    return n > 1 ? a[1] : None;
+}
+
+V os_abspath(V *a, int n, Kw *)
+{
+    checkArgs("abspath", n, 1, 1);
+    std::error_code ec;
+    return newStr(std::filesystem::absolute(std::filesystem::path(strOf(a[0])), ec).lexically_normal().string());
+}
+
+V osNativeModule()
+{
+    ModuleObj *m = new ModuleObj(tModule);
+    m->name = "_os";
+    m->dict = newDict();
+    setAttrStr(m->dict, "__name__", newStr("_os"));
+    setAttrStr(m->dict, "remove", makeNative("remove", os_remove));
+    setAttrStr(m->dict, "exists", makeNative("exists", os_exists));
+    setAttrStr(m->dict, "isfile", makeNative("isfile", os_isfile));
+    setAttrStr(m->dict, "isdir", makeNative("isdir", os_isdir));
+    setAttrStr(m->dict, "getsize", makeNative("getsize", os_getsize));
+    setAttrStr(m->dict, "getcwd", makeNative("getcwd", os_getcwd));
+    setAttrStr(m->dict, "listdir", makeNative("listdir", os_listdir));
+    setAttrStr(m->dict, "mkdir", makeNative("mkdir", os_mkdir));
+    setAttrStr(m->dict, "makedirs", makeNative("makedirs", os_makedirs));
+    setAttrStr(m->dict, "rmdir", makeNative("rmdir", os_rmdir));
+    setAttrStr(m->dict, "rename", makeNative("rename", os_rename));
+    setAttrStr(m->dict, "getenv", makeNative("getenv", os_getenv));
+    setAttrStr(m->dict, "abspath", makeNative("abspath", os_abspath));
+    return m;
+}
+
+} // namespace
+
+V openFile(V *a, int n, Kw *kw)
+{
+    std::string path = strOf(a[0]);
+    V modeV = n > 1 ? a[1] : kwArg(kw, "mode");
+    std::string mode = modeV ? strOf(modeV) : "r";
+    FileData *f = new FileData();
+    f->path = path;
+    f->mode = mode;
+    f->binary = mode.find('b') != std::string::npos;
+    bool plus = mode.find('+') != std::string::npos;
+    std::error_code ec;
+    if (mode.find('r') != std::string::npos)
+    {
+        FILE *fp = fopen(path.c_str(), "rb");
+        if (!fp)
+        {
+            if (std::filesystem::is_directory(std::filesystem::path(path), ec))
+                raiseV(osErrorFor(13, "Permission denied", path));
+            raiseV(osErrorFor(2, "No such file or directory", path));
+        }
+        char tmp[8192];
+        size_t k;
+        while ((k = fread(tmp, 1, sizeof tmp, fp)) > 0)
+            f->buf.append(tmp, k);
+        fclose(fp);
+        f->reading = true;
+        f->writing = plus;
+        if (plus)
+            f->appending = false;
+    }
+    else if (mode.find('w') != std::string::npos || mode.find('x') != std::string::npos)
+    {
+        if (mode.find('x') != std::string::npos && std::filesystem::exists(std::filesystem::path(path), ec))
+        {
+            raiseV(osErrorFor(17, "File exists", path));
+        }
+        FILE *fp = fopen(path.c_str(), "wb");
+        if (!fp)
+        {
+            raiseV(osErrorFor(2, "No such file or directory", path));
+        }
+        fclose(fp);
+        f->writing = true;
+        f->appending = true;
+        f->reading = plus;
+    }
+    else if (mode.find('a') != std::string::npos)
+    {
+        f->writing = true;
+        f->appending = true;
+        f->reading = plus;
+    }
+    else
+        raise(tValueError, "invalid mode: '" + mode + "'");
+    DataObj *o = new DataObj(tFile);
+    o->data = f;
+    return o;
+}
+
+void registerNativeModule(const std::string &name, V (*init)());
+
+void registerNativeModules()
+{
+    tPattern = newType("Pattern", tObject, L::Data);
+    tPattern->module = "re";
+    defMethod(tPattern, "match", pat_match);
+    defMethod(tPattern, "search", pat_search);
+    defMethod(tPattern, "fullmatch", pat_fullmatch);
+    defMethod(tPattern, "findall", pat_findall);
+    defMethod(tPattern, "finditer", pat_finditer);
+    defMethod(tPattern, "sub", pat_sub);
+    defMethod(tPattern, "subn", pat_subn);
+    defMethod(tPattern, "split", pat_split);
+    defMethod(tPattern, "__repr__", pat_repr);
+    defProperty(tPattern, "pattern", pat_pattern);
+    defProperty(tPattern, "flags", pat_flags);
+    defProperty(tPattern, "groups", pat_groups);
+    defProperty(tPattern, "groupindex", pat_groupindex);
+    tMatch = newType("Match", tObject, L::Data);
+    tMatch->module = "re";
+    defMethod(tMatch, "group", m_group);
+    defMethod(tMatch, "__getitem__", m_getitem);
+    defMethod(tMatch, "groups", m_groups);
+    defMethod(tMatch, "groupdict", m_groupdict);
+    defMethod(tMatch, "start", m_start);
+    defMethod(tMatch, "end", m_end);
+    defMethod(tMatch, "span", m_span);
+    defMethod(tMatch, "expand", m_expand);
+    defMethod(tMatch, "__bool__", m_bool);
+    defMethod(tMatch, "__repr__", m_repr);
+    defProperty(tMatch, "string", m_string);
+    defProperty(tMatch, "re", m_re);
+    defProperty(tMatch, "pos", m_pos);
+    defProperty(tMatch, "endpos", m_endpos);
+    defProperty(tMatch, "lastindex", m_lastindex);
+    defProperty(tMatch, "lastgroup", m_lastgroup);
+    {
+        V args[3] = {newStr("error"), tupleOf(std::vector<V>{tException}), newDict()};
+        tReError = static_cast<Type *>(call(tType, args, 3));
+        tReError->module = "re";
+        tReError->qualname = "error";
+    }
+    registerNativeModule("_re", patternModule);
+
+    tDeque = newType("deque", tObject, L::Data);
+    tDeque->module = "collections";
+    tDeque->hasDict = false;
+    dictSet(tDeque->dict, intern("__new__"), makeNative("__new__", deque_new, false));
+    defMethod(tDeque, "__init__", deque_init);
+    defMethod(tDeque, "append", deque_append);
+    defMethod(tDeque, "appendleft", deque_appendleft);
+    defMethod(tDeque, "pop", deque_pop);
+    defMethod(tDeque, "popleft", deque_popleft);
+    defMethod(tDeque, "extend", deque_extend);
+    defMethod(tDeque, "extendleft", deque_extendleft);
+    defMethod(tDeque, "rotate", deque_rotate);
+    defMethod(tDeque, "clear", deque_clear);
+    defMethod(tDeque, "count", deque_count);
+    defMethod(tDeque, "index", deque_index);
+    defMethod(tDeque, "remove", deque_remove);
+    defMethod(tDeque, "insert", deque_insert);
+    defMethod(tDeque, "reverse", deque_reverse);
+    defMethod(tDeque, "copy", deque_copy);
+    defMethod(tDeque, "__copy__", deque_copy);
+    defMethod(tDeque, "__len__", deque_len);
+    defMethod(tDeque, "__getitem__", deque_getitem);
+    defMethod(tDeque, "__setitem__", deque_setitem);
+    defMethod(tDeque, "__delitem__", deque_delitem);
+    defMethod(tDeque, "__iter__", deque_iter);
+    defMethod(tDeque, "__reversed__", deque_reversed);
+    defMethod(tDeque, "__contains__", deque_contains);
+    defMethod(tDeque, "__repr__", deque_repr);
+    defMethod(tDeque, "__bool__", deque_bool);
+    defMethod(tDeque, "__eq__", deque_eq);
+    defMethod(tDeque, "__iadd__", deque_iadd);
+    defMethod(tDeque, "__add__", deque_add);
+    defProperty(tDeque, "maxlen", deque_maxlen);
+    dictSet(tDeque->dict, intern("__hash__"), None);
+    registerNativeModule("_collections", collectionsModule);
+
+    tFile = newType("TextIOWrapper", tObject, L::Data);
+    tFile->module = "_io";
+    defMethod(tFile, "read", file_read);
+    defMethod(tFile, "readline", file_readline);
+    defMethod(tFile, "readlines", file_readlines);
+    defMethod(tFile, "write", file_write);
+    defMethod(tFile, "writelines", file_writelines);
+    defMethod(tFile, "close", file_close);
+    defMethod(tFile, "flush", file_flush);
+    defMethod(tFile, "seek", file_seek);
+    defMethod(tFile, "tell", file_tell);
+    defMethod(tFile, "__enter__", file_enter);
+    defMethod(tFile, "__exit__", file_exit);
+    defMethod(tFile, "__iter__", file_iter);
+    defProperty(tFile, "closed", file_closed);
+    defProperty(tFile, "name", file_name);
+    defProperty(tFile, "mode", file_mode);
+    registerNativeModule("time", timeModule);
+    registerNativeModule("_os", osNativeModule);
+}
+
+} // namespace py

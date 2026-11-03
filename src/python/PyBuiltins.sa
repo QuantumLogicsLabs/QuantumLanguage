@@ -1,0 +1,2478 @@
+// quantum: cpp
+// Python front-end: the builtins module, the native modules (sys, math),
+// imports, and the entry points the rest of the compiler calls.
+#include "PyMain.h.sa"
+#include "PyRt.h.sa"
+#include "PyAst.h.sa"
+#include "PyParse.h.sa"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace py
+{
+
+const std::vector<std::pair<std::string, std::string>> &librarySources();
+
+// ── output ─────────────────────────────────────────────────────────────────
+
+static std::string *outBuf;
+
+void writeOut(const std::string &s)
+{
+    if (!outBuf)
+        outBuf = new std::string();
+    outBuf->append(s);
+    if (outBuf->size() > (1 << 16))
+        flushOut();
+}
+
+void flushOut()
+{
+    if (outBuf && !outBuf->empty())
+    {
+        fwrite(outBuf->data(), 1, outBuf->size(), stdout);
+        outBuf->clear();
+    }
+    fflush(stdout);
+}
+
+static void writeErr(const std::string &s)
+{
+    flushOut();
+    fwrite(s.data(), 1, s.size(), stderr);
+    fflush(stderr);
+}
+
+static V sysStdout, sysStderr;
+
+// print(*objects, sep=' ', end='\n', file=None, flush=False)
+V builtinPrint(V *args, int n, Kw *kw)
+{
+    V sepV = kwArg(kw, "sep"), endV = kwArg(kw, "end"), fileV = kwArg(kw, "file");
+    std::string sep = (!sepV || sepV == None) ? " " : strOf(sepV);
+    std::string end = (!endV || endV == None) ? "\n" : strOf(endV);
+    std::string out;
+    for (int i = 0; i < n; ++i)
+    {
+        if (i)
+            out += sep;
+        out += strOf(args[i]);
+    }
+    out += end;
+    if (fileV && fileV != None && fileV != sysStdout)
+    {
+        if (fileV == sysStderr)
+        {
+            writeErr(out);
+            return None;
+        }
+        V w = getattr(fileV, intern("write"));
+        call1(w, newStr(out));
+        return None;
+    }
+    writeOut(out);
+    V fl = kwArg(kw, "flush");
+    if (fl && truthy(fl))
+        flushOut();
+    return None;
+}
+
+// ── builtin functions ──────────────────────────────────────────────────────
+
+static V b_len(V *a, int n, Kw *kw)
+{
+    noKw("len", kw);
+    checkArgs("len", n, 1, 1);
+    return mkint(lenOf(a[0]));
+}
+
+static V b_repr(V *a, int n, Kw *)
+{
+    checkArgs("repr", n, 1, 1);
+    return newStr(reprOf(a[0]));
+}
+
+extern std::string asciiOf(V v);
+
+static V b_ascii(V *a, int n, Kw *)
+{
+    checkArgs("ascii", n, 1, 1);
+    return newStr(asciiOf(a[0]));
+}
+
+static V b_format(V *a, int n, Kw *)
+{
+    checkArgs("format", n, 1, 2);
+    return newStr(formatValue(a[0], n > 1 ? strOf(a[1]) : ""));
+}
+
+static V b_abs(V *a, int n, Kw *)
+{
+    checkArgs("abs", n, 1, 1);
+    V x = a[0];
+    if (IS_SMALL(x))
+    {
+        int64_t v = SMALLV(x);
+        return mkint(v < 0 ? -v : v);
+    }
+    if (x->type == tFloat)
+        return mkfloat(fabs(static_cast<FloatObj *>(x)->v));
+    if (x->type == tComplex)
+    {
+        ComplexObj *c = static_cast<ComplexObj *>(x);
+        return mkfloat(hypot(c->re, c->im));
+    }
+    bool found;
+    V r = callSpecial(x, intern("__abs__"), nullptr, 0, found);
+    if (found)
+        return r;
+    raise(tTypeError, "bad operand type for abs(): '" + std::string(typeName(x)) + "'");
+}
+
+static V minmax(V *a, int n, Kw *kw, bool isMax)
+{
+    const char *name = isMax ? "max" : "min";
+    V key = kwArg(kw, "key");
+    V def = kwArg(kw, "default");
+    if (key == None)
+        key = nullptr;
+    std::vector<V> items;
+    if (n == 0)
+        raise(tTypeError, std::string(name) + " expected at least 1 argument, got 0");
+    if (n == 1)
+        items = toVector(a[0]);
+    else
+    {
+        if (def)
+            raise(tTypeError, std::string("Cannot specify a default for ") + name + "() with multiple positional arguments");
+        items.assign(a, a + n);
+    }
+    if (items.empty())
+    {
+        if (def)
+            return def;
+        raise(tValueError, std::string(name) + "() iterable argument is empty");
+    }
+    V best = items[0];
+    V bestKey = key ? call1(key, best) : best;
+    for (size_t i = 1; i < items.size(); ++i)
+    {
+        V k = key ? call1(key, items[i]) : items[i];
+        bool better = isMax ? lt(bestKey, k) : lt(k, bestKey);
+        if (better)
+        {
+            best = items[i];
+            bestKey = k;
+        }
+    }
+    return best;
+}
+
+static V b_min(V *a, int n, Kw *kw) { return minmax(a, n, kw, false); }
+static V b_max(V *a, int n, Kw *kw) { return minmax(a, n, kw, true); }
+
+// sum(): ints exactly, floats with CPython's compensated summation
+static V b_sum(V *a, int n, Kw *kw)
+{
+    checkArgs("sum", n, 1, 2);
+    V start = n > 1 ? a[1] : kwArg(kw, "start");
+    if (!start)
+        start = MKSMALL(0);
+    if (isStr(start))
+        raise(tTypeError, "sum() can't sum strings [use ''.join(seq) instead]");
+    V it = getiter(a[0]);
+    V result = start;
+    V x;
+    // integer fast path
+    if (IS_SMALL(result))
+    {
+        int64_t acc = SMALLV(result);
+        bool more = false;
+        while (iterNext(it, x))
+        {
+            if (IS_SMALL(x))
+            {
+                int64_t y = SMALLV(x);
+                int64_t s = acc + y;
+                if (FITS_SMALL(s))
+                {
+                    acc = s;
+                    continue;
+                }
+            }
+            result = mkint(acc);
+            more = true;
+            break;
+        }
+        if (!more)
+            return mkint(acc);
+        // x is the first item the fast path could not take
+        if (!IS_SMALL(x) && x->type == tFloat)
+        {
+            double f = (double)SMALLV(result) + 0.0;
+            if (!IS_SMALL(result))
+                f = toDouble(result);
+            double c = 0.0;
+            double v = static_cast<FloatObj *>(x)->v;
+            for (;;)
+            {
+                double t = f + v;
+                if (fabs(f) >= fabs(v))
+                    c += (f - t) + v;
+                else
+                    c += (v - t) + f;
+                f = t;
+                if (!iterNext(it, x))
+                {
+                    if (c != 0 && std::isfinite(c))
+                        f += c;
+                    return mkfloat(f);
+                }
+                if (!IS_SMALL(x) && x->type == tFloat)
+                    v = static_cast<FloatObj *>(x)->v;
+                else if (IS_SMALL(x) && SMALLV(x) > -((int64_t)1 << 53) && SMALLV(x) < ((int64_t)1 << 53))
+                    v = (double)SMALLV(x);
+                else
+                {
+                    if (c != 0 && std::isfinite(c))
+                        f += c;
+                    result = mkfloat(f);
+                    break;
+                }
+            }
+        }
+        result = binaryOp(result, x, OpAdd);
+    }
+    else if (!IS_SMALL(result) && result->type == tFloat)
+    {
+        double f = static_cast<FloatObj *>(result)->v, c = 0.0;
+        bool generic = false;
+        while (iterNext(it, x))
+        {
+            double v;
+            if (!IS_SMALL(x) && x->type == tFloat)
+                v = static_cast<FloatObj *>(x)->v;
+            else if (IS_SMALL(x) && SMALLV(x) > -((int64_t)1 << 53) && SMALLV(x) < ((int64_t)1 << 53))
+                v = (double)SMALLV(x);
+            else
+            {
+                generic = true;
+                break;
+            }
+            double t = f + v;
+            if (fabs(f) >= fabs(v))
+                c += (f - t) + v;
+            else
+                c += (v - t) + f;
+            f = t;
+        }
+        if (c != 0 && std::isfinite(c))
+            f += c;
+        result = mkfloat(f);
+        if (!generic)
+            return result;
+        result = binaryOp(result, x, OpAdd);
+    }
+    while (iterNext(it, x))
+        result = binaryOp(result, x, OpAdd);
+    return result;
+}
+
+static V b_sorted(V *a, int n, Kw *kw)
+{
+    checkArgs("sorted", n, 1, 1);
+    List *l = newList();
+    l->items = toVector(a[0]);
+    if (l->items.data() == (IS_SMALL(a[0]) ? nullptr : (typeOf(a[0])->layout == L::List ? static_cast<List *>(a[0])->items.data() : nullptr)))
+        l->items = std::vector<V>(l->items);
+    V key = kwArg(kw, "key");
+    V rev = kwArg(kw, "reverse");
+    listSort(l, key, rev && truthy(rev));
+    return l;
+}
+
+static V b_reversed(V *a, int n, Kw *)
+{
+    checkArgs("reversed", n, 1, 1);
+    V seq = a[0];
+    bool found;
+    V r = callSpecial(seq, intern("__reversed__"), nullptr, 0, found);
+    if (found)
+        return r;
+    if (!lookupMro(typeOf(seq), intern("__getitem__")) || !lookupMro(typeOf(seq), intern("__len__")))
+        raise(tTypeError, "'" + std::string(typeName(seq)) + "' object is not reversible");
+    int64_t *i = new int64_t(lenOf(seq));
+    return makeIter([seq, i](V &out) -> bool {
+        if (*i <= 0)
+            return false;
+        out = getitem(seq, mkint(--*i));
+        return true;
+    });
+}
+
+static V b_enumerate(V *a, int n, Kw *kw)
+{
+    V it = getiter(n > 0 ? a[0] : kwArg(kw, "iterable"));
+    V startV = n > 1 ? a[1] : kwArg(kw, "start");
+    V *idx = new V(startV ? startV : MKSMALL(0));
+    return makeIter([it, idx](V &out) -> bool {
+        V x;
+        if (!iterNext(it, x))
+            return false;
+        Tuple *t = newTuple(2);
+        t->items[0] = *idx;
+        t->items[1] = x;
+        *idx = IS_SMALL(*idx) ? mkint(SMALLV(*idx) + 1) : binaryOp(*idx, MKSMALL(1), OpAdd);
+        out = t;
+        return true;
+    });
+}
+
+static V b_zip(V *a, int n, Kw *kw)
+{
+    std::vector<V> *its = new std::vector<V>();
+    for (int i = 0; i < n; ++i)
+        its->push_back(getiter(a[i]));
+    V strictV = kwArg(kw, "strict");
+    bool strict = strictV && truthy(strictV);
+    return makeIter([its, strict](V &out) -> bool {
+        if (its->empty())
+            return false;
+        Tuple *t = newTuple(its->size());
+        for (size_t i = 0; i < its->size(); ++i)
+        {
+            V x;
+            if (!iterNext((*its)[i], x))
+            {
+                if (strict)
+                {
+                    if (i > 0)
+                        raise(tValueError, "zip() argument " + std::to_string(i + 1) + " is shorter than argument" + (i == 1 ? " 1" : "s 1-" + std::to_string(i)));
+                    for (size_t j = 1; j < its->size(); ++j)
+                    {
+                        V y;
+                        if (iterNext((*its)[j], y))
+                            raise(tValueError, "zip() argument " + std::to_string(j + 1) + " is longer than argument" + (j == 1 ? " 1" : "s 1-" + std::to_string(j)));
+                    }
+                }
+                return false;
+            }
+            t->items[i] = x;
+        }
+        out = t;
+        return true;
+    });
+}
+
+static V b_map(V *a, int n, Kw *)
+{
+    if (n < 2)
+        raise(tTypeError, "map() must have at least two arguments.");
+    V fn = a[0];
+    std::vector<V> *its = new std::vector<V>();
+    for (int i = 1; i < n; ++i)
+        its->push_back(getiter(a[i]));
+    return makeIter([fn, its](V &out) -> bool {
+        std::vector<V> args(its->size());
+        for (size_t i = 0; i < its->size(); ++i)
+            if (!iterNext((*its)[i], args[i]))
+                return false;
+        out = call(fn, args.data(), (int)args.size());
+        return true;
+    });
+}
+
+static V b_filter(V *a, int n, Kw *)
+{
+    checkArgs("filter", n, 2, 2);
+    V fn = a[0];
+    V it = getiter(a[1]);
+    return makeIter([fn, it](V &out) -> bool {
+        V x;
+        while (iterNext(it, x))
+        {
+            bool keep = fn == None ? truthy(x) : truthy(call1(fn, x));
+            if (keep)
+            {
+                out = x;
+                return true;
+            }
+        }
+        return false;
+    });
+}
+
+static V b_any(V *a, int n, Kw *)
+{
+    checkArgs("any", n, 1, 1);
+    V it = getiter(a[0]);
+    V x;
+    while (iterNext(it, x))
+        if (truthy(x))
+            return True;
+    return False;
+}
+
+static V b_all(V *a, int n, Kw *)
+{
+    checkArgs("all", n, 1, 1);
+    V it = getiter(a[0]);
+    V x;
+    while (iterNext(it, x))
+        if (!truthy(x))
+            return False;
+    return True;
+}
+
+static bool instanceCheck(V obj, V cls)
+{
+    if (!IS_SMALL(cls) && cls->type->layout == L::Tuple)
+    {
+        for (V c : static_cast<Tuple *>(cls)->items)
+            if (instanceCheck(obj, c))
+                return true;
+        return false;
+    }
+    if (typeOf(cls)->layout == L::Type && issub(typeOf(cls), tType))
+    {
+        Type *meta = typeOf(cls);
+        if (meta != tType)
+        {
+            V ic = lookupMro(meta, intern("__instancecheck__"));
+            if (ic && !(IS_SMALL(ic) || ic->type->layout == L::Native))
+                return truthy(call2(ic, cls, obj));
+        }
+        return isinst(obj, static_cast<Type *>(cls));
+    }
+    V ic;
+    if (getattrOpt(cls, intern("__instancecheck__"), ic))
+        return truthy(call1(ic, obj));
+    raise(tTypeError, "isinstance() arg 2 must be a type, a tuple of types, or a union");
+}
+
+static bool subclassCheck(V sub, V cls)
+{
+    if (!IS_SMALL(cls) && cls->type->layout == L::Tuple)
+    {
+        for (V c : static_cast<Tuple *>(cls)->items)
+            if (subclassCheck(sub, c))
+                return true;
+        return false;
+    }
+    if (typeOf(cls)->layout == L::Type && issub(typeOf(cls), tType))
+    {
+        Type *meta = typeOf(cls);
+        if (meta != tType)
+        {
+            V sc = lookupMro(meta, intern("__subclasscheck__"));
+            if (sc && !(IS_SMALL(sc) || sc->type->layout == L::Native))
+                return truthy(call2(sc, cls, sub));
+        }
+        if (typeOf(sub)->layout != L::Type)
+            raise(tTypeError, "issubclass() arg 1 must be a class");
+        return issub(static_cast<Type *>(sub), static_cast<Type *>(cls));
+    }
+    V sc;
+    if (getattrOpt(cls, intern("__subclasscheck__"), sc))
+        return truthy(call1(sc, sub));
+    raise(tTypeError, "issubclass() arg 2 must be a class, a tuple of classes, or a union");
+}
+
+static V b_isinstance(V *a, int n, Kw *)
+{
+    checkArgs("isinstance", n, 2, 2);
+    return mkbool(instanceCheck(a[0], a[1]));
+}
+
+static V b_issubclass(V *a, int n, Kw *)
+{
+    checkArgs("issubclass", n, 2, 2);
+    return mkbool(subclassCheck(a[0], a[1]));
+}
+
+static Str *attrName(V v)
+{
+    if (!isStr(v))
+        raise(tTypeError, "attribute name must be string, not '" + std::string(typeName(v)) + "'");
+    return intern(asStr(v)->s);
+}
+
+static V b_getattr(V *a, int n, Kw *)
+{
+    checkArgs("getattr", n, 2, 3);
+    if (n == 3)
+    {
+        V out;
+        try
+        {
+            if (getattrOpt(a[0], attrName(a[1]), out))
+                return out;
+        }
+        catch (PyThrow &e)
+        {
+            if (!isinst(e.exc, tAttributeError))
+                throw;
+        }
+        return a[2];
+    }
+    return getattr(a[0], attrName(a[1]));
+}
+
+static V b_setattr(V *a, int n, Kw *)
+{
+    checkArgs("setattr", n, 3, 3);
+    setattr(a[0], attrName(a[1]), a[2]);
+    return None;
+}
+
+static V b_delattr(V *a, int n, Kw *)
+{
+    checkArgs("delattr", n, 2, 2);
+    delattr(a[0], attrName(a[1]));
+    return None;
+}
+
+static V b_hasattr(V *a, int n, Kw *)
+{
+    checkArgs("hasattr", n, 2, 2);
+    return mkbool(hasattr(a[0], attrName(a[1])));
+}
+
+static V b_chr(V *a, int n, Kw *)
+{
+    checkArgs("chr", n, 1, 1);
+    int64_t c = indexOf(a[0]);
+    if (c < 0 || c > 0x10FFFF)
+        raise(tValueError, "chr() arg not in range(0x110000)");
+    return newStr(encodeUtf8((uint32_t)c));
+}
+
+static V b_ord(V *a, int n, Kw *)
+{
+    checkArgs("ord", n, 1, 1);
+    if (isStr(a[0]))
+    {
+        Str *s = asStr(a[0]);
+        if (s->len != 1)
+            raise(tTypeError, "ord() expected a character, but string of length " + std::to_string(s->len) + " found");
+        return mkint(strCharAt(s, 0));
+    }
+    if (typeOf(a[0])->layout == L::Bytes)
+    {
+        BytesObj *b = static_cast<BytesObj *>(a[0]);
+        if (b->s.size() != 1)
+            raise(tTypeError, "ord() expected a character, but string of length " + std::to_string(b->s.size()) + " found");
+        return mkint((unsigned char)b->s[0]);
+    }
+    raise(tTypeError, "ord() expected string of length 1, but " + std::string(typeName(a[0])) + " found");
+}
+
+static V radixStr(V v, int base, const char *prefix)
+{
+    V x = v;
+    if (!isIntLike(x))
+    {
+        bool found;
+        x = callSpecial(v, intern("__index__"), nullptr, 0, found);
+        if (!found)
+            raise(tTypeError, "'" + std::string(typeName(v)) + "' object cannot be interpreted as an integer");
+    }
+    bool neg = intSign(x) < 0;
+    V mag = neg ? binaryOp(MKSMALL(0), x, OpSub) : x;
+    return newStr(std::string(neg ? "-" : "") + prefix + intToString(mag, base));
+}
+
+static V b_hex(V *a, int n, Kw *)
+{
+    checkArgs("hex", n, 1, 1);
+    return radixStr(a[0], 16, "0x");
+}
+static V b_oct(V *a, int n, Kw *)
+{
+    checkArgs("oct", n, 1, 1);
+    return radixStr(a[0], 8, "0o");
+}
+static V b_bin(V *a, int n, Kw *)
+{
+    checkArgs("bin", n, 1, 1);
+    return radixStr(a[0], 2, "0b");
+}
+
+extern V numRound(V x, V nd);
+
+static V b_round(V *a, int n, Kw *kw)
+{
+    checkArgs("round", n, 1, 2);
+    V nd = n > 1 ? a[1] : kwArg(kw, "ndigits");
+    V x = a[0];
+    Type *t = typeOf(x);
+    if (t->builtin && (t->layout == L::Int || t->layout == L::Float))
+        return numRound(x, nd);
+    bool found;
+    V r = (nd && nd != None) ? callSpecial(x, intern("__round__"), &nd, 1, found) : callSpecial(x, intern("__round__"), nullptr, 0, found);
+    if (found)
+        return r;
+    raise(tTypeError, "type " + t->name + " doesn't define __round__ method");
+}
+
+static V b_divmod(V *a, int n, Kw *)
+{
+    checkArgs("divmod", n, 2, 2);
+    if (isIntLike(a[0]) && isIntLike(a[1]))
+    {
+        Tuple *t = newTuple(2);
+        t->items[0] = binaryOp(a[0], a[1], OpFloorDiv);
+        t->items[1] = binaryOp(a[0], a[1], OpMod);
+        return t;
+    }
+    bool found;
+    V r = callSpecial(a[0], intern("__divmod__"), &a[1], 1, found);
+    if (found && r != NotImpl)
+        return r;
+    if (!typeOf(a[1])->builtin)
+    {
+        r = callSpecial(a[1], intern("__rdivmod__"), &a[0], 1, found);
+        if (found && r != NotImpl)
+            return r;
+    }
+    Tuple *t = newTuple(2);
+    t->items[0] = binaryOp(a[0], a[1], OpFloorDiv);
+    t->items[1] = binaryOp(a[0], a[1], OpMod);
+    return t;
+}
+
+static V b_pow(V *a, int n, Kw *kw)
+{
+    checkArgs("pow", n, 2, 3);
+    V mod = n > 2 ? a[2] : kwArg(kw, "mod");
+    if (mod && mod != None)
+    {
+        if (!isIntLike(a[0]) || !isIntLike(a[1]) || !isIntLike(mod))
+        {
+            bool found;
+            V args[2] = {a[1], mod};
+            V r = callSpecial(a[0], intern("__pow__"), args, 2, found);
+            if (found)
+                return r;
+            raise(tTypeError, "pow() 3rd argument not allowed unless all arguments are integers");
+        }
+        return intPow(a[0], a[1], mod);
+    }
+    return binaryOp(a[0], a[1], OpPow);
+}
+
+static V b_hash(V *a, int n, Kw *)
+{
+    checkArgs("hash", n, 1, 1);
+    return mkint(hashOf(a[0]));
+}
+
+static V b_id(V *a, int n, Kw *)
+{
+    checkArgs("id", n, 1, 1);
+    return mkint(objectId(a[0]));
+}
+
+static V b_callable(V *a, int n, Kw *)
+{
+    checkArgs("callable", n, 1, 1);
+    V x = a[0];
+    if (IS_SMALL(x))
+        return False;
+    switch (x->type->layout)
+    {
+    case L::Func:
+    case L::Native:
+    case L::Method:
+        return True;
+    case L::Type:
+        if (issub(x->type, tType))
+            return True;
+        break;
+    default:
+        break;
+    }
+    return mkbool(lookupMro(x->type, intern("__call__")) != nullptr);
+}
+
+static V b_iter(V *a, int n, Kw *)
+{
+    checkArgs("iter", n, 1, 2);
+    if (n == 2)
+    {
+        V fn = a[0], sentinel = a[1];
+        bool *done = new bool(false);
+        return makeIter([fn, sentinel, done](V &out) -> bool {
+            if (*done)
+                return false;
+            V x = call0(fn);
+            if (eq(x, sentinel))
+            {
+                *done = true;
+                return false;
+            }
+            out = x;
+            return true;
+        });
+    }
+    return getiter(a[0]);
+}
+
+static V b_next(V *a, int n, Kw *)
+{
+    checkArgs("next", n, 1, 2);
+    V it = a[0];
+    Type *t = typeOf(it);
+    if (t->layout != L::Iter && t->layout != L::Gen && !lookupMro(t, intern("__next__")))
+        raise(tTypeError, "'" + t->name + "' object is not an iterator");
+    if (t->layout == L::Gen)
+    {
+        // a generator's return value travels in StopIteration
+        bool done;
+        V r = genSend(static_cast<GenObj *>(it), None, done);
+        if (!done)
+            return r;
+        if (n > 1)
+            return a[1];
+        extern V makeStopIteration(V value);
+        raiseV(makeStopIteration(r));
+    }
+    if (t->layout == L::Iter)
+    {
+        V x;
+        if (iterNext(it, x))
+            return x;
+        if (n > 1)
+            return a[1];
+        if (t->layout == L::Gen)
+        {
+            // a generator's return value travels in StopIteration
+            raiseV(makeExc(tStopIteration, ""));
+        }
+        V e = call0(tStopIteration);
+        raiseV(e);
+    }
+    try
+    {
+        bool found;
+        return callSpecial(it, intern("__next__"), nullptr, 0, found);
+    }
+    catch (PyThrow &e)
+    {
+        if (n > 1 && isinst(e.exc, tStopIteration))
+            return a[1];
+        throw;
+    }
+}
+
+static V b_vars(V *a, int n, Kw *)
+{
+    checkArgs("vars", n, 0, 1);
+    if (n == 0)
+    {
+        Frame *f = currentFrame();
+        return f && f->locals ? (V)f->locals : (V)newDict();
+    }
+    V d;
+    if (!getattrOpt(a[0], intern("__dict__"), d))
+        raise(tTypeError, "vars() argument must have __dict__ attribute");
+    return d;
+}
+
+static V b_dir(V *a, int n, Kw *)
+{
+    checkArgs("dir", n, 0, 1);
+    if (n == 0)
+    {
+        Frame *f = currentFrame();
+        List *l = newList();
+        Dict *d = f ? (f->locals ? f->locals : f->globals) : nullptr;
+        if (d)
+            for (const DEntry &e : d->entries)
+                if (e.key)
+                    l->items.push_back(e.key);
+        listSort(l, nullptr, false);
+        return l;
+    }
+    List *l = newList();
+    if (typeOf(a[0])->layout == L::Type && issub(typeOf(a[0]), tType) && typeOf(a[0]) == tType)
+    {
+        // a class: its own names and its bases'
+        Set *names = newSet();
+        for (Type *m : static_cast<Type *>(a[0])->mro)
+            for (const DEntry &e : m->dict->entries)
+                if (e.key)
+                    setAdd(names, e.key);
+        l->items = setItems(names);
+        listSort(l, nullptr, false);
+        return l;
+    }
+    if (typeOf(a[0])->layout == L::Module)
+    {
+        for (const DEntry &e : a[0]->dict->entries)
+            if (e.key)
+                l->items.push_back(e.key);
+        listSort(l, nullptr, false);
+        return l;
+    }
+    bool found;
+    V r = callSpecial(a[0], intern("__dir__"), nullptr, 0, found);
+    l->items = toVector(r);
+    listSort(l, nullptr, false);
+    return l;
+}
+
+static V b_globals(V *, int, Kw *)
+{
+    Frame *f = currentFrame();
+    return f ? (V)f->globals : (V)newDict();
+}
+
+static V b_locals(V *, int, Kw *)
+{
+    Frame *f = currentFrame();
+    if (!f)
+        return newDict();
+    if (f->locals)
+        return f->locals;
+    Dict *d = newDict();
+    for (size_t i = 0; i < f->code->varnames.size() && i < f->fast.size(); ++i)
+        if (f->fast[i] && f->code->varnames[i]->s[0] != '$' && f->code->varnames[i]->s[0] != '.')
+            dictSet(d, f->code->varnames[i], f->fast[i]);
+    for (size_t i = 0; i < f->code->cellvars.size(); ++i)
+        if (f->cells[i]->v)
+            dictSet(d, f->code->cellvars[i], f->cells[i]->v);
+    return d;
+}
+
+bool testModeActive();
+std::string testModeAnswer(const std::string &prompt);
+
+static V b_input(V *a, int n, Kw *)
+{
+    if (testModeActive())
+        return newStr(testModeAnswer(n > 0 ? strOf(a[0]) : ""));
+    if (n > 0)
+        writeOut(strOf(a[0]));
+    flushOut();
+    std::string line;
+    int ch;
+    bool any = false;
+    while ((ch = fgetc(stdin)) != EOF)
+    {
+        any = true;
+        if (ch == '\n')
+            break;
+        line += (char)ch;
+    }
+    if (!any)
+        raise(tEOFError, "EOF when reading a line");
+    if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+    return newStr(line);
+}
+
+static V b_exit(V *a, int n, Kw *)
+{
+    V e = n > 0 ? call1(tSystemExit, a[0]) : call0(tSystemExit);
+    raiseV(e);
+}
+
+static V b_import(V *a, int n, Kw *)
+{
+    checkArgs("__import__", n, 1, 5);
+    return importModule(strOf(a[0]), currentLine());
+}
+
+V openFile(V *a, int n, Kw *kw);
+
+static V b_open(V *a, int n, Kw *kw)
+{
+    checkArgs("open", n, 1, 8);
+    return openFile(a, n, kw);
+}
+
+static V compileAndRun(const std::string &src, V globals, V locals, bool isEval)
+{
+    Dict *g = globals && globals != None ? static_cast<Dict *>(globals) : currentFrame()->globals;
+    std::string text = isEval ? "__eval_result__ = (" + src + "\n)" : src;
+    std::vector<Node *> body;
+    try
+    {
+        body = parseModule(text);
+    }
+    catch (SyntaxErr &e)
+    {
+        raise(tSyntaxError, e.message);
+    }
+    Code *code = compileModule(body, "<string>", "<module>");
+    Dict *ns = locals && locals != None ? static_cast<Dict *>(locals) : g;
+    if (!dictGetC(g, "__builtins__"))
+        setAttrStr(g, "__builtins__", builtinsDict);
+    Frame *f = currentFrame();
+    if (!locals && !globals && f && !f->locals)
+    {
+        // eval inside a function sees its locals through a snapshot
+        Dict *snap = dictCopy(g);
+        for (size_t i = 0; i < f->code->varnames.size() && i < f->fast.size(); ++i)
+            if (f->fast[i])
+                dictSet(snap, f->code->varnames[i], f->fast[i]);
+        ns = snap;
+        g = snap;
+    }
+    Frame fr;
+    fr.code = code;
+    fr.globals = g;
+    fr.locals = ns;
+    fr.fast.assign((size_t)code->nlocals, nullptr);
+    runFrame(&fr);
+    if (isEval)
+    {
+        V r = dictGetC(ns, "__eval_result__");
+        dictDel(ns, intern("__eval_result__"));
+        return r ? r : None;
+    }
+    return None;
+}
+
+static V b_eval(V *a, int n, Kw *)
+{
+    checkArgs("eval", n, 1, 3);
+    return compileAndRun(strOf(a[0]), n > 1 ? a[1] : nullptr, n > 2 ? a[2] : nullptr, true);
+}
+
+static V b_exec(V *a, int n, Kw *)
+{
+    checkArgs("exec", n, 1, 3);
+    return compileAndRun(strOf(a[0]), n > 1 ? a[1] : nullptr, n > 2 ? a[2] : nullptr, false);
+}
+
+// ── constructors of the numeric types ──────────────────────────────────────
+
+static V int_new(V *a, int n, Kw *kw)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    V x = n > 1 ? a[1] : kwArg(kw, "x");
+    V baseV = n > 2 ? a[2] : kwArg(kw, "base");
+    V val;
+    if (!x)
+        val = MKSMALL(0);
+    else if (baseV)
+    {
+        int64_t base = indexOf(baseV);
+        std::string s;
+        if (isStr(x))
+            s = asStr(x)->s;
+        else if (typeOf(x)->layout == L::Bytes)
+            s = static_cast<BytesObj *>(x)->s;
+        else
+            raise(tTypeError, "int() can't convert non-string with explicit base");
+        if (base != 0 && (base < 2 || base > 36))
+            raise(tValueError, "int() base must be >= 2 and <= 36, or 0");
+        bool ok;
+        val = intFromString(s, (int)base, ok);
+        if (!ok)
+            raise(tValueError, "invalid literal for int() with base " + std::to_string(base) + ": " + quoteStr(s));
+    }
+    else if (isIntLike(x))
+        val = IS_SMALL(x) ? x : fromBig(toBig(x));
+    else if (isStr(x))
+    {
+        bool ok;
+        val = intFromString(asStr(x)->s, 10, ok);
+        if (!ok)
+        {
+            // non-ASCII digits are rare; report like CPython
+            raise(tValueError, "invalid literal for int() with base 10: " + quoteStr(asStr(x)->s));
+        }
+    }
+    else if (typeOf(x)->layout == L::Float)
+        val = intFromDouble(static_cast<FloatObj *>(x)->v);
+    else if (typeOf(x)->layout == L::Bytes)
+    {
+        bool ok;
+        val = intFromString(static_cast<BytesObj *>(x)->s, 10, ok);
+        if (!ok)
+            raise(tValueError, "invalid literal for int() with base 10: " + reprOf(x));
+    }
+    else
+    {
+        bool found;
+        val = callSpecial(x, intern("__int__"), nullptr, 0, found);
+        if (!found)
+            val = callSpecial(x, intern("__index__"), nullptr, 0, found);
+        if (!found)
+            val = callSpecial(x, intern("__trunc__"), nullptr, 0, found);
+        if (!found)
+            raise(tTypeError, "int() argument must be a string, a bytes-like object or a real number, not '" + std::string(typeName(x)) + "'");
+        if (!isIntLike(val))
+            raise(tTypeError, "__int__ returned non-int (type " + std::string(typeName(val)) + ")");
+    }
+    if (t == tInt)
+        return val;
+    if (t == tBool)
+        return mkbool(truthy(val));
+    IntObj *o = static_cast<IntObj *>(newObject(t));
+    int64_t s;
+    if (intSmall(val, s))
+        o->small = s;
+    else
+        o->big = new Big(toBig(val));
+    return o;
+}
+
+static V bool_new(V *a, int n, Kw *)
+{
+    checkArgs("bool", n - 1, 0, 1);
+    return mkbool(n > 1 && truthy(a[1]));
+}
+
+static V bool_repr(V *a, int, Kw *) { return newStr(static_cast<IntObj *>(a[0])->small ? "True" : "False"); }
+
+static V parseFloat(const std::string &text, bool &ok)
+{
+    ok = false;
+    std::string s;
+    size_t b = 0, e = text.size();
+    while (b < e && isspace((unsigned char)text[b]))
+        ++b;
+    while (e > b && isspace((unsigned char)text[e - 1]))
+        --e;
+    for (size_t i = b; i < e; ++i)
+    {
+        if (text[i] == '_')
+        {
+            if (i == b || i + 1 >= e || !isdigit((unsigned char)text[i - 1]) || !isdigit((unsigned char)text[i + 1]))
+                return nullptr;
+            continue;
+        }
+        s += (char)tolower((unsigned char)text[i]);
+    }
+    if (s.empty())
+        return nullptr;
+    std::string body = s;
+    double sign = 1;
+    if (body[0] == '+' || body[0] == '-')
+    {
+        if (body[0] == '-')
+            sign = -1;
+        body = body.substr(1);
+    }
+    if (body == "inf" || body == "infinity")
+    {
+        ok = true;
+        return mkfloat(sign * HUGE_VAL);
+    }
+    if (body == "nan")
+    {
+        ok = true;
+        return mkfloat(NAN);
+    }
+    // digits [. digits] [e [+-] digits]
+    size_t i = 0;
+    bool digits = false;
+    while (i < body.size() && isdigit((unsigned char)body[i]))
+        ++i, digits = true;
+    if (i < body.size() && body[i] == '.')
+    {
+        ++i;
+        while (i < body.size() && isdigit((unsigned char)body[i]))
+            ++i, digits = true;
+    }
+    if (!digits)
+        return nullptr;
+    if (i < body.size() && body[i] == 'e')
+    {
+        ++i;
+        if (i < body.size() && (body[i] == '+' || body[i] == '-'))
+            ++i;
+        bool ed = false;
+        while (i < body.size() && isdigit((unsigned char)body[i]))
+            ++i, ed = true;
+        if (!ed)
+            return nullptr;
+    }
+    if (i != body.size())
+        return nullptr;
+    ok = true;
+    return mkfloat(sign * strtod(body.c_str(), nullptr));
+}
+
+static V float_new(V *a, int n, Kw *)
+{
+    checkArgs("float", n - 1, 0, 1);
+    Type *t = static_cast<Type *>(a[0]);
+    double d = 0;
+    if (n > 1)
+    {
+        V x = a[1];
+        if (isStr(x) || typeOf(x)->layout == L::Bytes)
+        {
+            std::string s = isStr(x) ? asStr(x)->s : static_cast<BytesObj *>(x)->s;
+            bool ok;
+            V f = parseFloat(s, ok);
+            if (!ok)
+                raise(tValueError, "could not convert string to float: " + quoteStr(s));
+            d = static_cast<FloatObj *>(f)->v;
+        }
+        else if (isIntLike(x))
+            d = intToDouble(x);
+        else if (typeOf(x)->layout == L::Float)
+            d = static_cast<FloatObj *>(x)->v;
+        else
+        {
+            bool found;
+            V r = callSpecial(x, intern("__float__"), nullptr, 0, found);
+            if (!found)
+                r = callSpecial(x, intern("__index__"), nullptr, 0, found);
+            if (!found)
+                raise(tTypeError, "float() argument must be a string or a real number, not '" + std::string(typeName(x)) + "'");
+            d = toDouble(r);
+        }
+    }
+    if (t == tFloat)
+        return mkfloat(d);
+    FloatObj *o = static_cast<FloatObj *>(newObject(t));
+    o->v = d;
+    return o;
+}
+
+static V float_fromhex(V *a, int n, Kw *)
+{
+    checkArgs("fromhex", n - 1, 1, 1);
+    return mkfloat(strtod(strOf(a[1]).c_str(), nullptr));
+}
+
+static V complex_new(V *a, int n, Kw *kw)
+{
+    V re = n > 1 ? a[1] : kwArg(kw, "real");
+    V im = n > 2 ? a[2] : kwArg(kw, "imag");
+    double r = 0, i = 0;
+    if (re)
+    {
+        if (!IS_SMALL(re) && re->type->layout == L::Complex)
+        {
+            r = static_cast<ComplexObj *>(re)->re;
+            i = static_cast<ComplexObj *>(re)->im;
+        }
+        else if (isStr(re))
+        {
+            std::string s = asStr(re)->s;
+            std::string t;
+            for (char c : s)
+                if (!isspace((unsigned char)c) && c != '(' && c != ')')
+                    t += c;
+            if (!t.empty() && (t.back() == 'j' || t.back() == 'J'))
+            {
+                t.pop_back();
+                size_t split = std::string::npos;
+                for (size_t k = t.size(); k-- > 1;)
+                    if ((t[k] == '+' || t[k] == '-') && t[k - 1] != 'e' && t[k - 1] != 'E')
+                    {
+                        split = k;
+                        break;
+                    }
+                if (split == std::string::npos)
+                    i = t.empty() || t == "+" ? 1 : t == "-" ? -1 : strtod(t.c_str(), nullptr);
+                else
+                {
+                    r = strtod(t.substr(0, split).c_str(), nullptr);
+                    std::string ip = t.substr(split);
+                    i = ip == "+" ? 1 : ip == "-" ? -1 : strtod(ip.c_str(), nullptr);
+                }
+            }
+            else
+                r = strtod(t.c_str(), nullptr);
+        }
+        else
+            r = toDouble(re);
+    }
+    if (im)
+    {
+        if (!IS_SMALL(im) && im->type->layout == L::Complex)
+        {
+            r -= static_cast<ComplexObj *>(im)->im;
+            i += static_cast<ComplexObj *>(im)->re;
+        }
+        else
+            i += toDouble(im);
+    }
+    return new ComplexObj(static_cast<Type *>(a[0]), r, i);
+}
+
+static V complex_real(V *a, int, Kw *) { return mkfloat(static_cast<ComplexObj *>(a[0])->re); }
+static V complex_imag(V *a, int, Kw *) { return mkfloat(static_cast<ComplexObj *>(a[0])->im); }
+static V complex_conjugate(V *a, int, Kw *)
+{
+    ComplexObj *c = static_cast<ComplexObj *>(a[0]);
+    return new ComplexObj(tComplex, c->re, -c->im);
+}
+static V complex_abs(V *a, int, Kw *)
+{
+    ComplexObj *c = static_cast<ComplexObj *>(a[0]);
+    return mkfloat(hypot(c->re, c->im));
+}
+static V complex_neg(V *a, int, Kw *)
+{
+    ComplexObj *c = static_cast<ComplexObj *>(a[0]);
+    return new ComplexObj(tComplex, -c->re, -c->im);
+}
+static V complex_bool(V *a, int, Kw *)
+{
+    ComplexObj *c = static_cast<ComplexObj *>(a[0]);
+    return mkbool(c->re != 0 || c->im != 0);
+}
+
+
+static V notimpl_singleton(V *, int, Kw *) { return NotImpl; }
+
+// ── sys ────────────────────────────────────────────────────────────────────
+
+static V stream_write(V *a, int n, Kw *)
+{
+    checkArgs("write", n, 2, 2);
+    std::string s = strOf(a[1]);
+    if (a[0] == sysStderr)
+        writeErr(s);
+    else
+        writeOut(s);
+    return mkint((int64_t)asStr(a[1])->len);
+}
+
+static V stream_flush(V *, int, Kw *)
+{
+    flushOut();
+    return None;
+}
+
+static V sys_exit(V *a, int n, Kw *) { return b_exit(a, n, nullptr); }
+static int g_recursionLimit = 1000;
+static V sys_getrecursionlimit(V *, int, Kw *) { return mkint(g_recursionLimit); }
+static V sys_setrecursionlimit(V *a, int n, Kw *)
+{
+    checkArgs("setrecursionlimit", n, 1, 1);
+    g_recursionLimit = (int)indexOf(a[0]);
+    return None;
+}
+static V sys_getsizeof(V *a, int, Kw *)
+{
+    // rough sizes in the spirit of CPython's
+    V x = a[0];
+    switch (typeOf(x)->layout)
+    {
+    case L::List: return mkint(56 + 8 * (int64_t)static_cast<List *>(x)->items.size());
+    case L::Tuple: return mkint(40 + 8 * (int64_t)static_cast<Tuple *>(x)->items.size());
+    case L::Str: return mkint(49 + static_cast<Str *>(x)->len);
+    case L::Dict: return mkint(184);
+    case L::Set: return mkint(216);
+    case L::Float: return mkint(24);
+    default: return mkint(28);
+    }
+}
+static V sys_intern(V *a, int n, Kw *)
+{
+    checkArgs("intern", n, 1, 1);
+    return intern(strOf(a[0]));
+}
+
+static V sysModule()
+{
+    ModuleObj *m = new ModuleObj(tModule);
+    m->name = "sys";
+    m->dict = newDict();
+    Dict *d = m->dict;
+    setAttrStr(d, "__name__", newStr("sys"));
+    Type *streamType = newType("TextIOWrapper", tObject, L::Object);
+    defMethod(streamType, "write", stream_write);
+    defMethod(streamType, "flush", stream_flush);
+    sysStdout = new Obj(streamType);
+    sysStderr = new Obj(streamType);
+    setAttrStr(d, "stdout", sysStdout);
+    setAttrStr(d, "stderr", sysStderr);
+    setAttrStr(d, "__stdout__", sysStdout);
+    setAttrStr(d, "__stderr__", sysStderr);
+    setAttrStr(d, "stdin", None);
+    List *argv = newList();
+    argv->items.push_back(newStr(g_scriptPath));
+    setAttrStr(d, "argv", argv);
+    setAttrStr(d, "maxsize", mkint(INT64_MAX));
+    setAttrStr(d, "byteorder", newStr("little"));
+    setAttrStr(d, "platform", newStr("win32"));
+    setAttrStr(d, "version", newStr("3.13.0 (Quantum)"));
+    Tuple *vi = newTuple(5);
+    vi->items[0] = MKSMALL(3);
+    vi->items[1] = MKSMALL(13);
+    vi->items[2] = MKSMALL(0);
+    vi->items[3] = newStr("final");
+    vi->items[4] = MKSMALL(0);
+    setAttrStr(d, "version_info", vi);
+    setAttrStr(d, "modules", modulesDict);
+    setAttrStr(d, "path", newList());
+    setAttrStr(d, "maxunicode", mkint(0x10FFFF));
+    setAttrStr(d, "exit", makeNative("exit", sys_exit));
+    setAttrStr(d, "getrecursionlimit", makeNative("getrecursionlimit", sys_getrecursionlimit));
+    setAttrStr(d, "setrecursionlimit", makeNative("setrecursionlimit", sys_setrecursionlimit));
+    setAttrStr(d, "getsizeof", makeNative("getsizeof", sys_getsizeof));
+    setAttrStr(d, "intern", makeNative("intern", sys_intern));
+    Dict *fi = newDict();
+    (void)fi;
+    return m;
+}
+
+// ── math ───────────────────────────────────────────────────────────────────
+
+static double num(V v, const char *fn)
+{
+    if (IS_SMALL(v))
+        return (double)SMALLV(v);
+    L l = v->type->layout;
+    if (l == L::Float)
+        return static_cast<FloatObj *>(v)->v;
+    if (l == L::Int)
+        return intToDouble(v);
+    bool found;
+    V r = callSpecial(v, intern("__float__"), nullptr, 0, found);
+    if (found)
+        return toDouble(r);
+    r = callSpecial(v, intern("__index__"), nullptr, 0, found);
+    if (found)
+        return toDouble(r);
+    (void)fn;
+    raise(tTypeError, "must be real number, not " + std::string(typeName(v)));
+}
+
+static V mathResult(double r, double x)
+{
+    if (std::isnan(r) && !std::isnan(x))
+        raise(tValueError, "math domain error");
+    if (std::isinf(r) && std::isfinite(x))
+        raise(tOverflowError, "math range error");
+    return mkfloat(r);
+}
+
+static double nanIf(bool bad, double v) { return bad ? NAN : v; }
+
+static V m_sin(V *a, int n, Kw *)
+{
+    checkArgs("sin", n, 1, 1);
+    double x = num(a[0], "sin");
+    return mathResult(sin(x), x);
+}
+
+static V m_cos(V *a, int n, Kw *)
+{
+    checkArgs("cos", n, 1, 1);
+    double x = num(a[0], "cos");
+    return mathResult(cos(x), x);
+}
+
+static V m_tan(V *a, int n, Kw *)
+{
+    checkArgs("tan", n, 1, 1);
+    double x = num(a[0], "tan");
+    return mathResult(tan(x), x);
+}
+
+static V m_asin(V *a, int n, Kw *)
+{
+    checkArgs("asin", n, 1, 1);
+    double x = num(a[0], "asin");
+    return mathResult(nanIf(x < -1 || x > 1, asin(x)), x);
+}
+
+static V m_acos(V *a, int n, Kw *)
+{
+    checkArgs("acos", n, 1, 1);
+    double x = num(a[0], "acos");
+    return mathResult(nanIf(x < -1 || x > 1, acos(x)), x);
+}
+
+static V m_atan(V *a, int n, Kw *)
+{
+    checkArgs("atan", n, 1, 1);
+    double x = num(a[0], "atan");
+    return mathResult(atan(x), x);
+}
+
+static V m_sinh(V *a, int n, Kw *)
+{
+    checkArgs("sinh", n, 1, 1);
+    double x = num(a[0], "sinh");
+    return mathResult(sinh(x), x);
+}
+
+static V m_cosh(V *a, int n, Kw *)
+{
+    checkArgs("cosh", n, 1, 1);
+    double x = num(a[0], "cosh");
+    return mathResult(cosh(x), x);
+}
+
+static V m_tanh(V *a, int n, Kw *)
+{
+    checkArgs("tanh", n, 1, 1);
+    double x = num(a[0], "tanh");
+    return mathResult(tanh(x), x);
+}
+
+static V m_asinh(V *a, int n, Kw *)
+{
+    checkArgs("asinh", n, 1, 1);
+    double x = num(a[0], "asinh");
+    return mathResult(asinh(x), x);
+}
+
+static V m_acosh(V *a, int n, Kw *)
+{
+    checkArgs("acosh", n, 1, 1);
+    double x = num(a[0], "acosh");
+    return mathResult(nanIf(x < 1, acosh(x)), x);
+}
+
+static V m_atanh(V *a, int n, Kw *)
+{
+    checkArgs("atanh", n, 1, 1);
+    double x = num(a[0], "atanh");
+    return mathResult(nanIf(x <= -1 || x >= 1, atanh(x)), x);
+}
+
+static V m_exp(V *a, int n, Kw *)
+{
+    checkArgs("exp", n, 1, 1);
+    double x = num(a[0], "exp");
+    return mathResult(exp(x), x);
+}
+
+static V m_expm1(V *a, int n, Kw *)
+{
+    checkArgs("expm1", n, 1, 1);
+    double x = num(a[0], "expm1");
+    return mathResult(expm1(x), x);
+}
+
+static V m_exp2(V *a, int n, Kw *)
+{
+    checkArgs("exp2", n, 1, 1);
+    double x = num(a[0], "exp2");
+    return mathResult(exp2(x), x);
+}
+
+static V m_log1p(V *a, int n, Kw *)
+{
+    checkArgs("log1p", n, 1, 1);
+    double x = num(a[0], "log1p");
+    return mathResult(nanIf(x <= -1, log1p(x)), x);
+}
+
+static V m_fabs(V *a, int n, Kw *)
+{
+    checkArgs("fabs", n, 1, 1);
+    double x = num(a[0], "fabs");
+    return mathResult(fabs(x), x);
+}
+
+static V m_erf(V *a, int n, Kw *)
+{
+    checkArgs("erf", n, 1, 1);
+    double x = num(a[0], "erf");
+    return mathResult(erf(x), x);
+}
+
+static V m_erfc(V *a, int n, Kw *)
+{
+    checkArgs("erfc", n, 1, 1);
+    double x = num(a[0], "erfc");
+    return mathResult(erfc(x), x);
+}
+
+static V m_degrees(V *a, int n, Kw *)
+{
+    checkArgs("degrees", n, 1, 1);
+    double x = num(a[0], "degrees");
+    return mathResult(x * 180.0 / M_PI, x);
+}
+
+static V m_radians(V *a, int n, Kw *)
+{
+    checkArgs("radians", n, 1, 1);
+    double x = num(a[0], "radians");
+    return mathResult(x * M_PI / 180.0, x);
+}
+
+static V m_cbrt(V *a, int n, Kw *)
+{
+    checkArgs("cbrt", n, 1, 1);
+    double x = num(a[0], "cbrt");
+    return mathResult(cbrt(x), x);
+}
+
+static V m_gamma(V *a, int n, Kw *)
+{
+    checkArgs("gamma", n, 1, 1);
+    double x = num(a[0], "gamma");
+    if (x <= 0 && x == std::floor(x))
+        raise(tValueError, "math domain error");
+    return mathResult(tgamma(x), x);
+}
+
+static V m_lgamma(V *a, int n, Kw *)
+{
+    checkArgs("lgamma", n, 1, 1);
+    double x = num(a[0], "lgamma");
+    if (x <= 0 && x == std::floor(x))
+        raise(tValueError, "math domain error");
+    return mathResult(lgamma(x), x);
+}
+
+static V m_sqrt(V *a, int n, Kw *)
+{
+    checkArgs("sqrt", n, 1, 1);
+    double x = num(a[0], "sqrt");
+    if (x < 0)
+        raise(tValueError, "math domain error");
+    return mkfloat(sqrt(x));
+}
+
+static double logOf(V v)
+{
+    if (isIntLike(v) && !IS_SMALL(v) && static_cast<IntObj *>(v)->big)
+    {
+        // log of a huge int: split off a power of two
+        if (intSign(v) <= 0)
+            raise(tValueError, "math domain error");
+        std::string s = intToString(v, 16);
+        double mant = strtod(("0x" + s.substr(0, 13)).c_str(), nullptr);
+        return log(mant) + (double)(s.size() - 13) * 4 * log(2.0);
+    }
+    double x = num(v, "log");
+    if (x <= 0)
+        raise(tValueError, x == 0 ? "math domain error" : "math domain error");
+    return log(x);
+}
+
+static V m_log(V *a, int n, Kw *)
+{
+    checkArgs("log", n, 1, 2);
+    double r = logOf(a[0]);
+    if (n > 1)
+    {
+        double b = logOf(a[1]);
+        if (b == 0)
+            raise(tZeroDivisionError, "float division by zero");
+        r /= b;
+    }
+    return mkfloat(r);
+}
+
+static V m_log2(V *a, int n, Kw *)
+{
+    checkArgs("log2", n, 1, 1);
+    if (isIntLike(a[0]) && intSign(a[0]) > 0)
+    {
+        // exact for powers of two
+        int64_t s;
+        if (intSmall(a[0], s) && (s & (s - 1)) == 0)
+        {
+            int k = 0;
+            while (s > 1)
+                s >>= 1, ++k;
+            return mkfloat((double)k);
+        }
+        return mkfloat(logOf(a[0]) / log(2.0));
+    }
+    double x = num(a[0], "log2");
+    if (x <= 0)
+        raise(tValueError, "math domain error");
+    return mkfloat(log2(x));
+}
+
+static V m_log10(V *a, int n, Kw *)
+{
+    checkArgs("log10", n, 1, 1);
+    if (isIntLike(a[0]) && !IS_SMALL(a[0]))
+        return mkfloat(logOf(a[0]) / log(10.0));
+    double x = num(a[0], "log10");
+    if (x <= 0)
+        raise(tValueError, "math domain error");
+    return mkfloat(log10(x));
+}
+
+static V m_pow(V *a, int n, Kw *)
+{
+    checkArgs("pow", n, 2, 2);
+    double x = num(a[0], "pow"), y = num(a[1], "pow");
+    if (x == 0 && y < 0)
+        raise(tValueError, "math domain error");
+    if (x < 0 && y != std::floor(y))
+        raise(tValueError, "math domain error");
+    double r = pow(x, y);
+    if (std::isinf(r) && std::isfinite(x) && std::isfinite(y))
+        raise(tOverflowError, "math range error");
+    return mkfloat(r);
+}
+
+static V m_atan2(V *a, int n, Kw *)
+{
+    checkArgs("atan2", n, 2, 2);
+    return mkfloat(atan2(num(a[0], "atan2"), num(a[1], "atan2")));
+}
+
+static V m_hypot(V *a, int n, Kw *)
+{
+    double acc = 0;
+    if (n == 2)
+        return mkfloat(hypot(num(a[0], "hypot"), num(a[1], "hypot")));
+    double mx = 0;
+    for (int i = 0; i < n; ++i)
+        mx = fmax(mx, fabs(num(a[i], "hypot")));
+    if (mx == 0)
+        return mkfloat(0.0);
+    for (int i = 0; i < n; ++i)
+    {
+        double x = num(a[i], "hypot") / mx;
+        acc += x * x;
+    }
+    return mkfloat(mx * sqrt(acc));
+}
+
+static V m_copysign(V *a, int n, Kw *)
+{
+    checkArgs("copysign", n, 2, 2);
+    return mkfloat(copysign(num(a[0], "copysign"), num(a[1], "copysign")));
+}
+
+static V m_fmod(V *a, int n, Kw *)
+{
+    checkArgs("fmod", n, 2, 2);
+    double y = num(a[1], "fmod");
+    if (y == 0)
+        raise(tValueError, "math domain error");
+    return mkfloat(fmod(num(a[0], "fmod"), y));
+}
+
+static V m_remainder(V *a, int n, Kw *)
+{
+    checkArgs("remainder", n, 2, 2);
+    return mkfloat(remainder(num(a[0], "remainder"), num(a[1], "remainder")));
+}
+
+static V m_ldexp(V *a, int n, Kw *)
+{
+    checkArgs("ldexp", n, 2, 2);
+    return mkfloat(ldexp(num(a[0], "ldexp"), (int)indexOf(a[1])));
+}
+
+static V m_frexp(V *a, int n, Kw *)
+{
+    checkArgs("frexp", n, 1, 1);
+    int e;
+    double m = frexp(num(a[0], "frexp"), &e);
+    Tuple *t = newTuple(2);
+    t->items[0] = mkfloat(m);
+    t->items[1] = mkint(e);
+    return t;
+}
+
+static V m_modf(V *a, int n, Kw *)
+{
+    checkArgs("modf", n, 1, 1);
+    double ip;
+    double fp = modf(num(a[0], "modf"), &ip);
+    Tuple *t = newTuple(2);
+    t->items[0] = mkfloat(fp);
+    t->items[1] = mkfloat(ip);
+    return t;
+}
+
+static V roundingCall(V x, const char *dunder, double (*f)(double))
+{
+    if (isIntLike(x))
+        return IS_SMALL(x) ? x : fromBig(toBig(x));
+    if (!IS_SMALL(x) && x->type->layout == L::Float)
+        return intFromDouble(f(static_cast<FloatObj *>(x)->v));
+    bool found;
+    V r = callSpecial(x, intern(dunder), nullptr, 0, found);
+    if (found)
+        return r;
+    return intFromDouble(f(num(x, dunder)));
+}
+
+static V m_floor(V *a, int n, Kw *)
+{
+    checkArgs("floor", n, 1, 1);
+    return roundingCall(a[0], "__floor__", std::floor);
+}
+static V m_ceil(V *a, int n, Kw *)
+{
+    checkArgs("ceil", n, 1, 1);
+    return roundingCall(a[0], "__ceil__", std::ceil);
+}
+static V m_trunc(V *a, int n, Kw *)
+{
+    checkArgs("trunc", n, 1, 1);
+    return roundingCall(a[0], "__trunc__", std::trunc);
+}
+
+static V m_isnan(V *a, int n, Kw *)
+{
+    checkArgs("isnan", n, 1, 1);
+    return mkbool(std::isnan(num(a[0], "isnan")));
+}
+static V m_isinf(V *a, int n, Kw *)
+{
+    checkArgs("isinf", n, 1, 1);
+    return mkbool(std::isinf(num(a[0], "isinf")));
+}
+static V m_isfinite(V *a, int n, Kw *)
+{
+    checkArgs("isfinite", n, 1, 1);
+    return mkbool(std::isfinite(num(a[0], "isfinite")));
+}
+
+static V m_isclose(V *a, int n, Kw *kw)
+{
+    checkArgs("isclose", n, 2, 2);
+    double x = num(a[0], "isclose"), y = num(a[1], "isclose");
+    V rt = kwArg(kw, "rel_tol"), at = kwArg(kw, "abs_tol");
+    double rel = rt ? num(rt, "isclose") : 1e-9, abst = at ? num(at, "isclose") : 0.0;
+    if (x == y)
+        return True;
+    if (std::isinf(x) || std::isinf(y))
+        return False;
+    double diff = fabs(y - x);
+    return mkbool(diff <= fabs(rel * y) || diff <= fabs(rel * x) || diff <= abst);
+}
+
+static V intAbs(V v)
+{
+    return intSign(v) < 0 ? binaryOp(MKSMALL(0), v, OpSub) : v;
+}
+
+static V gcd2(V a, V b)
+{
+    int64_t x, y;
+    if (intSmall(a, x) && intSmall(b, y))
+    {
+        x = x < 0 ? -x : x;
+        y = y < 0 ? -y : y;
+        while (y)
+        {
+            int64_t t = x % y;
+            x = y;
+            y = t;
+        }
+        return mkint(x);
+    }
+    a = intAbs(a);
+    b = intAbs(b);
+    while (intSign(b) != 0)
+    {
+        V t = binaryOp(a, b, OpMod);
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+static V m_gcd(V *a, int n, Kw *)
+{
+    V r = MKSMALL(0);
+    for (int i = 0; i < n; ++i)
+    {
+        if (!isIntLike(a[i]))
+            raise(tTypeError, "'" + std::string(typeName(a[i])) + "' object cannot be interpreted as an integer");
+        r = gcd2(r, a[i]);
+    }
+    return r;
+}
+
+static V m_lcm(V *a, int n, Kw *)
+{
+    V r = MKSMALL(1);
+    for (int i = 0; i < n; ++i)
+    {
+        if (!isIntLike(a[i]))
+            raise(tTypeError, "'" + std::string(typeName(a[i])) + "' object cannot be interpreted as an integer");
+        if (intSign(a[i]) == 0)
+            return MKSMALL(0);
+        V g = gcd2(r, a[i]);
+        r = intAbs(binaryOp(binaryOp(r, g, OpFloorDiv), a[i], OpMul));
+    }
+    return r;
+}
+
+static V m_factorial(V *a, int n, Kw *)
+{
+    checkArgs("factorial", n, 1, 1);
+    if (!isIntLike(a[0]))
+    {
+        if (!IS_SMALL(a[0]) && a[0]->type->layout == L::Float)
+            raise(tTypeError, "'float' object cannot be interpreted as an integer");
+        raise(tTypeError, "'" + std::string(typeName(a[0])) + "' object cannot be interpreted as an integer");
+    }
+    int64_t k = indexOf(a[0]);
+    if (k < 0)
+        raise(tValueError, "factorial() not defined for negative values");
+    // multiply in a balanced tree to keep the operands similar in size
+    std::vector<V> parts;
+    for (int64_t i = 2; i <= k; ++i)
+        parts.push_back(mkint(i));
+    if (parts.empty())
+        return MKSMALL(1);
+    while (parts.size() > 1)
+    {
+        std::vector<V> next;
+        for (size_t i = 0; i + 1 < parts.size(); i += 2)
+            next.push_back(binaryOp(parts[i], parts[i + 1], OpMul));
+        if (parts.size() % 2)
+            next.push_back(parts.back());
+        parts = next;
+    }
+    return parts[0];
+}
+
+static V m_comb(V *a, int n, Kw *)
+{
+    checkArgs("comb", n, 2, 2);
+    int64_t nn = indexOf(a[0]), k = indexOf(a[1]);
+    if (nn < 0 || k < 0)
+        raise(tValueError, nn < 0 ? "n must be a non-negative integer" : "k must be a non-negative integer");
+    if (k > nn)
+        return MKSMALL(0);
+    if (k > nn - k)
+        k = nn - k;
+    V r = MKSMALL(1);
+    for (int64_t i = 1; i <= k; ++i)
+        r = binaryOp(binaryOp(r, mkint(nn - k + i), OpMul), mkint(i), OpFloorDiv);
+    return r;
+}
+
+static V m_perm(V *a, int n, Kw *)
+{
+    checkArgs("perm", n, 1, 2);
+    int64_t nn = indexOf(a[0]);
+    int64_t k = n > 1 && a[1] != None ? indexOf(a[1]) : nn;
+    if (nn < 0 || k < 0)
+        raise(tValueError, nn < 0 ? "n must be a non-negative integer" : "k must be a non-negative integer");
+    if (k > nn)
+        return MKSMALL(0);
+    V r = MKSMALL(1);
+    for (int64_t i = 0; i < k; ++i)
+        r = binaryOp(r, mkint(nn - i), OpMul);
+    return r;
+}
+
+static V m_isqrt(V *a, int n, Kw *)
+{
+    checkArgs("isqrt", n, 1, 1);
+    V x = a[0];
+    if (!isIntLike(x))
+    {
+        bool found;
+        x = callSpecial(a[0], intern("__index__"), nullptr, 0, found);
+        if (!found)
+            raise(tTypeError, "'" + std::string(typeName(a[0])) + "' object cannot be interpreted as an integer");
+    }
+    if (intSign(x) < 0)
+        raise(tValueError, "isqrt() argument must be nonnegative");
+    if (intSign(x) == 0)
+        return MKSMALL(0);
+    int64_t s;
+    if (intSmall(x, s) && s < ((int64_t)1 << 52))
+    {
+        int64_t r = (int64_t)std::sqrt((double)s);
+        while (r * r > s)
+            --r;
+        while ((r + 1) * (r + 1) <= s)
+            ++r;
+        return mkint(r);
+    }
+    // Newton's method on big ints
+    V r = intFromDouble(std::sqrt(intToDouble(x)));
+    for (;;)
+    {
+        V nr = binaryOp(binaryOp(r, binaryOp(x, r, OpFloorDiv), OpAdd), MKSMALL(2), OpFloorDiv);
+        if (intCompare(nr, r) >= 0)
+        {
+            // r may still be one too large
+            while (intCompare(binaryOp(r, r, OpMul), x) > 0)
+                r = binaryOp(r, MKSMALL(1), OpSub);
+            while (intCompare(binaryOp(binaryOp(r, MKSMALL(1), OpAdd), binaryOp(r, MKSMALL(1), OpAdd), OpMul), x) <= 0)
+                r = binaryOp(r, MKSMALL(1), OpAdd);
+            return r;
+        }
+        r = nr;
+    }
+}
+
+static V m_fsum(V *a, int n, Kw *)
+{
+    checkArgs("fsum", n, 1, 1);
+    // Shewchuk's exact summation (as math.fsum)
+    std::vector<double> partials;
+    for (V v : toVector(a[0]))
+    {
+        double x = num(v, "fsum");
+        size_t i = 0;
+        for (double y : partials)
+        {
+            if (fabs(x) < fabs(y))
+            {
+                double t = x;
+                x = y;
+                y = t;
+            }
+            double hi = x + y;
+            double lo = y - (hi - x);
+            if (lo != 0.0)
+                partials[i++] = lo;
+            x = hi;
+        }
+        partials.resize(i);
+        partials.push_back(x);
+    }
+    double hi = 0.0;
+    if (!partials.empty())
+    {
+        size_t k = partials.size();
+        hi = partials[--k];
+        double lo = 0;
+        while (k > 0)
+        {
+            double x = hi;
+            double y = partials[--k];
+            hi = x + y;
+            double yr = hi - x;
+            lo = y - yr;
+            if (lo != 0.0)
+                break;
+        }
+        if (k > 0 && ((lo < 0.0 && partials[k - 1] < 0.0) || (lo > 0.0 && partials[k - 1] > 0.0)))
+        {
+            double y = lo * 2.0;
+            double x = hi + y;
+            double yr = x - hi;
+            if (y == yr)
+                hi = x;
+        }
+    }
+    return mkfloat(hi);
+}
+
+static V m_prod(V *a, int n, Kw *kw)
+{
+    checkArgs("prod", n, 1, 1);
+    V start = kwArg(kw, "start");
+    V r = start ? start : MKSMALL(1);
+    for (V v : toVector(a[0]))
+        r = binaryOp(r, v, OpMul);
+    return r;
+}
+
+static V m_dist(V *a, int n, Kw *)
+{
+    checkArgs("dist", n, 2, 2);
+    std::vector<V> p = toVector(a[0]), q = toVector(a[1]);
+    if (p.size() != q.size())
+        raise(tValueError, "both points must have the same number of dimensions");
+    std::vector<V> diffs;
+    for (size_t i = 0; i < p.size(); ++i)
+        diffs.push_back(mkfloat(fabs(num(p[i], "dist") - num(q[i], "dist"))));
+    return m_hypot(diffs.data(), (int)diffs.size(), nullptr);
+}
+
+static V m_sumprod(V *a, int n, Kw *)
+{
+    checkArgs("sumprod", n, 2, 2);
+    std::vector<V> p = toVector(a[0]), q = toVector(a[1]);
+    if (p.size() != q.size())
+        raise(tValueError, "Inputs are not the same length");
+    bool allInt = true, allNum = true;
+    for (size_t i = 0; i < p.size(); ++i)
+        for (V v : {p[i], q[i]})
+        {
+            if (!isIntLike(v) || (!IS_SMALL(v) && v->type == tBool))
+                allInt = allInt && isIntLike(v);
+            if (!isIntLike(v) && !(typeOf(v) == tFloat))
+                allNum = false;
+        }
+    if (allNum && !allInt)
+    {
+        // a dot product with twice the working precision (TwoProduct and TwoSum)
+        double s = 0, c = 0;
+        for (size_t i = 0; i < p.size(); ++i)
+        {
+            double x = toDouble(p[i]), y = toDouble(q[i]);
+            double prod = x * y;
+            // the exact error of x*y by Dekker's split (no fma needed)
+            const double split = 134217729.0;
+            double tx = split * x, xh = tx - (tx - x), xl = x - xh;
+            double ty = split * y, yh = ty - (ty - y), yl = y - yh;
+            double pe = ((xh * yh - prod) + xh * yl + xl * yh) + xl * yl;
+            double t = s + prod;
+            double z = t - s;
+            double e = (s - (t - z)) + (prod - z);
+            s = t;
+            c += pe + e;
+        }
+        return mkfloat(s + c);
+    }
+    V r = MKSMALL(0);
+    for (size_t i = 0; i < p.size(); ++i)
+        r = binaryOp(r, binaryOp(p[i], q[i], OpMul), OpAdd);
+    return r;
+}
+
+static V m_nextafter(V *a, int n, Kw *)
+{
+    checkArgs("nextafter", n, 2, 2);
+    return mkfloat(nextafter(num(a[0], "nextafter"), num(a[1], "nextafter")));
+}
+
+static V m_ulp(V *a, int n, Kw *)
+{
+    checkArgs("ulp", n, 1, 1);
+    double x = fabs(num(a[0], "ulp"));
+    return mkfloat(nextafter(x, HUGE_VAL) - x);
+}
+
+struct NamedFn
+{
+    const char *name;
+    NativeFn fn;
+};
+
+static V mathModule()
+{
+    ModuleObj *m = new ModuleObj(tModule);
+    m->name = "math";
+    m->dict = newDict();
+    Dict *d = m->dict;
+    setAttrStr(d, "__name__", newStr("math"));
+    setAttrStr(d, "pi", mkfloat(M_PI));
+    setAttrStr(d, "e", mkfloat(M_E));
+    setAttrStr(d, "tau", mkfloat(2 * M_PI));
+    setAttrStr(d, "inf", mkfloat(HUGE_VAL));
+    setAttrStr(d, "nan", mkfloat(NAN));
+    NamedFn fns[] = {{"sin", m_sin}, {"cos", m_cos}, {"tan", m_tan}, {"asin", m_asin}, {"acos", m_acos}, {"atan", m_atan},
+               {"sinh", m_sinh}, {"cosh", m_cosh}, {"tanh", m_tanh}, {"asinh", m_asinh}, {"acosh", m_acosh},
+               {"atanh", m_atanh}, {"exp", m_exp}, {"expm1", m_expm1}, {"exp2", m_exp2}, {"log1p", m_log1p},
+               {"fabs", m_fabs}, {"erf", m_erf}, {"erfc", m_erfc}, {"degrees", m_degrees}, {"radians", m_radians},
+               {"cbrt", m_cbrt}, {"gamma", m_gamma}, {"lgamma", m_lgamma}, {"sqrt", m_sqrt}, {"log", m_log},
+               {"log2", m_log2}, {"log10", m_log10}, {"pow", m_pow}, {"atan2", m_atan2}, {"hypot", m_hypot},
+               {"copysign", m_copysign}, {"fmod", m_fmod}, {"remainder", m_remainder}, {"ldexp", m_ldexp},
+               {"frexp", m_frexp}, {"modf", m_modf}, {"floor", m_floor}, {"ceil", m_ceil}, {"trunc", m_trunc},
+               {"isnan", m_isnan}, {"isinf", m_isinf}, {"isfinite", m_isfinite}, {"isclose", m_isclose},
+               {"gcd", m_gcd}, {"lcm", m_lcm}, {"factorial", m_factorial}, {"comb", m_comb}, {"perm", m_perm},
+               {"isqrt", m_isqrt}, {"fsum", m_fsum}, {"prod", m_prod}, {"dist", m_dist}, {"sumprod", m_sumprod},
+               {"nextafter", m_nextafter}, {"ulp", m_ulp}};
+    for (auto &f : fns)
+        setAttrStr(d, f.name, makeNative(f.name, f.fn));
+    return m;
+}
+
+// ── imports ────────────────────────────────────────────────────────────────
+
+static std::unordered_map<std::string, V (*)()> *nativeModules;
+
+void registerNativeModule(const std::string &name, V (*init)())
+{
+    if (!nativeModules)
+        nativeModules = new std::unordered_map<std::string, V (*)()>();
+    (*nativeModules)[name] = init;
+}
+
+std::string librarySource(const std::string &name, bool &found)
+{
+    // a development override: QUANTUM_PYLIB=<dir> reads the library from disk
+    const char *dir = std::getenv("QUANTUM_PYLIB");
+    std::string file = name + ".sa";
+    if (dir)
+    {
+        std::string path = std::string(dir) + "/" + file;
+        FILE *fp = fopen(path.c_str(), "rb");
+        if (fp)
+        {
+            std::string s;
+            char buf[8192];
+            size_t k;
+            while ((k = fread(buf, 1, sizeof buf, fp)) > 0)
+                s.append(buf, k);
+            fclose(fp);
+            found = true;
+            return s;
+        }
+    }
+    for (const auto &lib : librarySources())
+        if (lib.first == file)
+        {
+            found = true;
+            return lib.second;
+        }
+    found = false;
+    return "";
+}
+
+static void runInModule(ModuleObj *m, const std::string &source, const std::string &filename)
+{
+    std::vector<Node *> body;
+    try
+    {
+        body = parseModule(source);
+    }
+    catch (SyntaxErr &e)
+    {
+        raise(tSyntaxError, filename + ":" + std::to_string(e.line) + ": " + e.message);
+    }
+    Code *code;
+    try
+    {
+        code = compileModule(body, filename, "<module>");
+    }
+    catch (SyntaxErr &e)
+    {
+        raise(tSyntaxError, filename + ":" + std::to_string(e.line) + ": " + e.message);
+    }
+    execModuleCode(code, m->dict);
+}
+
+V importModule(const std::string &name, int line)
+{
+    (void)line;
+    V existing = dictGetStr(modulesDict, intern(name));
+    if (existing)
+        return existing;
+    if (nativeModules)
+    {
+        auto it = nativeModules->find(name);
+        if (it != nativeModules->end())
+        {
+            V m = it->second();
+            dictSet(modulesDict, intern(name), m);
+            return m;
+        }
+    }
+    bool found;
+    std::string libName = name;
+    for (char &c : libName)
+        if (c == '.')
+            c = '_';
+    std::string src = librarySource(libName, found);
+    if (!found)
+    {
+        V e = makeExc(tModuleNotFoundError, "No module named '" + name + "'");
+        static_cast<ExcObj *>(e)->dict = newDict();
+        setAttrStr(static_cast<ExcObj *>(e)->dict, "name", newStr(name));
+        raiseV(e);
+    }
+    ModuleObj *m = new ModuleObj(tModule);
+    m->name = name;
+    m->dict = newDict();
+    setAttrStr(m->dict, "__name__", newStr(name));
+    setAttrStr(m->dict, "__builtins__", builtinsDict);
+    setAttrStr(m->dict, "__file__", newStr("<frozen " + name + ">"));
+    dictSet(modulesDict, intern(name), m);
+    try
+    {
+        runInModule(m, src, "<frozen " + name + ">");
+    }
+    catch (...)
+    {
+        dictDel(modulesDict, intern(name));
+        throw;
+    }
+    // a submodule is an attribute of its package
+    size_t dot = name.rfind('.');
+    if (dot != std::string::npos)
+    {
+        V parent = importModule(name.substr(0, dot), line);
+        setattr(parent, intern(name.substr(dot + 1)), m);
+    }
+    return m;
+}
+
+// ── setup ──────────────────────────────────────────────────────────────────
+
+static void def(const char *name, NativeFn fn) { setAttrStr(builtinsDict, name, makeNative(name, fn)); }
+
+static bool g_initialised = false;
+
+void initBuiltins()
+{
+    builtinsDict = newDict();
+    modulesDict = newDict();
+    def("print", builtinPrint);
+    def("len", b_len);
+    def("repr", b_repr);
+    def("ascii", b_ascii);
+    def("format", b_format);
+    def("abs", b_abs);
+    def("min", b_min);
+    def("max", b_max);
+    def("sum", b_sum);
+    def("sorted", b_sorted);
+    def("reversed", b_reversed);
+    def("enumerate", b_enumerate);
+    def("zip", b_zip);
+    def("map", b_map);
+    def("filter", b_filter);
+    def("any", b_any);
+    def("all", b_all);
+    def("isinstance", b_isinstance);
+    def("issubclass", b_issubclass);
+    def("getattr", b_getattr);
+    def("setattr", b_setattr);
+    def("delattr", b_delattr);
+    def("hasattr", b_hasattr);
+    def("chr", b_chr);
+    def("ord", b_ord);
+    def("hex", b_hex);
+    def("oct", b_oct);
+    def("bin", b_bin);
+    def("round", b_round);
+    def("divmod", b_divmod);
+    def("pow", b_pow);
+    def("hash", b_hash);
+    def("id", b_id);
+    def("callable", b_callable);
+    def("iter", b_iter);
+    def("next", b_next);
+    def("vars", b_vars);
+    def("dir", b_dir);
+    def("globals", b_globals);
+    def("locals", b_locals);
+    def("input", b_input);
+    def("exit", b_exit);
+    def("quit", b_exit);
+    def("__import__", b_import);
+    def("open", b_open);
+    def("eval", b_eval);
+    def("exec", b_exec);
+
+    Type *types[] = {tObject, tType, tInt, tBool, tFloat, tComplex, tStr, tBytes, tByteArray, tTuple, tList, tDict,
+                     tSet, tFrozenSet, tRange, tSlice, tProperty, tClassMethod, tStaticMethod, tSuper};
+    for (Type *t : types)
+        setAttrStr(builtinsDict, t->name.c_str(), t);
+    dictSet(tInt->dict, intern("__new__"), makeNative("__new__", int_new, false));
+    dictSet(tBool->dict, intern("__new__"), makeNative("__new__", bool_new, false));
+    defMethod(tBool, "__repr__", bool_repr);
+    defMethod(tBool, "__str__", bool_repr);
+    dictSet(tFloat->dict, intern("__new__"), makeNative("__new__", float_new, false));
+    defClassMethod(tFloat, "fromhex", float_fromhex);
+    dictSet(tComplex->dict, intern("__new__"), makeNative("__new__", complex_new, false));
+    defProperty(tComplex, "real", complex_real);
+    defProperty(tComplex, "imag", complex_imag);
+    defMethod(tComplex, "conjugate", complex_conjugate);
+    defMethod(tComplex, "__abs__", complex_abs);
+    defMethod(tComplex, "__neg__", complex_neg);
+    defMethod(tComplex, "__bool__", complex_bool);
+    setAttrStr(builtinsDict, "NotImplemented", NotImpl);
+    setAttrStr(builtinsDict, "Ellipsis", EllipsisV);
+    setAttrStr(builtinsDict, "None", None);
+    setAttrStr(builtinsDict, "True", True);
+    setAttrStr(builtinsDict, "False", False);
+    setAttrStr(builtinsDict, "__debug__", True);
+    setAttrStr(builtinsDict, "__name__", newStr("builtins"));
+    extern std::vector<Type *> &exceptionTypes();
+    for (Type *t : exceptionTypes())
+        setAttrStr(builtinsDict, t->name.c_str(), t);
+    setAttrStr(builtinsDict, "EnvironmentError", tOSError);
+    setAttrStr(builtinsDict, "IOError", tOSError);
+
+    registerNativeModule("builtins", []() -> V {
+        ModuleObj *m = new ModuleObj(tModule);
+        m->name = "builtins";
+        m->dict = builtinsDict;
+        return m;
+    });
+    registerNativeModule("sys", sysModule);
+    registerNativeModule("math", mathModule);
+    registerNativeModules();
+    (void)notimpl_singleton;
+}
+
+static void initRuntime()
+{
+    if (g_initialised)
+        return;
+    g_initialised = true;
+    initObjectModel();
+    initCollections();
+    initNumbers();
+    initStrings();
+    initVm();
+    initBuiltins();
+    // the builtins written in Python
+    bool found;
+    std::string src = librarySource("_prelude", found);
+    if (found)
+    {
+        ModuleObj *m = new ModuleObj(tModule);
+        m->name = "builtins";
+        m->dict = builtinsDict;
+        runInModule(m, src, "<frozen builtins>");
+    }
+}
+
+// The message CPython prints for an uncaught exception, and its traceback
+static void reportUncaught(V exc, RunFailure &failure, const std::string &path)
+{
+    std::string kind = typeName(exc);
+    std::string msg;
+    try
+    {
+        msg = strOf(exc);
+    }
+    catch (...)
+    {
+        msg = "<exception str() failed>";
+    }
+    ExcObj *e = IS_SMALL(exc) || exc->type->layout != L::Exc ? nullptr : static_cast<ExcObj *>(exc);
+    int line = e && !e->tbLines.empty() ? e->tbLines.front() : 0;
+    std::string out;
+    // the chain: causes and contexts first
+    std::vector<ExcObj *> chain;
+    std::vector<bool> viaCause;
+    for (ExcObj *x = e; x;)
+    {
+        chain.push_back(x);
+        ExcObj *next = nullptr;
+        bool cause = false;
+        if (x->cause)
+        {
+            next = static_cast<ExcObj *>(x->cause);
+            cause = true;
+        }
+        else if (x->context && !x->suppressContext)
+            next = static_cast<ExcObj *>(x->context);
+        viaCause.push_back(cause);
+        if (chain.size() > 20)
+            break;
+        x = next;
+    }
+    for (size_t i = chain.size(); i-- > 0;)
+    {
+        ExcObj *x = chain[i];
+        out += "Traceback (most recent call last):\n";
+        for (size_t k = x->tbLines.size(); k-- > 0;)
+            out += "  File \"" + path + "\", line " + std::to_string(x->tbLines[k]) + "\n";
+        std::string m;
+        try
+        {
+            m = strOf(x);
+        }
+        catch (...)
+        {
+        }
+        out += std::string(typeName(x)) + (m.empty() ? "" : ": " + m) + "\n";
+        for (const std::string &note : x->notes)
+            out += note + "\n";
+        if (i > 0)
+            out += viaCause[i - 1] ? "\nThe above exception was the direct cause of the following exception:\n\n"
+                                   : "\nDuring handling of the above exception, another exception occurred:\n\n";
+    }
+    if (!e)
+        out += kind + ": " + msg + "\n";
+    writeErr(out);
+    failure.failed = true;
+    failure.kind = kind;
+    failure.message = msg;
+    failure.line = line;
+}
+
+int runProgram(const std::string &source, const std::string &path, RunFailure &failure)
+{
+    g_scriptPath = path;
+    try
+    {
+        initRuntime();
+    }
+    catch (PyThrow &e)
+    {
+        flushOut();
+        reportUncaught(e.exc, failure, "<frozen builtins>");
+        return 1;
+    }
+    std::vector<Node *> body;
+    try
+    {
+        body = parseModule(source);
+    }
+    catch (SyntaxErr &e)
+    {
+        failure.failed = true;
+        failure.kind = "SyntaxError";
+        failure.message = e.message;
+        failure.line = e.line;
+        writeErr("  File \"" + path + "\", line " + std::to_string(e.line) + "\nSyntaxError: " + e.message + "\n");
+        return 1;
+    }
+    ModuleObj *main = new ModuleObj(tModule);
+    main->name = "__main__";
+    main->dict = newDict();
+    setAttrStr(main->dict, "__name__", newStr("__main__"));
+    setAttrStr(main->dict, "__file__", newStr(path));
+    setAttrStr(main->dict, "__builtins__", builtinsDict);
+    setAttrStr(main->dict, "__doc__", None);
+    dictSet(modulesDict, intern("__main__"), main);
+    int status = 0;
+    try
+    {
+        Code *code = compileModule(body, path, "<module>");
+        execModuleCode(code, main->dict);
+    }
+    catch (SyntaxErr &e)
+    {
+        failure.failed = true;
+        failure.kind = "SyntaxError";
+        failure.message = e.message;
+        failure.line = e.line;
+        writeErr("  File \"" + path + "\", line " + std::to_string(e.line) + "\nSyntaxError: " + e.message + "\n");
+        status = 1;
+    }
+    catch (PyThrow &e)
+    {
+        flushOut();
+        if (isinst(e.exc, tSystemExit))
+        {
+            ExcObj *x = static_cast<ExcObj *>(e.exc);
+            V code = x->args->items.empty() ? None : x->args->items[0];
+            if (code == None)
+                status = 0;
+            else if (isIntLike(code))
+                status = (int)indexOf(code);
+            else
+            {
+                writeErr(strOf(code) + "\n");
+                status = 1;
+            }
+        }
+        else
+        {
+            reportUncaught(e.exc, failure, path);
+            status = 1;
+        }
+    }
+    flushOut();
+    return status;
+}
+
+bool canRun(const std::string &source, const std::string &path, std::string &why)
+{
+    (void)path;
+    try
+    {
+        parseModule(source);
+        return true;
+    }
+    catch (SyntaxErr &e)
+    {
+        why = e.message;
+        return false;
+    }
+}
+
+} // namespace py

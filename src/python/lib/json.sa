@@ -1,0 +1,411 @@
+"""JSON encoder and decoder (as CPython's json, in pure Python)."""
+
+__all__ = ["dump", "dumps", "load", "loads", "JSONDecoder", "JSONDecodeError", "JSONEncoder"]
+
+import re
+
+
+class JSONDecodeError(ValueError):
+    def __init__(self, msg, doc, pos):
+        lineno = doc.count("\n", 0, pos) + 1
+        colno = pos - doc.rfind("\n", 0, pos)
+        errmsg = "%s: line %d column %d (char %d)" % (msg, lineno, colno, pos)
+        ValueError.__init__(self, errmsg)
+        self.msg = msg
+        self.doc = doc
+        self.pos = pos
+        self.lineno = lineno
+        self.colno = colno
+
+    def __reduce__(self):
+        return self.__class__, (self.msg, self.doc, self.pos)
+
+
+JSONDecodeError.__module__ = "json.decoder"
+
+_ESCAPE_DCT = {"\\": "\\\\", '"': '\\"', "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+for _i in range(0x20):
+    _ESCAPE_DCT.setdefault(chr(_i), "\\u{0:04x}".format(_i))
+
+
+def _encode_basestring(s):
+    return '"' + "".join(_ESCAPE_DCT.get(c, c) for c in s) + '"'
+
+
+def _encode_basestring_ascii(s):
+    out = []
+    for c in s:
+        e = _ESCAPE_DCT.get(c)
+        if e is not None:
+            out.append(e)
+        elif ord(c) < 128:
+            out.append(c)
+        else:
+            n = ord(c)
+            if n < 0x10000:
+                out.append("\\u{0:04x}".format(n))
+            else:
+                n -= 0x10000
+                s1 = 0xD800 | ((n >> 10) & 0x3FF)
+                s2 = 0xDC00 | (n & 0x3FF)
+                out.append("\\u{0:04x}\\u{1:04x}".format(s1, s2))
+    return '"' + "".join(out) + '"'
+
+
+class JSONEncoder:
+    item_separator = ", "
+    key_separator = ": "
+
+    def __init__(self, *, skipkeys=False, ensure_ascii=True, check_circular=True, allow_nan=True, sort_keys=False,
+                 indent=None, separators=None, default=None):
+        self.skipkeys = skipkeys
+        self.ensure_ascii = ensure_ascii
+        self.check_circular = check_circular
+        self.allow_nan = allow_nan
+        self.sort_keys = sort_keys
+        self.indent = indent
+        if separators is not None:
+            self.item_separator, self.key_separator = separators
+        elif indent is not None:
+            self.item_separator = ","
+        if default is not None:
+            self.default = default
+
+    def default(self, o):
+        raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+    def encode(self, o):
+        if isinstance(o, str):
+            if self.ensure_ascii:
+                return _encode_basestring_ascii(o)
+            return _encode_basestring(o)
+        return "".join(self.iterencode(o))
+
+    def iterencode(self, o, _one_shot=False):
+        markers = {} if self.check_circular else None
+        _encoder = _encode_basestring_ascii if self.ensure_ascii else _encode_basestring
+        indent = self.indent
+        if indent is not None and not isinstance(indent, str):
+            indent = " " * indent
+
+        def floatstr(o, allow_nan=self.allow_nan):
+            if o != o:
+                text = "NaN"
+            elif o == float("inf"):
+                text = "Infinity"
+            elif o == -float("inf"):
+                text = "-Infinity"
+            else:
+                return float.__repr__(o)
+            if not allow_nan:
+                raise ValueError("Out of range float values are not JSON compliant: " + repr(o))
+            return text
+
+        item_separator = self.item_separator
+        key_separator = self.key_separator
+        sort_keys = self.sort_keys
+        skipkeys = self.skipkeys
+        default = self.default
+        chunks = []
+
+        def enc(o, level):
+            if isinstance(o, str):
+                chunks.append(_encoder(o))
+            elif o is None:
+                chunks.append("null")
+            elif o is True:
+                chunks.append("true")
+            elif o is False:
+                chunks.append("false")
+            elif isinstance(o, int):
+                chunks.append(int.__repr__(o))
+            elif isinstance(o, float):
+                chunks.append(floatstr(o))
+            elif isinstance(o, (list, tuple)):
+                enc_list(o, level)
+            elif isinstance(o, dict):
+                enc_dict(o, level)
+            else:
+                if markers is not None:
+                    markerid = id(o)
+                    if markerid in markers:
+                        raise ValueError("Circular reference detected")
+                    markers[markerid] = o
+                enc(default(o), level)
+                if markers is not None:
+                    del markers[markerid]
+
+        def enc_list(lst, level):
+            if not lst:
+                chunks.append("[]")
+                return
+            if markers is not None:
+                markerid = id(lst)
+                if markerid in markers:
+                    raise ValueError("Circular reference detected")
+                markers[markerid] = lst
+            chunks.append("[")
+            if indent is not None:
+                level += 1
+                newline_indent = "\n" + indent * level
+                separator = item_separator + newline_indent
+                chunks.append(newline_indent)
+            else:
+                newline_indent = None
+                separator = item_separator
+            first = True
+            for value in lst:
+                if not first:
+                    chunks.append(separator)
+                first = False
+                enc(value, level)
+            if newline_indent is not None:
+                level -= 1
+                chunks.append("\n" + indent * level)
+            chunks.append("]")
+            if markers is not None:
+                del markers[markerid]
+
+        def enc_dict(dct, level):
+            if not dct:
+                chunks.append("{}")
+                return
+            if markers is not None:
+                markerid = id(dct)
+                if markerid in markers:
+                    raise ValueError("Circular reference detected")
+                markers[markerid] = dct
+            chunks.append("{")
+            if indent is not None:
+                level += 1
+                newline_indent = "\n" + indent * level
+                item_sep = item_separator + newline_indent
+                chunks.append(newline_indent)
+            else:
+                newline_indent = None
+                item_sep = item_separator
+            first = True
+            items = sorted(dct.items()) if sort_keys else dct.items()
+            for key, value in items:
+                if isinstance(key, str):
+                    pass
+                elif isinstance(key, float):
+                    key = floatstr(key)
+                elif key is True:
+                    key = "true"
+                elif key is False:
+                    key = "false"
+                elif key is None:
+                    key = "null"
+                elif isinstance(key, int):
+                    key = int.__repr__(key)
+                elif skipkeys:
+                    continue
+                else:
+                    raise TypeError(f"keys must be str, int, float, bool or None, not {key.__class__.__name__}")
+                if not first:
+                    chunks.append(item_sep)
+                first = False
+                chunks.append(_encoder(key))
+                chunks.append(key_separator)
+                enc(value, level)
+            if newline_indent is not None:
+                level -= 1
+                chunks.append("\n" + indent * level)
+            chunks.append("}")
+            if markers is not None:
+                del markers[markerid]
+
+        enc(o, 0)
+        return chunks
+
+
+NUMBER_RE = re.compile(r"(-?(?:0|[1-9][0-9]*))(\.[0-9]+)?([eE][-+]?[0-9]+)?")
+WHITESPACE = " \t\n\r"
+BACKSLASH = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+class JSONDecoder:
+    def __init__(self, *, object_hook=None, parse_float=None, parse_int=None, parse_constant=None, strict=True,
+                 object_pairs_hook=None):
+        self.object_hook = object_hook
+        self.parse_float = parse_float or float
+        self.parse_int = parse_int or int
+        self.parse_constant = parse_constant or {"-Infinity": float("-inf"), "Infinity": float("inf"), "NaN": float("nan")}.__getitem__
+        self.strict = strict
+        self.object_pairs_hook = object_pairs_hook
+
+    def decode(self, s):
+        obj, end = self.raw_decode(s, self._skip(s, 0))
+        end = self._skip(s, end)
+        if end != len(s):
+            raise JSONDecodeError("Extra data", s, end)
+        return obj
+
+    def _skip(self, s, i):
+        n = len(s)
+        while i < n and s[i] in WHITESPACE:
+            i += 1
+        return i
+
+    def raw_decode(self, s, idx=0):
+        try:
+            return self._value(s, idx)
+        except StopIteration as err:
+            raise JSONDecodeError("Expecting value", s, err.value) from None
+
+    def _value(self, s, idx):
+        if idx >= len(s):
+            raise StopIteration(idx)
+        c = s[idx]
+        if c == '"':
+            return self._string(s, idx + 1)
+        if c == "{":
+            return self._object(s, idx + 1)
+        if c == "[":
+            return self._array(s, idx + 1)
+        if c == "n" and s[idx:idx + 4] == "null":
+            return None, idx + 4
+        if c == "t" and s[idx:idx + 4] == "true":
+            return True, idx + 4
+        if c == "f" and s[idx:idx + 5] == "false":
+            return False, idx + 5
+        m = NUMBER_RE.match(s, idx)
+        if m is not None:
+            integer, frac, exp = m.groups()
+            if frac or exp:
+                res = self.parse_float(integer + (frac or "") + (exp or ""))
+            else:
+                res = self.parse_int(integer)
+            return res, m.end()
+        if c == "N" and s[idx:idx + 3] == "NaN":
+            return self.parse_constant("NaN"), idx + 3
+        if c == "I" and s[idx:idx + 8] == "Infinity":
+            return self.parse_constant("Infinity"), idx + 8
+        if c == "-" and s[idx:idx + 9] == "-Infinity":
+            return self.parse_constant("-Infinity"), idx + 9
+        raise StopIteration(idx)
+
+    def _string(self, s, end):
+        chunks = []
+        begin = end - 1
+        n = len(s)
+        while True:
+            j = end
+            while j < n and s[j] != '"' and s[j] != "\\":
+                if self.strict and s[j] < " ":
+                    raise JSONDecodeError("Invalid control character at", s, j)
+                j += 1
+            if j >= n:
+                raise JSONDecodeError("Unterminated string starting at", s, begin)
+            chunks.append(s[end:j])
+            if s[j] == '"':
+                return "".join(chunks), j + 1
+            esc = s[j + 1:j + 2]
+            if esc != "u":
+                if esc not in BACKSLASH:
+                    raise JSONDecodeError("Invalid \\escape: {0!r}".format(esc), s, j)
+                chunks.append(BACKSLASH[esc])
+                end = j + 2
+            else:
+                uni = int(s[j + 2:j + 6], 16)
+                end = j + 6
+                if 0xD800 <= uni <= 0xDBFF and s[end:end + 2] == "\\u":
+                    uni2 = int(s[end + 2:end + 6], 16)
+                    if 0xDC00 <= uni2 <= 0xDFFF:
+                        uni = 0x10000 + (((uni - 0xD800) << 10) | (uni2 - 0xDC00))
+                        end += 6
+                chunks.append(chr(uni))
+
+    def _object(self, s, end):
+        pairs = []
+        end = self._skip(s, end)
+        if s[end:end + 1] == "}":
+            if self.object_pairs_hook is not None:
+                return self.object_pairs_hook(pairs), end + 1
+            pairs = {}
+            if self.object_hook is not None:
+                pairs = self.object_hook(pairs)
+            return pairs, end + 1
+        while True:
+            if s[end:end + 1] != '"':
+                raise JSONDecodeError("Expecting property name enclosed in double quotes", s, end)
+            key, end = self._string(s, end + 1)
+            end = self._skip(s, end)
+            if s[end:end + 1] != ":":
+                raise JSONDecodeError("Expecting ':' delimiter", s, end)
+            end = self._skip(s, end + 1)
+            try:
+                value, end = self._value(s, end)
+            except StopIteration as err:
+                raise JSONDecodeError("Expecting value", s, err.value) from None
+            pairs.append((key, value))
+            end = self._skip(s, end)
+            nextchar = s[end:end + 1]
+            end += 1
+            if nextchar == "}":
+                break
+            if nextchar != ",":
+                raise JSONDecodeError("Expecting ',' delimiter", s, end - 1)
+            comma_idx = end - 1
+            end = self._skip(s, end)
+            if s[end:end + 1] == "}":
+                raise JSONDecodeError("Illegal trailing comma before end of object", s, comma_idx)
+        if self.object_pairs_hook is not None:
+            return self.object_pairs_hook(pairs), end
+        pairs = dict(pairs)
+        if self.object_hook is not None:
+            pairs = self.object_hook(pairs)
+        return pairs, end
+
+    def _array(self, s, end):
+        values = []
+        end = self._skip(s, end)
+        if s[end:end + 1] == "]":
+            return values, end + 1
+        while True:
+            try:
+                value, end = self._value(s, end)
+            except StopIteration as err:
+                raise JSONDecodeError("Expecting value", s, err.value) from None
+            values.append(value)
+            end = self._skip(s, end)
+            nextchar = s[end:end + 1]
+            end += 1
+            if nextchar == "]":
+                break
+            if nextchar != ",":
+                raise JSONDecodeError("Expecting ',' delimiter", s, end - 1)
+            comma_idx = end - 1
+            end = self._skip(s, end)
+            if s[end:end + 1] == "]":
+                raise JSONDecodeError("Illegal trailing comma before end of array", s, comma_idx)
+        return values, end
+
+
+def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True, allow_nan=True, cls=None, indent=None,
+          separators=None, default=None, sort_keys=False, **kw):
+    if cls is None:
+        cls = JSONEncoder
+    return cls(skipkeys=skipkeys, ensure_ascii=ensure_ascii, check_circular=check_circular, allow_nan=allow_nan,
+               indent=indent, separators=separators, default=default, sort_keys=sort_keys, **kw).encode(obj)
+
+
+def dump(obj, fp, **kwargs):
+    fp.write(dumps(obj, **kwargs))
+
+
+def loads(s, *, cls=None, object_hook=None, parse_float=None, parse_int=None, parse_constant=None,
+          object_pairs_hook=None, **kw):
+    if isinstance(s, (bytes, bytearray)):
+        s = s.decode("utf-8")
+    if not isinstance(s, str):
+        raise TypeError(f"the JSON object must be str, bytes or bytearray, not {s.__class__.__name__}")
+    if cls is None:
+        cls = JSONDecoder
+    return cls(object_hook=object_hook, parse_float=parse_float, parse_int=parse_int,
+               parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw).decode(s)
+
+
+def load(fp, **kwargs):
+    return loads(fp.read(), **kwargs)

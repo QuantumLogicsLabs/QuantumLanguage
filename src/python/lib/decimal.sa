@@ -1,0 +1,1359 @@
+"""Decimal fixed- and floating-point arithmetic (after CPython's _pydecimal)."""
+
+import math as _math
+from collections import namedtuple as _namedtuple
+
+__all__ = ["Decimal", "Context", "DecimalTuple", "DefaultContext", "BasicContext", "ExtendedContext",
+           "DecimalException", "Clamped", "InvalidOperation", "DivisionByZero", "Inexact", "Rounded",
+           "Subnormal", "Overflow", "Underflow", "FloatOperation", "DivisionImpossible", "InvalidContext",
+           "ConversionSyntax", "DivisionUndefined", "ROUND_DOWN", "ROUND_HALF_UP", "ROUND_HALF_EVEN",
+           "ROUND_CEILING", "ROUND_FLOOR", "ROUND_UP", "ROUND_HALF_DOWN", "ROUND_05UP", "setcontext",
+           "getcontext", "localcontext", "MAX_PREC", "MAX_EMAX", "MIN_EMIN", "MIN_ETINY", "HAVE_THREADS",
+           "HAVE_CONTEXTVAR"]
+
+MAX_PREC = 999999999999999999
+MAX_EMAX = 999999999999999999
+MIN_EMIN = -999999999999999999
+MIN_ETINY = MIN_EMIN - (MAX_PREC - 1)
+HAVE_THREADS = True
+HAVE_CONTEXTVAR = True
+
+ROUND_DOWN = "ROUND_DOWN"
+ROUND_HALF_UP = "ROUND_HALF_UP"
+ROUND_HALF_EVEN = "ROUND_HALF_EVEN"
+ROUND_CEILING = "ROUND_CEILING"
+ROUND_FLOOR = "ROUND_FLOOR"
+ROUND_UP = "ROUND_UP"
+ROUND_HALF_DOWN = "ROUND_HALF_DOWN"
+ROUND_05UP = "ROUND_05UP"
+
+DecimalTuple = _namedtuple("DecimalTuple", "sign digits exponent", module="decimal")
+
+
+class DecimalException(ArithmeticError):
+    def __str__(self):
+        if self.args:
+            return super().__str__()
+        return "[<class 'decimal.%s'>]" % type(self).__name__
+
+
+class Clamped(DecimalException):
+    pass
+
+
+class InvalidOperation(DecimalException):
+    pass
+
+
+class ConversionSyntax(InvalidOperation):
+    pass
+
+
+class DivisionByZero(DecimalException, ZeroDivisionError):
+    pass
+
+
+class DivisionImpossible(InvalidOperation):
+    pass
+
+
+class DivisionUndefined(InvalidOperation, ZeroDivisionError):
+    pass
+
+
+class Inexact(DecimalException):
+    pass
+
+
+class InvalidContext(InvalidOperation):
+    pass
+
+
+class Rounded(DecimalException):
+    pass
+
+
+class Subnormal(DecimalException):
+    pass
+
+
+class Overflow(Inexact, Rounded):
+    pass
+
+
+class Underflow(Inexact, Rounded, Subnormal):
+    pass
+
+
+class FloatOperation(DecimalException, TypeError):
+    pass
+
+
+for _c in (DecimalException, Clamped, InvalidOperation, ConversionSyntax, DivisionByZero, DivisionImpossible,
+           DivisionUndefined, Inexact, InvalidContext, Rounded, Subnormal, Overflow, Underflow, FloatOperation):
+    _c.__module__ = "decimal"
+
+
+class Context:
+    def __init__(self, prec=None, rounding=None, Emin=None, Emax=None, capitals=None, clamp=None, flags=None,
+                 traps=None):
+        dc = DefaultContext if "DefaultContext" in globals() else None
+        self.prec = prec if prec is not None else (dc.prec if dc else 28)
+        self.rounding = rounding if rounding is not None else (dc.rounding if dc else ROUND_HALF_EVEN)
+        self.Emin = Emin if Emin is not None else (dc.Emin if dc else -999999)
+        self.Emax = Emax if Emax is not None else (dc.Emax if dc else 999999)
+        self.capitals = capitals if capitals is not None else 1
+        self.clamp = clamp if clamp is not None else 0
+        self.traps = dict(traps) if isinstance(traps, dict) else {InvalidOperation: True, DivisionByZero: True, Overflow: True}
+        self.flags = {}
+
+    def copy(self):
+        c = Context(self.prec, self.rounding, self.Emin, self.Emax, self.capitals, self.clamp, None, self.traps)
+        return c
+
+    __copy__ = copy
+
+    def __repr__(self):
+        traps = [t.__name__ for t, v in self.traps.items() if v]
+        flags = [t.__name__ for t, v in self.flags.items() if v]
+        return ("Context(prec=%d, rounding=%s, Emin=%d, Emax=%d, capitals=%d, clamp=%d, flags=[%s], traps=[%s])"
+                % (self.prec, self.rounding, self.Emin, self.Emax, self.capitals, self.clamp, ", ".join(flags),
+                   ", ".join(traps)))
+
+    def Etiny(self):
+        return self.Emin - self.prec + 1
+
+    def Etop(self):
+        return self.Emax - self.prec + 1
+
+    def _raise_error(self, condition, explanation=None):
+        self.flags[condition] = True
+        if self.traps.get(condition) or any(self.traps.get(b) for b in condition.__mro__ if b is not condition and isinstance(b, type) and issubclass(b, DecimalException)):
+            raise condition([condition]) if explanation is None else condition(explanation)
+        if condition in (InvalidOperation, ConversionSyntax, DivisionUndefined, DivisionImpossible):
+            return _NaN
+        return None
+
+    def create_decimal(self, num="0"):
+        return Decimal(num)._fix(self)
+
+    def create_decimal_from_float(self, f):
+        return Decimal.from_float(f)._fix(self)
+
+    def clear_flags(self):
+        self.flags = {}
+
+    def clear_traps(self):
+        self.traps = {}
+
+    def add(self, a, b):
+        return _convert(a).__add__(b, context=self)
+
+    def subtract(self, a, b):
+        return _convert(a).__sub__(b, context=self)
+
+    def multiply(self, a, b):
+        return _convert(a).__mul__(b, context=self)
+
+    def divide(self, a, b):
+        return _convert(a).__truediv__(b, context=self)
+
+    def sqrt(self, a):
+        return _convert(a).sqrt(context=self)
+
+    def power(self, a, b, modulo=None):
+        return _convert(a).__pow__(b, modulo, context=self)
+
+    def quantize(self, a, b):
+        return _convert(a).quantize(b, context=self)
+
+    def to_sci_string(self, a):
+        return str(_convert(a))
+
+
+_current_context = None
+
+
+def getcontext():
+    global _current_context
+    if _current_context is None:
+        _current_context = DefaultContext.copy()
+    return _current_context
+
+
+def setcontext(context):
+    global _current_context
+    if context in (DefaultContext, BasicContext, ExtendedContext):
+        context = context.copy()
+        context.clear_flags()
+    _current_context = context
+
+
+class _ContextManager:
+    def __init__(self, new_context):
+        self.new_context = new_context.copy()
+
+    def __enter__(self):
+        self.saved_context = getcontext()
+        setcontext(self.new_context)
+        return self.new_context
+
+    def __exit__(self, t, v, tb):
+        setcontext(self.saved_context)
+
+
+def localcontext(ctx=None, **kwargs):
+    if ctx is None:
+        ctx = getcontext()
+    manager = _ContextManager(ctx)
+    for key, value in kwargs.items():
+        if key not in ("prec", "rounding", "Emin", "Emax", "capitals", "clamp", "flags", "traps"):
+            raise TypeError(f"'{key}' is an invalid keyword argument for this function")
+        setattr(manager.new_context, key, value)
+    return manager
+
+
+def _convert(other, raiseit=True, allow_float=False):
+    if isinstance(other, Decimal):
+        return other
+    if isinstance(other, int):
+        return Decimal(other)
+    if allow_float and isinstance(other, float):
+        return Decimal.from_float(other)
+    if raiseit:
+        raise TypeError("Unable to convert %s to Decimal" % other)
+    return NotImplemented
+
+
+def _dec(sign, coefficient, exponent, special=False):
+    self = object.__new__(Decimal)
+    self._sign = sign
+    self._int = coefficient
+    self._exp = exponent
+    self._is_special = special
+    return self
+
+
+class Decimal:
+    __slots__ = ("_exp", "_int", "_sign", "_is_special")
+
+    def __new__(cls, value="0", context=None):
+        self = object.__new__(cls)
+        if isinstance(value, str):
+            s = value.strip().replace("_", "")
+            m = _parse(s)
+            if m is None:
+                if context is None:
+                    context = getcontext()
+                if context.traps.get(InvalidOperation, True):
+                    raise InvalidOperation([ConversionSyntax])
+                return _NaN
+            sign, intpart, fracpart, exp, special = m
+            self._sign = sign
+            if special:
+                self._is_special = True
+                self._int = ""
+                self._exp = special
+                return self
+            self._int = str(int((intpart + fracpart) or "0"))
+            self._exp = exp - len(fracpart)
+            self._is_special = False
+            return self
+        if isinstance(value, int):
+            self._sign = 1 if value < 0 else 0
+            self._int = str(abs(value))
+            self._exp = 0
+            self._is_special = False
+            return self
+        if isinstance(value, Decimal):
+            self._sign = value._sign
+            self._int = value._int
+            self._exp = value._exp
+            self._is_special = value._is_special
+            return self
+        if isinstance(value, float):
+            d = Decimal.from_float(value)
+            self._sign, self._int, self._exp, self._is_special = d._sign, d._int, d._exp, d._is_special
+            return self
+        if isinstance(value, (list, tuple)):
+            sign, digits, exp = value
+            self._sign = sign
+            if exp == "F":
+                self._int = ""
+                self._exp = "F"
+                self._is_special = True
+            elif exp in ("n", "N"):
+                self._int = "".join(map(str, digits))
+                self._exp = exp
+                self._is_special = True
+            else:
+                self._int = str(int("".join(map(str, digits)) or "0"))
+                self._exp = exp
+                self._is_special = False
+            return self
+        raise TypeError("Cannot convert %r to Decimal" % value)
+
+    @classmethod
+    def from_float(cls, f):
+        if isinstance(f, int):
+            return cls(f)
+        if not isinstance(f, float):
+            raise TypeError("argument must be int or float.")
+        if _math.isinf(f) or _math.isnan(f):
+            return cls(repr(f))
+        sign = 0 if _math.copysign(1.0, f) == 1.0 else 1
+        n, d = abs(f).as_integer_ratio()
+        k = d.bit_length() - 1
+        result = _dec(sign, str(n * 5 ** k), -k)
+        return result if cls is Decimal else cls(result)
+
+    from_number = from_float
+
+    # ── predicates and parts ──
+
+    def _isnan(self):
+        if self._is_special:
+            if self._exp == "n":
+                return 1
+            if self._exp == "N":
+                return 2
+        return 0
+
+    def _isinfinity(self):
+        if self._exp == "F":
+            return -1 if self._sign else 1
+        return 0
+
+    def is_nan(self):
+        return self._exp in ("n", "N")
+
+    def is_qnan(self):
+        return self._exp == "n"
+
+    def is_snan(self):
+        return self._exp == "N"
+
+    def is_infinite(self):
+        return self._exp == "F"
+
+    def is_finite(self):
+        return not self._is_special
+
+    def is_zero(self):
+        return not self._is_special and self._int == "0"
+
+    def is_signed(self):
+        return self._sign == 1
+
+    def is_normal(self, context=None):
+        return not self._is_special and self._int != "0"
+
+    def is_integer(self):
+        if self._is_special:
+            return False
+        return self._exp >= 0 or self._int[self._exp:].strip("0") == ""
+
+    def __bool__(self):
+        return self._is_special or self._int != "0"
+
+    def adjusted(self):
+        try:
+            return self._exp + len(self._int) - 1
+        except TypeError:
+            return 0
+
+    def as_tuple(self):
+        return DecimalTuple(self._sign, tuple(map(int, self._int)), self._exp)
+
+    def as_integer_ratio(self):
+        if self._is_special:
+            raise ValueError("cannot convert NaN or infinity to integer ratio")
+        if not self:
+            return 0, 1
+        n = int(self._int)
+        if self._exp >= 0:
+            n, d = n * 10 ** self._exp, 1
+        else:
+            d5 = -self._exp
+            while d5 > 0 and n % 5 == 0:
+                n //= 5
+                d5 -= 1
+            d2 = -self._exp
+            shift2 = min((n & -n).bit_length() - 1, d2)
+            if shift2:
+                n >>= shift2
+                d2 -= shift2
+            d = 5 ** d5 << d2
+        if self._sign:
+            n = -n
+        return n, d
+
+    def copy_abs(self):
+        return _dec(0, self._int, self._exp, self._is_special)
+
+    def copy_negate(self):
+        return _dec(1 - self._sign, self._int, self._exp, self._is_special)
+
+    def copy_sign(self, other, context=None):
+        other = _convert(other)
+        return _dec(other._sign, self._int, self._exp, self._is_special)
+
+    # ── strings ──
+
+    def __str__(self, eng=False, context=None):
+        sign = ["", "-"][self._sign]
+        if self._is_special:
+            if self._exp == "F":
+                return sign + "Infinity"
+            elif self._exp == "n":
+                return sign + "NaN" + self._int
+            else:
+                return sign + "sNaN" + self._int
+        leftdigits = self._exp + len(self._int)
+        if self._exp <= 0 and leftdigits > -6:
+            dotplace = leftdigits
+        elif not eng:
+            dotplace = 1
+        elif self._int == "0":
+            dotplace = (leftdigits + 1) % 3 - 1
+        else:
+            dotplace = (leftdigits - 1) % 3 + 1
+        if dotplace <= 0:
+            intpart = "0"
+            fracpart = "." + "0" * (-dotplace) + self._int
+        elif dotplace >= len(self._int):
+            intpart = self._int + "0" * (dotplace - len(self._int))
+            fracpart = ""
+        else:
+            intpart = self._int[:dotplace]
+            fracpart = "." + self._int[dotplace:]
+        if leftdigits == dotplace:
+            exp = ""
+        else:
+            if context is None:
+                context = getcontext()
+            exp = ["e", "E"][context.capitals] + "%+d" % (leftdigits - dotplace)
+        return sign + intpart + fracpart + exp
+
+    def to_eng_string(self, context=None):
+        return self.__str__(eng=True, context=context)
+
+    def __repr__(self):
+        return "Decimal('%s')" % str(self)
+
+    # ── conversions ──
+
+    def __float__(self):
+        if self._isnan():
+            s = "-nan" if self._sign else "nan"
+        else:
+            s = str(self)
+        return float(s)
+
+    def __int__(self):
+        if self._is_special:
+            if self._isnan():
+                raise ValueError("Cannot convert NaN to integer")
+            raise OverflowError("Cannot convert infinity to integer")
+        s = (-1) ** self._sign
+        if self._exp >= 0:
+            return s * int(self._int) * 10 ** self._exp
+        return s * int(self._int[:self._exp] or "0")
+
+    __trunc__ = __int__
+
+    @property
+    def real(self):
+        return self
+
+    @property
+    def imag(self):
+        return Decimal(0)
+
+    def conjugate(self):
+        return self
+
+    def __complex__(self):
+        return complex(float(self))
+
+    def __hash__(self):
+        if self._is_special:
+            if self.is_snan():
+                raise TypeError("Cannot hash a signaling NaN value.")
+            elif self.is_nan():
+                return 0
+            return 314159 if not self._sign else -314159
+        n, d = self.as_integer_ratio()
+        if d == 1:
+            return hash(n)
+        from fractions import Fraction
+        return hash(Fraction(n, d))
+
+    # ── rounding ──
+
+    def _fix(self, context):
+        if self._is_special:
+            return self
+        Etiny = context.Etiny()
+        Etop = context.Etop()
+        if self._int == "0":
+            exp_max = [context.Emax, Etop][context.clamp]
+            new_exp = min(max(self._exp, Etiny), exp_max)
+            if new_exp != self._exp:
+                return _dec(self._sign, "0", new_exp)
+            return self
+        exp_min = len(self._int) + self._exp - context.prec
+        if exp_min > Etop:
+            context._raise_error(Overflow, "above Emax")
+            return _dec(self._sign, "", "F", True)
+        self_is_subnormal = exp_min < Etiny
+        if self_is_subnormal:
+            exp_min = Etiny
+        if self._exp < exp_min:
+            digits = len(self._int) + self._exp - exp_min
+            if digits < 0:
+                self = _dec(self._sign, "1", exp_min - 1)
+                digits = 0
+            changed = _rounders[context.rounding](self, digits)
+            coeff = self._int[:digits] or "0"
+            if changed > 0:
+                coeff = str(int(coeff) + 1)
+                if len(coeff) > context.prec:
+                    coeff = coeff[:-1]
+                    exp_min += 1
+            if exp_min > Etop:
+                context._raise_error(Overflow, "above Emax")
+                return _dec(self._sign, "", "F", True)
+            if changed:
+                context.flags[Inexact] = True
+                context.flags[Rounded] = True
+                if context.traps.get(Inexact):
+                    raise Inexact([Inexact])
+            return _dec(self._sign, coeff, exp_min)
+        if context.clamp == 1 and self._exp > Etop:
+            self_padded = self._int + "0" * (self._exp - Etop)
+            return _dec(self._sign, self_padded, Etop)
+        return self
+
+    def _rescale(self, exp, rounding):
+        if self._is_special:
+            return self
+        if self._int == "0":
+            return _dec(self._sign, "0", exp)
+        if self._exp >= exp:
+            return _dec(self._sign, self._int + "0" * (self._exp - exp), exp)
+        digits = len(self._int) + self._exp - exp
+        if digits < 0:
+            self = _dec(self._sign, "1", exp - 1)
+            digits = 0
+        this_function = _rounders[rounding]
+        changed = this_function(self, digits)
+        coeff = self._int[:digits] or "0"
+        if changed == 1:
+            coeff = str(int(coeff) + 1)
+        return _dec(self._sign, coeff, exp)
+
+    def quantize(self, exp, rounding=None, context=None):
+        exp = _convert(exp, raiseit=True)
+        if context is None:
+            context = getcontext()
+        if rounding is None:
+            rounding = context.rounding
+        if self._is_special or exp._is_special:
+            if self._isinfinity() and exp._isinfinity():
+                return Decimal(self)
+            return context._raise_error(InvalidOperation, "quantize with one INF")
+        if not (context.Etiny() <= exp._exp <= context.Emax):
+            return context._raise_error(InvalidOperation, "target exponent out of bounds in quantize")
+        if not self:
+            ans = _dec(self._sign, "0", exp._exp)
+            return ans._fix(context)
+        self_adjusted = self.adjusted()
+        if self_adjusted > context.Emax:
+            return context._raise_error(InvalidOperation, "exponent of quantize result too large for current context")
+        if self_adjusted - exp._exp + 1 > context.prec:
+            return context._raise_error(InvalidOperation, "quantize result has too many digits for current context")
+        ans = self._rescale(exp._exp, rounding)
+        if ans.adjusted() > context.Emax:
+            return context._raise_error(InvalidOperation, "exponent of quantize result too large for current context")
+        if len(ans._int) > context.prec:
+            return context._raise_error(InvalidOperation, "quantize result has too many digits for current context")
+        return ans
+
+    def same_quantum(self, other, context=None):
+        other = _convert(other)
+        return self._exp == other._exp
+
+    def to_integral_value(self, rounding=None, context=None):
+        if context is None:
+            context = getcontext()
+        if rounding is None:
+            rounding = context.rounding
+        if self._is_special or self._exp >= 0:
+            return Decimal(self)
+        return self._rescale(0, rounding)
+
+    to_integral = to_integral_value
+
+    def to_integral_exact(self, rounding=None, context=None):
+        return self.to_integral_value(rounding, context)
+
+    def normalize(self, context=None):
+        if context is None:
+            context = getcontext()
+        if self._is_special:
+            return self
+        dup = self._fix(context)
+        if dup._is_special:
+            return dup
+        if not dup:
+            return _dec(dup._sign, "0", 0)
+        exp_max = [context.Emax, context.Etop()][context.clamp]
+        end = len(dup._int)
+        exp = dup._exp
+        while dup._int[end - 1] == "0" and exp < exp_max:
+            exp += 1
+            end -= 1
+        return _dec(dup._sign, dup._int[:end], exp)
+
+    def __round__(self, n=None):
+        if n is not None:
+            if not isinstance(n, int):
+                raise TypeError("Second argument to round should be integral")
+            exp = _dec(0, "1", -n)
+            return self.quantize(exp)
+        if self._is_special:
+            if self.is_nan():
+                raise ValueError("cannot round a NaN")
+            raise OverflowError("cannot round an infinity")
+        return int(self._rescale(0, ROUND_HALF_EVEN))
+
+    def __floor__(self):
+        if self._is_special:
+            raise OverflowError("cannot round an infinity")
+        return int(self._rescale(0, ROUND_FLOOR))
+
+    def __ceil__(self):
+        if self._is_special:
+            raise OverflowError("cannot round an infinity")
+        return int(self._rescale(0, ROUND_CEILING))
+
+    # ── arithmetic ──
+
+    def __neg__(self, context=None):
+        if context is None:
+            context = getcontext()
+        if not self and context.rounding != ROUND_FLOOR:
+            ans = self.copy_abs()
+        else:
+            ans = self.copy_negate()
+        return ans._fix(context)
+
+    def __pos__(self, context=None):
+        if context is None:
+            context = getcontext()
+        if not self and context.rounding != ROUND_FLOOR:
+            ans = self.copy_abs()
+        else:
+            ans = Decimal(self)
+        return ans._fix(context)
+
+    def __abs__(self, round=True, context=None):
+        if not round:
+            return self.copy_abs()
+        if self._sign:
+            return self.__neg__(context=context)
+        return self.__pos__(context=context)
+
+    def __add__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        if context is None:
+            context = getcontext()
+        if self._is_special or other._is_special:
+            if self._isinfinity():
+                if self._sign != other._sign and other._isinfinity():
+                    return context._raise_error(InvalidOperation, "-INF + INF")
+                return Decimal(self)
+            if other._isinfinity():
+                return Decimal(other)
+            return _NaN
+        exp = min(self._exp, other._exp)
+        negativezero = 0
+        if context.rounding == ROUND_FLOOR and self._sign != other._sign:
+            negativezero = 1
+        if not self and not other:
+            sign = min(self._sign, other._sign)
+            if negativezero:
+                sign = 1
+            return _dec(sign, "0", exp)._fix(context)
+        if not self:
+            exp = max(exp, other._exp - context.prec - 1)
+            return other._rescale(exp, context.rounding)._fix(context)
+        if not other:
+            exp = max(exp, self._exp - context.prec - 1)
+            return self._rescale(exp, context.rounding)._fix(context)
+        a = int(self._int) * 10 ** (self._exp - exp)
+        b = int(other._int) * 10 ** (other._exp - exp)
+        if self._sign:
+            a = -a
+        if other._sign:
+            b = -b
+        total = a + b
+        if total == 0:
+            return _dec(negativezero, "0", exp)._fix(context)
+        return _dec(1 if total < 0 else 0, str(abs(total)), exp)._fix(context)
+
+    __radd__ = __add__
+
+    def __sub__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        return self.__add__(other.copy_negate(), context=context)
+
+    def __rsub__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        return other.__sub__(self, context=context)
+
+    def __mul__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        if context is None:
+            context = getcontext()
+        resultsign = self._sign ^ other._sign
+        if self._is_special or other._is_special:
+            if self._isinfinity() or other._isinfinity():
+                if not self or not other:
+                    return context._raise_error(InvalidOperation, "(+-)INF * 0")
+                return _dec(resultsign, "", "F", True)
+            return _NaN
+        resultexp = self._exp + other._exp
+        if not self or not other:
+            return _dec(resultsign, "0", resultexp)._fix(context)
+        return _dec(resultsign, str(int(self._int) * int(other._int)), resultexp)._fix(context)
+
+    __rmul__ = __mul__
+
+    def __truediv__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        if context is None:
+            context = getcontext()
+        sign = self._sign ^ other._sign
+        if self._is_special or other._is_special:
+            if self._isinfinity() and other._isinfinity():
+                return context._raise_error(InvalidOperation, "(+-)INF/(+-)INF")
+            if self._isinfinity():
+                return _dec(sign, "", "F", True)
+            if other._isinfinity():
+                return _dec(sign, "0", context.Etiny())
+            return _NaN
+        if not other:
+            if not self:
+                return context._raise_error(DivisionUndefined, "0 / 0")
+            return context._raise_error(DivisionByZero, "x / 0")
+        if not self:
+            exp = self._exp - other._exp
+            coeff = 0
+        else:
+            shift = len(other._int) - len(self._int) + context.prec + 1
+            exp = self._exp - other._exp - shift
+            if shift >= 0:
+                coeff, remainder = divmod(int(self._int) * 10 ** shift, int(other._int))
+            else:
+                coeff, remainder = divmod(int(self._int), int(other._int) * 10 ** -shift)
+            if remainder:
+                if coeff % 5 == 0:
+                    coeff += 1
+            else:
+                ideal_exp = self._exp - other._exp
+                while exp < ideal_exp and coeff % 10 == 0:
+                    coeff //= 10
+                    exp += 1
+        return _dec(sign, str(coeff), exp)._fix(context)
+
+    def __rtruediv__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        return other.__truediv__(self, context=context)
+
+    def _divide(self, other, context):
+        sign = self._sign ^ other._sign
+        if other._isinfinity():
+            ideal_exp = self._exp
+        else:
+            ideal_exp = min(self._exp, other._exp)
+        expdiff = self.adjusted() - other.adjusted()
+        if not self or other._isinfinity() or expdiff <= -2:
+            return (_dec(sign, "0", 0), self._rescale(ideal_exp, context.rounding))
+        if expdiff <= context.prec:
+            a = int(self._int)
+            b = int(other._int)
+            if self._exp >= other._exp:
+                a *= 10 ** (self._exp - other._exp)
+            else:
+                b *= 10 ** (other._exp - self._exp)
+            q, r = divmod(a, b)
+            if q < 10 ** context.prec:
+                return (_dec(sign, str(q), 0), _dec(self._sign, str(r), ideal_exp))
+        ans = context._raise_error(DivisionImpossible, "quotient too large in //, % or divmod")
+        return ans, ans
+
+    def __divmod__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        if context is None:
+            context = getcontext()
+        if not other:
+            if not self:
+                return context._raise_error(DivisionUndefined, "divmod(0, 0)"), None
+            return (context._raise_error(DivisionByZero, "x // 0"), context._raise_error(InvalidOperation, "x % 0"))
+        quotient, remainder = self._divide(other, context)
+        remainder = remainder._fix(context)
+        return quotient, remainder
+
+    def __rdivmod__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        return other.__divmod__(self, context=context)
+
+    def __mod__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        if context is None:
+            context = getcontext()
+        if not other:
+            if not self:
+                return context._raise_error(DivisionUndefined, "0 % 0")
+            return context._raise_error(InvalidOperation, "x % 0")
+        remainder = self._divide(other, context)[1]
+        return remainder._fix(context)
+
+    def __rmod__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        return other.__mod__(self, context=context)
+
+    def __floordiv__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        if context is None:
+            context = getcontext()
+        if not other:
+            if not self:
+                return context._raise_error(DivisionUndefined, "0 // 0")
+            return context._raise_error(DivisionByZero, "x // 0")
+        return self._divide(other, context)[0]
+
+    def __rfloordiv__(self, other, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        return other.__floordiv__(self, context=context)
+
+    def __pow__(self, other, modulo=None, context=None):
+        if context is None:
+            context = getcontext()
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        if modulo is not None:
+            m = int(_convert(modulo))
+            return Decimal(pow(int(self), int(other), m))
+        if not other:
+            if not self:
+                return context._raise_error(InvalidOperation, "0 ** 0")
+            return Decimal(1)
+        if other.is_integer():
+            n = int(other)
+            # exact power with guard digits, then round once
+            extra = len(str(abs(n))) + 3
+            ctx = context.copy()
+            ctx.prec = context.prec + extra
+            ctx.traps = {}
+            result = Decimal(1)
+            base = self
+            k = abs(n)
+            while k:
+                if k & 1:
+                    result = result.__mul__(base, context=ctx)
+                base = base.__mul__(base, context=ctx)
+                k >>= 1
+            if n < 0:
+                result = Decimal(1).__truediv__(result, context=ctx)
+            return result._fix(context)
+        # non-integral exponent: through floats with the context's precision
+        if self._sign:
+            return context._raise_error(InvalidOperation, "x ** y with x negative and y not an integer")
+        return Decimal(repr(float(self) ** float(other)))._fix(context)
+
+    def __rpow__(self, other, modulo=None, context=None):
+        other = _convert(other, raiseit=False)
+        if other is NotImplemented:
+            return other
+        return other.__pow__(self, modulo, context=context)
+
+    def sqrt(self, context=None):
+        if context is None:
+            context = getcontext()
+        if self._is_special:
+            if self._isinfinity() and self._sign == 0:
+                return Decimal(self)
+            return _NaN
+        if not self:
+            ans = _dec(self._sign, "0", self._exp // 2)
+            return ans._fix(context)
+        if self._sign == 1:
+            return context._raise_error(InvalidOperation, "sqrt(-x), x > 0")
+        prec = context.prec + 1
+        e = self._exp >> 1
+        c = int(self._int)
+        if self._exp & 1:
+            l = (len(self._int) >> 1) + 1
+            c *= 10
+        else:
+            l = len(self._int) + 1 >> 1
+        shift = prec - l
+        if shift >= 0:
+            c *= 100 ** shift
+            exact = True
+        else:
+            c, remainder = divmod(c, 100 ** -shift)
+            exact = not remainder
+        e -= shift
+        n = 10 ** prec
+        while True:
+            q = c // n
+            if n <= q:
+                break
+            else:
+                n = n + q >> 1
+        exact = exact and n * n == c
+        if exact:
+            if shift >= 0:
+                n //= 10 ** shift
+            else:
+                n *= 10 ** -shift
+            e += shift
+        else:
+            if n % 5 == 0:
+                n += 1
+        ans = _dec(0, str(n), e)
+        ctx = context.copy()
+        ctx.rounding = ROUND_HALF_EVEN
+        ans = ans._fix(ctx)
+        return ans
+
+    def exp(self, context=None):
+        if context is None:
+            context = getcontext()
+        return Decimal(repr(_math.exp(float(self))))._fix(context)
+
+    def ln(self, context=None):
+        if context is None:
+            context = getcontext()
+        return Decimal(repr(_math.log(float(self))))._fix(context)
+
+    def log10(self, context=None):
+        if context is None:
+            context = getcontext()
+        return Decimal(repr(_math.log10(float(self))))._fix(context)
+
+    def fma(self, other, third, context=None):
+        product = self.__mul__(other, context=Context(prec=MAX_PREC if False else 10 ** 6))
+        return product.__add__(third, context=context)
+
+    # ── comparison ──
+
+    def _cmp(self, other):
+        if self._is_special or other._is_special:
+            self_inf = self._isinfinity()
+            other_inf = other._isinfinity()
+            if self_inf == other_inf:
+                return 0
+            elif self_inf < other_inf:
+                return -1
+            return 1
+        if not self:
+            if not other:
+                return 0
+            return -((-1) ** other._sign)
+        if not other:
+            return (-1) ** self._sign
+        if other._sign < self._sign:
+            return -1
+        if self._sign < other._sign:
+            return 1
+        self_adjusted = self.adjusted()
+        other_adjusted = other.adjusted()
+        if self_adjusted == other_adjusted:
+            self_padded = self._int + "0" * (self._exp - other._exp)
+            other_padded = other._int + "0" * (other._exp - self._exp)
+            if self_padded == other_padded:
+                return 0
+            elif self_padded < other_padded:
+                return -((-1) ** self._sign)
+            return (-1) ** self._sign
+        elif self_adjusted > other_adjusted:
+            return (-1) ** self._sign
+        return -((-1) ** self._sign)
+
+    def _compare_other(self, other):
+        if isinstance(other, float):
+            return Decimal.from_float(other)
+        if isinstance(other, int):
+            return Decimal(other)
+        if isinstance(other, Decimal):
+            return other
+        try:
+            from fractions import Fraction
+        except ImportError:
+            return NotImplemented
+        if isinstance(other, Fraction):
+            return other
+        return NotImplemented
+
+    def __eq__(self, other, context=None):
+        o = self._compare_other(other)
+        if o is NotImplemented:
+            return o
+        if not isinstance(o, Decimal):
+            return self.as_integer_ratio() == (o.numerator, o.denominator)
+        if self._isnan() or o._isnan():
+            return False
+        return self._cmp(o) == 0
+
+    def __lt__(self, other, context=None):
+        o = self._compare_other(other)
+        if o is NotImplemented:
+            return o
+        if not isinstance(o, Decimal):
+            n, d = self.as_integer_ratio()
+            return n * o.denominator < o.numerator * d
+        if self._isnan() or o._isnan():
+            raise InvalidOperation([InvalidOperation])
+        return self._cmp(o) < 0
+
+    def __le__(self, other, context=None):
+        o = self._compare_other(other)
+        if o is NotImplemented:
+            return o
+        if not isinstance(o, Decimal):
+            n, d = self.as_integer_ratio()
+            return n * o.denominator <= o.numerator * d
+        return self._cmp(o) <= 0
+
+    def __gt__(self, other, context=None):
+        o = self._compare_other(other)
+        if o is NotImplemented:
+            return o
+        if not isinstance(o, Decimal):
+            n, d = self.as_integer_ratio()
+            return n * o.denominator > o.numerator * d
+        return self._cmp(o) > 0
+
+    def __ge__(self, other, context=None):
+        o = self._compare_other(other)
+        if o is NotImplemented:
+            return o
+        if not isinstance(o, Decimal):
+            n, d = self.as_integer_ratio()
+            return n * o.denominator >= o.numerator * d
+        return self._cmp(o) >= 0
+
+    def compare(self, other, context=None):
+        other = _convert(other)
+        return Decimal(self._cmp(other))
+
+    def max(self, other, context=None):
+        other = _convert(other)
+        if context is None:
+            context = getcontext()
+        c = self._cmp(other)
+        ans = other if c < 0 else self
+        return ans._fix(context)
+
+    def min(self, other, context=None):
+        other = _convert(other)
+        if context is None:
+            context = getcontext()
+        c = self._cmp(other)
+        ans = self if c <= 0 else other
+        return ans._fix(context)
+
+    def __reduce__(self):
+        return (self.__class__, (str(self),))
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    # ── format() ──
+
+    def __format__(self, specifier, context=None):
+        if context is None:
+            context = getcontext()
+        spec = _parse_format_specifier(specifier)
+        if self._is_special:
+            body = str(self.copy_abs())
+            if spec["type"] == "%":
+                body += "%"
+            return _format_align(self._sign, body, spec)
+        if spec["type"] is None:
+            spec["type"] = ["g", "G"][context.capitals]
+        if spec["type"] == "%":
+            self = _dec(self._sign, self._int, self._exp + 2)
+        rounding = context.rounding
+        precision = spec["precision"]
+        if precision is not None:
+            if spec["type"] in "eE":
+                self = self._round(precision + 1, rounding)
+            elif spec["type"] in "fF%":
+                self = self._rescale(-precision, rounding)
+            elif spec["type"] in "gG" and len(self._int) > precision:
+                self = self._round(precision, rounding)
+        if not self and self._exp > 0 and spec["type"] in "fF%":
+            self = self._rescale(0, rounding)
+        if not self and spec["no_neg_0"] and self._sign:
+            adjusted_sign = 0
+        else:
+            adjusted_sign = self._sign
+        leftdigits = self._exp + len(self._int)
+        if spec["type"] in "eE":
+            if not self and precision is not None:
+                dotplace = 1 - precision
+            else:
+                dotplace = 1
+        elif spec["type"] in "fF%":
+            dotplace = leftdigits
+        elif spec["type"] in "gG":
+            if self._exp <= 0 and leftdigits > -6:
+                dotplace = leftdigits
+            else:
+                dotplace = 1
+        if dotplace < 0:
+            intpart = "0"
+            fracpart = "0" * (-dotplace) + self._int
+        elif dotplace > len(self._int):
+            intpart = self._int + "0" * (dotplace - len(self._int))
+            fracpart = ""
+        else:
+            intpart = self._int[:dotplace] or "0"
+            fracpart = self._int[dotplace:]
+        exp = leftdigits - dotplace
+        return _format_number(adjusted_sign, intpart, fracpart, exp, spec)
+
+    def _round(self, places, rounding):
+        if places <= 0:
+            raise ValueError("argument should be at least 1 in _round")
+        if self._is_special or not self:
+            return Decimal(self)
+        ans = self._rescale(self.adjusted() + 1 - places, rounding)
+        if ans.adjusted() != self.adjusted():
+            ans = ans._rescale(ans.adjusted() + 1 - places, rounding)
+        return ans
+
+
+def _parse(s):
+    s0 = s
+    sign = 0
+    if s[:1] in "+-" and s:
+        sign = 1 if s[0] == "-" else 0
+        s = s[1:]
+    low = s.lower()
+    if low in ("inf", "infinity"):
+        return sign, "", "", 0, "F"
+    if low.startswith("nan") and low[3:].isdigit() or low == "nan":
+        return sign, "", "", 0, "n"
+    if low.startswith("snan"):
+        return sign, "", "", 0, "N"
+    mant, sep, exp = low.partition("e")
+    if sep:
+        e = exp
+        if e[:1] in "+-":
+            e = e[1:]
+        if not e or not e.isdigit():
+            return None
+        exp = int(exp)
+    else:
+        exp = 0
+    intpart, dot, fracpart = mant.partition(".")
+    if not intpart and not fracpart:
+        return None
+    if (intpart and not intpart.isdigit()) or (fracpart and not fracpart.isdigit()):
+        return None
+    if not s0.isascii():
+        return None
+    return sign, intpart, fracpart, exp, None
+
+
+def _all_zeros(s, i):
+    return s[i:].strip("0") == ""
+
+
+def _exact_half(s, i):
+    return s[i:i + 1] == "5" and _all_zeros(s, i + 1)
+
+
+def _round_down(self, prec):
+    if _all_zeros(self._int, prec):
+        return 0
+    return -1
+
+
+def _round_up(self, prec):
+    return -_round_down(self, prec)
+
+
+def _round_half_up(self, prec):
+    if self._int[prec:prec + 1] in ("5", "6", "7", "8", "9"):
+        return 1
+    elif _all_zeros(self._int, prec):
+        return 0
+    return -1
+
+
+def _round_half_down(self, prec):
+    if _exact_half(self._int, prec):
+        return -1
+    return _round_half_up(self, prec)
+
+
+def _round_half_even(self, prec):
+    if _exact_half(self._int, prec) and (prec == 0 or self._int[prec - 1] in ("0", "2", "4", "6", "8")):
+        return -1
+    return _round_half_up(self, prec)
+
+
+def _round_ceiling(self, prec):
+    if self._sign:
+        return _round_down(self, prec)
+    return -_round_down(self, prec)
+
+
+def _round_floor(self, prec):
+    if not self._sign:
+        return _round_down(self, prec)
+    return -_round_down(self, prec)
+
+
+def _round_05up(self, prec):
+    if prec and self._int[prec - 1] not in "05":
+        return _round_down(self, prec)
+    return -_round_down(self, prec)
+
+
+_rounders = {ROUND_DOWN: _round_down, ROUND_UP: _round_up, ROUND_HALF_UP: _round_half_up,
+             ROUND_HALF_DOWN: _round_half_down, ROUND_HALF_EVEN: _round_half_even, ROUND_CEILING: _round_ceiling,
+             ROUND_FLOOR: _round_floor, ROUND_05UP: _round_05up}
+
+
+def _parse_format_specifier(spec):
+    import re
+    m = re.fullmatch(r"(?:(?P<fill>.)?(?P<align>[<>=^]))?(?P<sign>[-+ ])?(?P<no_neg_0>z)?(?P<alt>\#)?(?P<zeropad>0)?(?P<minimumwidth>\d+)?(?P<thousands_sep>[,_])?(?:\.(?P<precision>\d+))?(?P<type>[eEfFgGn%])?", spec, re.DOTALL)
+    if m is None:
+        raise ValueError("Invalid format specifier: " + spec)
+    d = m.groupdict()
+    fill = d["fill"]
+    align = d["align"]
+    d["zeropad"] = d["zeropad"] is not None
+    if d["zeropad"]:
+        if fill is None:
+            fill = "0"
+        if align is None:
+            align = "="
+    d["fill"] = fill or " "
+    d["align"] = align or ">"
+    d["sign"] = d["sign"] or "-"
+    d["minimumwidth"] = int(d["minimumwidth"] or "0")
+    if d["precision"] is not None:
+        d["precision"] = int(d["precision"])
+    if d["precision"] == 0 and d["type"] in ("g", "G"):
+        d["precision"] = 1
+    d["no_neg_0"] = d["no_neg_0"] is not None
+    d["alt"] = d["alt"] is not None
+    if d["type"] == "n":
+        d["type"] = "g"
+    return d
+
+
+def _format_align(sign, body, spec):
+    minimumwidth = spec["minimumwidth"]
+    fill = spec["fill"]
+    padding = fill * (minimumwidth - len(sign) - len(body))
+    align = spec["align"]
+    if align == "<":
+        result = sign + body + padding
+    elif align == ">":
+        result = padding + sign + body
+    elif align == "=":
+        result = sign + padding + body
+    else:
+        half = len(padding) // 2
+        result = padding[:half] + sign + body + padding[half:]
+    return result
+
+
+def _format_sign(is_negative, spec):
+    if is_negative:
+        return "-"
+    elif spec["sign"] in " +":
+        return spec["sign"]
+    return ""
+
+
+def _insert_thousands_sep(digits, spec, min_width=1):
+    sep = spec["thousands_sep"]
+    if not sep:
+        return digits
+    groups = []
+    while digits:
+        groups.append(digits[-3:])
+        digits = digits[:-3]
+    return sep.join(reversed(groups))
+
+
+def _format_number(is_negative, intpart, fracpart, exp, spec):
+    sign = _format_sign(is_negative, spec)
+    if fracpart or spec["alt"]:
+        fracpart = "." + fracpart
+    if exp != 0 or spec["type"] in "eE":
+        echar = {"E": "E", "e": "e", "G": "E", "g": "e"}[spec["type"]]
+        fracpart += "{0}{1:+}".format(echar, exp)
+    if spec["type"] == "%":
+        fracpart += "%"
+    if spec["zeropad"] and spec["thousands_sep"]:
+        min_width = spec["minimumwidth"] - len(fracpart) - len(sign)
+        while len(_insert_thousands_sep(intpart, spec)) < min_width:
+            intpart = "0" + intpart
+        intpart = _insert_thousands_sep(intpart, spec)
+        return sign + intpart + fracpart
+    intpart = _insert_thousands_sep(intpart, spec)
+    return _format_align(sign, intpart + fracpart, spec)
+
+
+_NaN = _dec(0, "", "n", True)
+
+DefaultContext = Context(prec=28, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999, capitals=1, clamp=0,
+                         traps={DivisionByZero: True, Overflow: True, InvalidOperation: True})
+BasicContext = Context(prec=9, rounding=ROUND_HALF_UP, traps={DivisionByZero: True, Overflow: True,
+                                                             InvalidOperation: True, Clamped: True,
+                                                             Underflow: True})
+ExtendedContext = Context(prec=9, rounding=ROUND_HALF_EVEN, traps={})
+
+Decimal.__module__ = "decimal"
+Context.__module__ = "decimal"

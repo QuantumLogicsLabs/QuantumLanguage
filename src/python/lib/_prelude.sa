@@ -1,0 +1,88 @@
+# The builtins written in Python: what `list[int]` and `int | None` make.
+
+
+class _GenericAlias:
+    """list[int], dict[str, int] and the like."""
+
+    def __init__(self, origin, args):
+        self.__origin__ = origin
+        self.__args__ = args if isinstance(args, tuple) else (args,)
+
+    def __repr__(self):
+        def name(a):
+            if a is Ellipsis:
+                return "..."
+            if isinstance(a, type):
+                return a.__name__ if a.__module__ == "builtins" else a.__module__ + "." + a.__qualname__
+            return repr(a)
+        return f"{name(self.__origin__)}[{', '.join(name(a) for a in self.__args__)}]"
+
+    def __call__(self, *args, **kwargs):
+        return self.__origin__(*args, **kwargs)
+
+    def __getitem__(self, args):
+        return _GenericAlias(self.__origin__, args)
+
+    def __eq__(self, other):
+        if not isinstance(other, _GenericAlias):
+            return NotImplemented
+        return self.__origin__ is other.__origin__ and self.__args__ == other.__args__
+
+    def __hash__(self):
+        return hash((self.__origin__, self.__args__))
+
+    def __or__(self, other):
+        return _UnionType(self, other)
+
+    def __ror__(self, other):
+        return _UnionType(other, self)
+
+    def __mro_entries__(self, bases):
+        return (self.__origin__,)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self.__origin__, name)
+
+
+class _UnionType:
+    """int | None"""
+
+    def __init__(self, left, right):
+        args = []
+        for side in (left, right):
+            for a in (side.__args__ if isinstance(side, _UnionType) else (side,)):
+                a = type(None) if a is None else a
+                if a not in args:
+                    args.append(a)
+        self.__args__ = tuple(args)
+
+    def __repr__(self):
+        def name(a):
+            if a is type(None):
+                return "None"
+            if isinstance(a, type):
+                return a.__name__ if a.__module__ == "builtins" else a.__module__ + "." + a.__qualname__
+            return repr(a)
+        return " | ".join(name(a) for a in self.__args__)
+
+    def __or__(self, other):
+        return _UnionType(self, other)
+
+    def __ror__(self, other):
+        return _UnionType(other, self)
+
+    def __eq__(self, other):
+        if not isinstance(other, _UnionType):
+            return NotImplemented
+        return set(self.__args__) == set(other.__args__)
+
+    def __hash__(self):
+        return hash(frozenset(self.__args__))
+
+    def __instancecheck__(self, obj):
+        return isinstance(obj, self.__args__)
+
+    def __subclasscheck__(self, cls):
+        return issubclass(cls, self.__args__)

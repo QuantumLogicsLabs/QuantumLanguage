@@ -11,6 +11,8 @@
 //     (the JavaScript library: these .sa files hold JavaScript source)
 //   src/ruby/lib/*.sa -> RubyLibData.sa  ruby::librarySources()
 //     (the Ruby library: these .sa files hold Ruby source)
+//   src/python/lib/*.sa -> PyLibData.sa  py::librarySources()
+//     (the Python library: these .sa files hold Python source)
 // Run from compiler/:  quantum src/tools/embed.sa   (or qrun)
 // A file is rewritten only when its text changes.
 #include <algorithm>
@@ -130,6 +132,12 @@ int main()
         items.push_back({f, readText("src/ruby/lib/" + f)});
     changed += writeIfChanged("src/generated/RubyLibData.sa",
                               generate("src/ruby/lib", "ruby", "librarySources", items, "QRUBYLIB"));
+
+    items.clear();
+    for (const std::string &f : listFiles("src/python/lib", ".sa"))
+        items.push_back({f, readText("src/python/lib/" + f)});
+    changed += writeIfChanged("src/generated/PyLibData.sa",
+                              generate("src/python/lib", "py", "librarySources", items, "QPYLIB"));
 
     items.clear();
     for (const std::string &f : listFiles("src/js/lib", ".sa"))

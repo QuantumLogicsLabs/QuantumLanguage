@@ -1,0 +1,4530 @@
+// quantum: cpp
+// Python front-end: the object model. Types and their MRO, attribute lookup
+// with descriptors, calling, and the protocols every operator goes through:
+// a fast path for the builtin types, then the special methods found on the
+// type, the way CPython's abstract.c and typeobject.c do it.
+#include "PyRt.h.sa"
+#include "PyAst.h.sa"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <unordered_set>
+
+namespace py
+{
+
+Type *tObject, *tType, *tInt, *tBool, *tFloat, *tComplex, *tStr, *tBytes, *tByteArray, *tTuple, *tList, *tDict,
+    *tSet, *tFrozenSet, *tRange, *tSlice, *tFunc, *tNative, *tMethod, *tClassMethod, *tStaticMethod, *tProperty,
+    *tCell, *tCode, *tGen, *tModule, *tNoneType, *tNotImplType, *tEllipsisType, *tIter, *tDictKeys, *tDictValues,
+    *tDictItems, *tSuper, *tData;
+
+V None, True, False, NotImpl, EllipsisV;
+Dict *builtinsDict;
+Dict *modulesDict;
+std::string g_scriptPath;
+
+// ── interned strings ───────────────────────────────────────────────────────
+
+static std::unordered_map<std::string, Str *> *internTable;
+
+Str *newStr(const std::string &s)
+{
+    Str *o = new Str(tStr);
+    o->s = s;
+    bool ascii;
+    o->len = utf8Length(s, ascii);
+    o->ascii = ascii;
+    return o;
+}
+
+Str *newStrAscii(const std::string &s)
+{
+    Str *o = new Str(tStr);
+    o->s = s;
+    o->len = (int64_t)s.size();
+    return o;
+}
+
+Str *intern(const std::string &s)
+{
+    if (!internTable)
+        internTable = new std::unordered_map<std::string, Str *>();
+    auto it = internTable->find(s);
+    if (it != internTable->end())
+        return it->second;
+    Str *o = newStr(s);
+    (*internTable)[s] = o;
+    return o;
+}
+
+bool isStr(V v) { return !IS_SMALL(v) && v->type->layout == L::Str; }
+
+// ── allocation ─────────────────────────────────────────────────────────────
+
+Tuple *newTuple(size_t n)
+{
+    Tuple *t = new Tuple(tTuple);
+    t->items.resize(n, nullptr);
+    return t;
+}
+
+Tuple *tupleOf(const std::vector<V> &items)
+{
+    Tuple *t = new Tuple(tTuple);
+    t->items = items;
+    return t;
+}
+
+List *newList(size_t n)
+{
+    List *l = new List(tList);
+    l->items.resize(n, nullptr);
+    return l;
+}
+
+Dict *newDict() { return new Dict(tDict); }
+
+Set *newSet(Type *t) { return new Set(t ? t : tSet); }
+
+// An empty instance of `t`, in its solid base's layout
+V newObject(Type *t)
+{
+    Obj *o;
+    switch (t->layout)
+    {
+    case L::Int: o = new IntObj(t); break;
+    case L::Float: o = new FloatObj(t, 0.0); break;
+    case L::Complex: o = new ComplexObj(t, 0, 0); break;
+    case L::Str: o = new Str(t); break;
+    case L::Bytes: o = new BytesObj(t); break;
+    case L::Tuple: o = new Tuple(t); break;
+    case L::List: o = new List(t); break;
+    case L::Dict: o = new Dict(t); break;
+    case L::Set: o = new Set(t); break;
+    case L::Exc:
+    {
+        ExcObj *e = new ExcObj(t);
+        e->args = newTuple(0);
+        o = e;
+        break;
+    }
+    case L::Type: o = new Type(t); break;
+    case L::Module: o = new ModuleObj(t); break;
+    case L::Property: o = new PropertyObj(t); break;
+    case L::ClassMethod:
+    case L::StaticMethod: o = new WrapObj(t); break;
+    default: o = new Obj(t); break;
+    }
+    if (!t->builtin && t->hasDict)
+        o->dict = newDict();
+    return o;
+}
+
+// ── exceptions ─────────────────────────────────────────────────────────────
+
+V makeExc(Type *t, const std::string &msg)
+{
+    ExcObj *e = static_cast<ExcObj *>(newObject(t));
+    Tuple *args = newTuple(1);
+    args->items[0] = newStr(msg);
+    e->args = args;
+    return e;
+}
+
+[[noreturn]] void raiseV(V exc)
+{
+    throw PyThrow{exc};
+}
+
+[[noreturn]] void raise(Type *t, const std::string &msg)
+{
+    raiseV(makeExc(t, msg));
+}
+
+[[noreturn]] void raiseArgs(Type *t, V arg)
+{
+    ExcObj *e = static_cast<ExcObj *>(newObject(t));
+    Tuple *args = newTuple(1);
+    args->items[0] = arg;
+    e->args = args;
+    raiseV(e);
+}
+
+// `raise X` with a class or an instance
+V excFromTypeOrInstance(V v)
+{
+    if (typeOf(v)->layout == L::Type)
+    {
+        Type *t = static_cast<Type *>(v);
+        if (!issub(t, tBaseException))
+            raise(tTypeError, "exceptions must derive from BaseException");
+        return call(v, nullptr, 0);
+    }
+    if (!isinst(v, tBaseException))
+        raise(tTypeError, "exceptions must derive from BaseException");
+    return v;
+}
+
+std::string excMessage(V exc) { return strOf(exc); }
+
+const char *typeName(V v) { return typeOf(v)->name.c_str(); }
+
+// ── types ──────────────────────────────────────────────────────────────────
+
+bool issub(Type *a, Type *b)
+{
+    if (a == b)
+        return true;
+    for (Type *m : a->mro)
+        if (m == b)
+            return true;
+    return false;
+}
+
+// C3 linearization
+void computeMro(Type *t)
+{
+    std::vector<std::vector<Type *>> seqs;
+    for (Type *b : t->bases)
+        seqs.push_back(b->mro);
+    seqs.push_back(t->bases);
+    std::vector<Type *> out;
+    out.push_back(t);
+    for (;;)
+    {
+        bool any = false;
+        for (auto &s : seqs)
+            if (!s.empty())
+                any = true;
+        if (!any)
+            break;
+        Type *cand = nullptr;
+        for (auto &s : seqs)
+        {
+            if (s.empty())
+                continue;
+            Type *c = s[0];
+            bool inTail = false;
+            for (auto &s2 : seqs)
+                for (size_t i = 1; i < s2.size(); ++i)
+                    if (s2[i] == c)
+                        inTail = true;
+            if (!inTail)
+            {
+                cand = c;
+                break;
+            }
+        }
+        if (!cand)
+        {
+            std::string names;
+            std::vector<Type *> seen;
+            for (auto &sq : seqs)
+                if (!sq.empty() && std::find(seen.begin(), seen.end(), sq[0]) == seen.end())
+                {
+                    seen.push_back(sq[0]);
+                    names += (names.empty() ? "" : ", ") + sq[0]->name;
+                }
+            raise(tTypeError, "Cannot create a consistent method resolution order (MRO) for bases " + names);
+        }
+        out.push_back(cand);
+        for (auto &s : seqs)
+            if (!s.empty() && s[0] == cand)
+                s.erase(s.begin());
+    }
+    t->mro = out;
+}
+
+Type *newType(const std::string &name, Type *base, L layout)
+{
+    Type *t = new Type(tType);
+    t->name = name;
+    t->qualname = name;
+    t->module = "builtins";
+    t->layout = layout;
+    t->builtin = true;
+    t->hasDict = false;
+    t->dict = newDict();
+    if (base)
+        t->bases.push_back(base);
+    t->base = base;
+    computeMro(t);
+    return t;
+}
+
+V lookupMro(Type *t, Str *name)
+{
+    for (Type *m : t->mro)
+    {
+        V v = dictGetStr(m->dict, name);
+        if (v)
+            return v;
+    }
+    return nullptr;
+}
+
+V lookupMroAfter(Type *t, Type *after, Str *name)
+{
+    bool seen = false;
+    for (Type *m : t->mro)
+    {
+        if (seen)
+        {
+            V v = dictGetStr(m->dict, name);
+            if (v)
+                return v;
+        }
+        else if (m == after)
+            seen = true;
+    }
+    return nullptr;
+}
+
+// ── natives ────────────────────────────────────────────────────────────────
+
+V makeNative(const char *name, NativeFn fn, bool method)
+{
+    NativeObj *o = new NativeObj(tNative);
+    o->fn = fn;
+    o->name = name;
+    o->method = method;
+    return o;
+}
+
+V makeNativeClosure(const char *name, NativeClosure fn)
+{
+    NativeObj *o = new NativeObj(tNative);
+    o->closure = new NativeClosure(fn);
+    o->name = name;
+    return o;
+}
+
+V makeIter(std::function<bool(V &)> next)
+{
+    IterObj *it = new IterObj(tIter);
+    it->next = next;
+    return it;
+}
+
+void setAttrStr(Dict *d, const char *name, V v) { dictSet(d, intern(name), v); }
+
+void defMethod(Type *t, const char *name, NativeFn fn) { setAttrStr(t->dict, name, makeNative(name, fn, true)); }
+
+void defClassMethod(Type *t, const char *name, NativeFn fn)
+{
+    NativeObj *o = static_cast<NativeObj *>(makeNative(name, fn, true));
+    o->classMethod = true;
+    setAttrStr(t->dict, name, o);
+}
+
+void defStatic(Type *t, const char *name, NativeFn fn) { setAttrStr(t->dict, name, makeNative(name, fn, false)); }
+
+void defProperty(Type *t, const char *name, NativeFn getter)
+{
+    PropertyObj *p = new PropertyObj(tProperty);
+    p->fget = makeNative(name, getter, false);
+    setAttrStr(t->dict, name, p);
+}
+
+static void defGetSet(Type *t, const char *name, NativeFn getter, NativeFn setter)
+{
+    PropertyObj *p = new PropertyObj(tProperty);
+    p->fget = makeNative(name, getter, false);
+    p->fset = makeNative(name, setter, false);
+    setAttrStr(t->dict, name, p);
+}
+
+void checkArgs(const char *fname, int n, int min, int max)
+{
+    if (n < min || (max >= 0 && n > max))
+    {
+        char buf[200];
+        if (min == max)
+            snprintf(buf, sizeof buf, "%s() takes exactly %d argument%s (%d given)", fname, min, min == 1 ? "" : "s", n);
+        else if (n < min)
+            snprintf(buf, sizeof buf, "%s expected at least %d argument%s, got %d", fname, min, min == 1 ? "" : "s", n);
+        else
+            snprintf(buf, sizeof buf, "%s expected at most %d argument%s, got %d", fname, max, max == 1 ? "" : "s", n);
+        raise(tTypeError, buf);
+    }
+}
+
+void noKw(const char *fname, Kw *kw)
+{
+    if (kw && !kw->names.empty())
+        raise(tTypeError, std::string(fname) + "() takes no keyword arguments");
+}
+
+V kwArg(Kw *kw, const char *name)
+{
+    if (!kw)
+        return nullptr;
+    for (size_t i = 0; i < kw->names.size(); ++i)
+        if (kw->names[i]->s == name)
+            return kw->vals[i];
+    return nullptr;
+}
+
+int64_t objectId(V v)
+{
+    if (IS_SMALL(v))
+        return SMALLV(v);
+    return (int64_t)(uintptr_t)v;
+}
+
+// ── descriptors and attributes ─────────────────────────────────────────────
+
+static Str *s___get__, *s___set__, *s___delete__, *s___getattr__, *s___getattribute__, *s___setattr__,
+    *s___delattr__, *s___init__, *s___new__, *s___call__, *s___repr__, *s___str__, *s___hash__, *s___eq__,
+    *s___ne__, *s___lt__, *s___le__, *s___gt__, *s___ge__, *s___len__, *s___bool__, *s___iter__, *s___next__,
+    *s___getitem__, *s___setitem__, *s___delitem__, *s___contains__, *s___index__, *s___format__,
+    *s___class__, *s___dict__, *s___name__, *s___qualname__, *s___module__, *s___doc__, *s___init_subclass__,
+    *s___set_name__, *s___class_getitem__, *s___missing__, *s___reversed__, *s___neg__, *s___pos__,
+    *s___invert__, *s___abs__, *s___int__, *s___float__, *s___mro_entries__, *s___instancecheck__,
+    *s___subclasscheck__, *s___slots__, *s___abstractmethods__, *s___isabstractmethod__, *s___classcell__,
+    *s___qualname_attr, *s___weakref__, *s___annotations__, *s___orig_bases__, *s___length_hint__;
+
+static Str *binNames[13], *rbinNames[13], *ibinNames[13];
+
+static bool isDataDescriptor(V attr)
+{
+    Type *t = typeOf(attr);
+    if (t->layout == L::Property)
+        return true;
+    if (t->builtin)
+        return false;
+    return lookupMro(t, s___set__) || lookupMro(t, s___delete__);
+}
+
+V bindDescriptor(V attr, V obj, Type *type)
+{
+    if (IS_SMALL(attr))
+        return attr;
+    Type *at = attr->type;
+    switch (at->layout)
+    {
+    case L::Func:
+        if (!obj)
+            return attr;
+        {
+            MethodObj *m = new MethodObj(tMethod);
+            m->func = attr;
+            m->self = obj;
+            return m;
+        }
+    case L::Native:
+    {
+        NativeObj *n = static_cast<NativeObj *>(attr);
+        if (n->classMethod)
+        {
+            NativeObj *b = new NativeObj(tNative);
+            *b = *n;
+            b->self = type;
+            return b;
+        }
+        if (!n->method || !obj || n->self)
+            return attr;
+        NativeObj *b = new NativeObj(tNative);
+        *b = *n;
+        b->self = obj;
+        return b;
+    }
+    case L::ClassMethod:
+    {
+        MethodObj *m = new MethodObj(tMethod);
+        m->func = static_cast<WrapObj *>(attr)->func;
+        m->self = type;
+        return m;
+    }
+    case L::StaticMethod:
+        return static_cast<WrapObj *>(attr)->func;
+    case L::Property:
+    {
+        if (!obj)
+            return attr;
+        PropertyObj *p = static_cast<PropertyObj *>(attr);
+        if (!p->fget)
+            raise(tAttributeError, "property of '" + std::string(typeName(obj)) + "' object has no getter");
+        return call1(p->fget, obj);
+    }
+    default:
+        break;
+    }
+    if (at->builtin)
+        return attr;
+    V get = lookupMro(at, s___get__);
+    if (!get)
+        return attr;
+    V args[3] = {attr, obj ? obj : None, type};
+    return call(get, args, 3);
+}
+
+static V objectGetattribute(V obj, Str *name, bool &found);
+
+static V typeGetattribute(Type *t, Str *name, bool &found)
+{
+    found = true;
+    Type *meta = t->type;
+    V metaAttr = lookupMro(meta, name);
+    if (metaAttr && isDataDescriptor(metaAttr))
+        return bindDescriptor(metaAttr, t, meta);
+    V attr = lookupMro(t, name);
+    if (attr)
+    {
+        if (IS_SMALL(attr))
+            return attr;
+        switch (attr->type->layout)
+        {
+        case L::Func:
+        case L::Property:
+            return attr;
+        case L::Native:
+        {
+            NativeObj *n = static_cast<NativeObj *>(attr);
+            if (n->classMethod)
+                return bindDescriptor(attr, nullptr, t);
+            return attr;
+        }
+        case L::ClassMethod:
+        case L::StaticMethod:
+            return bindDescriptor(attr, nullptr, t);
+        default:
+            break;
+        }
+        if (!attr->type->builtin && lookupMro(attr->type, s___get__))
+        {
+            V args[3] = {attr, None, t};
+            return call(lookupMro(attr->type, s___get__), args, 3);
+        }
+        return attr;
+    }
+    if (metaAttr)
+        return bindDescriptor(metaAttr, t, meta);
+    found = false;
+    return nullptr;
+}
+
+static V objectGetattribute(V obj, Str *name, bool &found)
+{
+    found = true;
+    Type *t = typeOf(obj);
+    if (t->layout == L::Type && obj != nullptr && !IS_SMALL(obj))
+    {
+        if (issub(t, tType))
+            return typeGetattribute(static_cast<Type *>(obj), name, found);
+    }
+    V attr = lookupMro(t, name);
+    if (attr && isDataDescriptor(attr))
+        return bindDescriptor(attr, obj, t);
+    if (!IS_SMALL(obj) && obj->dict)
+    {
+        V v = dictGetStr(obj->dict, name);
+        if (v)
+            return v;
+    }
+    if (attr)
+        return bindDescriptor(attr, obj, t);
+    found = false;
+    return nullptr;
+}
+
+static V objectGetattributeNative(V *a, int n, Kw *)
+{
+    checkArgs("__getattribute__", n, 2, 2);
+    if (!isStr(a[1]))
+        raise(tTypeError, "attribute name must be string");
+    bool found;
+    V r = objectGetattribute(a[0], intern(asStr(a[1])->s), found);
+    if (!found)
+        raise(tAttributeError, "'" + std::string(typeName(a[0])) + "' object has no attribute '" + asStr(a[1])->s + "'");
+    return r;
+}
+
+static V nativeObjectGetattribute;
+
+[[noreturn]] static void attrError(V obj, Str *name)
+{
+    Type *t = typeOf(obj);
+    ExcObj *e;
+    if (t->layout == L::Type && issub(t, tType))
+        e = static_cast<ExcObj *>(makeExc(tAttributeError, "type object '" + static_cast<Type *>(obj)->name + "' has no attribute '" + name->s + "'"));
+    else if (t->layout == L::Module)
+        e = static_cast<ExcObj *>(makeExc(tAttributeError, "module '" + static_cast<ModuleObj *>(obj)->name + "' has no attribute '" + name->s + "'"));
+    else
+        e = static_cast<ExcObj *>(makeExc(tAttributeError, "'" + t->name + "' object has no attribute '" + name->s + "'"));
+    if (!e->dict)
+        e->dict = newDict();
+    setAttrStr(e->dict, "name", name);
+    setAttrStr(e->dict, "obj", obj);
+    raiseV(e);
+}
+
+bool getattrOpt(V obj, Str *name, V &out)
+{
+    Type *t = typeOf(obj);
+    if (!t->builtin)
+    {
+        V ga = lookupMro(t, s___getattribute__);
+        if (ga && ga != nativeObjectGetattribute)
+        {
+            try
+            {
+                V args[2] = {obj, name};
+                out = call(ga, args, 2);
+                return true;
+            }
+            catch (PyThrow &e)
+            {
+                if (!isinst(e.exc, tAttributeError))
+                    throw;
+                V gat = lookupMro(t, s___getattr__);
+                if (!gat)
+                    return false;
+                V args[2] = {obj, name};
+                out = call(gat, args, 2);
+                return true;
+            }
+        }
+    }
+    bool found;
+    out = objectGetattribute(obj, name, found);
+    if (found)
+        return true;
+    if (!t->builtin || t->layout == L::Type)
+    {
+        V gat = lookupMro(t, s___getattr__);
+        if (gat)
+        {
+            V args[2] = {obj, name};
+            try
+            {
+                out = call(gat, args, 2);
+                return true;
+            }
+            catch (PyThrow &e)
+            {
+                if (!isinst(e.exc, tAttributeError))
+                    throw;
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+V getattr(V obj, Str *name)
+{
+    Type *t = typeOf(obj);
+    if (!t->builtin)
+    {
+        V ga = lookupMro(t, s___getattribute__);
+        if (ga && ga != nativeObjectGetattribute)
+        {
+            V args[2] = {obj, name};
+            try
+            {
+                return call(ga, args, 2);
+            }
+            catch (PyThrow &e)
+            {
+                if (!isinst(e.exc, tAttributeError))
+                    throw;
+                V gat = lookupMro(t, s___getattr__);
+                if (!gat)
+                    throw;
+                return call(gat, args, 2);
+            }
+        }
+    }
+    bool found;
+    V r = objectGetattribute(obj, name, found);
+    if (found)
+        return r;
+    if (!t->builtin || t->layout == L::Type)
+    {
+        V gat = lookupMro(t, s___getattr__);
+        if (gat)
+        {
+            V args[2] = {obj, name};
+            return call(gat, args, 2);
+        }
+    }
+    attrError(obj, name);
+}
+
+bool hasattr(V obj, Str *name)
+{
+    V out;
+    try
+    {
+        return getattrOpt(obj, name, out);
+    }
+    catch (PyThrow &e)
+    {
+        if (isinst(e.exc, tAttributeError))
+            return false;
+        throw;
+    }
+}
+
+static bool slotAllowed(Type *t, Str *name)
+{
+    for (Type *m : t->mro)
+    {
+        for (Str *s : m->slots)
+            if (s->s == name->s)
+                return true;
+    }
+    return false;
+}
+
+static void objectSetattr(V obj, Str *name, V val)
+{
+    Type *t = typeOf(obj);
+    if (t->layout == L::Type && issub(t, tType) && !IS_SMALL(obj))
+    {
+        Type *cls = static_cast<Type *>(obj);
+        V metaAttr = lookupMro(t, name);
+        if (metaAttr && isDataDescriptor(metaAttr))
+        {
+            if (metaAttr->type->layout == L::Property)
+            {
+                PropertyObj *p = static_cast<PropertyObj *>(metaAttr);
+                if (!p->fset)
+                    raise(tAttributeError, "property '" + name->s + "' of '" + t->name + "' object has no setter");
+                call2(p->fset, obj, val);
+                return;
+            }
+            V setter = lookupMro(metaAttr->type, s___set__);
+            V args[3] = {metaAttr, obj, val};
+            call(setter, args, 3);
+            return;
+        }
+        if (cls->builtin)
+            raise(tTypeError, "cannot set '" + name->s + "' attribute of immutable type '" + cls->name + "'");
+        dictSet(cls->dict, name, val);
+        return;
+    }
+    V attr = lookupMro(t, name);
+    if (attr && isDataDescriptor(attr))
+    {
+        if (attr->type->layout == L::Property)
+        {
+            PropertyObj *p = static_cast<PropertyObj *>(attr);
+            if (!p->fset)
+                raise(tAttributeError, "property '" + name->s + "' of '" + t->name + "' object has no setter");
+            call2(p->fset, obj, val);
+            return;
+        }
+        V setter = lookupMro(attr->type, s___set__);
+        if (!setter)
+            raise(tAttributeError, "__set__");
+        V args[3] = {attr, obj, val};
+        call(setter, args, 3);
+        return;
+    }
+    if (IS_SMALL(obj))
+        attrError(obj, name);
+    if (t->slotsRestrict && !slotAllowed(t, name))
+    {
+        if (attr)
+            raise(tAttributeError, "'" + t->name + "' object attribute '" + name->s + "' is read-only");
+        raise(tAttributeError, "'" + t->name + "' object has no attribute '" + name->s + "' and no __dict__ for setting new attributes");
+    }
+    if (!obj->dict)
+    {
+        if (t->builtin && t->layout != L::Func && t->layout != L::Module && t->layout != L::Exc)
+            raise(tAttributeError, "'" + t->name + "' object has no attribute '" + name->s + "'");
+        obj->dict = newDict();
+    }
+    dictSet(obj->dict, name, val);
+}
+
+static void objectDelattr(V obj, Str *name)
+{
+    Type *t = typeOf(obj);
+    if (t->layout == L::Type && issub(t, tType))
+    {
+        Type *cls = static_cast<Type *>(obj);
+        if (!dictDel(cls->dict, name))
+            attrError(obj, name);
+        return;
+    }
+    V attr = lookupMro(t, name);
+    if (attr && isDataDescriptor(attr))
+    {
+        if (attr->type->layout == L::Property)
+        {
+            PropertyObj *p = static_cast<PropertyObj *>(attr);
+            if (!p->fdel)
+                raise(tAttributeError, "property '" + name->s + "' of '" + t->name + "' object has no deleter");
+            call1(p->fdel, obj);
+            return;
+        }
+        V del = lookupMro(attr->type, s___delete__);
+        if (!del)
+            raise(tAttributeError, "__delete__");
+        V args[2] = {attr, obj};
+        call(del, args, 2);
+        return;
+    }
+    if (IS_SMALL(obj) || !obj->dict || !dictDel(obj->dict, name))
+        attrError(obj, name);
+}
+
+static V nativeObjectSetattr, nativeObjectDelattr;
+
+void setattr(V obj, Str *name, V val)
+{
+    Type *t = typeOf(obj);
+    if (!t->builtin)
+    {
+        V sa = lookupMro(t, s___setattr__);
+        if (sa && sa != nativeObjectSetattr)
+        {
+            V args[3] = {obj, name, val};
+            call(sa, args, 3);
+            return;
+        }
+    }
+    objectSetattr(obj, name, val);
+}
+
+void delattr(V obj, Str *name)
+{
+    Type *t = typeOf(obj);
+    if (!t->builtin)
+    {
+        V da = lookupMro(t, s___delattr__);
+        if (da && da != nativeObjectDelattr)
+        {
+            V args[2] = {obj, name};
+            call(da, args, 2);
+            return;
+        }
+    }
+    objectDelattr(obj, name);
+}
+
+// ── calling ────────────────────────────────────────────────────────────────
+
+V typeCall(Type *t, V *args, int n, Kw *kw);
+
+V call(V f, V *args, int n, Kw *kw)
+{
+    if (IS_SMALL(f))
+        raise(tTypeError, "'int' object is not callable");
+    switch (f->type->layout)
+    {
+    case L::Func:
+        return callFunc(static_cast<Func *>(f), args, n, kw);
+    case L::Native:
+    {
+        NativeObj *nf = static_cast<NativeObj *>(f);
+        if (nf->self)
+        {
+            std::vector<V> all((size_t)n + 1);
+            all[0] = nf->self;
+            for (int i = 0; i < n; ++i)
+                all[(size_t)i + 1] = args[i];
+            return nf->closure ? (*nf->closure)(all.data(), n + 1, kw) : nf->fn(all.data(), n + 1, kw);
+        }
+        return nf->closure ? (*nf->closure)(args, n, kw) : nf->fn(args, n, kw);
+    }
+    case L::Method:
+    {
+        MethodObj *m = static_cast<MethodObj *>(f);
+        V stackArgs[8];
+        std::vector<V> heap;
+        V *all = stackArgs;
+        if (n + 1 > 8)
+        {
+            heap.resize((size_t)n + 1);
+            all = heap.data();
+        }
+        all[0] = m->self;
+        for (int i = 0; i < n; ++i)
+            all[i + 1] = args[i];
+        if (!IS_SMALL(m->func) && m->func->type->layout == L::Func)
+            return callFunc(static_cast<Func *>(m->func), all, n + 1, kw);
+        return call(m->func, all, n + 1, kw);
+    }
+    case L::Type:
+        if (issub(f->type, tType))
+        {
+            // a metaclass may define __call__ (EnumMeta: Color(1) looks a member up)
+            if (f->type != tType)
+            {
+                V mc = lookupMro(f->type, s___call__);
+                if (mc && !IS_SMALL(mc) && mc->type->layout != L::Native)
+                {
+                    std::vector<V> all((size_t)n + 1);
+                    all[0] = f;
+                    for (int i = 0; i < n; ++i)
+                        all[(size_t)i + 1] = args[i];
+                    return call(mc, all.data(), n + 1, kw);
+                }
+            }
+            return typeCall(static_cast<Type *>(f), args, n, kw);
+        }
+        break;
+    default:
+        break;
+    }
+    V c = lookupMro(f->type, s___call__);
+    if (!c)
+        raise(tTypeError, "'" + std::string(typeName(f)) + "' object is not callable");
+    std::vector<V> all((size_t)n + 1);
+    all[0] = f;
+    for (int i = 0; i < n; ++i)
+        all[(size_t)i + 1] = args[i];
+    return call(c, all.data(), n + 1, kw);
+}
+
+V call1(V f, V a) { return call(f, &a, 1); }
+
+V call2(V f, V a, V b)
+{
+    V args[2] = {a, b};
+    return call(f, args, 2);
+}
+
+V callMethodName(V obj, Str *name, V *args, int n, Kw *kw)
+{
+    V m = getattr(obj, name);
+    return call(m, args, n, kw);
+}
+
+// A special method looked up on the type (never the instance), called bound
+V callSpecial(V obj, Str *name, V *args, int n, bool &found)
+{
+    Type *t = typeOf(obj);
+    V m = lookupMro(t, name);
+    if (!m || m == None)
+    {
+        found = false;
+        return nullptr;
+    }
+    found = true;
+    V stackArgs[6];
+    std::vector<V> heap;
+    V *all = stackArgs;
+    if (n + 1 > 6)
+    {
+        heap.resize((size_t)n + 1);
+        all = heap.data();
+    }
+    all[0] = obj;
+    for (int i = 0; i < n; ++i)
+        all[i + 1] = args[i];
+    if (!IS_SMALL(m))
+    {
+        switch (m->type->layout)
+        {
+        case L::Func:
+            return callFunc(static_cast<Func *>(m), all, n + 1, nullptr);
+        case L::Native:
+        {
+            NativeObj *nf = static_cast<NativeObj *>(m);
+            if (!nf->self && nf->method)
+                return nf->closure ? (*nf->closure)(all, n + 1, nullptr) : nf->fn(all, n + 1, nullptr);
+            break;
+        }
+        case L::StaticMethod:
+            return call(static_cast<WrapObj *>(m)->func, args, n);
+        case L::ClassMethod:
+        {
+            all[0] = t;
+            return call(static_cast<WrapObj *>(m)->func, all, n + 1);
+        }
+        default:
+            break;
+        }
+    }
+    V bound = bindDescriptor(m, obj, t);
+    return call(bound, args, n);
+}
+
+static void callInitSubclass(Type *t, Kw *kw)
+{
+    // super(t, t).__init_subclass__(**kw): the first definition after t in its MRO
+    V m = lookupMroAfter(t, t, s___init_subclass__);
+    if (!m)
+        return;
+    V bound;
+    if (!IS_SMALL(m) && m->type->layout == L::ClassMethod)
+    {
+        MethodObj *mo = new MethodObj(tMethod);
+        mo->func = static_cast<WrapObj *>(m)->func;
+        mo->self = t;
+        bound = mo;
+    }
+    else if (!IS_SMALL(m) && m->type->layout == L::Func)
+    {
+        MethodObj *mo = new MethodObj(tMethod);
+        mo->func = m;
+        mo->self = t;
+        bound = mo;
+    }
+    else
+        bound = bindDescriptor(m, nullptr, t);
+    call(bound, nullptr, 0, kw);
+}
+
+static V s_objectInit, s_objectNew;
+
+V typeCall(Type *t, V *args, int n, Kw *kw)
+{
+    if (t == tType && n == 1 && (!kw || kw->names.empty()))
+        return typeOf(args[0]);
+    V newm = lookupMro(t, s___new__);
+    V obj;
+    if (newm == s_objectNew || !newm)
+    {
+        if (t->abstract)
+        {
+            V am = lookupMro(t, s___abstractmethods__);
+            std::vector<std::string> names;
+            if (am && am != None)
+                for (V x : toVector(am))
+                    names.push_back(strOf(x));
+            std::sort(names.begin(), names.end());
+            std::string list;
+            for (size_t i = 0; i < names.size(); ++i)
+                list += (i ? ", '" : "'") + names[i] + "'";
+            raise(tTypeError, "Can't instantiate abstract class " + t->name + " without an implementation for abstract method" + (names.size() == 1 ? " " : "s ") + list);
+        }
+        V init = lookupMro(t, s___init__);
+        if ((n > 0 || (kw && !kw->names.empty())) && init == s_objectInit)
+            raise(tTypeError, t->name + "() takes no arguments");
+        obj = newObject(t);
+    }
+    else
+    {
+        std::vector<V> all((size_t)n + 1);
+        all[0] = t;
+        for (int i = 0; i < n; ++i)
+            all[(size_t)i + 1] = args[i];
+        V fn = newm;
+        if (!IS_SMALL(newm) && newm->type->layout == L::StaticMethod)
+            fn = static_cast<WrapObj *>(newm)->func;
+        obj = call(fn, all.data(), n + 1, kw);
+    }
+    if (!isinst(obj, t))
+        return obj;
+    // a metaclass's __call__ or type(name, bases, ns) built a class: done
+    if (t == tType || (issub(t, tType) && typeOf(obj) == t && n == 3))
+    {
+        V init = lookupMro(t, s___init__);
+        if (init && init != s_objectInit && !(static_cast<Obj *>(init)->type->layout == L::Native))
+        {
+            std::vector<V> all((size_t)n + 1);
+            all[0] = obj;
+            for (int i = 0; i < n; ++i)
+                all[(size_t)i + 1] = args[i];
+            call(init, all.data(), n + 1, kw);
+        }
+        return obj;
+    }
+    V init = lookupMro(t, s___init__);
+    if (init && init != s_objectInit)
+    {
+        std::vector<V> all((size_t)n + 1);
+        all[0] = obj;
+        for (int i = 0; i < n; ++i)
+            all[(size_t)i + 1] = args[i];
+        V r = IS_SMALL(init) || init->type->layout != L::Func ? call(bindDescriptor(init, obj, t), args, n, kw)
+                                                               : callFunc(static_cast<Func *>(init), all.data(), n + 1, kw);
+        if (r != None)
+            raise(tTypeError, "__init__() should return None, not '" + std::string(typeName(r)) + "'");
+    }
+    return obj;
+}
+
+// ── truth, length, iteration ───────────────────────────────────────────────
+
+bool truthy(V v)
+{
+    if (v == True)
+        return true;
+    if (v == False || v == None)
+        return false;
+    if (IS_SMALL(v))
+        return SMALLV(v) != 0;
+    Type *t = v->type;
+    if (t->builtin)
+    {
+        switch (t->layout)
+        {
+        case L::Int: return intSign(v) != 0;
+        case L::Float: return static_cast<FloatObj *>(v)->v != 0;
+        case L::Str: return !static_cast<Str *>(v)->s.empty();
+        case L::List: return !static_cast<List *>(v)->items.empty();
+        case L::Tuple: return !static_cast<Tuple *>(v)->items.empty();
+        case L::Dict: return static_cast<Dict *>(v)->used != 0;
+        case L::Set: return static_cast<Set *>(v)->used != 0;
+        default: break;
+        }
+    }
+    bool found;
+    V r = callSpecial(v, s___bool__, nullptr, 0, found);
+    if (found)
+    {
+        if (r != True && r != False)
+            raise(tTypeError, "__bool__ should return bool, returned " + std::string(typeName(r)));
+        return r == True;
+    }
+    r = callSpecial(v, s___len__, nullptr, 0, found);
+    if (found)
+        return indexOf(r) != 0;
+    return true;
+}
+
+int64_t lenOf(V v)
+{
+    if (!IS_SMALL(v))
+    {
+        Type *t = v->type;
+        if (t->builtin)
+            switch (t->layout)
+            {
+            case L::Str: return static_cast<Str *>(v)->len;
+            case L::List: return (int64_t)static_cast<List *>(v)->items.size();
+            case L::Tuple: return (int64_t)static_cast<Tuple *>(v)->items.size();
+            case L::Dict: return static_cast<Dict *>(v)->used;
+            case L::Set: return static_cast<Set *>(v)->used;
+            default: break;
+            }
+    }
+    bool found;
+    V r = callSpecial(v, s___len__, nullptr, 0, found);
+    if (!found)
+        raise(tTypeError, "object of type '" + std::string(typeName(v)) + "' has no len()");
+    if (!isIntLike(r))
+        raise(tTypeError, "'" + std::string(typeName(r)) + "' object cannot be interpreted as an integer");
+    int64_t x = indexOf(r);
+    if (x < 0)
+        raise(tValueError, "__len__() should return >= 0");
+    return x;
+}
+
+int64_t indexOf(V v)
+{
+    int64_t x;
+    if (IS_SMALL(v))
+        return SMALLV(v);
+    if (v->type->layout == L::Int)
+    {
+        if (intSmall(v, x))
+            return x;
+        raise(tIndexError, "cannot fit 'int' into an index-sized integer");
+    }
+    bool found;
+    V r = callSpecial(v, s___index__, nullptr, 0, found);
+    if (found && isIntLike(r))
+        return indexOf(r);
+    raise(tTypeError, "'" + std::string(typeName(v)) + "' object cannot be interpreted as an integer");
+}
+
+V getiter(V v)
+{
+    if (!IS_SMALL(v) && v->type->layout == L::Iter)
+        return v;
+    if (!IS_SMALL(v) && v->type->layout == L::Gen && v->type->builtin)
+        return v;
+    bool found;
+    V r = callSpecial(v, s___iter__, nullptr, 0, found);
+    if (found)
+    {
+        if (!IS_SMALL(r) && (r->type->layout == L::Iter || r->type->layout == L::Gen))
+            return r;
+        if (!lookupMro(typeOf(r), s___next__))
+            raise(tTypeError, "iter() returned non-iterator of type '" + std::string(typeName(r)) + "'");
+        return r;
+    }
+    // the sequence protocol: __getitem__ from 0 until IndexError
+    V gi = lookupMro(typeOf(v), s___getitem__);
+    if (gi && gi != None)
+    {
+        int64_t *idx = new int64_t(0);
+        V seq = v;
+        return makeIter([seq, idx](V &out) -> bool {
+            try
+            {
+                out = getitem(seq, mkint((*idx)++));
+                return true;
+            }
+            catch (PyThrow &e)
+            {
+                if (isinst(e.exc, tIndexError) || isinst(e.exc, tStopIteration))
+                    return false;
+                throw;
+            }
+        });
+    }
+    raise(tTypeError, "'" + std::string(typeName(v)) + "' object is not iterable");
+}
+
+bool iterNext(V it, V &out)
+{
+    if (!IS_SMALL(it))
+    {
+        if (it->type->layout == L::Iter)
+        {
+            IterObj *io = static_cast<IterObj *>(it);
+            if (io->done)
+                return false;
+            if (io->next(out))
+                return true;
+            io->done = true;
+            return false;
+        }
+        if (it->type->layout == L::Gen)
+        {
+            bool done;
+            out = genSend(static_cast<GenObj *>(it), None, done);
+            return !done;
+        }
+    }
+    V nx = lookupMro(typeOf(it), s___next__);
+    if (!nx)
+        raise(tTypeError, "'" + std::string(typeName(it)) + "' object is not an iterator");
+    try
+    {
+        bool found;
+        out = callSpecial(it, s___next__, nullptr, 0, found);
+        return true;
+    }
+    catch (PyThrow &e)
+    {
+        if (isinst(e.exc, tStopIteration))
+            return false;
+        throw;
+    }
+}
+
+V iterNextOrNull(V it)
+{
+    V out;
+    return iterNext(it, out) ? out : nullptr;
+}
+
+std::vector<V> toVector(V iterable)
+{
+    if (!IS_SMALL(iterable))
+    {
+        if (iterable->type->layout == L::List && iterable->type->builtin)
+            return static_cast<List *>(iterable)->items;
+        if (iterable->type->layout == L::Tuple && iterable->type->builtin)
+            return static_cast<Tuple *>(iterable)->items;
+    }
+    std::vector<V> out;
+    V it = getiter(iterable);
+    V x;
+    while (iterNext(it, x))
+        out.push_back(x);
+    return out;
+}
+
+// ── repr / str ─────────────────────────────────────────────────────────────
+
+static std::unordered_set<V> *reprActive;
+
+static std::string addrOf(V v)
+{
+    char buf[32];
+    snprintf(buf, sizeof buf, "0x%012llx", (unsigned long long)(uintptr_t)v);
+    return buf;
+}
+
+std::string reprSeq(const std::vector<V> &items, const char *open, const char *close, bool tupleOne)
+{
+    std::string s = open;
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        if (i)
+            s += ", ";
+        s += reprOf(items[i]);
+    }
+    if (tupleOne && items.size() == 1)
+        s += ",";
+    return s + close;
+}
+
+static std::string qualifiedName(Type *t)
+{
+    if (t->module == "builtins" || t->module.empty())
+        return t->qualname;
+    return t->module + "." + t->qualname;
+}
+
+// The repr of a builtin layout (the native __repr__ of the builtin types)
+static std::string builtinRepr(V v)
+{
+    if (IS_SMALL(v))
+        return std::to_string(SMALLV(v));
+    Type *t = v->type;
+    switch (t->layout)
+    {
+    case L::Int:
+        if (issub(t, tBool))
+            return static_cast<IntObj *>(v)->small ? "True" : "False";
+        return intToString(v);
+    case L::Float: return floatRepr(static_cast<FloatObj *>(v)->v);
+    case L::Complex:
+    {
+        ComplexObj *c = static_cast<ComplexObj *>(v);
+        auto part = [](double d) {
+            std::string r = floatRepr(d);
+            if (r.size() > 2 && r.compare(r.size() - 2, 2, ".0") == 0)
+                r = r.substr(0, r.size() - 2);
+            return r;
+        };
+        if (c->re == 0 && !std::signbit(c->re))
+            return part(c->im) + "j";
+        std::string im = part(c->im);
+        if (im[0] != '-')
+            im = "+" + im;
+        return "(" + part(c->re) + im + "j)";
+    }
+    case L::Str: return quoteStr(static_cast<Str *>(v)->s);
+    case L::Bytes:
+    {
+        BytesObj *b = static_cast<BytesObj *>(v);
+        bool dq = b->s.find('\'') != std::string::npos && b->s.find('"') == std::string::npos;
+        std::string s = dq ? "b\"" : "b'";
+        for (unsigned char c : b->s)
+        {
+            if (c == '\\')
+                s += "\\\\";
+            else if (c == '\'' && !dq)
+                s += "\\'";
+            else if (c == '\n')
+                s += "\\n";
+            else if (c == '\r')
+                s += "\\r";
+            else if (c == '\t')
+                s += "\\t";
+            else if (c < 32 || c >= 127)
+            {
+                char buf[8];
+                snprintf(buf, sizeof buf, "\\x%02x", c);
+                s += buf;
+            }
+            else
+                s += (char)c;
+        }
+        s += dq ? "\"" : "'";
+        if (b->mutableBytes)
+            return "bytearray(" + s + ")";
+        return s;
+    }
+    case L::Tuple: return reprSeq(static_cast<Tuple *>(v)->items, "(", ")", true);
+    case L::List: return reprSeq(static_cast<List *>(v)->items, "[", "]", false);
+    case L::Dict:
+    {
+        Dict *d = static_cast<Dict *>(v);
+        std::string s = "{";
+        bool first = true;
+        for (const DEntry &e : d->entries)
+        {
+            if (!e.key)
+                continue;
+            if (!first)
+                s += ", ";
+            first = false;
+            s += reprOf(e.key) + ": " + reprOf(e.val);
+        }
+        return s + "}";
+    }
+    case L::Set:
+    {
+        Set *st = static_cast<Set *>(v);
+        bool frozen = issub(t, tFrozenSet);
+        std::string name = t->builtin ? (frozen ? "frozenset" : "set") : t->name;
+        if (st->used == 0)
+            return name + "()";
+        std::string inner = reprSeq(setItems(st), "{", "}", false);
+        if (frozen || !t->builtin)
+            return name + "(" + inner + ")";
+        return inner;
+    }
+    case L::Range:
+    {
+        RangeObj *r = static_cast<RangeObj *>(v);
+        std::string s = "range(" + std::to_string(r->start) + ", " + std::to_string(r->stop);
+        if (r->step != 1)
+            s += ", " + std::to_string(r->step);
+        return s + ")";
+    }
+    case L::Slice:
+    {
+        SliceObj *s = static_cast<SliceObj *>(v);
+        return "slice(" + reprOf(s->start) + ", " + reprOf(s->stop) + ", " + reprOf(s->step) + ")";
+    }
+    case L::Singleton:
+        if (v == None)
+            return "None";
+        if (v == NotImpl)
+            return "NotImplemented";
+        if (v == EllipsisV)
+            return "Ellipsis";
+        return "<singleton>";
+    case L::Type:
+    {
+        Type *c = static_cast<Type *>(v);
+        return "<class '" + qualifiedName(c) + "'>";
+    }
+    case L::Func:
+        return "<function " + strOf(static_cast<Func *>(v)->qualname) + " at " + addrOf(v) + ">";
+    case L::Native:
+    {
+        NativeObj *n = static_cast<NativeObj *>(v);
+        if (n->self)
+            return std::string("<built-in method ") + n->name + " of " + typeName(n->self) + " object at " + addrOf(n->self) + ">";
+        return std::string("<built-in function ") + n->name + ">";
+    }
+    case L::Method:
+    {
+        MethodObj *m = static_cast<MethodObj *>(v);
+        V qn;
+        std::string fname = getattrOpt(m->func, s___qualname__, qn) ? strOf(qn) : "?";
+        return "<bound method " + fname + " of " + reprOf(m->self) + ">";
+    }
+    case L::Gen:
+    {
+        GenObj *g = static_cast<GenObj *>(v);
+        return "<generator object " + strOf(g->qualname) + " at " + addrOf(v) + ">";
+    }
+    case L::Module:
+        return "<module '" + static_cast<ModuleObj *>(v)->name + "' (built-in)>";
+    case L::Exc:
+    {
+        ExcObj *e = static_cast<ExcObj *>(v);
+        std::string args = reprSeq(e->args->items, "(", ")", false);
+        return t->name + args;
+    }
+    case L::DictView:
+    {
+        DictView *dv = static_cast<DictView *>(v);
+        std::vector<V> items;
+        for (const DEntry &e : dv->d->entries)
+        {
+            if (!e.key)
+                continue;
+            if (dv->kind == 0)
+                items.push_back(e.key);
+            else if (dv->kind == 1)
+                items.push_back(e.val);
+            else
+            {
+                Tuple *tp = newTuple(2);
+                tp->items[0] = e.key;
+                tp->items[1] = e.val;
+                items.push_back(tp);
+            }
+        }
+        const char *names[] = {"dict_keys(", "dict_values(", "dict_items("};
+        return names[dv->kind] + reprSeq(items, "[", "]", false) + ")";
+    }
+    case L::Property: return "<property object at " + addrOf(v) + ">";
+    case L::Cell: return "<cell at " + addrOf(v) + ">";
+    case L::Iter: return "<" + t->name + " object at " + addrOf(v) + ">";
+    default:
+        break;
+    }
+    return "<" + qualifiedName(t) + " object at " + addrOf(v) + ">";
+}
+
+std::string reprOf(V v)
+{
+    if (IS_SMALL(v))
+        return std::to_string(SMALLV(v));
+    Type *t = v->type;
+    if (t == tStr)
+        return quoteStr(static_cast<Str *>(v)->s);
+    if (t == tFloat)
+        return floatRepr(static_cast<FloatObj *>(v)->v);
+    if (v == None)
+        return "None";
+    if (v == True)
+        return "True";
+    if (v == False)
+        return "False";
+    if (!reprActive)
+        reprActive = new std::unordered_set<V>();
+    bool container = t->layout == L::List || t->layout == L::Dict || t->layout == L::Set || t->layout == L::Tuple || !t->builtin;
+    if (container)
+    {
+        if (reprActive->count(v))
+            return t->layout == L::List ? "[...]" : t->layout == L::Dict ? "{...}" : "...";
+        reprActive->insert(v);
+    }
+    std::string out;
+    try
+    {
+        V m = lookupMro(t, s___repr__);
+        if (!m || (!IS_SMALL(m) && m->type->layout == L::Native && static_cast<NativeObj *>(m)->fn == nullptr))
+            out = builtinRepr(v);
+        else
+        {
+            bool found;
+            V r = callSpecial(v, s___repr__, nullptr, 0, found);
+            if (!isStr(r))
+                raise(tTypeError, "__repr__ returned non-string (type " + std::string(typeName(r)) + ")");
+            out = asStr(r)->s;
+        }
+    }
+    catch (...)
+    {
+        if (container)
+            reprActive->erase(v);
+        throw;
+    }
+    if (container)
+        reprActive->erase(v);
+    return out;
+}
+
+V reprV(V v) { return newStr(reprOf(v)); }
+
+std::string strOf(V v)
+{
+    if (IS_SMALL(v))
+        return std::to_string(SMALLV(v));
+    Type *t = v->type;
+    if (t == tStr)
+        return static_cast<Str *>(v)->s;
+    if (t == tFloat)
+        return floatRepr(static_cast<FloatObj *>(v)->v);
+    bool found;
+    V r = callSpecial(v, s___str__, nullptr, 0, found);
+    if (!found)
+        return reprOf(v);
+    if (!isStr(r))
+        raise(tTypeError, "__str__ returned non-string (type " + std::string(typeName(r)) + ")");
+    return asStr(r)->s;
+}
+
+V strV(V v)
+{
+    if (!IS_SMALL(v) && v->type == tStr)
+        return v;
+    return newStr(strOf(v));
+}
+
+// ── hashing ────────────────────────────────────────────────────────────────
+
+static int64_t tupleHash(Tuple *t)
+{
+    const uint64_t P1 = 11400714785074694791ULL, P2 = 14029467366897019727ULL, P5 = 2870177450012600261ULL;
+    uint64_t acc = P5;
+    for (V x : t->items)
+    {
+        uint64_t lane = (uint64_t)hashOf(x);
+        acc += lane * P2;
+        acc = (acc << 31) | (acc >> 33);
+        acc *= P1;
+    }
+    acc += (uint64_t)t->items.size() ^ (P5 ^ 3527539ULL);
+    if (acc == (uint64_t)-1)
+        return 1546275796;
+    return (int64_t)acc;
+}
+
+static uint64_t shuffleBits(uint64_t h) { return ((h ^ 89869747ULL) ^ (h << 16)) * 3644798167ULL; }
+
+static int64_t frozensetHash(Set *s)
+{
+    uint64_t hash = 0;
+    for (const SEntry &e : s->table)
+        hash ^= shuffleBits((uint64_t)e.hash);
+    if ((s->mask + 1 - s->fill) & 1)
+        hash ^= shuffleBits(0);
+    if ((s->fill - s->used) & 1)
+        hash ^= shuffleBits((uint64_t)-1);
+    hash ^= ((uint64_t)s->used + 1) * 1927868237ULL;
+    hash ^= (hash >> 11) ^ (hash >> 25);
+    hash = hash * 69069U + 907133923ULL;
+    if (hash == (uint64_t)-1)
+        hash = 590923713ULL;
+    return (int64_t)hash;
+}
+
+static int64_t builtinHash(V v)
+{
+    if (IS_SMALL(v))
+        return hashInt(v);
+    Type *t = v->type;
+    switch (t->layout)
+    {
+    case L::Int: return hashInt(v);
+    case L::Float: return hashDouble(static_cast<FloatObj *>(v)->v);
+    case L::Complex:
+    {
+        ComplexObj *c = static_cast<ComplexObj *>(v);
+        uint64_t h = (uint64_t)hashDouble(c->re) + 1000003ULL * (uint64_t)hashDouble(c->im);
+        return (int64_t)h == -1 ? -2 : (int64_t)h;
+    }
+    case L::Str:
+    {
+        Str *s = static_cast<Str *>(v);
+        if (s->hash == -1)
+            s->hash = hashString(s->s);
+        return s->hash;
+    }
+    case L::Bytes: return hashString(static_cast<BytesObj *>(v)->s);
+    case L::Tuple:
+    {
+        Tuple *tp = static_cast<Tuple *>(v);
+        if (tp->hash == -1)
+            tp->hash = tupleHash(tp);
+        return tp->hash;
+    }
+    case L::Set:
+    {
+        Set *s = static_cast<Set *>(v);
+        if (s->hash == -1)
+            s->hash = frozensetHash(s);
+        return s->hash;
+    }
+    case L::Range:
+    {
+        RangeObj *r = static_cast<RangeObj *>(v);
+        Tuple *tp = newTuple(3);
+        tp->items[0] = mkint(r->start);
+        tp->items[1] = mkint(r->stop);
+        tp->items[2] = mkint(r->step);
+        return tupleHash(tp);
+    }
+    case L::Singleton:
+        if (v == None)
+            return (int64_t)0xFCA86420;
+        break;
+    case L::Method:
+    {
+        MethodObj *m = static_cast<MethodObj *>(v);
+        return hashOf(m->self) ^ objectId(m->func);
+    }
+    default:
+        break;
+    }
+    uint64_t id = (uint64_t)(uintptr_t)v;
+    return (int64_t)((id >> 4) | (id << 60));
+}
+
+int64_t hashOf(V v)
+{
+    if (IS_SMALL(v))
+        return hashInt(v);
+    Type *t = v->type;
+    if (t == tStr)
+    {
+        Str *s = static_cast<Str *>(v);
+        if (s->hash == -1)
+            s->hash = hashString(s->s);
+        return s->hash;
+    }
+    if (t->builtin && t->layout != L::List && t->layout != L::Dict && t->layout != L::Data && !(t->layout == L::Set && t == tSet) &&
+        t->layout != L::Type)
+        return builtinHash(v);
+    V h = lookupMro(t, s___hash__);
+    if (!h || h == None)
+        raise(tTypeError, "unhashable type: '" + t->name + "'");
+    if (!IS_SMALL(h) && h->type->layout == L::Native && static_cast<NativeObj *>(h)->fn == nullptr &&
+        static_cast<NativeObj *>(h)->closure == nullptr)
+        return builtinHash(v);
+    bool found;
+    V r = callSpecial(v, s___hash__, nullptr, 0, found);
+    if (!isIntLike(r))
+        raise(tTypeError, "__hash__ method should return an integer");
+    int64_t x;
+    if (intSmall(r, x) && x != -1 && FITS_SMALL(x))
+        return x;
+    return hashInt(r);
+}
+
+// ── comparison ─────────────────────────────────────────────────────────────
+
+static Op swapOp(Op op)
+{
+    switch (op)
+    {
+    case OpLt: return OpGt;
+    case OpGt: return OpLt;
+    case OpLe: return OpGe;
+    case OpGe: return OpLe;
+    default: return op;
+    }
+}
+
+static Str *cmpName(Op op)
+{
+    switch (op)
+    {
+    case OpEq: return s___eq__;
+    case OpNe: return s___ne__;
+    case OpLt: return s___lt__;
+    case OpLe: return s___le__;
+    case OpGt: return s___gt__;
+    default: return s___ge__;
+    }
+}
+
+static const char *cmpSym(Op op)
+{
+    switch (op)
+    {
+    case OpEq: return "==";
+    case OpNe: return "!=";
+    case OpLt: return "<";
+    case OpLe: return "<=";
+    case OpGt: return ">";
+    default: return ">=";
+    }
+}
+
+static V cmpResult(int c, Op op)
+{
+    switch (op)
+    {
+    case OpEq: return mkbool(c == 0);
+    case OpNe: return mkbool(c != 0);
+    case OpLt: return mkbool(c < 0);
+    case OpLe: return mkbool(c <= 0);
+    case OpGt: return mkbool(c > 0);
+    default: return mkbool(c >= 0);
+    }
+}
+
+static bool isNumber(V v)
+{
+    if (IS_SMALL(v))
+        return true;
+    L l = v->type->layout;
+    return l == L::Int || l == L::Float;
+}
+
+// int vs float compared exactly
+static int compareNumbers(V a, V b)
+{
+    bool fa = !IS_SMALL(a) && a->type->layout == L::Float, fb = !IS_SMALL(b) && b->type->layout == L::Float;
+    if (!fa && !fb)
+        return intCompare(a, b);
+    if (fa && fb)
+    {
+        double x = static_cast<FloatObj *>(a)->v, y = static_cast<FloatObj *>(b)->v;
+        return x < y ? -1 : x > y ? 1 : 0;
+    }
+    double d = fa ? static_cast<FloatObj *>(a)->v : static_cast<FloatObj *>(b)->v;
+    V i = fa ? b : a;
+    int sign = fa ? -1 : 1; // result is for (int, float); flip when the float is on the left
+    int c;
+    if (std::isinf(d))
+        c = d > 0 ? -1 : 1;
+    else
+    {
+        int64_t s;
+        if (intSmall(i, s) && s > -((int64_t)1 << 53) && s < ((int64_t)1 << 53))
+        {
+            double x = (double)s;
+            c = x < d ? -1 : x > d ? 1 : 0;
+        }
+        else
+        {
+            double fl = std::floor(d);
+            V fi = intFromDouble(fl);
+            c = intCompare(i, fi);
+            if (c == 0 && fl != d)
+                c = -1;
+        }
+    }
+    return c * sign;
+}
+
+static V seqCompare(const std::vector<V> &a, const std::vector<V> &b, Op op)
+{
+    size_t n = a.size() < b.size() ? a.size() : b.size();
+    size_t i = 0;
+    for (; i < n; ++i)
+        if (!eq(a[i], b[i]))
+            break;
+    if (i >= n)
+    {
+        int c = a.size() < b.size() ? -1 : a.size() > b.size() ? 1 : 0;
+        return cmpResult(c, op);
+    }
+    if (op == OpEq)
+        return False;
+    if (op == OpNe)
+        return True;
+    return richCompare(a[i], b[i], op);
+}
+
+static bool setSubset(Set *a, Set *b)
+{
+    if (a->used > b->used)
+        return false;
+    for (const SEntry &e : a->table)
+        if (e.key && e.key != dummyKey() && !setHas(b, e.key))
+            return false;
+    return true;
+}
+
+static bool dictEqual(Dict *a, Dict *b)
+{
+    if (a->used != b->used)
+        return false;
+    for (const DEntry &e : a->entries)
+    {
+        if (!e.key)
+            continue;
+        V o = dictGet(b, e.key);
+        if (!o || !eq(e.val, o))
+            return false;
+    }
+    return true;
+}
+
+// The comparison of the builtin layouts; NotImpl when the pair is foreign
+static V builtinCompare(V a, V b, Op op)
+{
+    if (isNumber(a) && isNumber(b))
+    {
+        bool fa = !IS_SMALL(a) && a->type->layout == L::Float, fb = !IS_SMALL(b) && b->type->layout == L::Float;
+        if ((fa && std::isnan(static_cast<FloatObj *>(a)->v)) || (fb && std::isnan(static_cast<FloatObj *>(b)->v)))
+            return mkbool(op == OpNe);
+        return cmpResult(compareNumbers(a, b), op);
+    }
+    if (IS_SMALL(a) || IS_SMALL(b))
+    {
+        if ((op == OpEq || op == OpNe) && !IS_SMALL(b) && b->type->layout == L::Complex)
+        {
+            ComplexObj *c = static_cast<ComplexObj *>(b);
+            bool e = c->im == 0 && c->re == toDouble(a);
+            return mkbool(op == OpEq ? e : !e);
+        }
+        return NotImpl;
+    }
+    L la = a->type->layout, lb = b->type->layout;
+    if (la == L::Complex || lb == L::Complex)
+    {
+        if (op != OpEq && op != OpNe)
+            return NotImpl;
+        if (!(isNumber(a) || la == L::Complex) || !(isNumber(b) || lb == L::Complex))
+            return NotImpl;
+        double ar = la == L::Complex ? static_cast<ComplexObj *>(a)->re : toDouble(a);
+        double ai = la == L::Complex ? static_cast<ComplexObj *>(a)->im : 0;
+        double br = lb == L::Complex ? static_cast<ComplexObj *>(b)->re : toDouble(b);
+        double bi = lb == L::Complex ? static_cast<ComplexObj *>(b)->im : 0;
+        bool e = ar == br && ai == bi;
+        return mkbool(op == OpEq ? e : !e);
+    }
+    if (la != lb)
+    {
+        if (la == L::DictView || lb == L::DictView)
+        {
+            // keys views compare like sets
+            if (op != OpEq && op != OpNe)
+                return NotImpl;
+        }
+        return NotImpl;
+    }
+    switch (la)
+    {
+    case L::Str:
+    {
+        const std::string &x = static_cast<Str *>(a)->s, &y = static_cast<Str *>(b)->s;
+        int c = x.compare(y);
+        return cmpResult(c < 0 ? -1 : c > 0, op);
+    }
+    case L::Bytes:
+    {
+        const std::string &x = static_cast<BytesObj *>(a)->s, &y = static_cast<BytesObj *>(b)->s;
+        int c = x.compare(y);
+        return cmpResult(c < 0 ? -1 : c > 0, op);
+    }
+    case L::Tuple: return seqCompare(static_cast<Tuple *>(a)->items, static_cast<Tuple *>(b)->items, op);
+    case L::List: return seqCompare(static_cast<List *>(a)->items, static_cast<List *>(b)->items, op);
+    case L::Dict:
+        if (op != OpEq && op != OpNe)
+            return NotImpl;
+        return mkbool(dictEqual(static_cast<Dict *>(a), static_cast<Dict *>(b)) == (op == OpEq));
+    case L::Set:
+    {
+        Set *x = static_cast<Set *>(a), *y = static_cast<Set *>(b);
+        switch (op)
+        {
+        case OpEq: return mkbool(x->used == y->used && setSubset(x, y));
+        case OpNe: return mkbool(!(x->used == y->used && setSubset(x, y)));
+        case OpLe: return mkbool(setSubset(x, y));
+        case OpGe: return mkbool(setSubset(y, x));
+        case OpLt: return mkbool(x->used < y->used && setSubset(x, y));
+        default: return mkbool(x->used > y->used && setSubset(y, x));
+        }
+    }
+    case L::Range:
+    {
+        if (op != OpEq && op != OpNe)
+            return NotImpl;
+        RangeObj *x = static_cast<RangeObj *>(a), *y = static_cast<RangeObj *>(b);
+        auto len = [](RangeObj *r) {
+            if (r->step > 0)
+                return r->stop > r->start ? (r->stop - r->start + r->step - 1) / r->step : (int64_t)0;
+            return r->stop < r->start ? (r->start - r->stop - r->step - 1) / -r->step : (int64_t)0;
+        };
+        int64_t lx = len(x), ly = len(y);
+        bool e = lx == ly && (lx == 0 || (x->start == y->start && (lx == 1 || x->step == y->step)));
+        return mkbool(op == OpEq ? e : !e);
+    }
+    case L::DictView:
+    {
+        DictView *x = static_cast<DictView *>(a), *y = static_cast<DictView *>(b);
+        if (x->kind == 1 || y->kind == 1)
+            return NotImpl;
+        Set *sx = newSet(), *sy = newSet();
+        setUpdate(sx, a);
+        setUpdate(sy, b);
+        return builtinCompare(sx, sy, op);
+    }
+    case L::Singleton:
+    case L::Type:
+    case L::Func:
+    case L::Native:
+    case L::Module:
+    case L::Object:
+        if (op == OpEq)
+            return mkbool(a == b);
+        if (op == OpNe)
+            return mkbool(a != b);
+        return NotImpl;
+    case L::Method:
+    {
+        if (op != OpEq && op != OpNe)
+            return NotImpl;
+        MethodObj *x = static_cast<MethodObj *>(a), *y = static_cast<MethodObj *>(b);
+        bool e = x->func == y->func && x->self == y->self;
+        return mkbool(op == OpEq ? e : !e);
+    }
+    default:
+        if (op == OpEq)
+            return mkbool(a == b);
+        if (op == OpNe)
+            return mkbool(a != b);
+        return NotImpl;
+    }
+}
+
+static V tryCompare(V a, V b, Op op, bool &tried)
+{
+    tried = false;
+    Type *t = typeOf(a);
+    V m = lookupMro(t, cmpName(op));
+    if (!m || m == None)
+        return NotImpl;
+    tried = true;
+    bool found;
+    return callSpecial(a, cmpName(op), &b, 1, found);
+}
+
+static bool overrides(Type *sub, Str *name)
+{
+    // whether `sub` (a class) defines `name` somewhere before the builtin types
+    for (Type *m : sub->mro)
+    {
+        if (m->builtin)
+            return false;
+        if (dictGetStr(m->dict, name))
+            return true;
+    }
+    return false;
+}
+
+V richCompare(V a, V b, Op op)
+{
+    Type *ta = typeOf(a), *tb = typeOf(b);
+    if (ta->builtin && tb->builtin && ta->layout != L::Data && tb->layout != L::Data && ta->layout != L::Type && tb->layout != L::Type)
+    {
+        V r = builtinCompare(a, b, op);
+        if (r != NotImpl)
+            return r;
+    }
+    else
+    {
+        bool tried;
+        Op rop = swapOp(op);
+        bool reflectedFirst = ta != tb && issub(tb, ta) && overrides(tb, cmpName(rop));
+        if (reflectedFirst)
+        {
+            V r = tryCompare(b, a, rop, tried);
+            if (r != NotImpl)
+                return r;
+        }
+        V r = tryCompare(a, b, op, tried);
+        if (r != NotImpl)
+            return r;
+        if (!reflectedFirst)
+        {
+            r = tryCompare(b, a, rop, tried);
+            if (r != NotImpl)
+                return r;
+        }
+    }
+    if (op == OpEq)
+        return mkbool(a == b);
+    if (op == OpNe)
+        return mkbool(a != b);
+    raise(tTypeError, std::string("'") + cmpSym(op) + "' not supported between instances of '" + ta->name + "' and '" + tb->name + "'");
+}
+
+bool eq(V a, V b)
+{
+    if (a == b)
+        return true;
+    if (IS_SMALL(a) && IS_SMALL(b))
+        return false;
+    Type *ta = typeOf(a), *tb = typeOf(b);
+    if (ta == tStr && tb == tStr)
+        return static_cast<Str *>(a)->s == static_cast<Str *>(b)->s;
+    return truthy(richCompare(a, b, OpEq));
+}
+
+bool lt(V a, V b)
+{
+    if (IS_SMALL(a) && IS_SMALL(b))
+        return SMALLV(a) < SMALLV(b);
+    return truthy(richCompare(a, b, OpLt));
+}
+
+// ── arithmetic ─────────────────────────────────────────────────────────────
+
+static const char *opSym(Op op)
+{
+    switch (op)
+    {
+    case OpAdd: return "+";
+    case OpSub: return "-";
+    case OpMul: return "*";
+    case OpMatMul: return "@";
+    case OpDiv: return "/";
+    case OpFloorDiv: return "//";
+    case OpMod: return "%";
+    case OpPow: return "** or pow()";
+    case OpLShift: return "<<";
+    case OpRShift: return ">>";
+    case OpBitOr: return "|";
+    case OpBitXor: return "^";
+    case OpBitAnd: return "&";
+    default: return "?";
+    }
+}
+
+static V repeatSeq(const std::vector<V> &items, int64_t n, std::vector<V> &out)
+{
+    out.clear();
+    if (n <= 0)
+        return nullptr;
+    out.reserve(items.size() * (size_t)n);
+    for (int64_t i = 0; i < n; ++i)
+        out.insert(out.end(), items.begin(), items.end());
+    return nullptr;
+}
+
+// CPython's _Py_c_quot
+static void complexQuot(double ar, double ai, double br, double bi, double &rr, double &ri)
+{
+    double abr = br < 0 ? -br : br, abi = bi < 0 ? -bi : bi;
+    if (abr >= abi)
+    {
+        double ratio = bi / br;
+        double denom = br + bi * ratio;
+        rr = (ar + ai * ratio) / denom;
+        ri = (ai - ar * ratio) / denom;
+    }
+    else
+    {
+        double ratio = br / bi;
+        double denom = br * ratio + bi;
+        rr = (ar * ratio + ai) / denom;
+        ri = (ai * ratio - ar) / denom;
+    }
+}
+
+static V complexBinary(V a, V b, Op op)
+{
+    double ar, ai, br, bi;
+    auto parts = [](V v, double &r, double &i) -> bool {
+        if (!IS_SMALL(v) && v->type->layout == L::Complex)
+        {
+            r = static_cast<ComplexObj *>(v)->re;
+            i = static_cast<ComplexObj *>(v)->im;
+            return true;
+        }
+        if (isNumber(v))
+        {
+            r = toDouble(v);
+            i = 0;
+            return true;
+        }
+        return false;
+    };
+    if (!parts(a, ar, ai) || !parts(b, br, bi))
+        return NotImpl;
+    switch (op)
+    {
+    case OpAdd: return new ComplexObj(tComplex, ar + br, ai + bi);
+    case OpSub: return new ComplexObj(tComplex, ar - br, ai - bi);
+    case OpMul: return new ComplexObj(tComplex, ar * br - ai * bi, ar * bi + ai * br);
+    case OpDiv:
+    {
+        if (br == 0 && bi == 0)
+            raise(tZeroDivisionError, "division by zero");
+        double rr, ri;
+        complexQuot(ar, ai, br, bi, rr, ri);
+        return new ComplexObj(tComplex, rr, ri);
+    }
+    case OpPow:
+    {
+        if (bi == 0 && br == std::floor(br) && std::fabs(br) <= 100)
+        {
+            int64_t k = (int64_t)br;
+            bool neg = k < 0;
+            if (neg)
+                k = -k;
+            double rr = 1, ri = 0, xr = ar, xi = ai;
+            while (k > 0)
+            {
+                if (k & 1)
+                {
+                    double t = rr * xr - ri * xi;
+                    ri = rr * xi + ri * xr;
+                    rr = t;
+                }
+                double t = xr * xr - xi * xi;
+                xi = 2 * xr * xi;
+                xr = t;
+                k >>= 1;
+            }
+            if (neg)
+            {
+                if (rr == 0 && ri == 0)
+                    raise(tZeroDivisionError, "zero to a negative power");
+                double qr, qi;
+                complexQuot(1, 0, rr, ri, qr, qi);
+                return new ComplexObj(tComplex, qr, qi);
+            }
+            return new ComplexObj(tComplex, rr, ri);
+        }
+        if (ar == 0 && ai == 0)
+            return new ComplexObj(tComplex, (br == 0 && bi == 0) ? 1 : 0, 0);
+        double logr = log(hypot(ar, ai)), th = atan2(ai, ar);
+        double nr = exp(logr * br - th * bi), nt = th * br + logr * bi;
+        return new ComplexObj(tComplex, nr * cos(nt), nr * sin(nt));
+    }
+    default:
+        return NotImpl;
+    }
+}
+
+// The arithmetic of the builtin layouts; NotImpl when the pair is foreign
+V builtinBinary(V a, V b, Op op)
+{
+    bool ia = isIntLike(a), ib = isIntLike(b);
+    if (ia && ib)
+    {
+        V r = intBinary(a, b, op);
+        if (r)
+        {
+            // bool & bool stays a bool
+            if ((op == OpBitAnd || op == OpBitOr || op == OpBitXor) && !IS_SMALL(a) && !IS_SMALL(b) &&
+                a->type == tBool && b->type == tBool)
+                return mkbool(intSign(r) != 0);
+            return r;
+        }
+        return NotImpl;
+    }
+    bool na = ia || (!IS_SMALL(a) && a->type->layout == L::Float);
+    bool nb = ib || (!IS_SMALL(b) && b->type->layout == L::Float);
+    if (na && nb)
+    {
+        if (op == OpPow && ia == false && ib)
+        {
+            // float ** int
+        }
+        V r = floatBinary(toDouble(a), toDouble(b), op);
+        return r ? r : NotImpl;
+    }
+    if ((!IS_SMALL(a) && a->type->layout == L::Complex) || (!IS_SMALL(b) && b->type->layout == L::Complex))
+        return complexBinary(a, b, op);
+    if (IS_SMALL(a) && IS_SMALL(b))
+        return NotImpl;
+    L la = typeOf(a)->layout, lb = typeOf(b)->layout;
+    if (op == OpAdd && la == lb)
+    {
+        switch (la)
+        {
+        case L::Str:
+        {
+            Str *x = static_cast<Str *>(a), *y = static_cast<Str *>(b);
+            Str *r = new Str(tStr);
+            r->s = x->s + y->s;
+            r->len = x->len + y->len;
+            r->ascii = x->ascii && y->ascii;
+            return r;
+        }
+        case L::List:
+        {
+            List *r = newList();
+            r->items = static_cast<List *>(a)->items;
+            const std::vector<V> &y = static_cast<List *>(b)->items;
+            r->items.insert(r->items.end(), y.begin(), y.end());
+            return r;
+        }
+        case L::Tuple:
+        {
+            Tuple *r = newTuple(0);
+            r->items = static_cast<Tuple *>(a)->items;
+            const std::vector<V> &y = static_cast<Tuple *>(b)->items;
+            r->items.insert(r->items.end(), y.begin(), y.end());
+            return r;
+        }
+        case L::Bytes:
+        {
+            BytesObj *r = new BytesObj(static_cast<BytesObj *>(a)->mutableBytes ? tByteArray : tBytes);
+            r->mutableBytes = static_cast<BytesObj *>(a)->mutableBytes;
+            r->s = static_cast<BytesObj *>(a)->s + static_cast<BytesObj *>(b)->s;
+            return r;
+        }
+        default:
+            break;
+        }
+    }
+    if (op == OpMul && (ia || ib))
+    {
+        V seq = ia ? b : a;
+        int64_t n = indexOf(ia ? a : b);
+        switch (typeOf(seq)->layout)
+        {
+        case L::Str:
+        {
+            Str *s = static_cast<Str *>(seq);
+            Str *r = new Str(tStr);
+            if (n > 0)
+            {
+                r->s.reserve(s->s.size() * (size_t)n);
+                for (int64_t i = 0; i < n; ++i)
+                    r->s += s->s;
+                r->len = s->len * n;
+            }
+            r->ascii = s->ascii;
+            return r;
+        }
+        case L::List:
+        {
+            List *r = newList();
+            repeatSeq(static_cast<List *>(seq)->items, n, r->items);
+            return r;
+        }
+        case L::Tuple:
+        {
+            Tuple *r = newTuple(0);
+            repeatSeq(static_cast<Tuple *>(seq)->items, n, r->items);
+            return r;
+        }
+        case L::Bytes:
+        {
+            bool mut = static_cast<BytesObj *>(seq)->mutableBytes;
+            BytesObj *r = new BytesObj(mut ? tByteArray : tBytes);
+            r->mutableBytes = mut;
+            for (int64_t i = 0; i < n; ++i)
+                r->s += static_cast<BytesObj *>(seq)->s;
+            return r;
+        }
+        default:
+            break;
+        }
+    }
+    if (op == OpMod && la == L::Str)
+        return newStr(percentFormat(static_cast<Str *>(a), b));
+    if (la == L::Set && lb == L::Set)
+    {
+        Set *x = static_cast<Set *>(a), *y = static_cast<Set *>(b);
+        Type *rt = issub(a->type, tFrozenSet) ? tFrozenSet : tSet;
+        switch (op)
+        {
+        case OpBitOr:
+        {
+            Set *r = setCopy(x, rt);
+            setUpdate(r, y);
+            return r;
+        }
+        case OpBitAnd:
+        {
+            // CPython walks `other` unless it is the larger one
+            Set *r = newSet(rt);
+            Set *small = y, *large = x;
+            if (y->used > x->used)
+            {
+                small = x;
+                large = y;
+            }
+            for (const SEntry &e : small->table)
+                if (e.key && e.key != dummyKey() && setHas(large, e.key))
+                    setAdd(r, e.key);
+            return r;
+        }
+        case OpSub:
+        {
+            if ((x->used >> 2) > y->used)
+            {
+                // CPython copies and removes when the left side is much larger
+                Set *r = setCopy(x, rt);
+                for (const SEntry &e : y->table)
+                    if (e.key && e.key != dummyKey())
+                        setDiscard(r, e.key);
+                return r;
+            }
+            Set *r = newSet(rt);
+            for (const SEntry &e : x->table)
+                if (e.key && e.key != dummyKey() && !setHas(y, e.key))
+                    setAdd(r, e.key);
+            return r;
+        }
+        case OpBitXor:
+        {
+            // CPython: a copy of the right side, updated from the left
+            Set *r = setCopy(y, rt);
+            for (const SEntry &e : x->table)
+                if (e.key && e.key != dummyKey())
+                {
+                    if (!setDiscard(r, e.key))
+                        setAdd(r, e.key);
+                }
+            return r;
+        }
+        default:
+            break;
+        }
+    }
+    if ((la == L::DictView || lb == L::DictView) && (op == OpBitOr || op == OpBitAnd || op == OpSub || op == OpBitXor))
+    {
+        auto asSet = [](V v) {
+            Set *s = newSet();
+            setUpdate(s, v);
+            return s;
+        };
+        bool okA = la == L::Set || (la == L::DictView && static_cast<DictView *>(a)->kind != 1);
+        bool okB = lb == L::Set || lb == L::DictView || lb == L::List || lb == L::Tuple;
+        if (okA && okB)
+            return builtinBinary(asSet(a), asSet(b), op);
+    }
+    if (la == L::Dict && lb == L::Dict && op == OpBitOr)
+    {
+        Dict *r = dictCopy(static_cast<Dict *>(a));
+        for (const DEntry &e : static_cast<Dict *>(b)->entries)
+            if (e.key)
+                dictSet(r, e.key, e.val);
+        return r;
+    }
+    return NotImpl;
+}
+
+static V tryBinary(V a, V b, Str *name)
+{
+    Type *t = typeOf(a);
+    V m = lookupMro(t, name);
+    if (!m || m == None)
+        return NotImpl;
+    bool found;
+    return callSpecial(a, name, &b, 1, found);
+}
+
+V binaryOp(V a, V b, Op op)
+{
+    if (IS_SMALL(a) && IS_SMALL(b))
+    {
+        int64_t x = SMALLV(a), y = SMALLV(b);
+        switch (op)
+        {
+        case OpAdd: return mkint(x + y);
+        case OpSub: return mkint(x - y);
+        default: break;
+        }
+        V r = intBinary(a, b, op);
+        if (r)
+            return r;
+    }
+    Type *ta = typeOf(a), *tb = typeOf(b);
+    if (ta->builtin && tb->builtin && ta->layout != L::Data && tb->layout != L::Data && ta->layout != L::Type && tb->layout != L::Type)
+    {
+        V r = builtinBinary(a, b, op);
+        if (r != NotImpl)
+            return r;
+    }
+    else
+    {
+        Str *name = binNames[op], *rname = rbinNames[op];
+        bool reflectedFirst = ta != tb && issub(tb, ta) && overrides(tb, rname);
+        if (reflectedFirst)
+        {
+            V r = tryBinary(b, a, rname);
+            if (r != NotImpl)
+                return r;
+        }
+        V r = tryBinary(a, b, name);
+        if (r != NotImpl)
+            return r;
+        if (ta != tb && !reflectedFirst)
+        {
+            r = tryBinary(b, a, rname);
+            if (r != NotImpl)
+                return r;
+        }
+    }
+    if (op == OpAdd && ta->layout == L::Str && tb->layout != L::Str)
+        raise(tTypeError, "can only concatenate str (not \"" + tb->name + "\") to str");
+    if (op == OpAdd && ta->layout == L::List && tb->layout != L::List)
+        raise(tTypeError, "can only concatenate list (not \"" + tb->name + "\") to list");
+    if (op == OpAdd && ta->layout == L::Tuple && tb->layout != L::Tuple)
+        raise(tTypeError, "can only concatenate tuple (not \"" + tb->name + "\") to tuple");
+    if (op == OpMul && (ta->layout == L::Str || ta->layout == L::List || ta->layout == L::Tuple || tb->layout == L::Str ||
+                        tb->layout == L::List || tb->layout == L::Tuple))
+        raise(tTypeError, "can't multiply sequence by non-int of type '" + (isIntLike(a) || ta->layout == L::Float ? ta->name : tb->name) + "'");
+    raise(tTypeError, std::string("unsupported operand type(s) for ") + opSym(op) + ": '" + ta->name + "' and '" + tb->name + "'");
+}
+
+V inplaceOp(V a, V b, Op op)
+{
+    if (IS_SMALL(a) && IS_SMALL(b))
+        return binaryOp(a, b, op);
+    Type *ta = typeOf(a);
+    if (ta->builtin)
+    {
+        // list += iterable and list *= n mutate in place; set |= and the like too
+        if (ta->layout == L::List && op == OpAdd)
+        {
+            List *l = static_cast<List *>(a);
+            std::vector<V> items = toVector(b);
+            l->items.insert(l->items.end(), items.begin(), items.end());
+            return a;
+        }
+        if (ta->layout == L::List && op == OpMul && isIntLike(b))
+        {
+            List *l = static_cast<List *>(a);
+            std::vector<V> out;
+            repeatSeq(l->items, indexOf(b), out);
+            l->items = out;
+            return a;
+        }
+        if (ta == tSet && typeOf(b)->layout == L::Set)
+        {
+            Set *s = static_cast<Set *>(a), *o = static_cast<Set *>(b);
+            switch (op)
+            {
+            case OpBitOr:
+                setUpdate(s, o);
+                return a;
+            case OpBitAnd:
+            {
+                for (V k : setItems(s))
+                    if (!setHas(o, k))
+                        setDiscard(s, k);
+                return a;
+            }
+            case OpSub:
+                for (V k : setItems(o))
+                    setDiscard(s, k);
+                return a;
+            case OpBitXor:
+                for (V k : setItems(o))
+                    if (!setDiscard(s, k))
+                        setAdd(s, k);
+                return a;
+            default:
+                break;
+            }
+        }
+        if (ta->layout == L::Dict && op == OpBitOr)
+        {
+            Dict *d = static_cast<Dict *>(a);
+            if (typeOf(b)->layout == L::Dict)
+            {
+                for (const DEntry &e : static_cast<Dict *>(b)->entries)
+                    if (e.key)
+                        dictSet(d, e.key, e.val);
+            }
+            else
+                for (V pair : toVector(b))
+                {
+                    std::vector<V> kv = toVector(pair);
+                    dictSet(d, kv[0], kv[1]);
+                }
+            return a;
+        }
+        if (ta->layout == L::Bytes && static_cast<BytesObj *>(a)->mutableBytes && op == OpAdd)
+        {
+            static_cast<BytesObj *>(a)->s += static_cast<BytesObj *>(b)->s;
+            return a;
+        }
+        return binaryOp(a, b, op);
+    }
+    V m = lookupMro(ta, ibinNames[op]);
+    if (m && m != None)
+    {
+        bool found;
+        V r = callSpecial(a, ibinNames[op], &b, 1, found);
+        if (r != NotImpl)
+            return r;
+    }
+    return binaryOp(a, b, op);
+}
+
+V unaryOp(V a, Op op)
+{
+    if (op == OpNot)
+        return mkbool(!truthy(a));
+    if (IS_SMALL(a))
+    {
+        int64_t x = SMALLV(a);
+        if (op == OpNeg)
+            return mkint(-x);
+        if (op == OpPos)
+            return a;
+        return mkint(~x);
+    }
+    Type *t = a->type;
+    if (t->builtin)
+    {
+        if (t->layout == L::Int)
+        {
+            if (op == OpPos)
+                return fromBig(toBig(a));
+            if (op == OpNeg)
+                return intBinary(MKSMALL(0), a, OpSub);
+            return intBinary(MKSMALL(-1), a, OpBitXor);
+        }
+        if (t->layout == L::Float)
+        {
+            double d = static_cast<FloatObj *>(a)->v;
+            if (op == OpNeg)
+                return mkfloat(-d);
+            if (op == OpPos)
+                return mkfloat(d);
+        }
+        if (t->layout == L::Complex)
+        {
+            ComplexObj *c = static_cast<ComplexObj *>(a);
+            if (op == OpNeg)
+                return new ComplexObj(tComplex, -c->re, -c->im);
+            if (op == OpPos)
+                return a;
+        }
+    }
+    Str *name = op == OpNeg ? s___neg__ : op == OpPos ? s___pos__ : s___invert__;
+    bool found;
+    V r = callSpecial(a, name, nullptr, 0, found);
+    if (found)
+        return r;
+    const char *sym = op == OpNeg ? "-" : op == OpPos ? "+" : "~";
+    raise(tTypeError, std::string("bad operand type for unary ") + sym + ": '" + t->name + "'");
+}
+
+// ── items ──────────────────────────────────────────────────────────────────
+
+V getitem(V obj, V key)
+{
+    if (!IS_SMALL(obj))
+    {
+        Type *t = obj->type;
+        if (t == tList && IS_SMALL(key))
+        {
+            List *l = static_cast<List *>(obj);
+            int64_t i = SMALLV(key), n = (int64_t)l->items.size();
+            if (i < 0)
+                i += n;
+            if (i < 0 || i >= n)
+                raise(tIndexError, "list index out of range");
+            return l->items[(size_t)i];
+        }
+        if (t == tTuple && IS_SMALL(key))
+        {
+            Tuple *tp = static_cast<Tuple *>(obj);
+            int64_t i = SMALLV(key), n = (int64_t)tp->items.size();
+            if (i < 0)
+                i += n;
+            if (i < 0 || i >= n)
+                raise(tIndexError, "tuple index out of range");
+            return tp->items[(size_t)i];
+        }
+        if (t == tDict)
+        {
+            V v = dictGet(static_cast<Dict *>(obj), key);
+            if (v)
+                return v;
+            raiseArgs(tKeyError, key);
+        }
+    }
+    bool found;
+    V r = callSpecial(obj, s___getitem__, &key, 1, found);
+    if (found)
+        return r;
+    if (typeOf(obj)->layout == L::Type)
+    {
+        V cg;
+        if (getattrOpt(obj, s___class_getitem__, cg))
+            return call1(cg, key);
+        if (issub(static_cast<Type *>(obj), tObject))
+            raise(tTypeError, "type '" + static_cast<Type *>(obj)->name + "' is not subscriptable");
+    }
+    raise(tTypeError, "'" + std::string(typeName(obj)) + "' object is not subscriptable");
+}
+
+void setitem(V obj, V key, V val)
+{
+    if (!IS_SMALL(obj))
+    {
+        Type *t = obj->type;
+        if (t == tList && IS_SMALL(key))
+        {
+            List *l = static_cast<List *>(obj);
+            int64_t i = SMALLV(key), n = (int64_t)l->items.size();
+            if (i < 0)
+                i += n;
+            if (i < 0 || i >= n)
+                raise(tIndexError, "list assignment index out of range");
+            l->items[(size_t)i] = val;
+            return;
+        }
+        if (t == tDict)
+        {
+            dictSet(static_cast<Dict *>(obj), key, val);
+            return;
+        }
+    }
+    bool found;
+    V args[2] = {key, val};
+    callSpecial(obj, s___setitem__, args, 2, found);
+    if (!found)
+        raise(tTypeError, "'" + std::string(typeName(obj)) + "' object does not support item assignment");
+}
+
+void delitem(V obj, V key)
+{
+    bool found;
+    callSpecial(obj, s___delitem__, &key, 1, found);
+    if (!found)
+        raise(tTypeError, "'" + std::string(typeName(obj)) + "' object doesn't support item deletion");
+}
+
+bool contains(V container, V item)
+{
+    if (!IS_SMALL(container))
+    {
+        Type *t = container->type;
+        if (t->builtin)
+        {
+            switch (t->layout)
+            {
+            case L::Dict: return dictGet(static_cast<Dict *>(container), item) != nullptr;
+            case L::Set: return setHas(static_cast<Set *>(container), item);
+            case L::List:
+                for (V x : static_cast<List *>(container)->items)
+                    if (eq(x, item))
+                        return true;
+                return false;
+            case L::Tuple:
+                for (V x : static_cast<Tuple *>(container)->items)
+                    if (eq(x, item))
+                        return true;
+                return false;
+            case L::Str:
+                if (!isStr(item))
+                    raise(tTypeError, "'in <string>' requires string as left operand, not " + std::string(typeName(item)));
+                return static_cast<Str *>(container)->s.find(static_cast<Str *>(item)->s) != std::string::npos;
+            default:
+                break;
+            }
+        }
+    }
+    bool found;
+    V r = callSpecial(container, s___contains__, &item, 1, found);
+    if (found)
+        return truthy(r);
+    V it = getiter(container);
+    V x;
+    while (iterNext(it, x))
+        if (eq(x, item))
+            return true;
+    return false;
+}
+
+// ── format() ───────────────────────────────────────────────────────────────
+
+std::string formatValue(V v, const std::string &spec)
+{
+    Type *t = typeOf(v);
+    if (t->builtin || !lookupMro(t, s___format__) || lookupMro(t, s___format__) == dictGetStr(tObject->dict, s___format__))
+    {
+        if (t->builtin || lookupMro(t, s___format__) == dictGetStr(tObject->dict, s___format__))
+        {
+            // the layout's own format, unless a class only customised __str__
+            L l = t->layout;
+            if (!t->builtin && l == L::Object)
+            {
+                if (!spec.empty())
+                    raise(tTypeError, "unsupported format string passed to " + t->name + ".__format__");
+                return strOf(v);
+            }
+            if (l == L::Int && !issub(t, tBool))
+                return formatIntSpec(v, spec);
+            if (l == L::Int)
+            {
+                if (spec.empty())
+                    return strOf(v);
+                return formatIntSpec(mkint(static_cast<IntObj *>(v)->small), spec);
+            }
+            if (l == L::Float)
+                return formatFloatSpec(static_cast<FloatObj *>(v)->v, spec, false);
+            if (l == L::Str)
+                return formatStrSpec(static_cast<Str *>(v)->s, spec);
+            if (spec.empty())
+                return strOf(v);
+            if (l == L::Complex)
+            {
+                // precision and type apply to each part, width and alignment to the whole
+                ComplexObj *c = static_cast<ComplexObj *>(v);
+                size_t k = spec.size();
+                char type = k ? spec[k - 1] : 0;
+                bool typed = type && strchr("eEfFgGn%", type);
+                size_t dot = spec.find('.');
+                std::string head = dot != std::string::npos ? spec.substr(0, dot) : (typed ? spec.substr(0, k - 1) : spec);
+                std::string tail = dot != std::string::npos ? spec.substr(dot) : (typed ? spec.substr(k - 1) : "");
+                std::string sign, pad;
+                for (char ch : head)
+                    if (ch == '+' || ch == ' ')
+                        sign = std::string(1, ch);
+                    else
+                        pad += ch;
+                auto trim = [](std::string x) {
+                    if (x.size() > 2 && x.compare(x.size() - 2, 2, ".0") == 0)
+                        x = x.substr(0, x.size() - 2);
+                    return x;
+                };
+                std::string re, im;
+                if (typed || !tail.empty())
+                {
+                    re = formatFloatSpec(c->re, sign + tail, false);
+                    im = formatFloatSpec(c->im, "+" + tail, false);
+                }
+                else
+                {
+                    re = (c->re == 0 && !std::signbit(c->re)) ? "" : sign + trim(floatRepr(c->re));
+                    im = trim(floatRepr(c->im));
+                    if (im[0] != '-')
+                        im = "+" + im;
+                }
+                std::string body = re.empty() ? im.substr(im[0] == '+' ? 1 : 0) + "j" : re + im + "j";
+                if (!typed && !re.empty())
+                    body = "(" + body + ")";
+                if (pad.empty())
+                    return body;
+                bool aligned = strchr("<>^", pad[0]) || (pad.size() > 1 && strchr("<>^", pad[1]));
+                return formatStrSpec(body, aligned ? pad : ">" + pad);
+            }
+            return formatStrSpec(strOf(v), spec);
+        }
+    }
+    V specV = newStr(spec);
+    bool found;
+    V r = callSpecial(v, s___format__, &specV, 1, found);
+    if (!isStr(r))
+        raise(tTypeError, "__format__ must return a str");
+    return asStr(r)->s;
+}
+
+// ── natives for object and type ────────────────────────────────────────────
+
+static V object_new(V *a, int n, Kw *kw)
+{
+    (void)kw;
+    if (n < 1 || typeOf(a[0])->layout != L::Type)
+        raise(tTypeError, "object.__new__(X): X is not a type object");
+    Type *t = static_cast<Type *>(a[0]);
+    if (t->abstract)
+    {
+        V am = lookupMro(t, s___abstractmethods__);
+        std::vector<std::string> names;
+        if (am && am != None)
+            for (V x : toVector(am))
+                names.push_back(strOf(x));
+        std::sort(names.begin(), names.end());
+        std::string list;
+        for (size_t i = 0; i < names.size(); ++i)
+            list += (i ? ", '" : "'") + names[i] + "'";
+        raise(tTypeError, "Can't instantiate abstract class " + t->name + " without an implementation for abstract method" + (names.size() == 1 ? " " : "s ") + list);
+    }
+    return newObject(t);
+}
+
+static V object_init(V *, int, Kw *) { return None; }
+
+static V object_repr(V *a, int, Kw *)
+{
+    Type *t = typeOf(a[0]);
+    if (t->builtin)
+        return newStr(builtinRepr(a[0]));
+    return newStr("<" + qualifiedName(t) + " object at " + addrOf(a[0]) + ">");
+}
+
+static V object_str(V *a, int, Kw *) { return newStr(reprOf(a[0])); }
+
+static V object_eq(V *a, int n, Kw *)
+{
+    checkArgs("__eq__", n, 2, 2);
+    return a[0] == a[1] ? True : NotImpl;
+}
+
+static V object_ne(V *a, int n, Kw *)
+{
+    checkArgs("__ne__", n, 2, 2);
+    bool found;
+    V r = callSpecial(a[0], s___eq__, &a[1], 1, found);
+    if (r == NotImpl)
+        return NotImpl;
+    return mkbool(!truthy(r));
+}
+
+static V object_notimpl(V *, int, Kw *) { return NotImpl; }
+
+static V object_hash(V *a, int, Kw *) { return mkint(builtinHash(a[0]) >> 1); }
+
+static V object_format(V *a, int n, Kw *)
+{
+    checkArgs("__format__", n, 2, 2);
+    std::string spec = strOf(a[1]);
+    if (!spec.empty())
+        raise(tTypeError, "unsupported format string passed to " + std::string(typeName(a[0])) + ".__format__");
+    return newStr(strOf(a[0]));
+}
+
+static V object_setattr(V *a, int n, Kw *)
+{
+    checkArgs("__setattr__", n, 3, 3);
+    objectSetattr(a[0], intern(strOf(a[1])), a[2]);
+    return None;
+}
+
+static V object_delattr(V *a, int n, Kw *)
+{
+    checkArgs("__delattr__", n, 2, 2);
+    objectDelattr(a[0], intern(strOf(a[1])));
+    return None;
+}
+
+static V object_init_subclass(V *, int, Kw *) { return None; }
+
+static V object_class(V *a, int, Kw *) { return typeOf(a[0]); }
+
+static V object_dict(V *a, int, Kw *)
+{
+    V o = a[0];
+    if (!IS_SMALL(o) && o->type->slotsRestrict)
+        raise(tAttributeError, "'" + o->type->name + "' object has no attribute '__dict__'");
+    if (IS_SMALL(o))
+        raise(tAttributeError, "'int' object has no attribute '__dict__'");
+    if (o->type->layout == L::Type)
+        return static_cast<Type *>(o)->dict; // a mappingproxy in CPython
+    if (!o->dict)
+    {
+        if (o->type->builtin && o->type->layout != L::Func)
+            raise(tAttributeError, "'" + std::string(typeName(o)) + "' object has no attribute '__dict__'");
+        o->dict = newDict();
+    }
+    return o->dict;
+}
+
+static V object_dir(V *a, int, Kw *)
+{
+    Set *names = newSet();
+    V o = a[0];
+    if (!IS_SMALL(o) && o->dict)
+        for (const DEntry &e : o->dict->entries)
+            if (e.key)
+                setAdd(names, e.key);
+    for (Type *m : typeOf(o)->mro)
+        for (const DEntry &e : m->dict->entries)
+            if (e.key)
+                setAdd(names, e.key);
+    List *l = newList();
+    l->items = setItems(names);
+    listSort(l, nullptr, false);
+    return l;
+}
+
+static V object_reduce_ex(V *a, int, Kw *)
+{
+    raise(tTypeError, "cannot pickle '" + std::string(typeName(a[0])) + "' object");
+}
+
+static V object_subclasshook(V *, int, Kw *) { return NotImpl; }
+
+static void addType(Type *t);
+
+// type.__new__(meta, name, bases, ns) and type(name, bases, ns)
+static V type_new(V *a, int n, Kw *kw)
+{
+    if (n == 2)
+        return typeOf(a[1]);
+    checkArgs("type.__new__", n, 4, 4);
+    Type *meta = static_cast<Type *>(a[0]);
+    std::vector<V> bases = toVector(a[2]);
+    if (typeOf(a[3])->layout != L::Dict)
+        raise(tTypeError, "type.__new__() argument 3 must be dict");
+    Dict *ns = static_cast<Dict *>(a[3]);
+    Type *t = new Type(meta);
+    t->name = strOf(a[1]);
+    V qn = dictGetStr(ns, s___qualname__);
+    t->qualname = qn ? strOf(qn) : t->name;
+    t->builtin = false;
+    t->dict = dictCopy(ns);
+    if (qn)
+        dictDel(t->dict, s___qualname__);
+    V mod = dictGetStr(ns, s___module__);
+    t->module = mod ? strOf(mod) : "__main__";
+    if (bases.empty())
+        bases.push_back(tObject);
+    for (V b : bases)
+    {
+        if (typeOf(b)->layout != L::Type || !issub(typeOf(b), tType))
+            raise(tTypeError, "bases must be types");
+        Type *bt = static_cast<Type *>(b);
+        if (bt == tBool || bt == tRange || bt == tSlice || bt == tFunc || bt == tGen || bt == tNoneType)
+            raise(tTypeError, "type '" + bt->name + "' is not an acceptable base type");
+        t->bases.push_back(bt);
+    }
+    computeMro(t);
+    // the solid base: the most derived builtin layout
+    t->layout = L::Object;
+    t->base = t->bases[0];
+    for (Type *m : t->mro)
+        if (m->builtin && m->layout != L::Object)
+        {
+            t->layout = m->layout;
+            break;
+        }
+    t->hasDict = true;
+    V slots = dictGetStr(ns, s___slots__);
+    if (slots)
+    {
+        std::vector<V> sl = isStr(slots) ? std::vector<V>{slots} : toVector(slots);
+        bool hasDictSlot = false;
+        for (V s : sl)
+        {
+            if (strOf(s) == "__dict__")
+                hasDictSlot = true;
+            else
+                t->slots.push_back(intern(strOf(s)));
+        }
+        bool restrict = !hasDictSlot;
+        for (Type *m : t->mro)
+            if (m != t && !m->builtin && m->slots.empty() && !dictGetStr(m->dict, s___slots__))
+                restrict = false;
+        t->slotsRestrict = restrict;
+    }
+    // a class that defines __eq__ but not __hash__ is unhashable
+    if (dictGetStr(t->dict, s___eq__) && !dictGetStr(t->dict, s___hash__))
+        dictSet(t->dict, s___hash__, None);
+    // wrap __init_subclass__ and __class_getitem__ as classmethods, __new__ as a staticmethod
+    V isc = dictGetStr(t->dict, s___init_subclass__);
+    if (isc && !IS_SMALL(isc) && isc->type->layout == L::Func)
+    {
+        WrapObj *w = new WrapObj(tClassMethod);
+        w->func = isc;
+        dictSet(t->dict, s___init_subclass__, w);
+    }
+    V cgi = dictGetStr(t->dict, s___class_getitem__);
+    if (cgi && !IS_SMALL(cgi) && cgi->type->layout == L::Func)
+    {
+        WrapObj *w = new WrapObj(tClassMethod);
+        w->func = cgi;
+        dictSet(t->dict, s___class_getitem__, w);
+    }
+    V nw = dictGetStr(t->dict, s___new__);
+    if (nw && !IS_SMALL(nw) && nw->type->layout == L::Func)
+    {
+        WrapObj *w = new WrapObj(tStaticMethod);
+        w->func = nw;
+        dictSet(t->dict, s___new__, w);
+    }
+    // the class cell for zero-argument super()
+    V cell = dictGetStr(t->dict, s___classcell__);
+    if (cell)
+    {
+        static_cast<CellObj *>(cell)->v = t;
+        dictDel(t->dict, s___classcell__);
+    }
+    // abstract methods (only ABCMeta classes enforce them)
+    bool abcMeta = false;
+    for (Type *m : meta->mro)
+        if (m->name == "ABCMeta")
+            abcMeta = true;
+    Set *abstract = newSet();
+    for (const DEntry &e : abcMeta ? t->dict->entries : std::vector<DEntry>())
+    {
+        if (!e.key)
+            continue;
+        V flag;
+        if (!IS_SMALL(e.val) && e.val->type->layout != L::Singleton && getattrOpt(e.val, s___isabstractmethod__, flag) && truthy(flag))
+            setAdd(abstract, e.key);
+    }
+    for (Type *b : t->bases)
+    {
+        V am = abcMeta ? dictGetStr(b->dict, s___abstractmethods__) : nullptr;
+        if (!am)
+            continue;
+        for (V name : toVector(am))
+        {
+            V impl = lookupMro(t, asStr(name));
+            V flag;
+            if (impl && !IS_SMALL(impl) && impl->type->layout != L::Singleton && getattrOpt(impl, s___isabstractmethod__, flag) && truthy(flag))
+                setAdd(abstract, name);
+        }
+    }
+    if (abcMeta && (abstract->used > 0 || dictGetStr(t->dict, s___abstractmethods__)))
+    {
+        Set *fs = setCopy(abstract, tFrozenSet);
+        dictSet(t->dict, s___abstractmethods__, fs);
+        t->abstract = abstract->used > 0;
+    }
+    // __set_name__ on descriptors
+    std::vector<DEntry> entries = t->dict->entries;
+    for (const DEntry &e : entries)
+    {
+        if (!e.key || IS_SMALL(e.val) || e.val->type->builtin)
+            continue;
+        V sn = lookupMro(e.val->type, s___set_name__);
+        if (sn)
+        {
+            V args[3] = {e.val, t, e.key};
+            call(sn, args, 3);
+        }
+    }
+    addType(t);
+    callInitSubclass(t, kw);
+    return t;
+}
+
+static V type_init(V *, int, Kw *) { return None; }
+
+static V type_call(V *a, int n, Kw *kw)
+{
+    if (n < 1 || typeOf(a[0])->layout != L::Type)
+        raise(tTypeError, "descriptor '__call__' requires a type");
+    return typeCall(static_cast<Type *>(a[0]), a + 1, n - 1, kw);
+}
+
+static V type_repr(V *a, int, Kw *) { return newStr(builtinRepr(a[0])); }
+
+static V type_name_get(V *a, int, Kw *) { return newStr(static_cast<Type *>(a[0])->name); }
+static V type_name_set(V *a, int, Kw *)
+{
+    static_cast<Type *>(a[0])->name = strOf(a[1]);
+    return None;
+}
+static V type_qualname_get(V *a, int, Kw *) { return newStr(static_cast<Type *>(a[0])->qualname); }
+static V type_qualname_set(V *a, int, Kw *)
+{
+    static_cast<Type *>(a[0])->qualname = strOf(a[1]);
+    return None;
+}
+static V type_module_get(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    V m = dictGetStr(t->dict, s___module__);
+    return m ? m : newStr(t->module);
+}
+static V type_module_set(V *a, int, Kw *)
+{
+    static_cast<Type *>(a[0])->module = strOf(a[1]);
+    dictSet(static_cast<Type *>(a[0])->dict, s___module__, a[1]);
+    return None;
+}
+
+static V type_doc_set(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    if (t->builtin)
+        raise(tTypeError, "cannot set '__doc__' attribute of immutable type '" + t->name + "'");
+    dictSet(t->dict, s___doc__, a[1]);
+    return None;
+}
+
+static V type_annotations_set(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    if (t->builtin)
+        raise(tTypeError, "cannot set '__annotations__' attribute of immutable type '" + t->name + "'");
+    dictSet(t->dict, s___annotations__, a[1]);
+    return None;
+}
+
+static V type_doc_get(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    V d = dictGetStr(t->dict, s___doc__);
+    return d ? d : None;
+}
+
+static V type_mro_get(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    std::vector<V> items(t->mro.begin(), t->mro.end());
+    return tupleOf(items);
+}
+
+static V type_mro(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    List *l = newList();
+    for (Type *m : t->mro)
+        l->items.push_back(m);
+    return l;
+}
+
+static V type_bases_get(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    std::vector<V> items(t->bases.begin(), t->bases.end());
+    return tupleOf(items);
+}
+
+static V type_base_get(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    if (t->bases.empty())
+        return None;
+    return t->bases[0];
+}
+
+static std::vector<Type *> *allTypes;
+
+static V type_subclasses(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    List *l = newList();
+    if (allTypes)
+        for (Type *c : *allTypes)
+            for (Type *b : c->bases)
+                if (b == t)
+                    l->items.push_back(c);
+    return l;
+}
+
+static V type_instancecheck(V *a, int n, Kw *)
+{
+    checkArgs("__instancecheck__", n, 2, 2);
+    return mkbool(isinst(a[1], static_cast<Type *>(a[0])));
+}
+
+static V type_subclasscheck(V *a, int n, Kw *)
+{
+    checkArgs("__subclasscheck__", n, 2, 2);
+    if (typeOf(a[1])->layout != L::Type)
+        raise(tTypeError, "issubclass() arg 1 must be a class");
+    return mkbool(issub(static_cast<Type *>(a[1]), static_cast<Type *>(a[0])));
+}
+
+static V type_or(V *a, int n, Kw *)
+{
+    checkArgs("__or__", n, 2, 2);
+    V u = dictGetC(builtinsDict, "_UnionType");
+    if (!u)
+        return NotImpl;
+    return call2(u, a[0], a[1]);
+}
+
+static V type_ror(V *a, int n, Kw *)
+{
+    checkArgs("__ror__", n, 2, 2);
+    V u = dictGetC(builtinsDict, "_UnionType");
+    if (!u)
+        return NotImpl;
+    return call2(u, a[1], a[0]);
+}
+
+static V type_annotations_get(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    V an = dictGetStr(t->dict, s___annotations__);
+    if (an)
+        return an;
+    Dict *d = newDict();
+    if (!t->builtin)
+        dictSet(t->dict, s___annotations__, d);
+    return d;
+}
+
+static V type_abstract_get(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    V am = dictGetStr(t->dict, s___abstractmethods__);
+    if (!am)
+        raise(tAttributeError, "__abstractmethods__");
+    return am;
+}
+
+static V type_abstract_set(V *a, int, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    dictSet(t->dict, s___abstractmethods__, a[1]);
+    t->abstract = truthy(a[1]);
+    return None;
+}
+
+static V type_dict_get(V *a, int, Kw *) { return static_cast<Type *>(a[0])->dict; }
+
+static V type_prepare(V *, int, Kw *) { return newDict(); }
+
+// ── function, method and friends ───────────────────────────────────────────
+
+static V func_name_get(V *a, int, Kw *) { return static_cast<Func *>(a[0])->name; }
+static V func_name_set(V *a, int, Kw *)
+{
+    static_cast<Func *>(a[0])->name = a[1];
+    return None;
+}
+static V func_qualname_get(V *a, int, Kw *) { return static_cast<Func *>(a[0])->qualname; }
+static V func_qualname_set(V *a, int, Kw *)
+{
+    static_cast<Func *>(a[0])->qualname = a[1];
+    return None;
+}
+static V func_doc_get(V *a, int, Kw *) { return static_cast<Func *>(a[0])->doc; }
+static V func_doc_set(V *a, int, Kw *)
+{
+    static_cast<Func *>(a[0])->doc = a[1];
+    return None;
+}
+static V func_module_get(V *a, int, Kw *) { return static_cast<Func *>(a[0])->module; }
+static V func_module_set(V *a, int, Kw *)
+{
+    static_cast<Func *>(a[0])->module = a[1];
+    return None;
+}
+static V func_defaults_get(V *a, int, Kw *)
+{
+    Func *f = static_cast<Func *>(a[0]);
+    if (f->defaults.empty())
+        return None;
+    return tupleOf(f->defaults);
+}
+static V func_defaults_set(V *a, int, Kw *)
+{
+    Func *f = static_cast<Func *>(a[0]);
+    f->defaults = a[1] == None ? std::vector<V>() : toVector(a[1]);
+    return None;
+}
+static V func_kwdefaults_get(V *a, int, Kw *)
+{
+    Func *f = static_cast<Func *>(a[0]);
+    return f->kwdefaults ? (V)f->kwdefaults : None;
+}
+static V func_annotations_get(V *a, int, Kw *)
+{
+    Func *f = static_cast<Func *>(a[0]);
+    if (!f->annotations)
+        f->annotations = newDict();
+    return f->annotations;
+}
+static V func_annotations_set(V *a, int, Kw *)
+{
+    static_cast<Func *>(a[0])->annotations = static_cast<Dict *>(a[1]);
+    return None;
+}
+static V func_code_get(V *a, int, Kw *) { return static_cast<Func *>(a[0])->code; }
+static V func_globals_get(V *a, int, Kw *) { return static_cast<Func *>(a[0])->globals; }
+static V func_closure_get(V *a, int, Kw *)
+{
+    Func *f = static_cast<Func *>(a[0]);
+    if (f->closure.empty())
+        return None;
+    std::vector<V> items(f->closure.begin(), f->closure.end());
+    return tupleOf(items);
+}
+static V func_get(V *a, int n, Kw *)
+{
+    // function.__get__(obj, type)
+    if (n < 2 || a[1] == None)
+        return a[0];
+    MethodObj *m = new MethodObj(tMethod);
+    m->func = a[0];
+    m->self = a[1];
+    return m;
+}
+static V func_call(V *a, int n, Kw *kw) { return call(a[0], a + 1, n - 1, kw); }
+
+static V code_name_get(V *a, int, Kw *) { return newStr(static_cast<Code *>(a[0])->name); }
+static V code_argcount_get(V *a, int, Kw *) { return mkint(static_cast<Code *>(a[0])->argcount); }
+static V code_varnames_get(V *a, int, Kw *)
+{
+    Code *c = static_cast<Code *>(a[0]);
+    std::vector<V> items(c->varnames.begin(), c->varnames.end());
+    return tupleOf(items);
+}
+static V code_flags_get(V *a, int, Kw *)
+{
+    Code *c = static_cast<Code *>(a[0]);
+    int f = 0;
+    if (c->flags & CF_GENERATOR)
+        f |= 0x20;
+    if (c->flags & CF_VARARGS)
+        f |= 0x04;
+    if (c->flags & CF_VARKW)
+        f |= 0x08;
+    return mkint(f);
+}
+static V code_firstlineno_get(V *a, int, Kw *) { return mkint(static_cast<Code *>(a[0])->firstline); }
+static V code_filename_get(V *a, int, Kw *) { return newStr(static_cast<Code *>(a[0])->filename); }
+static V code_kwonly_get(V *a, int, Kw *) { return mkint(static_cast<Code *>(a[0])->kwonly); }
+static V strTuple(const std::vector<Str *> &v)
+{
+    std::vector<V> items(v.begin(), v.end());
+    return tupleOf(items);
+}
+static V code_freevars_get(V *a, int, Kw *) { return strTuple(static_cast<Code *>(a[0])->freevars); }
+static V code_cellvars_get(V *a, int, Kw *) { return strTuple(static_cast<Code *>(a[0])->cellvars); }
+static V code_names_get(V *a, int, Kw *) { return strTuple(static_cast<Code *>(a[0])->names); }
+static V code_nlocals_get(V *a, int, Kw *) { return mkint(static_cast<Code *>(a[0])->nlocals); }
+static V code_qualname_get(V *a, int, Kw *) { return newStr(static_cast<Code *>(a[0])->qualname); }
+static V code_posonly_get(V *a, int, Kw *) { return mkint(static_cast<Code *>(a[0])->posonly); }
+
+static V method_func_get(V *a, int, Kw *) { return static_cast<MethodObj *>(a[0])->func; }
+static V method_self_get(V *a, int, Kw *) { return static_cast<MethodObj *>(a[0])->self; }
+static V method_name_get(V *a, int, Kw *) { return getattr(static_cast<MethodObj *>(a[0])->func, s___name__); }
+static V method_qualname_get(V *a, int, Kw *) { return getattr(static_cast<MethodObj *>(a[0])->func, s___qualname__); }
+static V method_doc_get(V *a, int, Kw *) { return getattr(static_cast<MethodObj *>(a[0])->func, s___doc__); }
+static V method_getattr(V *a, int n, Kw *)
+{
+    checkArgs("__getattr__", n, 2, 2);
+    return getattr(static_cast<MethodObj *>(a[0])->func, intern(strOf(a[1])));
+}
+
+static V native_name_get(V *a, int, Kw *) { return newStr(static_cast<NativeObj *>(a[0])->name); }
+static V native_self_get(V *a, int, Kw *)
+{
+    V s = static_cast<NativeObj *>(a[0])->self;
+    return s ? s : None;
+}
+static V native_doc_get(V *, int, Kw *) { return None; }
+static V native_module_get(V *, int, Kw *) { return newStr("builtins"); }
+static V native_get(V *a, int n, Kw *)
+{
+    if (n < 2 || a[1] == None)
+        return a[0];
+    return bindDescriptor(a[0], a[1], typeOf(a[1]));
+}
+
+static V wrap_new(V *a, int n, Kw *)
+{
+    checkArgs("classmethod", n, 2, 2);
+    Type *t = static_cast<Type *>(a[0]);
+    WrapObj *w = static_cast<WrapObj *>(newObject(t));
+    w->func = a[1];
+    return w;
+}
+static V wrap_func_get(V *a, int, Kw *) { return static_cast<WrapObj *>(a[0])->func; }
+static V wrap_isabstract_get(V *a, int, Kw *)
+{
+    V f = static_cast<WrapObj *>(a[0])->func;
+    V flag;
+    if (getattrOpt(f, s___isabstractmethod__, flag))
+        return flag;
+    return False;
+}
+static V wrap_get(V *a, int n, Kw *)
+{
+    WrapObj *w = static_cast<WrapObj *>(a[0]);
+    V obj = n > 1 ? a[1] : None;
+    V owner = n > 2 && a[2] != None ? a[2] : (V)typeOf(obj);
+    if (issub(typeOf(a[0]), tStaticMethod))
+        return w->func;
+    MethodObj *m = new MethodObj(tMethod);
+    m->func = w->func;
+    m->self = owner;
+    return m;
+}
+static V wrap_call(V *a, int n, Kw *kw) { return call(static_cast<WrapObj *>(a[0])->func, a + 1, n - 1, kw); }
+static V wrap_getattr(V *a, int n, Kw *)
+{
+    checkArgs("__getattr__", n, 2, 2);
+    return getattr(static_cast<WrapObj *>(a[0])->func, intern(strOf(a[1])));
+}
+
+static V property_new(V *a, int n, Kw *kw)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    PropertyObj *p = static_cast<PropertyObj *>(newObject(t));
+    V args[4] = {nullptr, nullptr, nullptr, nullptr};
+    for (int i = 1; i < n && i <= 4; ++i)
+        args[i - 1] = a[i];
+    if (V x = kwArg(kw, "fget"))
+        args[0] = x;
+    if (V x = kwArg(kw, "fset"))
+        args[1] = x;
+    if (V x = kwArg(kw, "fdel"))
+        args[2] = x;
+    if (V x = kwArg(kw, "doc"))
+        args[3] = x;
+    p->fget = args[0] == None ? nullptr : args[0];
+    p->fset = args[1] == None ? nullptr : args[1];
+    p->fdel = args[2] == None ? nullptr : args[2];
+    p->doc = args[3];
+    if (!p->doc && p->fget)
+    {
+        V d;
+        if (getattrOpt(p->fget, s___doc__, d))
+            p->doc = d;
+    }
+    return p;
+}
+static V property_init(V *, int, Kw *) { return None; }
+static PropertyObj *propCopy(V self)
+{
+    PropertyObj *old = static_cast<PropertyObj *>(self);
+    PropertyObj *p = static_cast<PropertyObj *>(newObject(typeOf(self)));
+    p->fget = old->fget;
+    p->fset = old->fset;
+    p->fdel = old->fdel;
+    p->doc = old->doc;
+    return p;
+}
+static V property_getter(V *a, int, Kw *)
+{
+    PropertyObj *p = propCopy(a[0]);
+    p->fget = a[1];
+    return p;
+}
+static V property_setter(V *a, int, Kw *)
+{
+    PropertyObj *p = propCopy(a[0]);
+    p->fset = a[1];
+    return p;
+}
+static V property_deleter(V *a, int, Kw *)
+{
+    PropertyObj *p = propCopy(a[0]);
+    p->fdel = a[1];
+    return p;
+}
+static V property_get(V *a, int n, Kw *)
+{
+    PropertyObj *p = static_cast<PropertyObj *>(a[0]);
+    if (n < 2 || a[1] == None)
+        return a[0];
+    if (!p->fget)
+        raise(tAttributeError, "unreadable attribute");
+    return call1(p->fget, a[1]);
+}
+static V property_set(V *a, int n, Kw *)
+{
+    checkArgs("__set__", n, 3, 3);
+    PropertyObj *p = static_cast<PropertyObj *>(a[0]);
+    if (!p->fset)
+        raise(tAttributeError, "can't set attribute");
+    call2(p->fset, a[1], a[2]);
+    return None;
+}
+static V property_fget(V *a, int, Kw *)
+{
+    V f = static_cast<PropertyObj *>(a[0])->fget;
+    return f ? f : None;
+}
+static V property_fset(V *a, int, Kw *)
+{
+    V f = static_cast<PropertyObj *>(a[0])->fset;
+    return f ? f : None;
+}
+static V property_fdel(V *a, int, Kw *)
+{
+    V f = static_cast<PropertyObj *>(a[0])->fdel;
+    return f ? f : None;
+}
+static V property_doc(V *a, int, Kw *)
+{
+    V d = static_cast<PropertyObj *>(a[0])->doc;
+    return d ? d : None;
+}
+static V property_isabstract(V *a, int, Kw *)
+{
+    PropertyObj *p = static_cast<PropertyObj *>(a[0]);
+    V flag;
+    for (V f : {p->fget, p->fset, p->fdel})
+        if (f && getattrOpt(f, s___isabstractmethod__, flag) && truthy(flag))
+            return True;
+    return False;
+}
+static V property_name(V *a, int, Kw *)
+{
+    PropertyObj *p = static_cast<PropertyObj *>(a[0]);
+    if (p->fget)
+        return getattr(p->fget, s___name__);
+    return None;
+}
+
+// super(), super(T, obj)
+static V super_new(V *a, int n, Kw *)
+{
+    SuperObj *s = new SuperObj(tSuper);
+    if (n == 1)
+    {
+        Frame *f = currentFrame();
+        if (!f || f->code->argcount == 0 || f->fast.empty())
+            raise(tRuntimeError, "super(): no arguments");
+        // __class__ is a free variable of the method
+        CellObj *cell = nullptr;
+        Code *c = f->code;
+        for (size_t i = 0; i < c->freevars.size(); ++i)
+            if (c->freevars[i]->s == "__class__")
+                cell = f->cells[c->cellvars.size() + i];
+        if (!cell || !cell->v)
+            raise(tRuntimeError, "super(): __class__ cell not found");
+        s->start = static_cast<Type *>(cell->v);
+        V self = f->fast[0];
+        if (!self)
+        {
+            // the first argument may live in a cell
+            for (size_t i = 0; i < c->cellvars.size(); ++i)
+                if (!c->cell2arg.empty() && c->cell2arg[i] == 0)
+                    self = f->cells[i]->v;
+        }
+        s->self = self;
+        return s;
+    }
+    checkArgs("super", n - 1, 1, 2);
+    if (typeOf(a[1])->layout != L::Type)
+        raise(tTypeError, "super() argument 1 must be a type");
+    s->start = static_cast<Type *>(a[1]);
+    s->self = n > 2 ? a[2] : None;
+    return s;
+}
+
+static V super_getattribute(V *a, int n, Kw *)
+{
+    checkArgs("__getattribute__", n, 2, 2);
+    SuperObj *s = static_cast<SuperObj *>(a[0]);
+    Str *name = intern(strOf(a[1]));
+    if (name->s == "__class__")
+        return tSuper;
+    Type *startType = s->self == None ? s->start
+                      : (typeOf(s->self)->layout == L::Type && issub(static_cast<Type *>(s->self), s->start))
+                          ? static_cast<Type *>(s->self)
+                          : typeOf(s->self);
+    V attr = lookupMroAfter(startType, s->start, name);
+    if (!attr)
+        raise(tAttributeError, "'super' object has no attribute '" + name->s + "'");
+    bool selfIsType = s->self != None && typeOf(s->self)->layout == L::Type && issub(static_cast<Type *>(s->self), s->start);
+    if (selfIsType)
+    {
+        // super() inside a classmethod / __new__ / __init_subclass__
+        if (!IS_SMALL(attr) && attr->type->layout == L::ClassMethod)
+        {
+            MethodObj *m = new MethodObj(tMethod);
+            m->func = static_cast<WrapObj *>(attr)->func;
+            m->self = s->self;
+            return m;
+        }
+        if (!IS_SMALL(attr) && attr->type->layout == L::StaticMethod)
+            return static_cast<WrapObj *>(attr)->func;
+        if (!IS_SMALL(attr) && attr->type->layout == L::Native && static_cast<NativeObj *>(attr)->classMethod)
+            return bindDescriptor(attr, nullptr, static_cast<Type *>(s->self));
+        if (!IS_SMALL(attr) && attr->type->layout == L::Func && name->s == "__init_subclass__")
+        {
+            MethodObj *m = new MethodObj(tMethod);
+            m->func = attr;
+            m->self = s->self;
+            return m;
+        }
+        return attr;
+    }
+    if (s->self == None)
+        return attr;
+    return bindDescriptor(attr, s->self, typeOf(s->self));
+}
+
+static V super_thisclass(V *a, int, Kw *) { return static_cast<SuperObj *>(a[0])->start; }
+static V super_self(V *a, int, Kw *) { return static_cast<SuperObj *>(a[0])->self; }
+
+static V notimpl_bool(V *, int, Kw *) { return True; }
+
+static V module_repr(V *a, int, Kw *) { return newStr(builtinRepr(a[0])); }
+static V module_name_get(V *a, int, Kw *)
+{
+    V n = dictGetStr(a[0]->dict, s___name__);
+    return n ? n : newStr(static_cast<ModuleObj *>(a[0])->name);
+}
+
+static V singleton_repr(V *a, int, Kw *) { return newStr(builtinRepr(a[0])); }
+
+// The native dunders of the builtin layouts, so `int.__add__`, super()
+// calls from subclasses and the like reach them
+static void defBinaryDunders(Type *t)
+{
+    for (int op = OpAdd; op <= OpBitAnd; ++op)
+    {
+        Op o = (Op)op;
+        setAttrStr(t->dict, binNames[op]->s.c_str(), makeNativeClosure(binNames[op]->s.c_str(), [o](V *a, int n, Kw *) -> V {
+            checkArgs("binary op", n, 2, 2);
+            return builtinBinary(a[0], a[1], o);
+        }));
+        setAttrStr(t->dict, rbinNames[op]->s.c_str(), makeNativeClosure(rbinNames[op]->s.c_str(), [o](V *a, int n, Kw *) -> V {
+            checkArgs("binary op", n, 2, 2);
+            return builtinBinary(a[1], a[0], o);
+        }));
+        static_cast<NativeObj *>(dictGetStr(t->dict, binNames[op]))->method = true;
+        static_cast<NativeObj *>(dictGetStr(t->dict, rbinNames[op]))->method = true;
+    }
+}
+
+static void defCompareDunders(Type *t)
+{
+    Op ops[] = {OpEq, OpNe, OpLt, OpLe, OpGt, OpGe};
+    for (Op o : ops)
+    {
+        NativeObj *nf = static_cast<NativeObj *>(makeNativeClosure(cmpName(o)->s.c_str(), [o](V *a, int n, Kw *) -> V {
+            checkArgs("comparison", n, 2, 2);
+            return builtinCompare(a[0], a[1], o);
+        }));
+        nf->method = true;
+        dictSet(t->dict, cmpName(o), nf);
+    }
+}
+
+static void defCommonDunders(Type *t)
+{
+    NativeObj *r = static_cast<NativeObj *>(makeNativeClosure("__repr__", [](V *a, int, Kw *) -> V { return newStr(builtinRepr(a[0])); }));
+    r->method = true;
+    dictSet(t->dict, s___repr__, r);
+    NativeObj *h = static_cast<NativeObj *>(makeNativeClosure("__hash__", [](V *a, int, Kw *) -> V { return mkint(builtinHash(a[0])); }));
+    h->method = true;
+    dictSet(t->dict, s___hash__, h);
+}
+
+static V num_bool(V *a, int, Kw *) { return mkbool(truthy(a[0])); }
+static V num_neg(V *a, int, Kw *)
+{
+    if (typeOf(a[0])->layout == L::Int)
+        return intBinary(MKSMALL(0), a[0], OpSub);
+    if (typeOf(a[0])->layout == L::Float)
+        return mkfloat(-static_cast<FloatObj *>(a[0])->v);
+    return unaryOp(a[0], OpNeg);
+}
+static V num_pos(V *a, int, Kw *)
+{
+    if (typeOf(a[0])->layout == L::Int)
+        return fromBig(toBig(a[0]));
+    return mkfloat(toDouble(a[0]));
+}
+static V num_abs(V *a, int, Kw *)
+{
+    if (typeOf(a[0])->layout == L::Int)
+        return intSign(a[0]) < 0 ? intBinary(MKSMALL(0), a[0], OpSub) : fromBig(toBig(a[0]));
+    return mkfloat(fabs(toDouble(a[0])));
+}
+static V int_invert(V *a, int, Kw *) { return intBinary(MKSMALL(-1), a[0], OpBitXor); }
+static V int_index(V *a, int, Kw *) { return fromBig(toBig(a[0])); }
+static V int_float(V *a, int, Kw *) { return mkfloat(intToDouble(a[0])); }
+static V num_int(V *a, int, Kw *)
+{
+    if (typeOf(a[0])->layout == L::Int)
+        return fromBig(toBig(a[0]));
+    return intFromDouble(toDouble(a[0]));
+}
+static V num_format(V *a, int n, Kw *)
+{
+    checkArgs("__format__", n, 2, 2);
+    std::string spec = strOf(a[1]);
+    if (typeOf(a[0])->layout == L::Int)
+        return newStr(formatIntSpec(fromBig(toBig(a[0])), spec));
+    return newStr(formatFloatSpec(toDouble(a[0]), spec, false));
+}
+static V num_str(V *a, int, Kw *) { return newStr(builtinRepr(a[0])); }
+static V float_float(V *a, int, Kw *) { return mkfloat(toDouble(a[0])); }
+static V num_round(V *a, int n, Kw *kw);
+static V num_trunc(V *a, int, Kw *)
+{
+    if (typeOf(a[0])->layout == L::Int)
+        return fromBig(toBig(a[0]));
+    return intFromDouble(toDouble(a[0]));
+}
+static V num_floor(V *a, int, Kw *)
+{
+    if (typeOf(a[0])->layout == L::Int)
+        return fromBig(toBig(a[0]));
+    return intFromDouble(std::floor(toDouble(a[0])));
+}
+static V num_ceil(V *a, int, Kw *)
+{
+    if (typeOf(a[0])->layout == L::Int)
+        return fromBig(toBig(a[0]));
+    return intFromDouble(std::ceil(toDouble(a[0])));
+}
+static V num_getnewargs(V *a, int, Kw *)
+{
+    Tuple *t = newTuple(1);
+    t->items[0] = typeOf(a[0])->layout == L::Int ? fromBig(toBig(a[0])) : mkfloat(toDouble(a[0]));
+    return t;
+}
+
+// round(x[, ndigits]) for ints and floats
+V numRound(V x, V nd)
+{
+    if (typeOf(x)->layout == L::Int || IS_SMALL(x))
+    {
+        if (!nd || nd == None)
+            return fromBig(toBig(x));
+        int64_t d = indexOf(nd);
+        if (d >= 0)
+            return fromBig(toBig(x));
+        // round to a multiple of 10**-d, half to even
+        V p = intPow(MKSMALL(10), mkint(-d), nullptr);
+        V q = intBinary(x, p, OpFloorDiv);
+        V r = intBinary(x, p, OpMod);
+        V twice = intBinary(r, MKSMALL(2), OpMul);
+        int c = intCompare(twice, p);
+        if (c > 0 || (c == 0 && intSign(intBinary(q, MKSMALL(2), OpMod)) != 0))
+            q = intBinary(q, MKSMALL(1), OpAdd);
+        return intBinary(q, p, OpMul);
+    }
+    double d = toDouble(x);
+    if (!nd || nd == None)
+    {
+        double r = std::nearbyint(d); // banker's rounding in the default mode
+        if (std::fabs(d - std::trunc(d)) == 0.5)
+            r = 2.0 * std::round(d / 2.0);
+        else
+            r = std::round(d);
+        return intFromDouble(r);
+    }
+    int64_t nd2 = indexOf(nd);
+    if (!std::isfinite(d))
+        return mkfloat(d);
+    if (nd2 > 22)
+        return mkfloat(d);
+    if (nd2 < -22)
+        return mkfloat(0.0 * d);
+    // correctly rounded through the decimal string, as CPython does
+    char buf[512];
+    if (nd2 >= 0)
+    {
+        snprintf(buf, sizeof buf, "%.*f", (int)nd2, d);
+        return mkfloat(strtod(buf, nullptr));
+    }
+    double p = pow(10.0, (double)-nd2);
+    double y = d / p;
+    double z = std::round(y);
+    if (std::fabs(y - std::trunc(y)) == 0.5)
+        z = 2.0 * std::round(y / 2.0);
+    return mkfloat(z * p);
+}
+
+static V num_round(V *a, int n, Kw *kw)
+{
+    V nd = n > 1 ? a[1] : kwArg(kw, "ndigits");
+    return numRound(a[0], nd);
+}
+
+static void defNumberDunders(Type *t, bool isInt)
+{
+    defBinaryDunders(t);
+    defCompareDunders(t);
+    defCommonDunders(t);
+    defMethod(t, "__bool__", num_bool);
+    defMethod(t, "__neg__", num_neg);
+    defMethod(t, "__pos__", num_pos);
+    defMethod(t, "__abs__", num_abs);
+    defMethod(t, "__int__", num_int);
+    defMethod(t, "__format__", num_format);
+    defMethod(t, "__str__", num_str);
+    defMethod(t, "__round__", num_round);
+    defMethod(t, "__trunc__", num_trunc);
+    defMethod(t, "__floor__", num_floor);
+    defMethod(t, "__ceil__", num_ceil);
+    defMethod(t, "__getnewargs__", num_getnewargs);
+    if (isInt)
+    {
+        defMethod(t, "__invert__", int_invert);
+        defMethod(t, "__index__", int_index);
+        defMethod(t, "__float__", int_float);
+    }
+    else
+        defMethod(t, "__float__", float_float);
+}
+
+static void addType(Type *t)
+{
+    if (!allTypes)
+        allTypes = new std::vector<Type *>();
+    allTypes->push_back(t);
+}
+
+V nativeTypeNew(Type *t)
+{
+    (void)t;
+    return nullptr;
+}
+
+static Type *excType(const char *name, Type *base)
+{
+    Type *t = newType(name, base, L::Exc);
+    t->hasDict = true;
+    addType(t);
+    return t;
+}
+
+static void initExceptionTypes();
+
+void initObjectModel()
+{
+    // bootstrap: type and object before anything can be allocated through them
+    tType = new Type(nullptr);
+    tType->type = tType;
+    tObject = new Type(tType);
+    tStr = new Type(tType);
+    tDict = new Type(tType);
+    tType->dict = new Dict(tDict);
+    tObject->dict = new Dict(tDict);
+    tStr->dict = new Dict(tDict);
+    tDict->dict = new Dict(tDict);
+    auto setup = [](Type *t, const char *name, Type *base, L layout) {
+        t->name = name;
+        t->qualname = name;
+        t->module = "builtins";
+        t->layout = layout;
+        t->builtin = true;
+        t->hasDict = false;
+        if (base)
+        {
+            t->bases.push_back(base);
+            t->base = base;
+        }
+        t->mro.clear();
+        t->mro.push_back(t);
+        if (base)
+            for (Type *m : base->mro)
+                t->mro.push_back(m);
+    };
+    setup(tObject, "object", nullptr, L::Object);
+    setup(tType, "type", tObject, L::Type);
+    setup(tStr, "str", tObject, L::Str);
+    setup(tDict, "dict", tObject, L::Dict);
+    tType->dict->type = tDict;
+    tObject->dict->type = tDict;
+    tStr->dict->type = tDict;
+    tDict->dict->type = tDict;
+
+    tInt = newType("int", tObject, L::Int);
+    tBool = newType("bool", tInt, L::Int);
+    tFloat = newType("float", tObject, L::Float);
+    tComplex = newType("complex", tObject, L::Complex);
+    tBytes = newType("bytes", tObject, L::Bytes);
+    tByteArray = newType("bytearray", tObject, L::Bytes);
+    tTuple = newType("tuple", tObject, L::Tuple);
+    tList = newType("list", tObject, L::List);
+    tSet = newType("set", tObject, L::Set);
+    tFrozenSet = newType("frozenset", tObject, L::Set);
+    tRange = newType("range", tObject, L::Range);
+    tSlice = newType("slice", tObject, L::Slice);
+    tFunc = newType("function", tObject, L::Func);
+    tNative = newType("builtin_function_or_method", tObject, L::Native);
+    tMethod = newType("method", tObject, L::Method);
+    tClassMethod = newType("classmethod", tObject, L::ClassMethod);
+    tStaticMethod = newType("staticmethod", tObject, L::StaticMethod);
+    tProperty = newType("property", tObject, L::Property);
+    tCell = newType("cell", tObject, L::Cell);
+    tCode = newType("code", tObject, L::Code);
+    tGen = newType("generator", tObject, L::Gen);
+    tModule = newType("module", tObject, L::Module);
+    tNoneType = newType("NoneType", tObject, L::Singleton);
+    tNotImplType = newType("NotImplementedType", tObject, L::Singleton);
+    tEllipsisType = newType("ellipsis", tObject, L::Singleton);
+    tIter = newType("iterator", tObject, L::Iter);
+    tDictKeys = newType("dict_keys", tObject, L::DictView);
+    tDictValues = newType("dict_values", tObject, L::DictView);
+    tDictItems = newType("dict_items", tObject, L::DictView);
+    tSuper = newType("super", tObject, L::Super);
+    tData = newType("object", tObject, L::Data);
+    tModule->hasDict = true;
+    tFunc->hasDict = true;
+    Type *all[] = {tObject, tType, tStr, tDict, tInt, tBool, tFloat, tComplex, tBytes, tByteArray, tTuple, tList, tSet,
+                   tFrozenSet, tRange, tSlice, tFunc, tNative, tMethod, tClassMethod, tStaticMethod, tProperty, tCell,
+                   tCode, tGen, tModule, tNoneType, tNotImplType, tEllipsisType, tIter, tDictKeys, tDictValues,
+                   tDictItems, tSuper};
+    for (Type *t : all)
+        addType(t);
+
+    None = new Obj(tNoneType);
+    NotImpl = new Obj(tNotImplType);
+    EllipsisV = new Obj(tEllipsisType);
+    IntObj *t1 = new IntObj(tBool);
+    t1->small = 1;
+    IntObj *f0 = new IntObj(tBool);
+    f0->small = 0;
+    True = t1;
+    False = f0;
+
+#define S(var, text) var = intern(text)
+    S(s___get__, "__get__");
+    S(s___set__, "__set__");
+    S(s___delete__, "__delete__");
+    S(s___getattr__, "__getattr__");
+    S(s___getattribute__, "__getattribute__");
+    S(s___setattr__, "__setattr__");
+    S(s___delattr__, "__delattr__");
+    S(s___init__, "__init__");
+    S(s___new__, "__new__");
+    S(s___call__, "__call__");
+    S(s___repr__, "__repr__");
+    S(s___str__, "__str__");
+    S(s___hash__, "__hash__");
+    S(s___eq__, "__eq__");
+    S(s___ne__, "__ne__");
+    S(s___lt__, "__lt__");
+    S(s___le__, "__le__");
+    S(s___gt__, "__gt__");
+    S(s___ge__, "__ge__");
+    S(s___len__, "__len__");
+    S(s___bool__, "__bool__");
+    S(s___iter__, "__iter__");
+    S(s___next__, "__next__");
+    S(s___getitem__, "__getitem__");
+    S(s___setitem__, "__setitem__");
+    S(s___delitem__, "__delitem__");
+    S(s___contains__, "__contains__");
+    S(s___index__, "__index__");
+    S(s___format__, "__format__");
+    S(s___class__, "__class__");
+    S(s___dict__, "__dict__");
+    S(s___name__, "__name__");
+    S(s___qualname__, "__qualname__");
+    S(s___module__, "__module__");
+    S(s___doc__, "__doc__");
+    S(s___init_subclass__, "__init_subclass__");
+    S(s___set_name__, "__set_name__");
+    S(s___class_getitem__, "__class_getitem__");
+    S(s___missing__, "__missing__");
+    S(s___reversed__, "__reversed__");
+    S(s___neg__, "__neg__");
+    S(s___pos__, "__pos__");
+    S(s___invert__, "__invert__");
+    S(s___abs__, "__abs__");
+    S(s___int__, "__int__");
+    S(s___float__, "__float__");
+    S(s___mro_entries__, "__mro_entries__");
+    S(s___instancecheck__, "__instancecheck__");
+    S(s___subclasscheck__, "__subclasscheck__");
+    S(s___slots__, "__slots__");
+    S(s___abstractmethods__, "__abstractmethods__");
+    S(s___isabstractmethod__, "__isabstractmethod__");
+    S(s___classcell__, "__classcell__");
+    S(s___weakref__, "__weakref__");
+    S(s___annotations__, "__annotations__");
+    S(s___orig_bases__, "__orig_bases__");
+    S(s___length_hint__, "__length_hint__");
+#undef S
+    const char *bn[] = {"add", "sub", "mul", "matmul", "truediv", "floordiv", "mod", "pow", "lshift", "rshift", "or", "xor", "and"};
+    for (int i = 0; i < 13; ++i)
+    {
+        binNames[i] = intern(std::string("__") + bn[i] + "__");
+        rbinNames[i] = intern(std::string("__r") + bn[i] + "__");
+        ibinNames[i] = intern(std::string("__i") + bn[i] + "__");
+    }
+
+    // object
+    s_objectNew = makeNative("__new__", object_new, false);
+    dictSet(tObject->dict, s___new__, s_objectNew);
+    s_objectInit = makeNative("__init__", object_init, true);
+    dictSet(tObject->dict, s___init__, s_objectInit);
+    defMethod(tObject, "__repr__", object_repr);
+    defMethod(tObject, "__str__", object_str);
+    defMethod(tObject, "__eq__", object_eq);
+    defMethod(tObject, "__ne__", object_ne);
+    defMethod(tObject, "__lt__", object_notimpl);
+    defMethod(tObject, "__le__", object_notimpl);
+    defMethod(tObject, "__gt__", object_notimpl);
+    defMethod(tObject, "__ge__", object_notimpl);
+    defMethod(tObject, "__hash__", object_hash);
+    defMethod(tObject, "__format__", object_format);
+    nativeObjectSetattr = makeNative("__setattr__", object_setattr, true);
+    dictSet(tObject->dict, s___setattr__, nativeObjectSetattr);
+    nativeObjectDelattr = makeNative("__delattr__", object_delattr, true);
+    dictSet(tObject->dict, s___delattr__, nativeObjectDelattr);
+    nativeObjectGetattribute = makeNative("__getattribute__", objectGetattributeNative, true);
+    dictSet(tObject->dict, s___getattribute__, nativeObjectGetattribute);
+    defClassMethod(tObject, "__init_subclass__", object_init_subclass);
+    defClassMethod(tObject, "__subclasshook__", object_subclasshook);
+    defMethod(tObject, "__dir__", object_dir);
+    defMethod(tObject, "__reduce_ex__", object_reduce_ex);
+    PropertyObj *cls = new PropertyObj(tProperty);
+    cls->fget = makeNative("__class__", object_class, false);
+    dictSet(tObject->dict, s___class__, cls);
+    PropertyObj *dictProp = new PropertyObj(tProperty);
+    dictProp->fget = makeNative("__dict__", object_dict, false);
+    dictSet(tObject->dict, s___dict__, dictProp);
+    setAttrStr(tObject->dict, "__doc__", newStr("The base class of the class hierarchy."));
+
+    // type
+    dictSet(tType->dict, s___new__, makeNative("__new__", type_new, false));
+    defMethod(tType, "__init__", type_init);
+    defMethod(tType, "__call__", type_call);
+    defMethod(tType, "__repr__", type_repr);
+    defMethod(tType, "mro", type_mro);
+    defMethod(tType, "__subclasses__", type_subclasses);
+    defMethod(tType, "__instancecheck__", type_instancecheck);
+    defMethod(tType, "__subclasscheck__", type_subclasscheck);
+    defMethod(tType, "__or__", type_or);
+    defMethod(tType, "__ror__", type_ror);
+    defClassMethod(tType, "__prepare__", type_prepare);
+    defGetSet(tType, "__name__", type_name_get, type_name_set);
+    defGetSet(tType, "__qualname__", type_qualname_get, type_qualname_set);
+    defGetSet(tType, "__module__", type_module_get, type_module_set);
+    defGetSet(tType, "__doc__", type_doc_get, type_doc_set);
+    defProperty(tType, "__mro__", type_mro_get);
+    defProperty(tType, "__bases__", type_bases_get);
+    defProperty(tType, "__base__", type_base_get);
+    defProperty(tType, "__dict__", type_dict_get);
+    defGetSet(tType, "__annotations__", type_annotations_get, type_annotations_set);
+    defGetSet(tType, "__abstractmethods__", type_abstract_get, type_abstract_set);
+
+    // functions
+    defGetSet(tFunc, "__name__", func_name_get, func_name_set);
+    defGetSet(tFunc, "__qualname__", func_qualname_get, func_qualname_set);
+    defGetSet(tFunc, "__doc__", func_doc_get, func_doc_set);
+    defGetSet(tFunc, "__module__", func_module_get, func_module_set);
+    defGetSet(tFunc, "__defaults__", func_defaults_get, func_defaults_set);
+    defProperty(tFunc, "__kwdefaults__", func_kwdefaults_get);
+    defGetSet(tFunc, "__annotations__", func_annotations_get, func_annotations_set);
+    defProperty(tFunc, "__code__", func_code_get);
+    defProperty(tFunc, "__globals__", func_globals_get);
+    defProperty(tFunc, "__closure__", func_closure_get);
+    defMethod(tFunc, "__get__", func_get);
+    defMethod(tFunc, "__call__", func_call);
+    defCommonDunders(tFunc);
+    defProperty(tCode, "co_name", code_name_get);
+    defProperty(tCode, "co_argcount", code_argcount_get);
+    defProperty(tCode, "co_varnames", code_varnames_get);
+    defProperty(tCode, "co_flags", code_flags_get);
+    defProperty(tCode, "co_firstlineno", code_firstlineno_get);
+    defProperty(tCode, "co_filename", code_filename_get);
+    defProperty(tCode, "co_kwonlyargcount", code_kwonly_get);
+    defProperty(tCode, "co_posonlyargcount", code_posonly_get);
+    defProperty(tCode, "co_freevars", code_freevars_get);
+    defProperty(tCode, "co_cellvars", code_cellvars_get);
+    defProperty(tCode, "co_names", code_names_get);
+    defProperty(tCode, "co_nlocals", code_nlocals_get);
+    defProperty(tCode, "co_qualname", code_qualname_get);
+    defProperty(tMethod, "__func__", method_func_get);
+    defProperty(tMethod, "__self__", method_self_get);
+    defProperty(tMethod, "__name__", method_name_get);
+    defProperty(tMethod, "__qualname__", method_qualname_get);
+    defProperty(tMethod, "__doc__", method_doc_get);
+    defMethod(tMethod, "__getattr__", method_getattr);
+    defCompareDunders(tMethod);
+    defCommonDunders(tMethod);
+    defProperty(tNative, "__name__", native_name_get);
+    defProperty(tNative, "__qualname__", native_name_get);
+    defProperty(tNative, "__self__", native_self_get);
+    defProperty(tNative, "__doc__", native_doc_get);
+    defProperty(tNative, "__module__", native_module_get);
+    defMethod(tNative, "__get__", native_get);
+    defMethod(tNative, "__call__", func_call);
+    defMethod(tMethod, "__call__", func_call);
+    defCommonDunders(tNative);
+    for (Type *w : {tClassMethod, tStaticMethod})
+    {
+        dictSet(w->dict, s___new__, makeNative("__new__", wrap_new, false));
+        defProperty(w, "__func__", wrap_func_get);
+        defProperty(w, "__wrapped__", wrap_func_get);
+        defProperty(w, "__isabstractmethod__", wrap_isabstract_get);
+        defMethod(w, "__get__", wrap_get);
+        defMethod(w, "__getattr__", wrap_getattr);
+        w->hasDict = true;
+    }
+    defMethod(tStaticMethod, "__call__", wrap_call);
+    dictSet(tProperty->dict, s___new__, makeNative("__new__", property_new, false));
+    defMethod(tProperty, "__init__", property_init);
+    defMethod(tProperty, "getter", property_getter);
+    defMethod(tProperty, "setter", property_setter);
+    defMethod(tProperty, "deleter", property_deleter);
+    defMethod(tProperty, "__get__", property_get);
+    defMethod(tProperty, "__set__", property_set);
+    defProperty(tProperty, "fget", property_fget);
+    defProperty(tProperty, "fset", property_fset);
+    defProperty(tProperty, "fdel", property_fdel);
+    defProperty(tProperty, "__doc__", property_doc);
+    defProperty(tProperty, "__isabstractmethod__", property_isabstract);
+    defProperty(tProperty, "__name__", property_name);
+    dictSet(tSuper->dict, s___new__, makeNative("__new__", super_new, false));
+    defMethod(tSuper, "__getattribute__", super_getattribute);
+    defProperty(tSuper, "__thisclass__", super_thisclass);
+    defProperty(tSuper, "__self__", super_self);
+    tSuper->builtin = false; // so its __getattribute__ is honoured
+    tSuper->hasDict = false;
+    defMethod(tNotImplType, "__bool__", notimpl_bool);
+    for (Type *s : {tNoneType, tNotImplType, tEllipsisType})
+    {
+        defMethod(s, "__repr__", singleton_repr);
+        defCompareDunders(s);
+    }
+    defMethod(tModule, "__repr__", module_repr);
+    defProperty(tModule, "__name__", module_name_get);
+
+    // numbers
+    defNumberDunders(tInt, true);
+    defNumberDunders(tFloat, false);
+    defBinaryDunders(tComplex);
+    defCompareDunders(tComplex);
+    defCommonDunders(tComplex);
+    // sequences and the rest share the layout-based comparison and repr
+    for (Type *t : {tStr, tBytes, tByteArray, tTuple, tList, tDict, tSet, tFrozenSet, tRange, tSlice, tDictKeys,
+                    tDictValues, tDictItems, tGen, tCell, tIter, tProperty, tType})
+    {
+        defCompareDunders(t);
+        if (!dictGetStr(t->dict, s___repr__))
+            defCommonDunders(t);
+    }
+    for (Type *t : {tStr, tBytes, tTuple, tList, tSet, tFrozenSet, tDict, tDictKeys, tDictItems})
+    {
+        Op ops[] = {OpAdd, OpMul, OpMod, OpBitOr, OpBitAnd, OpSub, OpBitXor};
+        for (Op o : ops)
+        {
+            NativeObj *f = static_cast<NativeObj *>(makeNativeClosure(binNames[o]->s.c_str(), [o](V *a, int n, Kw *) -> V {
+                checkArgs("binary op", n, 2, 2);
+                return builtinBinary(a[0], a[1], o);
+            }));
+            f->method = true;
+            dictSet(t->dict, binNames[o], f);
+            NativeObj *r = static_cast<NativeObj *>(makeNativeClosure(rbinNames[o]->s.c_str(), [o](V *a, int n, Kw *) -> V {
+                checkArgs("binary op", n, 2, 2);
+                return builtinBinary(a[1], a[0], o);
+            }));
+            r->method = true;
+            dictSet(t->dict, rbinNames[o], r);
+        }
+    }
+    for (Type *t : {tList, tDict, tSet, tByteArray})
+        dictSet(t->dict, s___hash__, None);
+    initExceptionTypes();
+}
+
+// ── exceptions ─────────────────────────────────────────────────────────────
+
+Type *tBaseException, *tException, *tStopIteration, *tGeneratorExit, *tKeyboardInterrupt, *tSystemExit,
+    *tArithmeticError, *tZeroDivisionError, *tOverflowError, *tAssertionError, *tAttributeError, *tLookupError,
+    *tIndexError, *tKeyError, *tNameError, *tUnboundLocalError, *tRuntimeError, *tRecursionError,
+    *tNotImplementedError, *tTypeError, *tValueError, *tUnicodeError, *tImportError, *tModuleNotFoundError, *tOSError,
+    *tFileNotFoundError, *tEOFError, *tMemoryError, *tSyntaxError, *tStopAsyncIteration, *tUnicodeDecodeError,
+    *tUnicodeEncodeError, *tFloatingPointError, *tBufferError, *tWarning, *tUserWarning, *tDeprecationWarning,
+    *tRuntimeWarning, *tPermissionError, *tTimeoutError, *tIsADirectoryError, *tExceptionGroup, *tBaseExceptionGroup,
+    *tConnectionError, *tFileExistsError, *tIndentationError, *tTabError, *tSystemError, *tReferenceError,
+    *tProcessLookupError, *tChildProcessError, *tBrokenPipeError, *tInterruptedError, *tBlockingIOError,
+    *tUnicodeTranslateError, *tFutureWarning, *tPendingDeprecationWarning, *tSyntaxWarning, *tImportWarning,
+    *tUnicodeWarning, *tBytesWarning, *tResourceWarning, *tEncodingWarning, *tNotADirectoryError,
+    *tConnectionResetError, *tConnectionRefusedError, *tConnectionAbortedError;
+
+static V exc_new(V *a, int n, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    ExcObj *e = static_cast<ExcObj *>(newObject(t));
+    std::vector<V> args(a + 1, a + n);
+    e->args = tupleOf(args);
+    return e;
+}
+
+static V exc_init(V *a, int n, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    std::vector<V> args(a + 1, a + n);
+    e->args = tupleOf(args);
+    return None;
+}
+
+static V exc_str(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    if (e->args->items.empty())
+        return newStr("");
+    if (e->args->items.size() == 1)
+        return strV(e->args->items[0]);
+    return newStr(reprOf(e->args));
+}
+
+static V keyerror_str(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    if (e->args->items.size() == 1)
+        return newStr(reprOf(e->args->items[0]));
+    return exc_str(a, 1, nullptr);
+}
+
+static V exc_repr(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    std::string args = e->args->items.size() == 1 ? "(" + reprOf(e->args->items[0]) + ")" : reprOf(e->args);
+    return newStr(std::string(typeName(a[0])) + args);
+}
+
+static V exc_args_get(V *a, int, Kw *) { return static_cast<ExcObj *>(a[0])->args; }
+static V exc_args_set(V *a, int, Kw *)
+{
+    static_cast<ExcObj *>(a[0])->args = tupleOf(toVector(a[1]));
+    return None;
+}
+static V exc_cause_get(V *a, int, Kw *)
+{
+    V c = static_cast<ExcObj *>(a[0])->cause;
+    return c ? c : None;
+}
+static V exc_cause_set(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    e->cause = a[1] == None ? nullptr : a[1];
+    e->suppressContext = true;
+    return None;
+}
+static V exc_context_get(V *a, int, Kw *)
+{
+    V c = static_cast<ExcObj *>(a[0])->context;
+    return c ? c : None;
+}
+static V exc_context_set(V *a, int, Kw *)
+{
+    static_cast<ExcObj *>(a[0])->context = a[1] == None ? nullptr : a[1];
+    return None;
+}
+static V exc_suppress_get(V *a, int, Kw *) { return mkbool(static_cast<ExcObj *>(a[0])->suppressContext); }
+static V exc_suppress_set(V *a, int, Kw *)
+{
+    static_cast<ExcObj *>(a[0])->suppressContext = truthy(a[1]);
+    return None;
+}
+static V exc_traceback_get(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    return e->tbLines.empty() ? None : (V)tupleOf(std::vector<V>{mkint(e->tbLines[0])});
+}
+static V exc_with_traceback(V *a, int, Kw *) { return a[0]; }
+static V exc_add_note(V *a, int n, Kw *)
+{
+    checkArgs("add_note", n, 2, 2);
+    if (!isStr(a[1]))
+        raise(tTypeError, "note must be a str, not '" + std::string(typeName(a[1])) + "'");
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    e->notes.push_back(asStr(a[1])->s);
+    if (!e->dict)
+        e->dict = newDict();
+    V notes = dictGetC(e->dict, "__notes__");
+    if (!notes)
+    {
+        notes = newList();
+        setAttrStr(e->dict, "__notes__", notes);
+    }
+    static_cast<List *>(notes)->items.push_back(a[1]);
+    return None;
+}
+static V stopiter_value_get(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    if (e->dict)
+    {
+        V v = dictGetC(e->dict, "value");
+        if (v)
+            return v;
+    }
+    return e->args->items.empty() ? None : e->args->items[0];
+}
+static V systemexit_code_get(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    return e->args->items.empty() ? None : e->args->items.size() == 1 ? e->args->items[0] : (V)e->args;
+}
+
+static V oserror_errno(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    return e->args->items.size() >= 2 ? e->args->items[0] : None;
+}
+static V oserror_strerror(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    return e->args->items.size() >= 2 ? e->args->items[1] : None;
+}
+
+static Type *osErrorFor(int64_t err)
+{
+    switch (err)
+    {
+    case 2: return tFileNotFoundError;
+    case 13: return tPermissionError;
+    case 17: return tFileExistsError;
+    case 21: return tIsADirectoryError;
+    case 20: return tNotADirectoryError;
+    case 32: return tBrokenPipeError;
+    case 110:
+    case 60: return tTimeoutError;
+    case 111:
+    case 61: return tConnectionRefusedError;
+    case 104:
+    case 54: return tConnectionResetError;
+    case 103:
+    case 53: return tConnectionAbortedError;
+    case 3: return tProcessLookupError;
+    case 10: return tChildProcessError;
+    case 11:
+    case 35: return tBlockingIOError;
+    case 4: return tInterruptedError;
+    default: return nullptr;
+    }
+}
+
+V osErrorFor(int64_t errnoValue, const std::string &msg, const std::string &path)
+{
+    V args[4] = {tOSError, mkint(errnoValue), newStr(msg), newStr(path)};
+    extern V callOsErrorNew(V *a, int n);
+    return callOsErrorNew(args, 4);
+}
+
+static V oserror_new(V *a, int n, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    if (t == tOSError && n >= 3 && isIntLike(a[1]))
+    {
+        Type *sub = osErrorFor(indexOf(a[1]));
+        if (sub)
+            t = sub;
+    }
+    ExcObj *e = static_cast<ExcObj *>(newObject(t));
+    std::vector<V> args(a + 1, a + n);
+    if (args.size() >= 3 && args.size() <= 5)
+    {
+        if (!e->dict)
+            e->dict = newDict();
+        setAttrStr(e->dict, "filename", args[2]);
+        if (args.size() >= 5)
+            setAttrStr(e->dict, "filename2", args[4]);
+        args.resize(2);
+    }
+    e->args = tupleOf(args);
+    return e;
+}
+
+static V oserror_init(V *, int, Kw *) { return None; }
+
+V callOsErrorNew(V *a, int n) { return oserror_new(a, n, nullptr); }
+
+static V oserror_str(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    V fn = e->dict ? dictGetC(e->dict, "filename") : nullptr;
+    if (e->args->items.size() == 2)
+    {
+        std::string s = "[Errno " + strOf(e->args->items[0]) + "] " + strOf(e->args->items[1]);
+        if (fn && fn != None)
+            s += ": " + reprOf(fn);
+        V fn2 = e->dict ? dictGetC(e->dict, "filename2") : nullptr;
+        if (fn2 && fn2 != None)
+            s += " -> " + reprOf(fn2);
+        return newStr(s);
+    }
+    return exc_str(a, 1, nullptr);
+}
+
+static V oserror_filename(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    V fn = e->dict ? dictGetC(e->dict, "filename") : nullptr;
+    return fn ? fn : None;
+}
+
+static V unicodeArg(V *a, size_t i)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    if (e->args->items.size() != 5)
+        raise(tAttributeError, "attribute not set");
+    return e->args->items[i];
+}
+static V unicode_encoding(V *a, int, Kw *) { return unicodeArg(a, 0); }
+static V unicode_object(V *a, int, Kw *) { return unicodeArg(a, 1); }
+static V unicode_start(V *a, int, Kw *) { return unicodeArg(a, 2); }
+static V unicode_end(V *a, int, Kw *) { return unicodeArg(a, 3); }
+static V unicode_reason(V *a, int, Kw *) { return unicodeArg(a, 4); }
+
+static V unicode_str(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    if (e->args->items.size() != 5)
+        return exc_str(a, 1, nullptr);
+    std::string enc = strOf(e->args->items[0]), reason = strOf(e->args->items[4]);
+    int64_t start = indexOf(e->args->items[2]), end = indexOf(e->args->items[3]);
+    V obj = e->args->items[1];
+    char buf[64];
+    if (issub(typeOf(a[0]), tUnicodeDecodeError))
+    {
+        const std::string &b = static_cast<BytesObj *>(obj)->s;
+        if (end == start + 1 && start < (int64_t)b.size())
+        {
+            snprintf(buf, sizeof buf, "0x%02x", (unsigned char)b[(size_t)start]);
+            return newStr("'" + enc + "' codec can't decode byte " + buf + " in position " + std::to_string(start) + ": " + reason);
+        }
+        return newStr("'" + enc + "' codec can't decode bytes in position " + std::to_string(start) + "-" + std::to_string(end - 1) + ": " + reason);
+    }
+    if (end == start + 1 && isStr(obj))
+    {
+        uint32_t c = strCharAt(asStr(obj), start);
+        if (c < 0x100)
+            snprintf(buf, sizeof buf, "\\x%02x", c);
+        else if (c < 0x10000)
+            snprintf(buf, sizeof buf, "\\u%04x", c);
+        else
+            snprintf(buf, sizeof buf, "\\U%08x", c);
+        return newStr("'" + enc + "' codec can't encode character '" + buf + "' in position " + std::to_string(start) + ": " + reason);
+    }
+    return newStr("'" + enc + "' codec can't encode characters in position " + std::to_string(start) + "-" + std::to_string(end - 1) + ": " + reason);
+}
+
+V makeUnicodeError(Type *t, const std::string &enc, V object, int64_t start, int64_t end, const std::string &reason)
+{
+    ExcObj *e = static_cast<ExcObj *>(newObject(t));
+    std::vector<V> args;
+    args.push_back(newStr(enc));
+    args.push_back(object);
+    args.push_back(mkint(start));
+    args.push_back(mkint(end));
+    args.push_back(newStr(reason));
+    e->args = tupleOf(args);
+    return e;
+}
+
+static V exc_reduce(V *a, int, Kw *)
+{
+    ExcObj *e = static_cast<ExcObj *>(a[0]);
+    Tuple *t = newTuple(2);
+    t->items[0] = typeOf(a[0]);
+    t->items[1] = e->args;
+    return t;
+}
+
+static void initExceptionTypes()
+{
+    tBaseException = excType("BaseException", tObject);
+    dictSet(tBaseException->dict, s___new__, makeNative("__new__", exc_new, false));
+    defMethod(tBaseException, "__init__", exc_init);
+    defMethod(tBaseException, "__str__", exc_str);
+    defMethod(tBaseException, "__repr__", exc_repr);
+    defMethod(tBaseException, "with_traceback", exc_with_traceback);
+    defMethod(tBaseException, "add_note", exc_add_note);
+    defMethod(tBaseException, "__reduce__", exc_reduce);
+    defGetSet(tBaseException, "args", exc_args_get, exc_args_set);
+    defGetSet(tBaseException, "__cause__", exc_cause_get, exc_cause_set);
+    defGetSet(tBaseException, "__context__", exc_context_get, exc_context_set);
+    defGetSet(tBaseException, "__suppress_context__", exc_suppress_get, exc_suppress_set);
+    defProperty(tBaseException, "__traceback__", exc_traceback_get);
+    tException = excType("Exception", tBaseException);
+    tGeneratorExit = excType("GeneratorExit", tBaseException);
+    tKeyboardInterrupt = excType("KeyboardInterrupt", tBaseException);
+    tSystemExit = excType("SystemExit", tBaseException);
+    defProperty(tSystemExit, "code", systemexit_code_get);
+    tStopIteration = excType("StopIteration", tException);
+    defProperty(tStopIteration, "value", stopiter_value_get);
+    tStopAsyncIteration = excType("StopAsyncIteration", tException);
+    tArithmeticError = excType("ArithmeticError", tException);
+    tZeroDivisionError = excType("ZeroDivisionError", tArithmeticError);
+    tOverflowError = excType("OverflowError", tArithmeticError);
+    tFloatingPointError = excType("FloatingPointError", tArithmeticError);
+    tAssertionError = excType("AssertionError", tException);
+    tAttributeError = excType("AttributeError", tException);
+    tBufferError = excType("BufferError", tException);
+    tEOFError = excType("EOFError", tException);
+    tImportError = excType("ImportError", tException);
+    tModuleNotFoundError = excType("ModuleNotFoundError", tImportError);
+    tLookupError = excType("LookupError", tException);
+    tIndexError = excType("IndexError", tLookupError);
+    tKeyError = excType("KeyError", tLookupError);
+    defMethod(tKeyError, "__str__", keyerror_str);
+    tMemoryError = excType("MemoryError", tException);
+    tNameError = excType("NameError", tException);
+    tUnboundLocalError = excType("UnboundLocalError", tNameError);
+    tOSError = excType("OSError", tException);
+    defProperty(tOSError, "errno", oserror_errno);
+    defProperty(tOSError, "strerror", oserror_strerror);
+    dictSet(tOSError->dict, intern("__new__"), makeNative("__new__", oserror_new, false));
+    defMethod(tOSError, "__init__", oserror_init);
+    defMethod(tOSError, "__str__", oserror_str);
+    tFileNotFoundError = excType("FileNotFoundError", tOSError);
+    tFileExistsError = excType("FileExistsError", tOSError);
+    tPermissionError = excType("PermissionError", tOSError);
+    tTimeoutError = excType("TimeoutError", tOSError);
+    tIsADirectoryError = excType("IsADirectoryError", tOSError);
+    tNotADirectoryError = excType("NotADirectoryError", tOSError);
+    tConnectionError = excType("ConnectionError", tOSError);
+    tConnectionResetError = excType("ConnectionResetError", tConnectionError);
+    tConnectionRefusedError = excType("ConnectionRefusedError", tConnectionError);
+    tConnectionAbortedError = excType("ConnectionAbortedError", tConnectionError);
+    tBrokenPipeError = excType("BrokenPipeError", tConnectionError);
+    tProcessLookupError = excType("ProcessLookupError", tOSError);
+    tChildProcessError = excType("ChildProcessError", tOSError);
+    tInterruptedError = excType("InterruptedError", tOSError);
+    tBlockingIOError = excType("BlockingIOError", tOSError);
+    tReferenceError = excType("ReferenceError", tException);
+    tRuntimeError = excType("RuntimeError", tException);
+    tRecursionError = excType("RecursionError", tRuntimeError);
+    tNotImplementedError = excType("NotImplementedError", tRuntimeError);
+    tSyntaxError = excType("SyntaxError", tException);
+    tIndentationError = excType("IndentationError", tSyntaxError);
+    tTabError = excType("TabError", tIndentationError);
+    tSystemError = excType("SystemError", tException);
+    tTypeError = excType("TypeError", tException);
+    tValueError = excType("ValueError", tException);
+    tUnicodeError = excType("UnicodeError", tValueError);
+    tUnicodeDecodeError = excType("UnicodeDecodeError", tUnicodeError);
+    tUnicodeEncodeError = excType("UnicodeEncodeError", tUnicodeError);
+    tUnicodeTranslateError = excType("UnicodeTranslateError", tUnicodeError);
+    for (Type *t : {tUnicodeEncodeError, tUnicodeDecodeError})
+    {
+        defProperty(t, "encoding", unicode_encoding);
+        defProperty(t, "object", unicode_object);
+        defProperty(t, "start", unicode_start);
+        defProperty(t, "end", unicode_end);
+        defProperty(t, "reason", unicode_reason);
+        defMethod(t, "__str__", unicode_str);
+    }
+    tWarning = excType("Warning", tException);
+    tUserWarning = excType("UserWarning", tWarning);
+    tDeprecationWarning = excType("DeprecationWarning", tWarning);
+    tPendingDeprecationWarning = excType("PendingDeprecationWarning", tWarning);
+    tSyntaxWarning = excType("SyntaxWarning", tWarning);
+    tRuntimeWarning = excType("RuntimeWarning", tWarning);
+    tFutureWarning = excType("FutureWarning", tWarning);
+    tImportWarning = excType("ImportWarning", tWarning);
+    tUnicodeWarning = excType("UnicodeWarning", tWarning);
+    tBytesWarning = excType("BytesWarning", tWarning);
+    tResourceWarning = excType("ResourceWarning", tWarning);
+    tEncodingWarning = excType("EncodingWarning", tWarning);
+    tBaseExceptionGroup = excType("BaseExceptionGroup", tBaseException);
+    tExceptionGroup = excType("ExceptionGroup", tBaseExceptionGroup);
+    tExceptionGroup->bases.push_back(tException);
+    computeMro(tExceptionGroup);
+}
+
+std::vector<Type *> &exceptionTypes()
+{
+    static std::vector<Type *> v;
+    if (v.empty() && allTypes)
+        for (Type *t : *allTypes)
+            if (t->layout == L::Exc)
+                v.push_back(t);
+    return v;
+}
+
+} // namespace py

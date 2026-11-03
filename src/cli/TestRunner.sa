@@ -51,7 +51,10 @@ static void redirectStdinToNull()
 static bool isInputDriven(const std::string &m)
 {
     return m.find("got string") != m.npos || m.find("got nil") != m.npos ||
-           m.find("Cannot convert ''") != m.npos;
+           m.find("Cannot convert ''") != m.npos ||
+           // the Python front-end's int('') / float('') on an empty test answer
+           m.find("invalid literal for int() with base 10: ''") != m.npos ||
+           m.find("could not convert string to float: ''") != m.npos;
 }
 
 // ── Process-isolated VM execution ────────────────────────────────────────────

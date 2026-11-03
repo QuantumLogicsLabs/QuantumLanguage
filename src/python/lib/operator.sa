@@ -1,0 +1,251 @@
+"""Standard operators as functions."""
+
+import builtins as _b
+
+
+def lt(a, b): return a < b
+def le(a, b): return a <= b
+def eq(a, b): return a == b
+def ne(a, b): return a != b
+def ge(a, b): return a >= b
+def gt(a, b): return a > b
+def not_(a): return not a
+def truth(a): return True if a else False
+def is_(a, b): return a is b
+def is_not(a, b): return a is not b
+def is_none(a): return a is None
+def is_not_none(a): return a is not None
+def abs(a): return _b.abs(a)
+def add(a, b): return a + b
+def and_(a, b): return a & b
+def floordiv(a, b): return a // b
+def index(a): return a.__index__()
+def inv(a): return ~a
+invert = inv
+def lshift(a, b): return a << b
+def mod(a, b): return a % b
+def mul(a, b): return a * b
+def matmul(a, b): return a @ b
+def neg(a): return -a
+def or_(a, b): return a | b
+def pos(a): return +a
+def pow(a, b): return a ** b
+def rshift(a, b): return a >> b
+def sub(a, b): return a - b
+def truediv(a, b): return a / b
+def xor(a, b): return a ^ b
+
+
+def concat(a, b):
+    if not hasattr(a, "__getitem__"):
+        raise TypeError(f"'{type(a).__name__}' object can't be concatenated")
+    return a + b
+
+
+def contains(a, b): return b in a
+def countOf(a, b): return sum(1 for i in a if i is b or i == b)
+
+
+def delitem(a, b):
+    del a[b]
+
+
+def getitem(a, b): return a[b]
+
+
+def indexOf(a, b):
+    for i, j in enumerate(a):
+        if j is b or j == b:
+            return i
+    raise ValueError("sequence.index(x): x not in sequence")
+
+
+def setitem(a, b, c):
+    a[b] = c
+
+
+def length_hint(obj, default=0):
+    try:
+        return len(obj)
+    except TypeError:
+        pass
+    hint = getattr(type(obj), "__length_hint__", None)
+    if hint is None:
+        return default
+    val = hint(obj)
+    return default if val is NotImplemented else val
+
+
+def call(obj, /, *args, **kwargs): return obj(*args, **kwargs)
+
+
+def iadd(a, b):
+    a += b
+    return a
+
+
+def iand(a, b):
+    a &= b
+    return a
+
+
+def iconcat(a, b):
+    a += b
+    return a
+
+
+def ifloordiv(a, b):
+    a //= b
+    return a
+
+
+def ilshift(a, b):
+    a <<= b
+    return a
+
+
+def imod(a, b):
+    a %= b
+    return a
+
+
+def imul(a, b):
+    a *= b
+    return a
+
+
+def ior(a, b):
+    a |= b
+    return a
+
+
+def ipow(a, b):
+    a **= b
+    return a
+
+
+def irshift(a, b):
+    a >>= b
+    return a
+
+
+def isub(a, b):
+    a -= b
+    return a
+
+
+def itruediv(a, b):
+    a /= b
+    return a
+
+
+def ixor(a, b):
+    a ^= b
+    return a
+
+
+class attrgetter:
+    __slots__ = ("_attrs", "_call")
+
+    def __init__(self, attr, /, *attrs):
+        if not attrs:
+            if not isinstance(attr, str):
+                raise TypeError("attribute name must be a string")
+            self._attrs = (attr,)
+            names = attr.split(".")
+
+            def func(obj):
+                for name in names:
+                    obj = getattr(obj, name)
+                return obj
+            self._call = func
+        else:
+            self._attrs = (attr,) + attrs
+            getters = tuple(map(attrgetter, self._attrs))
+
+            def func(obj):
+                return tuple(getter(obj) for getter in getters)
+            self._call = func
+
+    def __call__(self, obj, /):
+        return self._call(obj)
+
+    def __repr__(self):
+        return "operator.attrgetter(%s)" % ", ".join(map(repr, self._attrs))
+
+
+class itemgetter:
+    __slots__ = ("_items", "_call")
+
+    def __init__(self, item, /, *items):
+        if not items:
+            self._items = (item,)
+
+            def func(obj):
+                return obj[item]
+            self._call = func
+        else:
+            self._items = items = (item,) + items
+
+            def func(obj):
+                return tuple(obj[i] for i in items)
+            self._call = func
+
+    def __call__(self, obj, /):
+        return self._call(obj)
+
+    def __repr__(self):
+        return "operator.itemgetter(%s)" % ", ".join(map(repr, self._items))
+
+
+class methodcaller:
+    __slots__ = ("_name", "_args", "_kwargs")
+
+    def __init__(self, name, /, *args, **kwargs):
+        self._name = name
+        if not isinstance(self._name, str):
+            raise TypeError("method name must be a string")
+        self._args = args
+        self._kwargs = kwargs
+
+    def __call__(self, obj, /):
+        return getattr(obj, self._name)(*self._args, **self._kwargs)
+
+    def __repr__(self):
+        args = [repr(self._name)]
+        args.extend(map(repr, self._args))
+        args.extend("%s=%r" % (k, v) for k, v in self._kwargs.items())
+        return "operator.methodcaller(%s)" % ", ".join(args)
+
+
+__lt__ = lt
+__le__ = le
+__eq__ = eq
+__ne__ = ne
+__ge__ = ge
+__gt__ = gt
+__not__ = not_
+__abs__ = abs
+__add__ = add
+__and__ = and_
+__floordiv__ = floordiv
+__index__ = index
+__inv__ = inv
+__invert__ = invert
+__lshift__ = lshift
+__mod__ = mod
+__mul__ = mul
+__matmul__ = matmul
+__neg__ = neg
+__or__ = or_
+__pos__ = pos
+__pow__ = pow
+__rshift__ = rshift
+__sub__ = sub
+__truediv__ = truediv
+__xor__ = xor
+__concat__ = concat
+__contains__ = contains
+__delitem__ = delitem
+__getitem__ = getitem
+__setitem__ = setitem

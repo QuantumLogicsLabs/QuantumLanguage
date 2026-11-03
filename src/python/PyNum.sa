@@ -1,0 +1,1355 @@
+// quantum: cpp
+// Python front-end: numbers. Arbitrary-precision integers (small ones are
+// tagged in the pointer; larger ones are IntObj with a Big), floats with
+// Python's shortest repr, CPython's numeric hashes, and the int and float
+// methods.
+#include "PyRt.h.sa"
+#include "PyAst.h.sa"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace py
+{
+
+// ── magnitude arithmetic ───────────────────────────────────────────────────
+
+typedef std::vector<uint32_t> Mag;
+
+static void trimMag(Mag &m)
+{
+    while (!m.empty() && m.back() == 0)
+        m.pop_back();
+}
+
+static void trim(Big &b)
+{
+    trimMag(b.d);
+    if (b.d.empty())
+        b.neg = false;
+}
+
+static Mag magFromU64(uint64_t v)
+{
+    Mag m;
+    while (v)
+    {
+        m.push_back((uint32_t)v);
+        v >>= 32;
+    }
+    return m;
+}
+
+static Big bigFromI64(int64_t v)
+{
+    Big b;
+    uint64_t m;
+    if (v < 0)
+    {
+        b.neg = true;
+        m = (uint64_t)(-(v + 1)) + 1;
+    }
+    else
+        m = (uint64_t)v;
+    b.d = magFromU64(m);
+    return b;
+}
+
+static int cmpMag(const Mag &a, const Mag &b)
+{
+    if (a.size() != b.size())
+        return a.size() < b.size() ? -1 : 1;
+    for (size_t i = a.size(); i-- > 0;)
+        if (a[i] != b[i])
+            return a[i] < b[i] ? -1 : 1;
+    return 0;
+}
+
+static Mag addMag(const Mag &a, const Mag &b)
+{
+    const Mag &x = a.size() >= b.size() ? a : b;
+    const Mag &y = a.size() >= b.size() ? b : a;
+    Mag r(x.size() + 1);
+    uint64_t carry = 0;
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        uint64_t s = (uint64_t)x[i] + (i < y.size() ? y[i] : 0) + carry;
+        r[i] = (uint32_t)s;
+        carry = s >> 32;
+    }
+    r[x.size()] = (uint32_t)carry;
+    trimMag(r);
+    return r;
+}
+
+// a - b with a >= b
+static Mag subMag(const Mag &a, const Mag &b)
+{
+    Mag r(a.size());
+    int64_t borrow = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        int64_t s = (int64_t)a[i] - (i < b.size() ? b[i] : 0) - borrow;
+        if (s < 0)
+        {
+            s += ((int64_t)1 << 32);
+            borrow = 1;
+        }
+        else
+            borrow = 0;
+        r[i] = (uint32_t)s;
+    }
+    trimMag(r);
+    return r;
+}
+
+static Mag mulMag(const Mag &a, const Mag &b)
+{
+    if (a.empty() || b.empty())
+        return Mag();
+    Mag r(a.size() + b.size(), 0);
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        uint64_t carry = 0, ai = a[i];
+        if (ai == 0)
+            continue;
+        for (size_t j = 0; j < b.size(); ++j)
+        {
+            uint64_t t = ai * b[j] + r[i + j] + carry;
+            r[i + j] = (uint32_t)t;
+            carry = t >> 32;
+        }
+        size_t k = i + b.size();
+        while (carry)
+        {
+            uint64_t t = (uint64_t)r[k] + carry;
+            r[k++] = (uint32_t)t;
+            carry = t >> 32;
+        }
+    }
+    trimMag(r);
+    return r;
+}
+
+// Divides by a single limb; returns the remainder
+static uint32_t divSmall(Mag &a, uint32_t d)
+{
+    uint64_t rem = 0;
+    for (size_t i = a.size(); i-- > 0;)
+    {
+        uint64_t cur = (rem << 32) | a[i];
+        a[i] = (uint32_t)(cur / d);
+        rem = cur % d;
+    }
+    trimMag(a);
+    return (uint32_t)rem;
+}
+
+static int nlz32(uint32_t x)
+{
+    if (x == 0)
+        return 32;
+    int n = 0;
+    while (!(x & 0x80000000u))
+    {
+        x <<= 1;
+        ++n;
+    }
+    return n;
+}
+
+// Knuth's algorithm D: q = a / b, r = a % b (magnitudes)
+static void divModMag(const Mag &a, const Mag &b, Mag &q, Mag &r)
+{
+    if (cmpMag(a, b) < 0)
+    {
+        q.clear();
+        r = a;
+        return;
+    }
+    if (b.size() == 1)
+    {
+        q = a;
+        uint32_t rem = divSmall(q, b[0]);
+        r = magFromU64(rem);
+        return;
+    }
+    int s = nlz32(b.back());
+    size_t n = b.size(), m = a.size() - b.size();
+    Mag bn(n), an(a.size() + 1);
+    for (size_t i = n - 1; i > 0; --i)
+        bn[i] = (b[i] << s) | (s ? (uint32_t)((uint64_t)b[i - 1] >> (32 - s)) : 0);
+    bn[0] = b[0] << s;
+    an[a.size()] = s ? (uint32_t)((uint64_t)a[a.size() - 1] >> (32 - s)) : 0;
+    for (size_t i = a.size() - 1; i > 0; --i)
+        an[i] = (a[i] << s) | (s ? (uint32_t)((uint64_t)a[i - 1] >> (32 - s)) : 0);
+    an[0] = a[0] << s;
+    q.assign(m + 1, 0);
+    const uint64_t B = (uint64_t)1 << 32;
+    for (size_t j = m + 1; j-- > 0;)
+    {
+        uint64_t num = ((uint64_t)an[j + n] << 32) | an[j + n - 1];
+        uint64_t qhat = num / bn[n - 1];
+        uint64_t rhat = num % bn[n - 1];
+        while (qhat >= B || qhat * bn[n - 2] > ((rhat << 32) | an[j + n - 2]))
+        {
+            --qhat;
+            rhat += bn[n - 1];
+            if (rhat >= B)
+                break;
+        }
+        int64_t borrow = 0;
+        uint64_t carry = 0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            uint64_t p = qhat * bn[i] + carry;
+            carry = p >> 32;
+            int64_t t = (int64_t)an[i + j] - (int64_t)(uint32_t)p - borrow;
+            if (t < 0)
+            {
+                t += (int64_t)B;
+                borrow = 1;
+            }
+            else
+                borrow = 0;
+            an[i + j] = (uint32_t)t;
+        }
+        int64_t t = (int64_t)an[j + n] - (int64_t)carry - borrow;
+        if (t < 0)
+        {
+            an[j + n] = (uint32_t)(t + (int64_t)B);
+            // add back
+            --qhat;
+            uint64_t c = 0;
+            for (size_t i = 0; i < n; ++i)
+            {
+                uint64_t s2 = (uint64_t)an[i + j] + bn[i] + c;
+                an[i + j] = (uint32_t)s2;
+                c = s2 >> 32;
+            }
+            an[j + n] = (uint32_t)((uint64_t)an[j + n] + c);
+        }
+        else
+            an[j + n] = (uint32_t)t;
+        q[j] = (uint32_t)qhat;
+    }
+    trimMag(q);
+    r.assign(n, 0);
+    for (size_t i = 0; i < n; ++i)
+        r[i] = (an[i] >> s) | (s ? (uint32_t)((uint64_t)an[i + 1] << (32 - s)) : 0);
+    trimMag(r);
+}
+
+static Big bigAdd(const Big &a, const Big &b)
+{
+    Big r;
+    if (a.neg == b.neg)
+    {
+        r.d = addMag(a.d, b.d);
+        r.neg = a.neg;
+    }
+    else if (cmpMag(a.d, b.d) >= 0)
+    {
+        r.d = subMag(a.d, b.d);
+        r.neg = a.neg;
+    }
+    else
+    {
+        r.d = subMag(b.d, a.d);
+        r.neg = b.neg;
+    }
+    trim(r);
+    return r;
+}
+
+static Big bigNeg(Big a)
+{
+    if (!a.d.empty())
+        a.neg = !a.neg;
+    return a;
+}
+
+static Big bigSub(const Big &a, const Big &b) { return bigAdd(a, bigNeg(b)); }
+
+static Big bigMul(const Big &a, const Big &b)
+{
+    Big r;
+    r.d = mulMag(a.d, b.d);
+    r.neg = a.neg != b.neg;
+    trim(r);
+    return r;
+}
+
+static int bigCmp(const Big &a, const Big &b)
+{
+    if (a.neg != b.neg)
+        return a.neg ? -1 : 1;
+    int c = cmpMag(a.d, b.d);
+    return a.neg ? -c : c;
+}
+
+static bool bigIsZero(const Big &a) { return a.d.empty(); }
+
+// Floor division and modulo, Python's way (remainder takes the divisor's sign)
+static void bigDivMod(const Big &a, const Big &b, Big &q, Big &r)
+{
+    if (bigIsZero(b))
+        raise(tZeroDivisionError, "integer division or modulo by zero");
+    Mag qm, rm;
+    divModMag(a.d, b.d, qm, rm);
+    q.d = qm;
+    q.neg = a.neg != b.neg;
+    r.d = rm;
+    r.neg = a.neg;
+    trim(q);
+    trim(r);
+    if (!bigIsZero(r) && (a.neg != b.neg))
+    {
+        q = bigSub(q, bigFromI64(1));
+        r = bigAdd(r, b);
+    }
+}
+
+static bool bigToI64(const Big &b, int64_t &out)
+{
+    if (b.d.size() > 2)
+        return false;
+    uint64_t m = 0;
+    for (size_t i = b.d.size(); i-- > 0;)
+        m = (m << 32) | b.d[i];
+    if (b.neg)
+    {
+        if (m > (uint64_t)1 << 63)
+            return false;
+        out = m == ((uint64_t)1 << 63) ? INT64_MIN : -(int64_t)m;
+    }
+    else
+    {
+        if (m > (uint64_t)INT64_MAX)
+            return false;
+        out = (int64_t)m;
+    }
+    return true;
+}
+
+static int64_t bitLengthMag(const Mag &m)
+{
+    if (m.empty())
+        return 0;
+    return (int64_t)(m.size() - 1) * 32 + (32 - nlz32(m.back()));
+}
+
+static Mag shlMag(const Mag &a, int64_t n)
+{
+    if (a.empty())
+        return a;
+    size_t limbs = (size_t)(n / 32);
+    int bits = (int)(n % 32);
+    Mag r(a.size() + limbs + 1, 0);
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        uint64_t v = (uint64_t)a[i] << bits;
+        r[i + limbs] |= (uint32_t)v;
+        r[i + limbs + 1] |= (uint32_t)(v >> 32);
+    }
+    trimMag(r);
+    return r;
+}
+
+static Mag shrMag(const Mag &a, int64_t n)
+{
+    size_t limbs = (size_t)(n / 32);
+    int bits = (int)(n % 32);
+    if (limbs >= a.size())
+        return Mag();
+    Mag r(a.size() - limbs, 0);
+    for (size_t i = 0; i < r.size(); ++i)
+    {
+        uint64_t v = a[i + limbs];
+        if (i + limbs + 1 < a.size())
+            v |= (uint64_t)a[i + limbs + 1] << 32;
+        r[i] = (uint32_t)(v >> bits);
+    }
+    trimMag(r);
+    return r;
+}
+
+static bool lowBitsNonzero(const Mag &a, int64_t n)
+{
+    for (int64_t i = 0; i < n / 32 && (size_t)i < a.size(); ++i)
+        if (a[(size_t)i])
+            return true;
+    size_t li = (size_t)(n / 32);
+    int bits = (int)(n % 32);
+    if (li < a.size() && bits && (a[li] & ((1u << bits) - 1)))
+        return true;
+    return false;
+}
+
+static Big bigShl(const Big &a, int64_t n)
+{
+    Big r;
+    r.d = shlMag(a.d, n);
+    r.neg = a.neg;
+    trim(r);
+    return r;
+}
+
+static Big bigShr(const Big &a, int64_t n)
+{
+    // floor: a negative value shifts to -(ceil(|a| / 2**n))
+    Big r;
+    r.d = shrMag(a.d, n);
+    if (a.neg && lowBitsNonzero(a.d, n))
+        r.d = addMag(r.d, magFromU64(1));
+    r.neg = a.neg;
+    trim(r);
+    return r;
+}
+
+// Two's complement limbs of width w (w limbs)
+static Mag twos(const Big &a, size_t w)
+{
+    Mag r(w, 0);
+    for (size_t i = 0; i < a.d.size() && i < w; ++i)
+        r[i] = a.d[i];
+    if (a.neg)
+    {
+        uint64_t carry = 1;
+        for (size_t i = 0; i < w; ++i)
+        {
+            uint64_t v = (uint64_t)(uint32_t)~r[i] + carry;
+            r[i] = (uint32_t)v;
+            carry = v >> 32;
+        }
+    }
+    return r;
+}
+
+static Big fromTwos(Mag r)
+{
+    Big b;
+    if (!r.empty() && (r.back() & 0x80000000u))
+    {
+        uint64_t carry = 1;
+        for (size_t i = 0; i < r.size(); ++i)
+        {
+            uint64_t v = (uint64_t)(uint32_t)~r[i] + carry;
+            r[i] = (uint32_t)v;
+            carry = v >> 32;
+        }
+        b.neg = true;
+    }
+    b.d = r;
+    trim(b);
+    return b;
+}
+
+static Big bigBitOp(const Big &a, const Big &b, Op op)
+{
+    size_t w = (a.d.size() > b.d.size() ? a.d.size() : b.d.size()) + 1;
+    Mag x = twos(a, w), y = twos(b, w);
+    for (size_t i = 0; i < w; ++i)
+        x[i] = op == OpBitAnd ? (x[i] & y[i]) : op == OpBitOr ? (x[i] | y[i]) : (x[i] ^ y[i]);
+    return fromTwos(x);
+}
+
+static std::string magToDecimal(Mag m)
+{
+    if (m.empty())
+        return "0";
+    std::vector<uint32_t> chunks;
+    while (!m.empty())
+        chunks.push_back(divSmall(m, 1000000000u));
+    std::string s = std::to_string(chunks.back());
+    char buf[16];
+    for (size_t i = chunks.size() - 1; i-- > 0;)
+    {
+        snprintf(buf, sizeof buf, "%09u", chunks[i]);
+        s += buf;
+    }
+    return s;
+}
+
+static std::string bigToString(const Big &b, int base)
+{
+    std::string s;
+    if (base == 10)
+        s = magToDecimal(b.d);
+    else
+    {
+        Mag m = b.d;
+        if (m.empty())
+            s = "0";
+        while (!m.empty())
+        {
+            uint32_t r = divSmall(m, (uint32_t)base);
+            s += "0123456789abcdefghijklmnopqrstuvwxyz"[r];
+        }
+        std::string rev(s.rbegin(), s.rend());
+        s = rev;
+    }
+    return b.neg ? "-" + s : s;
+}
+
+static double magToDouble(const Mag &m)
+{
+    int64_t bits = bitLengthMag(m);
+    if (bits <= 64)
+    {
+        uint64_t v = 0;
+        for (size_t i = m.size(); i-- > 0;)
+            v = (v << 32) | m[i];
+        return (double)v;
+    }
+    if (bits > 1024)
+        return HUGE_VAL;
+    int64_t shift = bits - 64;
+    Mag top = shrMag(m, shift);
+    uint64_t v = 0;
+    for (size_t i = top.size(); i-- > 0;)
+        v = (v << 32) | top[i];
+    if (lowBitsNonzero(m, shift))
+        v |= 1; // sticky bit: rounds correctly
+    return ldexp((double)v, (int)shift);
+}
+
+// ── V-level integers ───────────────────────────────────────────────────────
+
+bool isIntLike(V v)
+{
+    if (IS_SMALL(v))
+        return true;
+    return v->type->layout == L::Int;
+}
+
+V fromBig(const Big &b)
+{
+    int64_t v;
+    if (bigToI64(b, v) && FITS_SMALL(v))
+        return MKSMALL(v);
+    IntObj *o = new IntObj(tInt);
+    o->big = new Big(b);
+    return o;
+}
+
+V mkint(int64_t i)
+{
+    if (FITS_SMALL(i))
+        return MKSMALL(i);
+    return fromBig(bigFromI64(i));
+}
+
+Big toBig(V v)
+{
+    if (IS_SMALL(v))
+        return bigFromI64(SMALLV(v));
+    IntObj *o = static_cast<IntObj *>(v);
+    if (o->big)
+        return *o->big;
+    return bigFromI64(o->small);
+}
+
+bool intSmall(V v, int64_t &out)
+{
+    if (IS_SMALL(v))
+    {
+        out = SMALLV(v);
+        return true;
+    }
+    if (v->type->layout != L::Int)
+        return false;
+    IntObj *o = static_cast<IntObj *>(v);
+    if (!o->big)
+    {
+        out = o->small;
+        return true;
+    }
+    return bigToI64(*o->big, out);
+}
+
+double intToDouble(V v)
+{
+    int64_t s;
+    if (intSmall(v, s))
+        return (double)s;
+    Big b = toBig(v);
+    double d = magToDouble(b.d);
+    if (std::isinf(d))
+        raise(tOverflowError, "int too large to convert to float");
+    return b.neg ? -d : d;
+}
+
+double toDouble(V v)
+{
+    if (IS_SMALL(v))
+        return (double)SMALLV(v);
+    if (v->type->layout == L::Float)
+        return static_cast<FloatObj *>(v)->v;
+    if (v->type->layout == L::Int)
+        return intToDouble(v);
+    bool found = false;
+    V r = callSpecial(v, intern("__float__"), nullptr, 0, found);
+    if (found)
+        return toDouble(r);
+    r = callSpecial(v, intern("__index__"), nullptr, 0, found);
+    if (found)
+        return toDouble(r);
+    raise(tTypeError, std::string("must be real number, not ") + typeName(v));
+}
+
+int intSign(V v)
+{
+    int64_t s;
+    if (intSmall(v, s))
+        return s < 0 ? -1 : s > 0;
+    Big b = toBig(v);
+    return b.neg ? -1 : 1;
+}
+
+int intCompare(V a, V b)
+{
+    int64_t x, y;
+    if (intSmall(a, x) && intSmall(b, y))
+        return x < y ? -1 : x > y;
+    return bigCmp(toBig(a), toBig(b));
+}
+
+V intFromDouble(double d)
+{
+    if (std::isnan(d))
+        raise(tValueError, "cannot convert float NaN to integer");
+    if (std::isinf(d))
+        raise(tOverflowError, "cannot convert float infinity to integer");
+    d = std::trunc(d);
+    if (d > -9.2e18 && d < 9.2e18)
+        return mkint((int64_t)d);
+    int e;
+    double m = frexp(fabs(d), &e); // d = m * 2^e, 0.5 <= m < 1
+    uint64_t mant = (uint64_t)ldexp(m, 53);
+    Big b;
+    b.d = magFromU64(mant);
+    b = bigShl(b, e - 53);
+    b.neg = d < 0;
+    trim(b);
+    return fromBig(b);
+}
+
+std::string intToString(V v, int base)
+{
+    int64_t s;
+    if (base == 10 && intSmall(v, s))
+        return std::to_string(s);
+    return bigToString(toBig(v), base);
+}
+
+V intFromString(const std::string &text, int base, bool &ok)
+{
+    ok = false;
+    std::string s;
+    // strip whitespace and underscores between digits
+    size_t a = 0, b = text.size();
+    while (a < b && isspace((unsigned char)text[a]))
+        ++a;
+    while (b > a && isspace((unsigned char)text[b - 1]))
+        --b;
+    s = text.substr(a, b - a);
+    bool neg = false;
+    size_t i = 0;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-'))
+        neg = s[i++] == '-';
+    if (base == 0)
+    {
+        base = 10;
+        if (i + 1 < s.size() && s[i] == '0')
+        {
+            char p = (char)tolower(s[i + 1]);
+            if (p == 'x')
+                base = 16, i += 2;
+            else if (p == 'o')
+                base = 8, i += 2;
+            else if (p == 'b')
+                base = 2, i += 2;
+        }
+    }
+    else if (i + 1 < s.size() && s[i] == '0')
+    {
+        char p = (char)tolower(s[i + 1]);
+        if ((base == 16 && p == 'x') || (base == 8 && p == 'o') || (base == 2 && p == 'b'))
+            i += 2;
+    }
+    if (i >= s.size())
+        return nullptr;
+    Mag m;
+    bool lastUnderscore = true;
+    for (; i < s.size(); ++i)
+    {
+        char c = s[i];
+        if (c == '_')
+        {
+            if (lastUnderscore)
+                return nullptr;
+            lastUnderscore = true;
+            continue;
+        }
+        int d;
+        if (c >= '0' && c <= '9')
+            d = c - '0';
+        else if (c >= 'a' && c <= 'z')
+            d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z')
+            d = c - 'A' + 10;
+        else
+            return nullptr;
+        if (d >= base)
+            return nullptr;
+        lastUnderscore = false;
+        // m = m * base + d
+        uint64_t carry = (uint64_t)d;
+        for (size_t k = 0; k < m.size(); ++k)
+        {
+            uint64_t t = (uint64_t)m[k] * (uint64_t)base + carry;
+            m[k] = (uint32_t)t;
+            carry = t >> 32;
+        }
+        if (carry)
+            m.push_back((uint32_t)carry);
+    }
+    if (lastUnderscore)
+        return nullptr;
+    trimMag(m);
+    Big bg;
+    bg.d = m;
+    bg.neg = neg;
+    trim(bg);
+    ok = true;
+    return fromBig(bg);
+}
+
+int64_t hashInt(V v)
+{
+    const uint64_t P = ((uint64_t)1 << 61) - 1;
+    int64_t s;
+    if (intSmall(v, s))
+    {
+        if (s == -1)
+            return -2;
+        if (s >= 0 && (uint64_t)s < P)
+            return s;
+        if (s < 0 && (uint64_t)(-(s + 1)) + 1 < P)
+            return s;
+    }
+    Big b = toBig(v);
+    uint64_t h = 0;
+    for (size_t i = b.d.size(); i-- > 0;)
+    {
+        // h = (h << 32 + limb) mod P, done in 61-bit arithmetic
+        h = ((h << 32) & P) | (h >> (61 - 32));
+        h += b.d[i];
+        if (h >= P)
+            h -= P;
+    }
+    int64_t r = b.neg ? -(int64_t)h : (int64_t)h;
+    if (r == -1)
+        r = -2;
+    return r;
+}
+
+int64_t hashDouble(double d)
+{
+    const uint64_t P = ((uint64_t)1 << 61) - 1;
+    if (std::isinf(d))
+        return d > 0 ? 314159 : -314159;
+    if (std::isnan(d))
+        return 0; // CPython hashes NaN by identity; programs never print it
+    int e;
+    double m = frexp(d, &e);
+    int sign = 1;
+    if (m < 0)
+    {
+        sign = -1;
+        m = -m;
+    }
+    uint64_t x = 0;
+    while (m)
+    {
+        x = ((x << 28) & P) | x >> (61 - 28);
+        m *= 268435456.0;
+        e -= 28;
+        uint64_t y = (uint64_t)m;
+        m -= (double)y;
+        x += y;
+        if (x >= P)
+            x -= P;
+    }
+    e = e >= 0 ? e % 61 : 61 - 1 - ((-1 - e) % 61);
+    x = ((x << e) & P) | x >> (61 - e);
+    int64_t r = (int64_t)x * sign;
+    if (r == -1)
+        r = -2;
+    return r;
+}
+
+// ── float repr ─────────────────────────────────────────────────────────────
+
+std::string floatRepr(double d)
+{
+    if (std::isnan(d))
+        return "nan";
+    if (std::isinf(d))
+        return d > 0 ? "inf" : "-inf";
+    if (d == 0)
+        return std::signbit(d) ? "-0.0" : "0.0";
+    char buf[64];
+    int prec = 1;
+    for (; prec <= 17; ++prec)
+    {
+        snprintf(buf, sizeof buf, "%.*e", prec - 1, d);
+        if (strtod(buf, nullptr) == d)
+            break;
+    }
+    // buf: [-]d.ddde[+-]xx
+    std::string s = buf;
+    bool neg = s[0] == '-';
+    if (neg)
+        s = s.substr(1);
+    size_t epos = s.find('e');
+    int exp10 = atoi(s.c_str() + epos + 1);
+    std::string digits;
+    for (size_t i = 0; i < epos; ++i)
+        if (s[i] != '.')
+            digits += s[i];
+    while (digits.size() > 1 && digits.back() == '0')
+        digits.pop_back();
+    std::string out;
+    if (exp10 >= -5 + 1 && exp10 < 16)
+    {
+        if (exp10 >= 0)
+        {
+            std::string ip, fp;
+            if ((int)digits.size() <= exp10 + 1)
+            {
+                ip = digits + std::string((size_t)(exp10 + 1 - (int)digits.size()), '0');
+                fp = "0";
+            }
+            else
+            {
+                ip = digits.substr(0, (size_t)exp10 + 1);
+                fp = digits.substr((size_t)exp10 + 1);
+            }
+            out = ip + "." + fp;
+        }
+        else
+            out = "0." + std::string((size_t)(-exp10 - 1), '0') + digits;
+    }
+    else
+    {
+        out = digits.substr(0, 1);
+        if (digits.size() > 1)
+            out += "." + digits.substr(1);
+        char eb[16];
+        snprintf(eb, sizeof eb, "e%c%02d", exp10 < 0 ? '-' : '+', exp10 < 0 ? -exp10 : exp10);
+        out += eb;
+    }
+    return neg ? "-" + out : out;
+}
+
+V mkfloat(double d) { return new FloatObj(tFloat, d); }
+
+// ── arithmetic ─────────────────────────────────────────────────────────────
+
+static double floorMod(double a, double b)
+{
+    double m = fmod(a, b);
+    if (m != 0)
+    {
+        if ((b < 0) != (m < 0))
+            m += b;
+    }
+    else
+        m = copysign(0.0, b);
+    return m;
+}
+
+V floatBinary(double a, double b, Op op)
+{
+    switch (op)
+    {
+    case OpAdd: return mkfloat(a + b);
+    case OpSub: return mkfloat(a - b);
+    case OpMul: return mkfloat(a * b);
+    case OpDiv:
+        if (b == 0)
+            raise(tZeroDivisionError, "float division by zero");
+        return mkfloat(a / b);
+    case OpFloorDiv:
+        if (b == 0)
+            raise(tZeroDivisionError, "float floor division by zero");
+    {
+        // CPython's float_divmod
+        double mod = fmod(a, b);
+        double div = (a - mod) / b;
+        if (mod != 0 && ((b < 0) != (mod < 0)))
+            div -= 1.0;
+        double fd;
+        if (div != 0)
+        {
+            fd = std::floor(div);
+            if (div - fd > 0.5)
+                fd += 1.0;
+        }
+        else
+            fd = copysign(0.0, a / b);
+        return mkfloat(fd);
+    }
+    case OpMod:
+        if (b == 0)
+            raise(tZeroDivisionError, "float modulo by zero");
+        return mkfloat(floorMod(a, b));
+    case OpPow:
+    {
+        if (a == 0 && b < 0)
+            raise(tZeroDivisionError, "zero to a negative power");
+        if (a < 0 && b != std::floor(b))
+        {
+            // a complex result
+            double r = pow(-a, b);
+            double ang = b * M_PI;
+            return new ComplexObj(tComplex, r * cos(ang), r * sin(ang));
+        }
+        double r = pow(a, b);
+        if (std::isinf(r) && !std::isinf(a) && !std::isinf(b))
+            raise(tOverflowError, "(34, 'Result too large')");
+        return mkfloat(r);
+    }
+    default:
+        return nullptr;
+    }
+}
+
+static V smallBinary(int64_t x, int64_t y, Op op)
+{
+    switch (op)
+    {
+    case OpAdd: return mkint(x + y);
+    case OpSub: return mkint(x - y);
+    case OpMul:
+    {
+        int64_t ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
+        if (ax < ((int64_t)1 << 30) && ay < ((int64_t)1 << 30))
+            return mkint(x * y);
+        return fromBig(bigMul(bigFromI64(x), bigFromI64(y)));
+    }
+    case OpFloorDiv:
+    {
+        if (y == 0)
+            raise(tZeroDivisionError, "integer division or modulo by zero");
+        int64_t q = x / y;
+        if ((x % y != 0) && ((x < 0) != (y < 0)))
+            --q;
+        return mkint(q);
+    }
+    case OpMod:
+    {
+        if (y == 0)
+            raise(tZeroDivisionError, "integer modulo by zero");
+        int64_t m = x % y;
+        if (m != 0 && ((m < 0) != (y < 0)))
+            m += y;
+        return mkint(m);
+    }
+    case OpBitAnd: return mkint(x & y);
+    case OpBitOr: return mkint(x | y);
+    case OpBitXor: return mkint(x ^ y);
+    case OpLShift:
+        if (y < 0)
+            raise(tValueError, "negative shift count");
+        if (y < 62 && (x == 0 || (x > 0 ? x : -x) < ((int64_t)1 << (61 - y))))
+            return mkint(x * ((int64_t)1 << y));
+        return fromBig(bigShl(bigFromI64(x), y));
+    case OpRShift:
+        if (y < 0)
+            raise(tValueError, "negative shift count");
+        if (y >= 63)
+            return mkint(x < 0 ? -1 : 0);
+        return mkint(x >> y);
+    default:
+        return nullptr;
+    }
+}
+
+// Correctly rounded a / b for integers
+static V intTrueDiv(V a, V b)
+{
+    int64_t x, y;
+    if (intSmall(a, x) && intSmall(b, y))
+    {
+        if (y == 0)
+            raise(tZeroDivisionError, "division by zero");
+        const int64_t lim = (int64_t)1 << 53;
+        if (x > -lim && x < lim && y > -lim && y < lim)
+            return mkfloat((double)x / (double)y);
+    }
+    Big A = toBig(a), B = toBig(b);
+    if (bigIsZero(B))
+        raise(tZeroDivisionError, "division by zero");
+    if (bigIsZero(A))
+        return mkfloat(A.neg != B.neg ? -0.0 : 0.0);
+    bool neg = A.neg != B.neg;
+    // scale so the quotient has at least 55 bits, then round with a sticky bit
+    int64_t shift = 55 - (bitLengthMag(A.d) - bitLengthMag(B.d));
+    Mag num = A.d, den = B.d;
+    if (shift > 0)
+        num = shlMag(num, shift);
+    else if (shift < 0)
+        den = shlMag(den, -shift);
+    Mag q, r;
+    divModMag(num, den, q, r);
+    double qd = magToDouble(q);
+    if (!r.empty())
+    {
+        // fold the remainder into a sticky bit below the precision
+        Mag q2 = shlMag(q, 1);
+        q2 = addMag(q2, magFromU64(1));
+        qd = magToDouble(q2) / 2;
+    }
+    double res = ldexp(qd, (int)-shift);
+    if (std::isinf(res))
+        raise(tOverflowError, "integer division result too large for a float");
+    return mkfloat(neg ? -res : res);
+}
+
+V intPow(V a, V b, V mod)
+{
+    if (mod && mod != None)
+    {
+        Big m = toBig(mod);
+        if (bigIsZero(m))
+            raise(tValueError, "pow() 3rd argument cannot be 0");
+        Big e = toBig(b);
+        Big base = toBig(a);
+        Big q, r;
+        if (e.neg)
+        {
+            // modular inverse
+            Big g0 = m, g1;
+            bigDivMod(base, m, q, g1);
+            Big x0 = bigFromI64(0), x1 = bigFromI64(1);
+            Big mm = m;
+            mm.neg = false;
+            g0 = mm;
+            while (!bigIsZero(g1))
+            {
+                Big qq, rr;
+                bigDivMod(g0, g1, qq, rr);
+                g0 = g1;
+                g1 = rr;
+                Big nx = bigSub(x0, bigMul(qq, x1));
+                x0 = x1;
+                x1 = nx;
+            }
+            if (bigCmp(g0, bigFromI64(1)) != 0)
+                raise(tValueError, "base is not invertible for the given modulus");
+            base = x0;
+            e.neg = false;
+        }
+        bigDivMod(base, m, q, r);
+        base = r;
+        Big result = bigFromI64(1);
+        bigDivMod(result, m, q, result);
+        int64_t nbits = bitLengthMag(e.d);
+        for (int64_t i = 0; i < nbits; ++i)
+        {
+            if (e.d[(size_t)(i / 32)] >> (i % 32) & 1)
+            {
+                Big t = bigMul(result, base);
+                bigDivMod(t, m, q, result);
+            }
+            Big t = bigMul(base, base);
+            bigDivMod(t, m, q, base);
+        }
+        return fromBig(result);
+    }
+    if (intSign(b) < 0)
+    {
+        double x = intToDouble(a), y = intToDouble(b);
+        if (x == 0)
+            raise(tZeroDivisionError, "zero to a negative power");
+        return mkfloat(pow(x, y));
+    }
+    int64_t x, y;
+    if (intSmall(a, x) && intSmall(b, y))
+    {
+        // fast path while it fits
+        int64_t r = 1, base = x, e = y;
+        bool overflow = false;
+        while (e > 0)
+        {
+            if (e & 1)
+            {
+                if (r != 0 && (base > 3037000499LL || base < -3037000499LL || r > 3037000499LL || r < -3037000499LL))
+                {
+                    overflow = true;
+                    break;
+                }
+                r *= base;
+            }
+            e >>= 1;
+            if (e > 0)
+            {
+                if (base > 3037000499LL || base < -3037000499LL)
+                {
+                    overflow = true;
+                    break;
+                }
+                base *= base;
+            }
+        }
+        if (!overflow)
+            return mkint(r);
+    }
+    Big base = toBig(a);
+    Big e = toBig(b);
+    if (bitLengthMag(e.d) > 40)
+        raise(tOverflowError, "exponent too large");
+    Big result = bigFromI64(1);
+    int64_t nbits = bitLengthMag(e.d);
+    for (int64_t i = nbits; i-- > 0;)
+    {
+        result = bigMul(result, result);
+        if (e.d[(size_t)(i / 32)] >> (i % 32) & 1)
+            result = bigMul(result, base);
+    }
+    return fromBig(result);
+}
+
+V intBinary(V a, V b, Op op)
+{
+    int64_t x, y;
+    bool sa = intSmall(a, x), sb = intSmall(b, y);
+    if (sa && sb && FITS_SMALL(x) && FITS_SMALL(y))
+    {
+        if (op == OpDiv)
+            return intTrueDiv(a, b);
+        if (op == OpPow)
+            return intPow(a, b, nullptr);
+        V r = smallBinary(x, y, op);
+        if (r)
+            return r;
+    }
+    switch (op)
+    {
+    case OpAdd: return fromBig(bigAdd(toBig(a), toBig(b)));
+    case OpSub: return fromBig(bigSub(toBig(a), toBig(b)));
+    case OpMul: return fromBig(bigMul(toBig(a), toBig(b)));
+    case OpDiv: return intTrueDiv(a, b);
+    case OpFloorDiv:
+    case OpMod:
+    {
+        Big q, r;
+        bigDivMod(toBig(a), toBig(b), q, r);
+        return fromBig(op == OpFloorDiv ? q : r);
+    }
+    case OpPow: return intPow(a, b, nullptr);
+    case OpBitAnd:
+    case OpBitOr:
+    case OpBitXor: return fromBig(bigBitOp(toBig(a), toBig(b), op));
+    case OpLShift:
+    case OpRShift:
+    {
+        if (intSign(b) < 0)
+            raise(tValueError, "negative shift count");
+        int64_t n;
+        if (!intSmall(b, n))
+            raise(tOverflowError, "too many digits in integer");
+        return fromBig(op == OpLShift ? bigShl(toBig(a), n) : bigShr(toBig(a), n));
+    }
+    default:
+        return nullptr;
+    }
+}
+
+// ── int and float methods ──────────────────────────────────────────────────
+
+static V int_bit_length(V *a, int n, Kw *)
+{
+    (void)n;
+    return mkint(bitLengthMag(toBig(a[0]).d));
+}
+
+static V int_bit_count(V *a, int, Kw *)
+{
+    Big b = toBig(a[0]);
+    int64_t c = 0;
+    for (uint32_t limb : b.d)
+        for (; limb; limb &= limb - 1)
+            ++c;
+    return mkint(c);
+}
+
+static V int_conjugate(V *a, int, Kw *)
+{
+    return IS_SMALL(a[0]) ? a[0] : fromBig(toBig(a[0]));
+}
+
+static V int_as_integer_ratio(V *a, int, Kw *)
+{
+    Tuple *t = newTuple(2);
+    t->items[0] = fromBig(toBig(a[0]));
+    t->items[1] = MKSMALL(1);
+    return t;
+}
+
+static V int_is_integer(V *, int, Kw *) { return True; }
+
+static V int_to_bytes(V *a, int n, Kw *kw)
+{
+    V lenV = n > 1 ? a[1] : kwArg(kw, "length");
+    V orderV = n > 2 ? a[2] : kwArg(kw, "byteorder");
+    V signedV = kwArg(kw, "signed");
+    int64_t length = lenV ? indexOf(lenV) : 1;
+    bool little = orderV && strOf(orderV) == "little";
+    bool sgn = signedV && truthy(signedV);
+    Big b = toBig(a[0]);
+    if (b.neg && !sgn)
+        raise(tOverflowError, "can't convert negative int to unsigned");
+    Mag t = twos(b, (size_t)(length / 4 + 2));
+    std::string out((size_t)length, '\0');
+    for (int64_t i = 0; i < length; ++i)
+        out[(size_t)(little ? i : length - 1 - i)] = (char)(t[(size_t)(i / 4)] >> ((i % 4) * 8));
+    BytesObj *r = new BytesObj(tBytes);
+    r->s = out;
+    return r;
+}
+
+static V int_from_bytes(V *a, int n, Kw *kw)
+{
+    // classmethod: a[0] = cls
+    V data = n > 1 ? a[1] : kwArg(kw, "bytes");
+    V orderV = n > 2 ? a[2] : kwArg(kw, "byteorder");
+    V signedV = kwArg(kw, "signed");
+    bool little = orderV && strOf(orderV) == "little";
+    std::string s;
+    if (typeOf(data)->layout == L::Bytes)
+        s = static_cast<BytesObj *>(data)->s;
+    else
+        for (V x : toVector(data))
+            s += (char)indexOf(x);
+    Mag m((s.size() + 3) / 4 + 1, 0);
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        size_t pos = little ? i : s.size() - 1 - i;
+        m[i / 4] |= (uint32_t)(unsigned char)s[pos] << ((i % 4) * 8);
+    }
+    Big b;
+    if (signedV && truthy(signedV) && !s.empty() && ((unsigned char)s[little ? s.size() - 1 : 0] & 0x80))
+    {
+        // sign-extend
+        for (size_t i = s.size(); i < m.size() * 4; ++i)
+            m[i / 4] |= (uint32_t)0xFF << ((i % 4) * 8);
+        b = fromTwos(m);
+    }
+    else
+    {
+        b.d = m;
+        trim(b);
+    }
+    return fromBig(b);
+}
+
+static V int_real(V *a, int, Kw *) { return fromBig(toBig(a[0])); }
+static V int_imag(V *, int, Kw *) { return MKSMALL(0); }
+static V int_denominator(V *, int, Kw *) { return MKSMALL(1); }
+
+static V float_is_integer(V *a, int, Kw *)
+{
+    double d = toDouble(a[0]);
+    return mkbool(std::isfinite(d) && d == std::floor(d));
+}
+
+static V float_as_integer_ratio(V *a, int, Kw *)
+{
+    double d = toDouble(a[0]);
+    if (std::isinf(d))
+        raise(tOverflowError, "cannot convert Infinity to integer ratio");
+    if (std::isnan(d))
+        raise(tValueError, "cannot convert NaN to integer ratio");
+    int e;
+    double m = frexp(d, &e);
+    for (int i = 0; i < 300 && m != std::floor(m); ++i)
+    {
+        m *= 2.0;
+        e--;
+    }
+    V num = intFromDouble(m);
+    V den = MKSMALL(1);
+    if (e > 0)
+        num = intBinary(num, intBinary(MKSMALL(1), mkint(e), OpLShift), OpMul);
+    else
+        den = intBinary(MKSMALL(1), mkint(-e), OpLShift);
+    // reduce: numerator odd unless e > 0 already handled
+    Tuple *t = newTuple(2);
+    t->items[0] = num;
+    t->items[1] = den;
+    return t;
+}
+
+static V float_conjugate(V *a, int, Kw *) { return mkfloat(toDouble(a[0])); }
+static V float_imag(V *, int, Kw *) { return mkfloat(0.0); }
+
+// CPython's float_hex: 0x<1 hex digit>.<13 hex digits>p<exponent>
+static V float_hex(V *a, int, Kw *)
+{
+    double x = toDouble(a[0]);
+    if (std::isnan(x) || std::isinf(x))
+        return newStr(floatRepr(x));
+    if (x == 0)
+        return newStr(std::signbit(x) ? "-0x0.0p+0" : "0x0.0p+0");
+    const char *digits = "0123456789abcdef";
+    int e;
+    double m = frexp(fabs(x), &e);
+    int shift = 1 - (-1021 - e > 0 ? -1021 - e : 0);
+    m = ldexp(m, shift);
+    e -= shift;
+    std::string out = x < 0 ? "-0x" : "0x";
+    int d = (int)m;
+    out += digits[d];
+    m -= d;
+    out += '.';
+    for (int i = 0; i < 13; ++i)
+    {
+        m *= 16.0;
+        d = (int)m;
+        out += digits[d];
+        m -= d;
+    }
+    out += 'p';
+    out += e < 0 ? '-' : '+';
+    out += std::to_string(e < 0 ? -e : e);
+    return newStr(out);
+}
+
+void initNumbers()
+{
+    defMethod(tInt, "bit_length", int_bit_length);
+    defMethod(tInt, "bit_count", int_bit_count);
+    defMethod(tInt, "conjugate", int_conjugate);
+    defMethod(tInt, "as_integer_ratio", int_as_integer_ratio);
+    defMethod(tInt, "is_integer", int_is_integer);
+    defMethod(tInt, "to_bytes", int_to_bytes);
+    defClassMethod(tInt, "from_bytes", int_from_bytes);
+    defProperty(tInt, "real", int_real);
+    defProperty(tInt, "imag", int_imag);
+    defProperty(tInt, "numerator", int_real);
+    defProperty(tInt, "denominator", int_denominator);
+    defMethod(tFloat, "is_integer", float_is_integer);
+    defMethod(tFloat, "as_integer_ratio", float_as_integer_ratio);
+    defMethod(tFloat, "conjugate", float_conjugate);
+    defMethod(tFloat, "hex", float_hex);
+    defProperty(tFloat, "real", float_conjugate);
+    defProperty(tFloat, "imag", float_imag);
+}
+
+} // namespace py

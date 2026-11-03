@@ -1,0 +1,2381 @@
+// quantum: cpp
+// Python front-end: the containers. dict keeps insertion order; set is
+// CPython's open-addressing table, probe for probe, so sets of numbers
+// iterate (and print) in the order CPython gives; list sorts with a stable
+// merge sort using only `<`, as list.sort does.
+#include "PyRt.h.sa"
+#include "PyAst.h.sa"
+
+#include <algorithm>
+
+namespace py
+{
+
+// ── dict ───────────────────────────────────────────────────────────────────
+
+static inline bool keyEq(V a, V b)
+{
+    if (a == b)
+        return true;
+    if (IS_SMALL(a) || IS_SMALL(b))
+    {
+        if (IS_SMALL(a) && IS_SMALL(b))
+            return false;
+        return eq(a, b);
+    }
+    if (a->type == tStr && b->type == tStr)
+        return static_cast<Str *>(a)->s == static_cast<Str *>(b)->s;
+    return eq(a, b);
+}
+
+static void dictRebuild(Dict *d, size_t minSize)
+{
+    // compact the entries and rebuild the index
+    std::vector<DEntry> live;
+    live.reserve((size_t)d->used);
+    for (const DEntry &e : d->entries)
+        if (e.key)
+            live.push_back(e);
+    d->entries = live;
+    size_t size = 8;
+    while (size * 2 < (minSize + 1) * 3)
+        size <<= 1;
+    d->index.assign(size, -1);
+    size_t mask = size - 1;
+    for (size_t k = 0; k < d->entries.size(); ++k)
+    {
+        uint64_t h = (uint64_t)d->entries[k].hash;
+        size_t i = (size_t)h & mask;
+        uint64_t perturb = h;
+        while (d->index[i] != -1)
+        {
+            perturb >>= 5;
+            i = (size_t)((i * 5 + perturb + 1) & mask);
+        }
+        d->index[i] = (int32_t)k;
+    }
+}
+
+// Index slot holding key, or -1; `slot` is where to insert when missing
+static int64_t dictFind(Dict *d, V key, int64_t hash, size_t &slot)
+{
+    if (d->index.empty())
+        dictRebuild(d, 0);
+    size_t mask = d->index.size() - 1;
+    size_t i = (size_t)(uint64_t)hash & mask;
+    uint64_t perturb = (uint64_t)hash;
+    int64_t firstDeleted = -1;
+    for (;;)
+    {
+        int32_t ix = d->index[i];
+        if (ix == -1)
+        {
+            slot = firstDeleted >= 0 ? (size_t)firstDeleted : i;
+            return -1;
+        }
+        if (ix == -2)
+        {
+            if (firstDeleted < 0)
+                firstDeleted = (int64_t)i;
+        }
+        else
+        {
+            DEntry &e = d->entries[(size_t)ix];
+            if (e.key == key || (e.hash == hash && keyEq(e.key, key)))
+            {
+                slot = i;
+                return ix;
+            }
+        }
+        perturb >>= 5;
+        i = (size_t)((i * 5 + perturb + 1) & mask);
+    }
+}
+
+V dictGet(Dict *d, V key)
+{
+    if (d->used == 0)
+        return nullptr;
+    size_t slot;
+    int64_t ix = dictFind(d, key, hashOf(key), slot);
+    return ix < 0 ? nullptr : d->entries[(size_t)ix].val;
+}
+
+V dictGetStr(Dict *d, Str *key)
+{
+    if (d->used == 0)
+        return nullptr;
+    if (key->hash == -1)
+        key->hash = hashString(key->s);
+    size_t mask = d->index.size() - 1;
+    size_t i = (size_t)(uint64_t)key->hash & mask;
+    uint64_t perturb = (uint64_t)key->hash;
+    for (;;)
+    {
+        int32_t ix = d->index[i];
+        if (ix == -1)
+            return nullptr;
+        if (ix >= 0)
+        {
+            DEntry &e = d->entries[(size_t)ix];
+            if (e.key == key)
+                return e.val;
+            if (e.hash == key->hash && !IS_SMALL(e.key) && e.key->type->layout == L::Str &&
+                static_cast<Str *>(e.key)->s == key->s)
+                return e.val;
+            if (e.hash == key->hash && !IS_SMALL(e.key) && e.key->type->layout != L::Str && keyEq(e.key, key))
+                return e.val;
+        }
+        perturb >>= 5;
+        i = (size_t)((i * 5 + perturb + 1) & mask);
+    }
+}
+
+V dictGetC(Dict *d, const char *key) { return dictGetStr(d, intern(key)); }
+
+void dictSet(Dict *d, V key, V val)
+{
+    int64_t h = hashOf(key);
+    size_t slot;
+    int64_t ix = dictFind(d, key, h, slot);
+    if (ix >= 0)
+    {
+        d->entries[(size_t)ix].val = val;
+        return;
+    }
+    DEntry e;
+    e.key = key;
+    e.val = val;
+    e.hash = h;
+    d->entries.push_back(e);
+    d->index[slot] = (int32_t)(d->entries.size() - 1);
+    ++d->used;
+    ++d->version;
+    if (d->entries.size() * 3 >= d->index.size() * 2)
+        dictRebuild(d, (size_t)d->used * 2);
+}
+
+bool dictDel(Dict *d, V key)
+{
+    if (d->used == 0)
+        return false;
+    size_t slot;
+    int64_t ix = dictFind(d, key, hashOf(key), slot);
+    if (ix < 0)
+        return false;
+    d->entries[(size_t)ix].key = nullptr;
+    d->entries[(size_t)ix].val = nullptr;
+    d->index[slot] = -2;
+    --d->used;
+    ++d->version;
+    return true;
+}
+
+void dictClear(Dict *d)
+{
+    d->entries.clear();
+    d->index.clear();
+    d->used = 0;
+    ++d->version;
+}
+
+Dict *dictCopy(Dict *d)
+{
+    Dict *r = newDict();
+    for (const DEntry &e : d->entries)
+        if (e.key)
+            dictSet(r, e.key, e.val);
+    return r;
+}
+
+static V dictIter(Dict *d, int kind)
+{
+    size_t *pos = new size_t(0);
+    uint64_t ver = d->version;
+    int64_t size = d->used;
+    return makeIter([d, kind, pos, ver, size](V &out) -> bool {
+        if (d->used != size || d->version != ver)
+        {
+            if (d->used != size)
+                raise(tRuntimeError, "dictionary changed size during iteration");
+            raise(tRuntimeError, "dictionary keys changed during iteration");
+        }
+        while (*pos < d->entries.size())
+        {
+            DEntry &e = d->entries[(*pos)++];
+            if (!e.key)
+                continue;
+            if (kind == 0)
+                out = e.key;
+            else if (kind == 1)
+                out = e.val;
+            else
+            {
+                Tuple *t = newTuple(2);
+                t->items[0] = e.key;
+                t->items[1] = e.val;
+                out = t;
+            }
+            return true;
+        }
+        return false;
+    });
+}
+
+static Dict *asDict(V v)
+{
+    if (IS_SMALL(v) || v->type->layout != L::Dict)
+        raise(tTypeError, "descriptor requires a 'dict' object");
+    return static_cast<Dict *>(v);
+}
+
+// d.update(other) / dict(other): a mapping (has keys()) or pairs
+static void dictUpdateFrom(Dict *d, V other)
+{
+    if (!IS_SMALL(other) && other->type->layout == L::Dict && other->type->builtin)
+    {
+        for (const DEntry &e : static_cast<Dict *>(other)->entries)
+            if (e.key)
+                dictSet(d, e.key, e.val);
+        return;
+    }
+    V keys;
+    if (!IS_SMALL(other) && other->type->layout == L::Dict && !lookupMro(typeOf(other), intern("keys")))
+        keys = nullptr;
+    if (getattrOpt(other, intern("keys"), keys))
+    {
+        for (V k : toVector(call0(keys)))
+            dictSet(d, k, getitem(other, k));
+        return;
+    }
+    int64_t i = 0;
+    for (V pair : toVector(other))
+    {
+        std::vector<V> kv = toVector(pair);
+        if (kv.size() != 2)
+            raise(tValueError, "dictionary update sequence element #" + std::to_string(i) + " has length " +
+                                   std::to_string(kv.size()) + "; 2 is required");
+        dictSet(d, kv[0], kv[1]);
+        ++i;
+    }
+}
+
+static V dict_new(V *a, int, Kw *)
+{
+    return newObject(static_cast<Type *>(a[0]));
+}
+
+static V dict_init(V *a, int n, Kw *kw)
+{
+    Dict *d = asDict(a[0]);
+    checkArgs("dict", n - 1, 0, 1);
+    if (n > 1)
+        dictUpdateFrom(d, a[1]);
+    if (kw)
+        for (size_t i = 0; i < kw->names.size(); ++i)
+            dictSet(d, kw->names[i], kw->vals[i]);
+    return None;
+}
+
+static V dict_getitem(V *a, int n, Kw *)
+{
+    checkArgs("__getitem__", n, 2, 2);
+    Dict *d = asDict(a[0]);
+    V v = dictGet(d, a[1]);
+    if (v)
+        return v;
+    if (!a[0]->type->builtin)
+    {
+        bool found;
+        V r = callSpecial(a[0], intern("__missing__"), &a[1], 1, found);
+        if (found)
+            return r;
+    }
+    raiseArgs(tKeyError, a[1]);
+}
+
+static V dict_setitem(V *a, int n, Kw *)
+{
+    checkArgs("__setitem__", n, 3, 3);
+    dictSet(asDict(a[0]), a[1], a[2]);
+    return None;
+}
+
+static V dict_delitem(V *a, int n, Kw *)
+{
+    checkArgs("__delitem__", n, 2, 2);
+    if (!dictDel(asDict(a[0]), a[1]))
+        raiseArgs(tKeyError, a[1]);
+    return None;
+}
+
+static V dict_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    return mkbool(dictGet(asDict(a[0]), a[1]) != nullptr);
+}
+
+static V dict_len(V *a, int, Kw *) { return mkint(asDict(a[0])->used); }
+static V dict_iter(V *a, int, Kw *) { return dictIter(asDict(a[0]), 0); }
+
+static V dict_reversed(V *a, int, Kw *)
+{
+    Dict *d = asDict(a[0]);
+    std::vector<V> keys;
+    for (const DEntry &e : d->entries)
+        if (e.key)
+            keys.push_back(e.key);
+    size_t *pos = new size_t(keys.size());
+    std::vector<V> *ks = new std::vector<V>(keys);
+    return makeIter([ks, pos](V &out) -> bool {
+        if (*pos == 0)
+            return false;
+        out = (*ks)[--*pos];
+        return true;
+    });
+}
+
+static V dict_get(V *a, int n, Kw *)
+{
+    checkArgs("get", n - 1, 1, 2);
+    V v = dictGet(asDict(a[0]), a[1]);
+    return v ? v : (n > 2 ? a[2] : None);
+}
+
+static V dict_setdefault(V *a, int n, Kw *)
+{
+    checkArgs("setdefault", n - 1, 1, 2);
+    Dict *d = asDict(a[0]);
+    V v = dictGet(d, a[1]);
+    if (v)
+        return v;
+    V def = n > 2 ? a[2] : None;
+    dictSet(d, a[1], def);
+    return def;
+}
+
+static V dict_pop(V *a, int n, Kw *)
+{
+    checkArgs("pop", n - 1, 1, 2);
+    Dict *d = asDict(a[0]);
+    V v = dictGet(d, a[1]);
+    if (v)
+    {
+        dictDel(d, a[1]);
+        return v;
+    }
+    if (n > 2)
+        return a[2];
+    raiseArgs(tKeyError, a[1]);
+}
+
+static V dict_popitem(V *a, int, Kw *)
+{
+    Dict *d = asDict(a[0]);
+    for (size_t i = d->entries.size(); i-- > 0;)
+    {
+        DEntry e = d->entries[i];
+        if (!e.key)
+            continue;
+        dictDel(d, e.key);
+        Tuple *t = newTuple(2);
+        t->items[0] = e.key;
+        t->items[1] = e.val;
+        return t;
+    }
+    raise(tKeyError, "popitem(): dictionary is empty");
+}
+
+static V makeView(V d, int kind)
+{
+    DictView *v = new DictView(kind == 0 ? tDictKeys : kind == 1 ? tDictValues : tDictItems);
+    v->d = asDict(d);
+    v->kind = kind;
+    return v;
+}
+
+static V dict_keys(V *a, int, Kw *) { return makeView(a[0], 0); }
+static V dict_values(V *a, int, Kw *) { return makeView(a[0], 1); }
+static V dict_items(V *a, int, Kw *) { return makeView(a[0], 2); }
+
+static V dict_update(V *a, int n, Kw *kw)
+{
+    Dict *d = asDict(a[0]);
+    checkArgs("update", n - 1, 0, 1);
+    if (n > 1)
+    {
+        if (!a[0]->type->builtin)
+        {
+            // a subclass's __setitem__ sees every key
+            V other = a[1];
+            V keys;
+            std::vector<V> pairs;
+            if (!IS_SMALL(other) && other->type->layout == L::Dict)
+            {
+                for (const DEntry &e : static_cast<Dict *>(other)->entries)
+                    if (e.key)
+                        setitem(a[0], e.key, e.val);
+            }
+            else if (getattrOpt(other, intern("keys"), keys))
+            {
+                for (V k : toVector(call0(keys)))
+                    setitem(a[0], k, getitem(other, k));
+            }
+            else
+                for (V pair : toVector(other))
+                {
+                    std::vector<V> kv = toVector(pair);
+                    setitem(a[0], kv[0], kv[1]);
+                }
+        }
+        else
+            dictUpdateFrom(d, a[1]);
+    }
+    if (kw)
+        for (size_t i = 0; i < kw->names.size(); ++i)
+            setitem(a[0], kw->names[i], kw->vals[i]);
+    return None;
+}
+
+static V dict_clear(V *a, int, Kw *)
+{
+    dictClear(asDict(a[0]));
+    return None;
+}
+
+static V dict_copy(V *a, int, Kw *) { return dictCopy(asDict(a[0])); }
+
+static V dict_fromkeys(V *a, int n, Kw *)
+{
+    checkArgs("fromkeys", n - 1, 1, 2);
+    V d = call0(a[0]);
+    V val = n > 2 ? a[2] : None;
+    for (V k : toVector(a[1]))
+        setitem(d, k, val);
+    return d;
+}
+
+static V dict_class_getitem(V *a, int n, Kw *)
+{
+    V ga = dictGetC(builtinsDict, "_GenericAlias");
+    if (!ga)
+        return a[0];
+    return call2(ga, a[0], n > 1 ? a[1] : None);
+}
+
+// ── dict views ─────────────────────────────────────────────────────────────
+
+static V view_len(V *a, int, Kw *) { return mkint(static_cast<DictView *>(a[0])->d->used); }
+static V view_iter(V *a, int, Kw *)
+{
+    DictView *v = static_cast<DictView *>(a[0]);
+    return dictIter(v->d, v->kind);
+}
+static V view_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    DictView *v = static_cast<DictView *>(a[0]);
+    if (v->kind == 0)
+        return mkbool(dictGet(v->d, a[1]) != nullptr);
+    if (v->kind == 2)
+    {
+        std::vector<V> kv = toVector(a[1]);
+        if (kv.size() != 2)
+            return False;
+        V val = dictGet(v->d, kv[0]);
+        return mkbool(val && eq(val, kv[1]));
+    }
+    for (const DEntry &e : v->d->entries)
+        if (e.key && eq(e.val, a[1]))
+            return True;
+    return False;
+}
+static V view_reversed(V *a, int, Kw *)
+{
+    DictView *v = static_cast<DictView *>(a[0]);
+    std::vector<V> items = toVector(a[0]);
+    std::vector<V> *rev = new std::vector<V>(items);
+    std::reverse(rev->begin(), rev->end());
+    size_t *pos = new size_t(0);
+    (void)v;
+    return makeIter([rev, pos](V &out) -> bool {
+        if (*pos >= rev->size())
+            return false;
+        out = (*rev)[(*pos)++];
+        return true;
+    });
+}
+static V view_isdisjoint(V *a, int n, Kw *)
+{
+    checkArgs("isdisjoint", n, 2, 2);
+    for (V x : toVector(a[1]))
+        if (contains(a[0], x))
+            return False;
+    return True;
+}
+static V view_mapping(V *a, int, Kw *) { return static_cast<DictView *>(a[0])->d; }
+
+// ── set ────────────────────────────────────────────────────────────────────
+
+static Obj *dummyObj;
+
+V dummyKey() { return dummyObj; }
+
+static const int LINEAR_PROBES = 9;
+
+static void setInsertClean(std::vector<SEntry> &table, int64_t mask, V key, int64_t hash)
+{
+    uint64_t perturb = (uint64_t)hash;
+    size_t i = (size_t)((uint64_t)hash & (uint64_t)mask);
+    for (;;)
+    {
+        SEntry *entry = &table[i];
+        if (!entry->key)
+        {
+            entry->key = key;
+            entry->hash = hash;
+            return;
+        }
+        if ((int64_t)i + LINEAR_PROBES <= mask)
+        {
+            for (int j = 0; j < LINEAR_PROBES; ++j)
+            {
+                ++entry;
+                if (!entry->key)
+                {
+                    entry->key = key;
+                    entry->hash = hash;
+                    return;
+                }
+            }
+        }
+        perturb >>= 5;
+        i = (size_t)((i * 5 + 1 + perturb) & (uint64_t)mask);
+    }
+}
+
+static void setResize(Set *s, int64_t minused)
+{
+    int64_t newsize = 8;
+    while (newsize <= minused)
+        newsize <<= 1;
+    std::vector<SEntry> old = s->table;
+    s->table.assign((size_t)newsize, SEntry{nullptr, 0});
+    s->mask = newsize - 1;
+    for (const SEntry &e : old)
+        if (e.key && e.key != dummyObj)
+            setInsertClean(s->table, s->mask, e.key, e.hash);
+    s->fill = s->used;
+}
+
+// One attempt at adding: 0 added, 1 already present, 2 the table changed
+// under a comparison (start again)
+static int setAddAttempt(Set *s, V key, int64_t hash)
+{
+    int64_t mask = s->mask;
+    size_t i = (size_t)((uint64_t)hash & (uint64_t)mask);
+    SEntry *freeslot = nullptr;
+    uint64_t perturb = (uint64_t)hash;
+    for (;;)
+    {
+        SEntry *entry = &s->table[i];
+        int probes = ((int64_t)i + LINEAR_PROBES <= mask) ? LINEAR_PROBES : 0;
+        do
+        {
+            if (entry->hash == 0 && entry->key == nullptr)
+            {
+                if (freeslot)
+                {
+                    ++s->used;
+                    freeslot->key = key;
+                    freeslot->hash = hash;
+                    return 0;
+                }
+                ++s->fill;
+                ++s->used;
+                entry->key = key;
+                entry->hash = hash;
+                if (s->fill * 5 >= mask * 3)
+                    setResize(s, s->used > 50000 ? s->used * 2 : s->used * 4);
+                return 0;
+            }
+            if (entry->hash == hash && entry->key != dummyObj)
+            {
+                V startkey = entry->key;
+                if (startkey == key)
+                    return 1;
+                size_t sizeBefore = s->table.size();
+                bool same = keyEq(startkey, key);
+                if (sizeBefore != s->table.size() || s->mask != mask)
+                    return 2;
+                if (same)
+                    return 1;
+            }
+            else if (entry->hash == -1 && entry->key == dummyObj)
+            {
+                if (!freeslot)
+                    freeslot = entry;
+            }
+            ++entry;
+        } while (probes--);
+        perturb >>= 5;
+        i = (size_t)((i * 5 + 1 + perturb) & (uint64_t)mask);
+    }
+}
+
+static bool setAddEntry(Set *s, V key, int64_t hash)
+{
+    for (;;)
+    {
+        int r = setAddAttempt(s, key, hash);
+        if (r != 2)
+            return r == 0;
+    }
+}
+
+// The entry holding key, or nullptr
+static SEntry *setLookup(Set *s, V key, int64_t hash)
+{
+    int64_t mask = s->mask;
+    size_t i = (size_t)((uint64_t)hash & (uint64_t)mask);
+    uint64_t perturb = (uint64_t)hash;
+    for (;;)
+    {
+        SEntry *entry = &s->table[i];
+        int probes = ((int64_t)i + LINEAR_PROBES <= mask) ? LINEAR_PROBES : 0;
+        do
+        {
+            if (entry->hash == 0 && entry->key == nullptr)
+                return nullptr;
+            if (entry->hash == hash && entry->key != dummyObj && keyEq(entry->key, key))
+                return entry;
+            ++entry;
+        } while (probes--);
+        perturb >>= 5;
+        i = (size_t)((i * 5 + 1 + perturb) & (uint64_t)mask);
+    }
+}
+
+bool setAdd(Set *s, V key) { return setAddEntry(s, key, hashOf(key)); }
+
+bool setHas(Set *s, V key)
+{
+    if (s->used == 0)
+    {
+        hashOf(key); // unhashable keys still raise
+        return false;
+    }
+    return setLookup(s, key, hashOf(key)) != nullptr;
+}
+
+bool setDiscard(Set *s, V key)
+{
+    SEntry *e = setLookup(s, key, hashOf(key));
+    if (!e)
+        return false;
+    e->key = dummyObj;
+    e->hash = -1;
+    --s->used;
+    return true;
+}
+
+static void setMerge(Set *s, Set *other)
+{
+    if (other == s || other->used == 0)
+        return;
+    if ((s->fill + other->used) * 5 >= s->mask * 3)
+        setResize(s, (s->used + other->used) * 2);
+    if (s->fill == 0 && s->mask == other->mask && other->fill == other->used)
+    {
+        for (size_t i = 0; i < other->table.size(); ++i)
+            if (other->table[i].key && other->table[i].key != dummyObj)
+                s->table[i] = other->table[i];
+        s->fill = other->fill;
+        s->used = other->used;
+        return;
+    }
+    if (s->fill == 0)
+    {
+        for (const SEntry &e : other->table)
+            if (e.key && e.key != dummyObj)
+                setInsertClean(s->table, s->mask, e.key, e.hash);
+        s->fill = other->used;
+        s->used = other->used;
+        return;
+    }
+    std::vector<SEntry> entries = other->table;
+    for (const SEntry &e : entries)
+        if (e.key && e.key != dummyObj)
+            setAddEntry(s, e.key, e.hash);
+}
+
+void setUpdate(Set *s, V iterable)
+{
+    if (!IS_SMALL(iterable) && iterable->type->layout == L::Set)
+    {
+        setMerge(s, static_cast<Set *>(iterable));
+        return;
+    }
+    if (!IS_SMALL(iterable) && iterable->type->layout == L::Dict && iterable->type->builtin)
+    {
+        Dict *d = static_cast<Dict *>(iterable);
+        if ((s->fill + d->used) * 5 >= s->mask * 3)
+            setResize(s, (s->used + d->used) * 2);
+        for (const DEntry &e : d->entries)
+            if (e.key)
+                setAddEntry(s, e.key, e.hash);
+        return;
+    }
+    V it = getiter(iterable);
+    V x;
+    while (iterNext(it, x))
+        setAdd(s, x);
+}
+
+Set *setCopy(Set *s, Type *t)
+{
+    Set *r = newSet(t);
+    setMerge(r, s);
+    return r;
+}
+
+std::vector<V> setItems(Set *s)
+{
+    std::vector<V> out;
+    out.reserve((size_t)s->used);
+    for (const SEntry &e : s->table)
+        if (e.key && e.key != dummyObj)
+            out.push_back(e.key);
+    return out;
+}
+
+static Set *asSet(V v)
+{
+    if (IS_SMALL(v) || v->type->layout != L::Set)
+        raise(tTypeError, "descriptor requires a 'set' object");
+    return static_cast<Set *>(v);
+}
+
+static Set *toSetArg(V v)
+{
+    if (!IS_SMALL(v) && v->type->layout == L::Set)
+        return static_cast<Set *>(v);
+    Set *s = newSet();
+    setUpdate(s, v);
+    return s;
+}
+
+static Type *resultType(V self)
+{
+    return issub(typeOf(self), tFrozenSet) ? tFrozenSet : tSet;
+}
+
+static V set_new(V *a, int n, Kw *)
+{
+    Type *t = static_cast<Type *>(a[0]);
+    Set *s = static_cast<Set *>(newObject(t));
+    if (issub(t, tFrozenSet) && n > 1)
+        setUpdate(s, a[1]);
+    return s;
+}
+
+static V set_init(V *a, int n, Kw *)
+{
+    Set *s = asSet(a[0]);
+    if (issub(typeOf(a[0]), tFrozenSet))
+        return None;
+    checkArgs("set", n - 1, 0, 1);
+    if (s->used)
+    {
+        s->table.assign(8, SEntry{nullptr, 0});
+        s->mask = 7;
+        s->fill = s->used = 0;
+    }
+    if (n > 1)
+        setUpdate(s, a[1]);
+    return None;
+}
+
+static V set_add(V *a, int n, Kw *)
+{
+    checkArgs("add", n - 1, 1, 1);
+    setAdd(asSet(a[0]), a[1]);
+    return None;
+}
+
+static V set_remove(V *a, int n, Kw *)
+{
+    checkArgs("remove", n - 1, 1, 1);
+    if (!setDiscard(asSet(a[0]), a[1]))
+        raiseArgs(tKeyError, a[1]);
+    return None;
+}
+
+static V set_discard(V *a, int n, Kw *)
+{
+    checkArgs("discard", n - 1, 1, 1);
+    setDiscard(asSet(a[0]), a[1]);
+    return None;
+}
+
+static V set_pop(V *a, int, Kw *)
+{
+    Set *s = asSet(a[0]);
+    if (s->used == 0)
+        raise(tKeyError, "pop from an empty set");
+    size_t i = (size_t)(s->finger & s->mask);
+    while (!s->table[i].key || s->table[i].key == dummyObj)
+    {
+        ++i;
+        if (i > (size_t)s->mask)
+            i = 0;
+    }
+    V key = s->table[i].key;
+    s->table[i].key = dummyObj;
+    s->table[i].hash = -1;
+    --s->used;
+    s->finger = (int64_t)i + 1;
+    return key;
+}
+
+static V set_clear(V *a, int, Kw *)
+{
+    Set *s = asSet(a[0]);
+    s->table.assign(8, SEntry{nullptr, 0});
+    s->mask = 7;
+    s->fill = s->used = 0;
+    return None;
+}
+
+static V set_copy(V *a, int, Kw *) { return setCopy(asSet(a[0]), resultType(a[0])); }
+
+static V set_len(V *a, int, Kw *) { return mkint(asSet(a[0])->used); }
+
+static V set_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    V key = a[1];
+    // a set looks up a set argument as a frozenset
+    if (!IS_SMALL(key) && key->type == tSet)
+    {
+        key = setCopy(static_cast<Set *>(key), tFrozenSet);
+    }
+    return mkbool(setHas(asSet(a[0]), key));
+}
+
+static V set_iter(V *a, int, Kw *)
+{
+    Set *s = asSet(a[0]);
+    size_t *pos = new size_t(0);
+    int64_t size = s->used;
+    return makeIter([s, pos, size](V &out) -> bool {
+        if (s->used != size)
+            raise(tRuntimeError, "Set changed size during iteration");
+        while (*pos < s->table.size())
+        {
+            const SEntry &e = s->table[(*pos)++];
+            if (e.key && e.key != dummyObj)
+            {
+                out = e.key;
+                return true;
+            }
+        }
+        return false;
+    });
+}
+
+static V set_update(V *a, int n, Kw *)
+{
+    Set *s = asSet(a[0]);
+    for (int i = 1; i < n; ++i)
+        setUpdate(s, a[i]);
+    return None;
+}
+
+static V set_union(V *a, int n, Kw *)
+{
+    Set *r = setCopy(asSet(a[0]), resultType(a[0]));
+    for (int i = 1; i < n; ++i)
+        setUpdate(r, a[i]);
+    return r;
+}
+
+extern V builtinBinary(V a, V b, Op op);
+
+static V set_intersection(V *a, int n, Kw *)
+{
+    V r = setCopy(asSet(a[0]), resultType(a[0]));
+    for (int i = 1; i < n; ++i)
+    {
+        Set *o = toSetArg(a[i]);
+        r = builtinBinary(r, o, OpBitAnd);
+    }
+    return r;
+}
+
+static V set_difference(V *a, int n, Kw *)
+{
+    V r = setCopy(asSet(a[0]), resultType(a[0]));
+    for (int i = 1; i < n; ++i)
+        r = builtinBinary(r, toSetArg(a[i]), OpSub);
+    return r;
+}
+
+static V set_symmetric_difference(V *a, int n, Kw *)
+{
+    checkArgs("symmetric_difference", n - 1, 1, 1);
+    Set *self = asSet(a[0]);
+    Set *r = newSet(resultType(a[0]));
+    setUpdate(r, a[1]);
+    for (V k : setItems(self))
+        if (!setDiscard(r, k))
+            setAdd(r, k);
+    return r;
+}
+
+static V set_intersection_update(V *a, int n, Kw *)
+{
+    Set *s = asSet(a[0]);
+    for (int i = 1; i < n; ++i)
+    {
+        Set *o = toSetArg(a[i]);
+        V r = builtinBinary(s, o, OpBitAnd);
+        Set *rs = static_cast<Set *>(r);
+        s->table = rs->table;
+        s->mask = rs->mask;
+        s->fill = rs->fill;
+        s->used = rs->used;
+    }
+    return None;
+}
+
+static V set_difference_update(V *a, int n, Kw *)
+{
+    Set *s = asSet(a[0]);
+    for (int i = 1; i < n; ++i)
+        for (V k : toVector(a[i]))
+            setDiscard(s, k);
+    return None;
+}
+
+static V set_symmetric_difference_update(V *a, int n, Kw *)
+{
+    checkArgs("symmetric_difference_update", n - 1, 1, 1);
+    Set *s = asSet(a[0]);
+    Set *o = toSetArg(a[1]);
+    for (V k : setItems(o))
+        if (!setDiscard(s, k))
+            setAdd(s, k);
+    return None;
+}
+
+static V set_issubset(V *a, int n, Kw *)
+{
+    checkArgs("issubset", n - 1, 1, 1);
+    Set *s = asSet(a[0]);
+    Set *o = toSetArg(a[1]);
+    for (V k : setItems(s))
+        if (!setHas(o, k))
+            return False;
+    return True;
+}
+
+static V set_issuperset(V *a, int n, Kw *)
+{
+    checkArgs("issuperset", n - 1, 1, 1);
+    Set *s = asSet(a[0]);
+    for (V k : toVector(a[1]))
+        if (!setHas(s, k))
+            return False;
+    return True;
+}
+
+static V set_isdisjoint(V *a, int n, Kw *)
+{
+    checkArgs("isdisjoint", n - 1, 1, 1);
+    Set *s = asSet(a[0]);
+    for (V k : toVector(a[1]))
+        if (setHas(s, k))
+            return False;
+    return True;
+}
+
+// ── list ───────────────────────────────────────────────────────────────────
+
+static List *asList(V v)
+{
+    if (IS_SMALL(v) || v->type->layout != L::List)
+        raise(tTypeError, "descriptor requires a 'list' object");
+    return static_cast<List *>(v);
+}
+
+// CPython's PySlice_AdjustIndices: [start, stop, step] for a sequence of len
+std::vector<int64_t> sliceIndices(SliceObj *s, int64_t len, int64_t &count)
+{
+    int64_t step = 1, start, stop;
+    if (s->step != None)
+    {
+        step = indexOf(s->step);
+        if (step == 0)
+            raise(tValueError, "slice step cannot be zero");
+    }
+    auto clampIndex = [](V v, int64_t def) -> int64_t {
+        if (v == None)
+            return def;
+        if (isIntLike(v))
+        {
+            int64_t x;
+            if (intSmall(v, x))
+                return x;
+            return intSign(v) < 0 ? INT64_MIN / 2 : INT64_MAX / 2;
+        }
+        return indexOf(v);
+    };
+    if (step > 0)
+    {
+        start = clampIndex(s->start, 0);
+        stop = clampIndex(s->stop, len);
+        if (start < 0)
+        {
+            start += len;
+            if (start < 0)
+                start = 0;
+        }
+        else if (start > len)
+            start = len;
+        if (stop < 0)
+        {
+            stop += len;
+            if (stop < 0)
+                stop = 0;
+        }
+        else if (stop > len)
+            stop = len;
+        count = stop > start ? (stop - start + step - 1) / step : 0;
+    }
+    else
+    {
+        start = clampIndex(s->start, len - 1);
+        stop = clampIndex(s->stop, -1);
+        if (s->start != None && start < 0)
+        {
+            start += len;
+            if (start < 0)
+                start = -1;
+        }
+        else if (start >= len)
+            start = len - 1;
+        if (s->stop != None)
+        {
+            if (stop < 0)
+            {
+                stop += len;
+                if (stop < 0)
+                    stop = -1;
+            }
+            else if (stop >= len)
+                stop = len - 1;
+        }
+        count = stop < start ? (start - stop - 1) / -step + 1 : 0;
+    }
+    std::vector<int64_t> r(3);
+    r[0] = start;
+    r[1] = stop;
+    r[2] = step;
+    return r;
+}
+
+static bool isSlice(V v) { return !IS_SMALL(v) && v->type->layout == L::Slice; }
+
+static std::vector<V> sliceOf(const std::vector<V> &items, SliceObj *s)
+{
+    int64_t count;
+    std::vector<int64_t> ix = sliceIndices(s, (int64_t)items.size(), count);
+    std::vector<V> out;
+    out.reserve((size_t)count);
+    for (int64_t k = 0, i = ix[0]; k < count; ++k, i += ix[2])
+        out.push_back(items[(size_t)i]);
+    return out;
+}
+
+static int64_t normIndex(V key, int64_t n, const char *what)
+{
+    int64_t i = indexOf(key);
+    if (i < 0)
+        i += n;
+    if (i < 0 || i >= n)
+        raise(tIndexError, std::string(what) + " index out of range");
+    return i;
+}
+
+static V list_new(V *a, int, Kw *) { return newObject(static_cast<Type *>(a[0])); }
+
+static V list_init(V *a, int n, Kw *kw)
+{
+    noKw("list", kw);
+    checkArgs("list", n - 1, 0, 1);
+    List *l = asList(a[0]);
+    l->items.clear();
+    if (n > 1)
+        l->items = toVector(a[1]);
+    return None;
+}
+
+static V list_getitem(V *a, int n, Kw *)
+{
+    checkArgs("__getitem__", n, 2, 2);
+    List *l = asList(a[0]);
+    if (isSlice(a[1]))
+    {
+        List *r = newList();
+        r->items = sliceOf(l->items, static_cast<SliceObj *>(a[1]));
+        return r;
+    }
+    if (!isIntLike(a[1]) && !lookupMro(typeOf(a[1]), intern("__index__")))
+        raise(tTypeError, "list indices must be integers or slices, not " + std::string(typeName(a[1])));
+    return l->items[(size_t)normIndex(a[1], (int64_t)l->items.size(), "list")];
+}
+
+static V list_setitem(V *a, int n, Kw *)
+{
+    checkArgs("__setitem__", n, 3, 3);
+    List *l = asList(a[0]);
+    if (isSlice(a[1]))
+    {
+        SliceObj *s = static_cast<SliceObj *>(a[1]);
+        std::vector<V> vals = toVector(a[2]);
+        int64_t count;
+        std::vector<int64_t> ix = sliceIndices(s, (int64_t)l->items.size(), count);
+        if (ix[2] == 1)
+        {
+            int64_t start = ix[0], stop = ix[1] < start ? start : ix[1];
+            l->items.erase(l->items.begin() + start, l->items.begin() + stop);
+            l->items.insert(l->items.begin() + start, vals.begin(), vals.end());
+            return None;
+        }
+        if ((int64_t)vals.size() != count)
+            raise(tValueError, "attempt to assign sequence of size " + std::to_string(vals.size()) +
+                                   " to extended slice of size " + std::to_string(count));
+        for (int64_t k = 0, i = ix[0]; k < count; ++k, i += ix[2])
+            l->items[(size_t)i] = vals[(size_t)k];
+        return None;
+    }
+    int64_t i = indexOf(a[1]);
+    int64_t len = (int64_t)l->items.size();
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "list assignment index out of range");
+    l->items[(size_t)i] = a[2];
+    return None;
+}
+
+static V list_delitem(V *a, int n, Kw *)
+{
+    checkArgs("__delitem__", n, 2, 2);
+    List *l = asList(a[0]);
+    if (isSlice(a[1]))
+    {
+        int64_t count;
+        std::vector<int64_t> ix = sliceIndices(static_cast<SliceObj *>(a[1]), (int64_t)l->items.size(), count);
+        std::vector<bool> drop(l->items.size(), false);
+        for (int64_t k = 0, i = ix[0]; k < count; ++k, i += ix[2])
+            drop[(size_t)i] = true;
+        std::vector<V> keep;
+        for (size_t i = 0; i < l->items.size(); ++i)
+            if (!drop[i])
+                keep.push_back(l->items[i]);
+        l->items = keep;
+        return None;
+    }
+    int64_t i = indexOf(a[1]), len = (int64_t)l->items.size();
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "list assignment index out of range");
+    l->items.erase(l->items.begin() + i);
+    return None;
+}
+
+static V list_len(V *a, int, Kw *) { return mkint((int64_t)asList(a[0])->items.size()); }
+
+static V seqIterOf(V seq, bool isList)
+{
+    size_t *pos = new size_t(0);
+    if (isList)
+    {
+        List *l = static_cast<List *>(seq);
+        return makeIter([l, pos](V &out) -> bool {
+            if (*pos >= l->items.size())
+                return false;
+            out = l->items[(*pos)++];
+            return true;
+        });
+    }
+    Tuple *t = static_cast<Tuple *>(seq);
+    return makeIter([t, pos](V &out) -> bool {
+        if (*pos >= t->items.size())
+            return false;
+        out = t->items[(*pos)++];
+        return true;
+    });
+}
+
+static V list_iter(V *a, int, Kw *) { return seqIterOf(asList(a[0]), true); }
+
+static V list_reversed(V *a, int, Kw *)
+{
+    List *l = asList(a[0]);
+    int64_t *pos = new int64_t((int64_t)l->items.size());
+    return makeIter([l, pos](V &out) -> bool {
+        if (*pos > (int64_t)l->items.size())
+            *pos = (int64_t)l->items.size();
+        if (*pos <= 0)
+            return false;
+        --*pos;
+        out = l->items[(size_t)*pos];
+        return true;
+    });
+}
+
+static V list_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    for (V x : asList(a[0])->items)
+        if (keyEq(x, a[1]))
+            return True;
+    return False;
+}
+
+static V list_append(V *a, int n, Kw *)
+{
+    checkArgs("append", n - 1, 1, 1);
+    asList(a[0])->items.push_back(a[1]);
+    return None;
+}
+
+static V list_extend(V *a, int n, Kw *)
+{
+    checkArgs("extend", n - 1, 1, 1);
+    List *l = asList(a[0]);
+    std::vector<V> items = toVector(a[1]);
+    l->items.insert(l->items.end(), items.begin(), items.end());
+    return None;
+}
+
+static V list_insert(V *a, int n, Kw *)
+{
+    checkArgs("insert", n - 1, 2, 2);
+    List *l = asList(a[0]);
+    int64_t i = indexOf(a[1]), len = (int64_t)l->items.size();
+    if (i < 0)
+    {
+        i += len;
+        if (i < 0)
+            i = 0;
+    }
+    if (i > len)
+        i = len;
+    l->items.insert(l->items.begin() + i, a[2]);
+    return None;
+}
+
+static V list_pop(V *a, int n, Kw *)
+{
+    checkArgs("pop", n - 1, 0, 1);
+    List *l = asList(a[0]);
+    if (l->items.empty())
+        raise(tIndexError, "pop from empty list");
+    int64_t len = (int64_t)l->items.size();
+    int64_t i = n > 1 ? indexOf(a[1]) : len - 1;
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "pop index out of range");
+    V v = l->items[(size_t)i];
+    l->items.erase(l->items.begin() + i);
+    return v;
+}
+
+static V list_remove(V *a, int n, Kw *)
+{
+    checkArgs("remove", n - 1, 1, 1);
+    List *l = asList(a[0]);
+    for (size_t i = 0; i < l->items.size(); ++i)
+        if (keyEq(l->items[i], a[1]))
+        {
+            l->items.erase(l->items.begin() + (int64_t)i);
+            return None;
+        }
+    raise(tValueError, "list.remove(x): x not in list");
+}
+
+static V list_index(V *a, int n, Kw *)
+{
+    checkArgs("index", n - 1, 1, 3);
+    List *l = asList(a[0]);
+    int64_t len = (int64_t)l->items.size();
+    int64_t start = n > 2 ? indexOf(a[2]) : 0, stop = n > 3 ? indexOf(a[3]) : len;
+    if (start < 0)
+        start = start + len < 0 ? 0 : start + len;
+    if (stop < 0)
+        stop = stop + len < 0 ? 0 : stop + len;
+    for (int64_t i = start; i < stop && i < (int64_t)l->items.size(); ++i)
+        if (keyEq(l->items[(size_t)i], a[1]))
+            return mkint(i);
+    raise(tValueError, reprOf(a[1]) + " is not in list");
+}
+
+static V list_count(V *a, int n, Kw *)
+{
+    checkArgs("count", n - 1, 1, 1);
+    int64_t c = 0;
+    for (V x : asList(a[0])->items)
+        if (keyEq(x, a[1]))
+            ++c;
+    return mkint(c);
+}
+
+static V list_clear(V *a, int, Kw *)
+{
+    asList(a[0])->items.clear();
+    return None;
+}
+
+static V list_copy(V *a, int, Kw *)
+{
+    List *r = newList();
+    r->items = asList(a[0])->items;
+    return r;
+}
+
+static V list_reverse(V *a, int, Kw *)
+{
+    List *l = asList(a[0]);
+    std::reverse(l->items.begin(), l->items.end());
+    return None;
+}
+
+// CPython's listsort (Objects/listobject.c, 3.13), comparison for
+// comparison: programs can count the __lt__ calls a sort makes.
+namespace
+{
+
+struct KV
+{
+    V key, val;
+};
+
+struct TimSort
+{
+    struct Run
+    {
+        size_t base, len;
+        int power;
+    };
+    std::vector<KV> &a;
+    std::vector<KV> tmp;
+    std::vector<Run> pending;
+    size_t listlen;
+    int64_t minGallop = 7;
+    static const int MIN_GALLOP = 7;
+
+    TimSort(std::vector<KV> &arr) : a(arr), listlen(arr.size()) {}
+
+    static bool LT(const KV &x, const KV &y) { return lt(x.key, y.key); }
+
+    void reverse(size_t lo, size_t n)
+    {
+        std::reverse(a.begin() + (long)lo, a.begin() + (long)(lo + n));
+    }
+
+    size_t countRun(size_t lo, size_t nremaining)
+    {
+        size_t n;
+        for (n = 1; n < nremaining; ++n)
+            if (LT(a[lo + n], a[lo + n - 1]))
+                break;
+        if (n == nremaining)
+            return n;
+        if (n > 1)
+        {
+            if (LT(a[lo], a[lo + n - 1]))
+                return n;
+            reverse(lo, n);
+        }
+        ++n;
+        size_t neq = 0;
+        for (; n < nremaining; ++n)
+        {
+            if (LT(a[lo + n], a[lo + n - 1]))
+            {
+                if (neq)
+                {
+                    ++neq;
+                    reverse(lo + n - neq, neq);
+                    neq = 0;
+                }
+            }
+            else
+            {
+                if (LT(a[lo + n - 1], a[lo + n]))
+                    break;
+                ++neq;
+            }
+        }
+        if (neq)
+        {
+            ++neq;
+            reverse(lo + n - neq, neq);
+            neq = 0;
+        }
+        reverse(lo, n);
+        for (; n < nremaining; ++n)
+            if (LT(a[lo + n], a[lo + n - 1]))
+                break;
+        return n;
+    }
+
+    void binarySort(size_t lo, size_t n, size_t ok)
+    {
+        if (!ok)
+            ++ok;
+        for (; ok < n; ++ok)
+        {
+            size_t L = 0, R = ok;
+            KV pivot = a[lo + ok];
+            do
+            {
+                size_t M = (L + R) >> 1;
+                if (LT(pivot, a[lo + M]))
+                    R = M;
+                else
+                    L = M + 1;
+            } while (L < R);
+            for (size_t M = ok; M > L; --M)
+                a[lo + M] = a[lo + M - 1];
+            a[lo + L] = pivot;
+        }
+    }
+
+    static size_t minrun(size_t n)
+    {
+        size_t r = 0;
+        while (n >= 64)
+        {
+            r |= n & 1;
+            n >>= 1;
+        }
+        return n + r;
+    }
+
+    // a[p .. p+n), searching with a hint index
+    size_t gallopLeft(const KV &key, const KV *p, int64_t n, int64_t hint)
+    {
+        int64_t ofs, lastofs, k;
+        const KV *base = p;
+        p += hint;
+        lastofs = 0;
+        ofs = 1;
+        if (LT(*p, key))
+        {
+            int64_t maxofs = n - hint;
+            while (ofs < maxofs)
+            {
+                if (LT(p[ofs], key))
+                {
+                    lastofs = ofs;
+                    ofs = (ofs << 1) + 1;
+                }
+                else
+                    break;
+            }
+            if (ofs > maxofs)
+                ofs = maxofs;
+            lastofs += hint;
+            ofs += hint;
+        }
+        else
+        {
+            int64_t maxofs = hint + 1;
+            while (ofs < maxofs)
+            {
+                if (LT(*(p - ofs), key))
+                    break;
+                lastofs = ofs;
+                ofs = (ofs << 1) + 1;
+            }
+            if (ofs > maxofs)
+                ofs = maxofs;
+            k = lastofs;
+            lastofs = hint - ofs;
+            ofs = hint - k;
+        }
+        ++lastofs;
+        while (lastofs < ofs)
+        {
+            int64_t m = lastofs + ((ofs - lastofs) >> 1);
+            if (LT(base[m], key))
+                lastofs = m + 1;
+            else
+                ofs = m;
+        }
+        return (size_t)ofs;
+    }
+
+    size_t gallopRight(const KV &key, const KV *p, int64_t n, int64_t hint)
+    {
+        int64_t ofs, lastofs, k;
+        const KV *base = p;
+        p += hint;
+        lastofs = 0;
+        ofs = 1;
+        if (LT(key, *p))
+        {
+            int64_t maxofs = hint + 1;
+            while (ofs < maxofs)
+            {
+                if (LT(key, *(p - ofs)))
+                {
+                    lastofs = ofs;
+                    ofs = (ofs << 1) + 1;
+                }
+                else
+                    break;
+            }
+            if (ofs > maxofs)
+                ofs = maxofs;
+            k = lastofs;
+            lastofs = hint - ofs;
+            ofs = hint - k;
+        }
+        else
+        {
+            int64_t maxofs = n - hint;
+            while (ofs < maxofs)
+            {
+                if (LT(key, p[ofs]))
+                    break;
+                lastofs = ofs;
+                ofs = (ofs << 1) + 1;
+            }
+            if (ofs > maxofs)
+                ofs = maxofs;
+            lastofs += hint;
+            ofs += hint;
+        }
+        ++lastofs;
+        while (lastofs < ofs)
+        {
+            int64_t m = lastofs + ((ofs - lastofs) >> 1);
+            if (LT(key, base[m]))
+                ofs = m;
+            else
+                lastofs = m + 1;
+        }
+        return (size_t)ofs;
+    }
+
+    // merges a[pa .. pa+na) and a[pb .. pb+nb), na <= nb, pb == pa + na
+    // The loop's result: 0 when done, 1 when the rest of b goes before a's last
+    int mergeLoLoop(size_t &dest, size_t &ia, size_t &ib, int64_t &na, int64_t &nb)
+    {
+        a[dest++] = a[ib++];
+        --nb;
+        if (nb == 0)
+            return 0;
+        if (na == 1)
+            return 1;
+        for (;;)
+        {
+            int64_t acount = 0, bcount = 0;
+            for (;;)
+            {
+                if (LT(a[ib], tmp[ia]))
+                {
+                    a[dest++] = a[ib++];
+                    ++bcount;
+                    acount = 0;
+                    --nb;
+                    if (nb == 0)
+                        return 0;
+                    if (bcount >= minGallop)
+                        break;
+                }
+                else
+                {
+                    a[dest++] = tmp[ia++];
+                    ++acount;
+                    bcount = 0;
+                    --na;
+                    if (na == 1)
+                        return 1;
+                    if (acount >= minGallop)
+                        break;
+                }
+            }
+            ++minGallop;
+            do
+            {
+                minGallop -= minGallop > 1;
+                int64_t k = (int64_t)gallopRight(a[ib], tmp.data() + ia, na, 0);
+                acount = k;
+                if (k)
+                {
+                    for (int64_t t = 0; t < k; ++t)
+                        a[dest++] = tmp[ia++];
+                    na -= k;
+                    if (na == 1)
+                        return 1;
+                    if (na == 0)
+                        return 0;
+                }
+                a[dest++] = a[ib++];
+                --nb;
+                if (nb == 0)
+                    return 0;
+                k = (int64_t)gallopLeft(tmp[ia], a.data() + ib, nb, 0);
+                bcount = k;
+                if (k)
+                {
+                    for (int64_t t = 0; t < k; ++t)
+                        a[dest++] = a[ib++];
+                    nb -= k;
+                    if (nb == 0)
+                        return 0;
+                }
+                a[dest++] = tmp[ia++];
+                --na;
+                if (na == 1)
+                    return 1;
+            } while (acount >= MIN_GALLOP || bcount >= MIN_GALLOP);
+            ++minGallop;
+        }
+    }
+
+    void mergeLo(size_t pa, int64_t na, size_t pb, int64_t nb)
+    {
+        tmp.assign(a.begin() + (long)pa, a.begin() + (long)(pa + (size_t)na));
+        size_t dest = pa, ia = 0, ib = pb;
+        if (mergeLoLoop(dest, ia, ib, na, nb) == 0)
+        {
+            for (int64_t t = 0; t < na; ++t)
+                a[dest++] = tmp[ia++];
+            return;
+        }
+        for (int64_t t = 0; t < nb; ++t)
+            a[dest++] = a[ib++];
+        a[dest] = tmp[ia];
+    }
+
+    // na > nb; the loop's result: 0 when done, 1 when the rest of a goes after b's first
+    int mergeHiLoop(size_t pa, int64_t &dest, int64_t &ia, int64_t &ib, int64_t &na, int64_t &nb)
+    {
+        a[(size_t)dest--] = a[(size_t)ia--];
+        --na;
+        if (na == 0)
+            return 0;
+        if (nb == 1)
+            return 1;
+        for (;;)
+        {
+            int64_t acount = 0, bcount = 0;
+            for (;;)
+            {
+                if (LT(tmp[(size_t)ib], a[(size_t)ia]))
+                {
+                    a[(size_t)dest--] = a[(size_t)ia--];
+                    ++acount;
+                    bcount = 0;
+                    --na;
+                    if (na == 0)
+                        return 0;
+                    if (acount >= minGallop)
+                        break;
+                }
+                else
+                {
+                    a[(size_t)dest--] = tmp[(size_t)ib--];
+                    ++bcount;
+                    acount = 0;
+                    --nb;
+                    if (nb == 1)
+                        return 1;
+                    if (bcount >= minGallop)
+                        break;
+                }
+            }
+            ++minGallop;
+            do
+            {
+                minGallop -= minGallop > 1;
+                int64_t k = (int64_t)gallopRight(tmp[(size_t)ib], a.data() + pa, na, na - 1);
+                k = na - k;
+                acount = k;
+                if (k)
+                {
+                    for (int64_t t = 0; t < k; ++t)
+                        a[(size_t)dest--] = a[(size_t)ia--];
+                    na -= k;
+                    if (na == 0)
+                        return 0;
+                }
+                a[(size_t)dest--] = tmp[(size_t)ib--];
+                --nb;
+                if (nb == 1)
+                    return 1;
+                k = (int64_t)gallopLeft(a[(size_t)ia], tmp.data(), nb, nb - 1);
+                k = nb - k;
+                bcount = k;
+                if (k)
+                {
+                    for (int64_t t = 0; t < k; ++t)
+                        a[(size_t)dest--] = tmp[(size_t)ib--];
+                    nb -= k;
+                    if (nb == 1)
+                        return 1;
+                    if (nb == 0)
+                        return 0;
+                }
+                a[(size_t)dest--] = a[(size_t)ia--];
+                --na;
+                if (na == 0)
+                    return 0;
+            } while (acount >= MIN_GALLOP || bcount >= MIN_GALLOP);
+            ++minGallop;
+        }
+    }
+
+    void mergeHi(size_t pa, int64_t na, size_t pb, int64_t nb)
+    {
+        tmp.assign(a.begin() + (long)pb, a.begin() + (long)(pb + (size_t)nb));
+        int64_t dest = (int64_t)(pb + (size_t)nb - 1);
+        int64_t ia = (int64_t)(pa + (size_t)na - 1);
+        int64_t ib = nb - 1;
+        if (mergeHiLoop(pa, dest, ia, ib, na, nb) == 0)
+        {
+            for (int64_t t = 0; t < nb; ++t)
+                a[(size_t)dest--] = tmp[(size_t)ib--];
+            return;
+        }
+        for (int64_t t = 0; t < na; ++t)
+            a[(size_t)dest--] = a[(size_t)ia--];
+        a[(size_t)dest] = tmp[(size_t)ib];
+    }
+
+    void mergeAt(size_t i)
+    {
+        size_t pa = pending[i].base, pb = pending[i + 1].base;
+        int64_t na = (int64_t)pending[i].len, nb = (int64_t)pending[i + 1].len;
+        pending[i].len = (size_t)(na + nb);
+        if (i + 3 == pending.size())
+            pending[i + 1] = pending[i + 2];
+        pending.pop_back();
+        int64_t k = (int64_t)gallopRight(a[pb], a.data() + pa, na, 0);
+        pa += (size_t)k;
+        na -= k;
+        if (na == 0)
+            return;
+        nb = (int64_t)gallopLeft(a[pa + (size_t)na - 1], a.data() + pb, nb, nb - 1);
+        if (nb <= 0)
+            return;
+        if (na <= nb)
+            mergeLo(pa, na, pb, nb);
+        else
+            mergeHi(pa, na, pb, nb);
+    }
+
+    static int powerloop(int64_t s1, int64_t n1, int64_t n2, int64_t n)
+    {
+        int result = 0;
+        int64_t a = 2 * s1 + n1;
+        int64_t b = a + n1 + n2;
+        for (;;)
+        {
+            ++result;
+            if (a >= n)
+            {
+                a -= n;
+                b -= n;
+            }
+            else if (b >= n)
+                break;
+            a <<= 1;
+            b <<= 1;
+        }
+        return result;
+    }
+
+    void foundNewRun(size_t n2)
+    {
+        if (!pending.empty())
+        {
+            Run &last = pending.back();
+            int power = powerloop((int64_t)last.base, (int64_t)last.len, (int64_t)n2, (int64_t)listlen);
+            while (pending.size() > 1 && pending[pending.size() - 2].power > power)
+                mergeAt(pending.size() - 2);
+            pending.back().power = power;
+        }
+    }
+
+    void forceCollapse()
+    {
+        while (pending.size() > 1)
+        {
+            size_t n = pending.size() - 2;
+            if (n > 0 && pending[n - 1].len < pending[n + 1].len)
+                --n;
+            mergeAt(n);
+        }
+    }
+
+    void sort()
+    {
+        size_t nremaining = a.size();
+        if (nremaining < 2)
+            return;
+        size_t mr = minrun(nremaining);
+        size_t lo = 0;
+        do
+        {
+            size_t n = countRun(lo, nremaining);
+            if (n < mr)
+            {
+                size_t force = nremaining <= mr ? nremaining : mr;
+                binarySort(lo, force, n);
+                n = force;
+            }
+            foundNewRun(n);
+            Run r;
+            r.base = lo;
+            r.len = n;
+            r.power = 0;
+            pending.push_back(r);
+            lo += n;
+            nremaining -= n;
+        } while (nremaining);
+        forceCollapse();
+    }
+};
+
+} // namespace
+
+V listSort(List *l, V key, bool reverse)
+{
+    std::vector<V> items = l->items;
+    std::vector<V> keys;
+    if (key && key != None)
+    {
+        keys.reserve(items.size());
+        for (V x : items)
+            keys.push_back(call1(key, x));
+    }
+    else
+        keys = items;
+    std::vector<size_t> idx(items.size());
+    for (size_t i = 0; i < idx.size(); ++i)
+        idx[i] = i;
+    // fast paths: all small ints / all strings / all floats
+    bool allSmall = true, allStr = true;
+    for (V k : keys)
+    {
+        if (!IS_SMALL(k))
+            allSmall = false;
+        if (IS_SMALL(k) || k->type != tStr)
+            allStr = false;
+    }
+    if (allSmall)
+    {
+        if (reverse)
+            std::stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) { return SMALLV(keys[y]) < SMALLV(keys[x]); });
+        else
+            std::stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) { return SMALLV(keys[x]) < SMALLV(keys[y]); });
+    }
+    else if (allStr)
+    {
+        if (reverse)
+            std::stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) {
+                return static_cast<Str *>(keys[y])->s < static_cast<Str *>(keys[x])->s;
+            });
+        else
+            std::stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) {
+                return static_cast<Str *>(keys[x])->s < static_cast<Str *>(keys[y])->s;
+            });
+    }
+    else
+    {
+        // as CPython: reverse, sort stably, reverse back (keeps equal items in order)
+        std::vector<KV> kv(items.size());
+        for (size_t i = 0; i < items.size(); ++i)
+        {
+            kv[i].key = keys[i];
+            kv[i].val = items[i];
+        }
+        if (reverse)
+            std::reverse(kv.begin(), kv.end());
+        TimSort ts(kv);
+        ts.sort();
+        if (reverse)
+            std::reverse(kv.begin(), kv.end());
+        for (size_t i = 0; i < kv.size(); ++i)
+            items[i] = kv[i].val;
+        l->items = items;
+        return None;
+    }
+    std::vector<V> out(items.size());
+    for (size_t i = 0; i < idx.size(); ++i)
+        out[i] = items[idx[i]];
+    l->items = out;
+    return None;
+}
+
+static V list_sort(V *a, int n, Kw *kw)
+{
+    if (n > 1)
+        raise(tTypeError, "sort() takes no positional arguments");
+    V key = kwArg(kw, "key");
+    V rev = kwArg(kw, "reverse");
+    List *l = asList(a[0]);
+    std::vector<V> saved = l->items;
+    l->items.clear(); // CPython empties the list while sorting
+    List tmp(tList);
+    tmp.items = saved;
+    try
+    {
+        listSort(&tmp, key, rev && truthy(rev));
+    }
+    catch (...)
+    {
+        l->items = saved;
+        throw;
+    }
+    if (!l->items.empty())
+        raise(tValueError, "list modified during sort");
+    l->items = tmp.items;
+    return None;
+}
+
+static V list_iadd(V *a, int n, Kw *)
+{
+    checkArgs("__iadd__", n, 2, 2);
+    List *l = asList(a[0]);
+    std::vector<V> items = toVector(a[1]);
+    l->items.insert(l->items.end(), items.begin(), items.end());
+    return a[0];
+}
+
+static V list_imul(V *a, int n, Kw *)
+{
+    checkArgs("__imul__", n, 2, 2);
+    List *l = asList(a[0]);
+    int64_t k = indexOf(a[1]);
+    std::vector<V> out;
+    for (int64_t i = 0; i < k; ++i)
+        out.insert(out.end(), l->items.begin(), l->items.end());
+    l->items = out;
+    return a[0];
+}
+
+static V list_class_getitem(V *a, int n, Kw *) { return dict_class_getitem(a, n, nullptr); }
+
+// ── tuple ──────────────────────────────────────────────────────────────────
+
+static Tuple *asTuple(V v)
+{
+    if (IS_SMALL(v) || v->type->layout != L::Tuple)
+        raise(tTypeError, "descriptor requires a 'tuple' object");
+    return static_cast<Tuple *>(v);
+}
+
+static V tuple_new(V *a, int n, Kw *kw)
+{
+    noKw("tuple", kw);
+    checkArgs("tuple", n - 1, 0, 1);
+    Type *t = static_cast<Type *>(a[0]);
+    if (t == tTuple && n > 1 && typeOf(a[1]) == tTuple)
+        return a[1];
+    Tuple *r = static_cast<Tuple *>(newObject(t));
+    if (n > 1)
+        r->items = toVector(a[1]);
+    return r;
+}
+
+static V tuple_getitem(V *a, int n, Kw *)
+{
+    checkArgs("__getitem__", n, 2, 2);
+    Tuple *t = asTuple(a[0]);
+    if (isSlice(a[1]))
+        return tupleOf(sliceOf(t->items, static_cast<SliceObj *>(a[1])));
+    if (!isIntLike(a[1]) && !lookupMro(typeOf(a[1]), intern("__index__")))
+        raise(tTypeError, "tuple indices must be integers or slices, not " + std::string(typeName(a[1])));
+    return t->items[(size_t)normIndex(a[1], (int64_t)t->items.size(), "tuple")];
+}
+
+static V tuple_len(V *a, int, Kw *) { return mkint((int64_t)asTuple(a[0])->items.size()); }
+static V tuple_iter(V *a, int, Kw *) { return seqIterOf(asTuple(a[0]), false); }
+
+static V tuple_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    for (V x : asTuple(a[0])->items)
+        if (keyEq(x, a[1]))
+            return True;
+    return False;
+}
+
+static V tuple_index(V *a, int n, Kw *)
+{
+    checkArgs("index", n - 1, 1, 3);
+    Tuple *t = asTuple(a[0]);
+    int64_t len = (int64_t)t->items.size();
+    int64_t start = n > 2 ? indexOf(a[2]) : 0, stop = n > 3 ? indexOf(a[3]) : len;
+    if (start < 0)
+        start = start + len < 0 ? 0 : start + len;
+    if (stop < 0)
+        stop = stop + len < 0 ? 0 : stop + len;
+    for (int64_t i = start; i < stop && i < len; ++i)
+        if (keyEq(t->items[(size_t)i], a[1]))
+            return mkint(i);
+    raise(tValueError, "tuple.index(x): x not in tuple");
+}
+
+static V tuple_count(V *a, int n, Kw *)
+{
+    checkArgs("count", n - 1, 1, 1);
+    int64_t c = 0;
+    for (V x : asTuple(a[0])->items)
+        if (keyEq(x, a[1]))
+            ++c;
+    return mkint(c);
+}
+
+static V tuple_getnewargs(V *a, int, Kw *)
+{
+    Tuple *t = newTuple(1);
+    t->items[0] = tupleOf(asTuple(a[0])->items);
+    return t;
+}
+
+// ── range ──────────────────────────────────────────────────────────────────
+
+static int64_t rangeLen(RangeObj *r)
+{
+    if (r->step > 0)
+        return r->stop > r->start ? (r->stop - r->start + r->step - 1) / r->step : 0;
+    return r->stop < r->start ? (r->start - r->stop - r->step - 1) / -r->step : 0;
+}
+
+static V range_new(V *a, int n, Kw *kw)
+{
+    noKw("range", kw);
+    checkArgs("range", n - 1, 1, 3);
+    RangeObj *r = new RangeObj(tRange);
+    for (int i = 1; i < n; ++i)
+        if (!isIntLike(a[i]) && !lookupMro(typeOf(a[i]), intern("__index__")))
+            raise(tTypeError, "'" + std::string(typeName(a[i])) + "' object cannot be interpreted as an integer");
+    if (n == 2)
+    {
+        r->start = 0;
+        r->stop = indexOf(a[1]);
+        r->step = 1;
+    }
+    else
+    {
+        r->start = indexOf(a[1]);
+        r->stop = indexOf(a[2]);
+        r->step = n > 3 ? indexOf(a[3]) : 1;
+        if (r->step == 0)
+            raise(tValueError, "range() arg 3 must not be zero");
+    }
+    return r;
+}
+
+static V range_len(V *a, int, Kw *) { return mkint(rangeLen(static_cast<RangeObj *>(a[0]))); }
+
+static V range_iter(V *a, int, Kw *)
+{
+    RangeObj *r = static_cast<RangeObj *>(a[0]);
+    int64_t *cur = new int64_t(r->start);
+    int64_t stop = r->stop, step = r->step;
+    return makeIter([cur, stop, step](V &out) -> bool {
+        if (step > 0 ? *cur >= stop : *cur <= stop)
+            return false;
+        out = mkint(*cur);
+        *cur += step;
+        return true;
+    });
+}
+
+static V range_reversed(V *a, int, Kw *)
+{
+    RangeObj *r = static_cast<RangeObj *>(a[0]);
+    int64_t len = rangeLen(r);
+    int64_t *k = new int64_t(len);
+    int64_t start = r->start, step = r->step;
+    return makeIter([k, start, step](V &out) -> bool {
+        if (*k <= 0)
+            return false;
+        --*k;
+        out = mkint(start + *k * step);
+        return true;
+    });
+}
+
+static V range_getitem(V *a, int n, Kw *)
+{
+    checkArgs("__getitem__", n, 2, 2);
+    RangeObj *r = static_cast<RangeObj *>(a[0]);
+    int64_t len = rangeLen(r);
+    if (isSlice(a[1]))
+    {
+        int64_t count;
+        std::vector<int64_t> ix = sliceIndices(static_cast<SliceObj *>(a[1]), len, count);
+        RangeObj *s = new RangeObj(tRange);
+        s->start = r->start + ix[0] * r->step;
+        s->step = r->step * ix[2];
+        s->stop = s->start + count * s->step;
+        return s;
+    }
+    int64_t i = indexOf(a[1]);
+    if (i < 0)
+        i += len;
+    if (i < 0 || i >= len)
+        raise(tIndexError, "range object index out of range");
+    return mkint(r->start + i * r->step);
+}
+
+static bool rangeHas(RangeObj *r, V v, int64_t &pos)
+{
+    int64_t x;
+    if (!isIntLike(v) || !intSmall(v, x))
+        return false;
+    if (r->step > 0 ? (x < r->start || x >= r->stop) : (x > r->start || x <= r->stop))
+        return false;
+    if ((x - r->start) % r->step != 0)
+        return false;
+    pos = (x - r->start) / r->step;
+    return true;
+}
+
+static V range_contains(V *a, int n, Kw *)
+{
+    checkArgs("__contains__", n, 2, 2);
+    RangeObj *r = static_cast<RangeObj *>(a[0]);
+    int64_t pos;
+    if (isIntLike(a[1]))
+        return mkbool(rangeHas(r, a[1], pos));
+    int64_t len = rangeLen(r);
+    for (int64_t i = 0; i < len; ++i)
+        if (eq(mkint(r->start + i * r->step), a[1]))
+            return True;
+    return False;
+}
+
+static V range_index(V *a, int n, Kw *)
+{
+    checkArgs("index", n - 1, 1, 1);
+    int64_t pos;
+    if (rangeHas(static_cast<RangeObj *>(a[0]), a[1], pos))
+        return mkint(pos);
+    raise(tValueError, reprOf(a[1]) + " is not in range");
+}
+
+static V range_count(V *a, int n, Kw *)
+{
+    checkArgs("count", n - 1, 1, 1);
+    int64_t pos;
+    return mkint(rangeHas(static_cast<RangeObj *>(a[0]), a[1], pos) ? 1 : 0);
+}
+
+static V range_start(V *a, int, Kw *) { return mkint(static_cast<RangeObj *>(a[0])->start); }
+static V range_stop(V *a, int, Kw *) { return mkint(static_cast<RangeObj *>(a[0])->stop); }
+static V range_step(V *a, int, Kw *) { return mkint(static_cast<RangeObj *>(a[0])->step); }
+
+// ── slice ──────────────────────────────────────────────────────────────────
+
+static V slice_new(V *a, int n, Kw *)
+{
+    checkArgs("slice", n - 1, 1, 3);
+    SliceObj *s = new SliceObj(tSlice);
+    if (n == 2)
+    {
+        s->start = None;
+        s->stop = a[1];
+        s->step = None;
+    }
+    else
+    {
+        s->start = a[1];
+        s->stop = a[2];
+        s->step = n > 3 ? a[3] : None;
+    }
+    return s;
+}
+
+static V slice_start(V *a, int, Kw *) { return static_cast<SliceObj *>(a[0])->start; }
+static V slice_stop(V *a, int, Kw *) { return static_cast<SliceObj *>(a[0])->stop; }
+static V slice_step(V *a, int, Kw *) { return static_cast<SliceObj *>(a[0])->step; }
+
+static V slice_indices(V *a, int n, Kw *)
+{
+    checkArgs("indices", n - 1, 1, 1);
+    int64_t count;
+    std::vector<int64_t> ix = sliceIndices(static_cast<SliceObj *>(a[0]), indexOf(a[1]), count);
+    Tuple *t = newTuple(3);
+    t->items[0] = mkint(ix[0]);
+    t->items[1] = mkint(ix[1]);
+    t->items[2] = mkint(ix[2]);
+    return t;
+}
+
+// ── cells and iterators ────────────────────────────────────────────────────
+
+static V cell_contents(V *a, int, Kw *)
+{
+    V v = static_cast<CellObj *>(a[0])->v;
+    if (!v)
+        raise(tValueError, "Cell is empty");
+    return v;
+}
+
+static V iter_iter(V *a, int, Kw *) { return a[0]; }
+
+static V iter_next(V *a, int, Kw *)
+{
+    V out;
+    if (iterNext(a[0], out))
+        return out;
+    raiseV(makeExc(tStopIteration, ""));
+}
+
+static V iter_length_hint(V *a, int, Kw *)
+{
+    IterObj *it = static_cast<IterObj *>(a[0]);
+    if (it->lengthHint)
+        return mkint(it->lengthHint());
+    return NotImpl;
+}
+
+void initCollections()
+{
+    dummyObj = new Obj(tObject);
+
+    dictSet(tDict->dict, intern("__new__"), makeNative("__new__", dict_new, false));
+    defMethod(tDict, "__init__", dict_init);
+    defMethod(tDict, "__getitem__", dict_getitem);
+    defMethod(tDict, "__setitem__", dict_setitem);
+    defMethod(tDict, "__delitem__", dict_delitem);
+    defMethod(tDict, "__contains__", dict_contains);
+    defMethod(tDict, "__len__", dict_len);
+    defMethod(tDict, "__iter__", dict_iter);
+    defMethod(tDict, "__reversed__", dict_reversed);
+    defMethod(tDict, "get", dict_get);
+    defMethod(tDict, "setdefault", dict_setdefault);
+    defMethod(tDict, "pop", dict_pop);
+    defMethod(tDict, "popitem", dict_popitem);
+    defMethod(tDict, "keys", dict_keys);
+    defMethod(tDict, "values", dict_values);
+    defMethod(tDict, "items", dict_items);
+    defMethod(tDict, "update", dict_update);
+    defMethod(tDict, "clear", dict_clear);
+    defMethod(tDict, "copy", dict_copy);
+    defClassMethod(tDict, "fromkeys", dict_fromkeys);
+    defClassMethod(tDict, "__class_getitem__", dict_class_getitem);
+
+    for (Type *t : {tDictKeys, tDictValues, tDictItems})
+    {
+        defMethod(t, "__len__", view_len);
+        defMethod(t, "__iter__", view_iter);
+        defMethod(t, "__contains__", view_contains);
+        defMethod(t, "__reversed__", view_reversed);
+        defMethod(t, "isdisjoint", view_isdisjoint);
+        defProperty(t, "mapping", view_mapping);
+    }
+
+    for (Type *t : {tSet, tFrozenSet})
+    {
+        dictSet(t->dict, intern("__new__"), makeNative("__new__", set_new, false));
+        defMethod(t, "__init__", set_init);
+        defMethod(t, "__len__", set_len);
+        defMethod(t, "__contains__", set_contains);
+        defMethod(t, "__iter__", set_iter);
+        defMethod(t, "copy", set_copy);
+        defMethod(t, "union", set_union);
+        defMethod(t, "intersection", set_intersection);
+        defMethod(t, "difference", set_difference);
+        defMethod(t, "symmetric_difference", set_symmetric_difference);
+        defMethod(t, "issubset", set_issubset);
+        defMethod(t, "issuperset", set_issuperset);
+        defMethod(t, "isdisjoint", set_isdisjoint);
+        defClassMethod(t, "__class_getitem__", dict_class_getitem);
+    }
+    defMethod(tSet, "add", set_add);
+    defMethod(tSet, "remove", set_remove);
+    defMethod(tSet, "discard", set_discard);
+    defMethod(tSet, "pop", set_pop);
+    defMethod(tSet, "clear", set_clear);
+    defMethod(tSet, "update", set_update);
+    defMethod(tSet, "intersection_update", set_intersection_update);
+    defMethod(tSet, "difference_update", set_difference_update);
+    defMethod(tSet, "symmetric_difference_update", set_symmetric_difference_update);
+
+    dictSet(tList->dict, intern("__new__"), makeNative("__new__", list_new, false));
+    defMethod(tList, "__init__", list_init);
+    defMethod(tList, "__getitem__", list_getitem);
+    defMethod(tList, "__setitem__", list_setitem);
+    defMethod(tList, "__delitem__", list_delitem);
+    defMethod(tList, "__len__", list_len);
+    defMethod(tList, "__iter__", list_iter);
+    defMethod(tList, "__reversed__", list_reversed);
+    defMethod(tList, "__contains__", list_contains);
+    defMethod(tList, "__iadd__", list_iadd);
+    defMethod(tList, "__imul__", list_imul);
+    defMethod(tList, "append", list_append);
+    defMethod(tList, "extend", list_extend);
+    defMethod(tList, "insert", list_insert);
+    defMethod(tList, "pop", list_pop);
+    defMethod(tList, "remove", list_remove);
+    defMethod(tList, "index", list_index);
+    defMethod(tList, "count", list_count);
+    defMethod(tList, "clear", list_clear);
+    defMethod(tList, "copy", list_copy);
+    defMethod(tList, "reverse", list_reverse);
+    defMethod(tList, "sort", list_sort);
+    defClassMethod(tList, "__class_getitem__", list_class_getitem);
+
+    dictSet(tTuple->dict, intern("__new__"), makeNative("__new__", tuple_new, false));
+    defMethod(tTuple, "__getitem__", tuple_getitem);
+    defMethod(tTuple, "__len__", tuple_len);
+    defMethod(tTuple, "__iter__", tuple_iter);
+    defMethod(tTuple, "__contains__", tuple_contains);
+    defMethod(tTuple, "index", tuple_index);
+    defMethod(tTuple, "count", tuple_count);
+    defMethod(tTuple, "__getnewargs__", tuple_getnewargs);
+    defClassMethod(tTuple, "__class_getitem__", dict_class_getitem);
+    defClassMethod(tType, "__class_getitem__", dict_class_getitem);
+
+    dictSet(tRange->dict, intern("__new__"), makeNative("__new__", range_new, false));
+    defMethod(tRange, "__len__", range_len);
+    defMethod(tRange, "__iter__", range_iter);
+    defMethod(tRange, "__reversed__", range_reversed);
+    defMethod(tRange, "__getitem__", range_getitem);
+    defMethod(tRange, "__contains__", range_contains);
+    defMethod(tRange, "index", range_index);
+    defMethod(tRange, "count", range_count);
+    defProperty(tRange, "start", range_start);
+    defProperty(tRange, "stop", range_stop);
+    defProperty(tRange, "step", range_step);
+
+    dictSet(tSlice->dict, intern("__new__"), makeNative("__new__", slice_new, false));
+    defProperty(tSlice, "start", slice_start);
+    defProperty(tSlice, "stop", slice_stop);
+    defProperty(tSlice, "step", slice_step);
+    defMethod(tSlice, "indices", slice_indices);
+
+    defProperty(tCell, "cell_contents", cell_contents);
+    defMethod(tIter, "__iter__", iter_iter);
+    defMethod(tIter, "__next__", iter_next);
+    defMethod(tIter, "__length_hint__", iter_length_hint);
+}
+
+} // namespace py

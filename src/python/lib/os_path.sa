@@ -1,0 +1,94 @@
+"""Pathname manipulations (Windows rules, as ntpath)."""
+
+import _os
+
+sep = "\\"
+altsep = "/"
+extsep = "."
+
+exists = _os.exists
+isfile = _os.isfile
+isdir = _os.isdir
+getsize = _os.getsize
+abspath = _os.abspath
+
+
+def _split_drive(p):
+    if len(p) >= 2 and p[1] == ":":
+        return p[:2], p[2:]
+    return "", p
+
+
+def join(path, *paths):
+    result = path
+    for p in paths:
+        drive, rest = _split_drive(p)
+        if drive or rest[:1] in ("\\", "/"):
+            result = p
+            continue
+        if not result or result[-1] in ("\\", "/"):
+            result = result + p
+        else:
+            result = result + sep + p
+    return result
+
+
+def split(p):
+    drive, rest = _split_drive(p)
+    i = len(rest)
+    while i and rest[i - 1] not in "\\/":
+        i -= 1
+    head, tail = rest[:i], rest[i:]
+    stripped = head.rstrip("\\/")
+    return drive + (stripped or head), tail
+
+
+def basename(p):
+    return split(p)[1]
+
+
+def dirname(p):
+    return split(p)[0]
+
+
+def splitext(p):
+    sep_index = max(p.rfind("\\"), p.rfind("/"))
+    dot_index = p.rfind(".")
+    if dot_index > sep_index:
+        filename_index = sep_index + 1
+        while filename_index < dot_index:
+            if p[filename_index] != ".":
+                return p[:dot_index], p[dot_index:]
+            filename_index += 1
+    return p, ""
+
+
+def splitdrive(p):
+    return _split_drive(p)
+
+
+def isabs(p):
+    drive, rest = _split_drive(p)
+    return rest[:1] in ("\\", "/")
+
+
+def normpath(path):
+    drive, rest = _split_drive(path.replace("/", "\\"))
+    prefix = "\\" if rest.startswith("\\") else ""
+    parts = []
+    for part in rest.split("\\"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            elif not prefix:
+                parts.append(part)
+            continue
+        parts.append(part)
+    result = drive + prefix + "\\".join(parts)
+    return result or "."
+
+
+def expanduser(path):
+    return path

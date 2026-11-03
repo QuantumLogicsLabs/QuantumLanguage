@@ -1,0 +1,21 @@
+// quantum: cpp
+#pragma once
+// Python front-end: the lexer and parser.
+#include "PyAst.h.sa"
+
+#include <string>
+#include <vector>
+
+namespace py
+{
+
+struct SyntaxErr
+{
+    std::string message;
+    int line = 0, col = 0;
+};
+
+// The statements of a module; throws SyntaxErr
+std::vector<Node *> parseModule(const std::string &source);
+
+} // namespace py

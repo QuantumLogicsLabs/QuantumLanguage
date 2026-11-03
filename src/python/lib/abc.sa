@@ -1,0 +1,84 @@
+"""Abstract Base Classes."""
+
+_registries = {}
+
+
+def abstractmethod(funcobj):
+    funcobj.__isabstractmethod__ = True
+    return funcobj
+
+
+class abstractclassmethod(classmethod):
+    __isabstractmethod__ = True
+
+    def __init__(self, callable):
+        callable.__isabstractmethod__ = True
+        super().__init__(callable)
+
+
+class abstractstaticmethod(staticmethod):
+    __isabstractmethod__ = True
+
+    def __init__(self, callable):
+        callable.__isabstractmethod__ = True
+        super().__init__(callable)
+
+
+class abstractproperty(property):
+    __isabstractmethod__ = True
+
+
+class ABCMeta(type):
+    def __new__(mcls, name, bases, namespace, /, **kwargs):
+        cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+        _registries[cls] = []
+        return cls
+
+    def register(cls, subclass):
+        if not isinstance(subclass, type):
+            raise TypeError("Can only register classes")
+        if issubclass(subclass, cls):
+            return subclass
+        _registries.setdefault(cls, []).append(subclass)
+        return subclass
+
+    def __instancecheck__(cls, instance):
+        return cls.__subclasscheck__(type(instance))
+
+    def __subclasscheck__(cls, subclass):
+        if not isinstance(subclass, type):
+            raise TypeError("issubclass() arg 1 must be a class")
+        if cls in subclass.__mro__:
+            return True
+        ok = cls.__subclasshook__(subclass)
+        if ok is not NotImplemented:
+            return bool(ok)
+        for r in _registries.get(cls, ()):
+            if issubclass(subclass, r):
+                return True
+        for scls in cls.__subclasses__():
+            if scls is not cls and issubclass(subclass, scls):
+                return True
+        return False
+
+
+class ABC(metaclass=ABCMeta):
+    __slots__ = ()
+
+
+def get_cache_token():
+    return 0
+
+
+def update_abstractmethods(cls):
+    abstracts = set()
+    for scls in cls.__bases__:
+        for name in getattr(scls, "__abstractmethods__", ()):
+            value = getattr(cls, name, None)
+            if getattr(value, "__isabstractmethod__", False):
+                abstracts.add(name)
+    for name, value in cls.__dict__.items():
+        if getattr(value, "__isabstractmethod__", False):
+            abstracts.add(name)
+    cls.__abstractmethods__ = frozenset(abstracts)
+    return cls

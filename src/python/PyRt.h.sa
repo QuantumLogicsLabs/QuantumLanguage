@@ -1,0 +1,706 @@
+// quantum: cpp
+#pragma once
+// Python front-end: the runtime. A value is a pointer to an object, except
+// small integers, which live in the pointer itself (low bit set). Objects
+// are never freed: the programs this runs are short.
+//
+// Every object starts with its type and an optional attribute dict; each
+// builtin type has a layout (the C++ struct its instances use), and a class
+// derived from a builtin type keeps its base's layout, so `class Stack(list)`
+// instances are lists with a dict.
+#include "PyAst.h.sa"
+
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
+
+namespace py
+{
+
+struct Obj;
+typedef Obj *V;
+
+#define IS_SMALL(v) ((((uintptr_t)(v)) & 1) != 0)
+#define SMALLV(v) (((int64_t)(intptr_t)(v)) >> 1)
+#define MKSMALL(i) ((V)(intptr_t)((((uint64_t)(int64_t)(i)) << 1) | 1))
+#define SMALL_MAX ((((int64_t)1) << 61) - 1)
+#define SMALL_MIN (-(((int64_t)1) << 61))
+#define FITS_SMALL(i) ((i) >= SMALL_MIN && (i) <= SMALL_MAX)
+
+enum class L : uint8_t
+{
+    Object,
+    Type,
+    Int,
+    Float,
+    Complex,
+    Str,
+    Bytes,
+    Tuple,
+    List,
+    Dict,
+    Set,
+    Range,
+    Slice,
+    Func,
+    Native,
+    Method,
+    ClassMethod,
+    StaticMethod,
+    Property,
+    Cell,
+    Code,
+    Gen,
+    Module,
+    Exc,
+    Iter,
+    DictView,
+    Super,
+    Singleton,
+    Data
+};
+
+struct Type;
+struct Dict;
+struct Str;
+struct Tuple;
+
+struct Obj
+{
+    Type *type;
+    Dict *dict = nullptr;
+    Obj(Type *t) : type(t) {}
+    virtual ~Obj() {}
+};
+
+// ── numbers ────────────────────────────────────────────────────────────────
+
+// Arbitrary-precision magnitude with a sign; limbs little-endian, no
+// leading zero limbs (zero is an empty vector)
+struct Big
+{
+    bool neg = false;
+    std::vector<uint32_t> d;
+};
+
+struct IntObj : Obj
+{
+    int64_t small = 0;
+    Big *big = nullptr; // set when the value does not fit `small`
+    IntObj(Type *t) : Obj(t) {}
+};
+
+struct FloatObj : Obj
+{
+    double v;
+    FloatObj(Type *t, double x) : Obj(t), v(x) {}
+};
+
+struct ComplexObj : Obj
+{
+    double re, im;
+    ComplexObj(Type *t, double r, double i) : Obj(t), re(r), im(i) {}
+};
+
+// ── strings ────────────────────────────────────────────────────────────────
+
+struct Str : Obj
+{
+    std::string s;      // UTF-8
+    int64_t len = 0;    // in code points
+    int64_t hash = -1;  // cached; -1 = not computed
+    bool ascii = true;
+    std::vector<uint32_t> *cps = nullptr; // code points, made on demand for non-ASCII indexing
+    Str(Type *t) : Obj(t) {}
+};
+
+struct BytesObj : Obj
+{
+    std::string s;
+    bool mutableBytes = false; // bytearray
+    BytesObj(Type *t) : Obj(t) {}
+};
+
+// ── containers ─────────────────────────────────────────────────────────────
+
+struct Tuple : Obj
+{
+    std::vector<V> items;
+    int64_t hash = -1;
+    Tuple(Type *t) : Obj(t) {}
+};
+
+struct List : Obj
+{
+    std::vector<V> items;
+    List(Type *t) : Obj(t) {}
+};
+
+struct DEntry
+{
+    V key;
+    V val;
+    int64_t hash;
+};
+
+// Insertion-ordered hash table (a key of nullptr marks a deleted entry)
+struct Dict : Obj
+{
+    std::vector<DEntry> entries;
+    std::vector<int32_t> index; // -1 empty, -2 deleted, else entry position
+    int64_t used = 0;
+    uint64_t version = 0;       // bumped on insertion/deletion (iteration checks)
+    V missing = nullptr;        // defaultdict's factory and the like live in the subclass; unused here
+    Dict(Type *t) : Obj(t) {}
+};
+
+struct SEntry
+{
+    V key;      // nullptr: never used; dummyKey(): deleted
+    int64_t hash;
+};
+
+// CPython's set table, probe for probe, so sets print in the same order
+struct Set : Obj
+{
+    std::vector<SEntry> table;
+    int64_t mask = 7, fill = 0, used = 0, finger = 0;
+    int64_t hash = -1; // frozenset
+    Set(Type *t) : Obj(t) { table.resize(8, SEntry{nullptr, 0}); }
+};
+
+struct RangeObj : Obj
+{
+    int64_t start, stop, step;
+    RangeObj(Type *t) : Obj(t) {}
+};
+
+struct SliceObj : Obj
+{
+    V start, stop, step;
+    SliceObj(Type *t) : Obj(t) {}
+};
+
+// ── code and functions ─────────────────────────────────────────────────────
+
+enum OpCode : uint8_t
+{
+    O_NOP,
+    O_POP,
+    O_DUP,
+    O_DUP2,
+    O_ROT2,
+    O_ROT3,
+    O_ROT4,
+    O_CONST,         // consts[arg]
+    O_LOAD_FAST,     // fast[arg]
+    O_STORE_FAST,
+    O_DEL_FAST,
+    O_LOAD_DEREF,    // cells[arg]
+    O_STORE_DEREF,
+    O_DEL_DEREF,
+    O_LOAD_CLASSDEREF, // class body: locals dict, then cells[arg]
+    O_LOAD_CLOSURE,  // push cells[arg] itself
+    O_LOAD_GLOBAL,   // names[arg]
+    O_STORE_GLOBAL,
+    O_DEL_GLOBAL,
+    O_LOAD_NAME,     // locals dict, globals, builtins
+    O_STORE_NAME,
+    O_DEL_NAME,
+    O_LOAD_ATTR,     // names[arg]
+    O_STORE_ATTR,    // TOS = obj, TOS1 = value
+    O_DEL_ATTR,
+    O_LOAD_METHOD,   // pushes (callable, self-or-null)
+    O_CALL_METHOD,   // arg = argc
+    O_CALL,          // arg = argc
+    O_CALL_KW,       // arg = argc incl. keywords; TOS = tuple of keyword names
+    O_CALL_EX,       // arg & 1: kwargs dict on top; then args tuple, then callable
+    O_BINARY,        // arg = Op
+    O_INPLACE,       // arg = Op
+    O_UNARY,         // arg = Op
+    O_COMPARE,       // arg = Op (comparisons, in, is)
+    O_SUBSCR,
+    O_STORE_SUBSCR,  // TOS = key, TOS1 = container, TOS2 = value
+    O_DEL_SUBSCR,
+    O_BUILD_TUPLE,
+    O_BUILD_LIST,
+    O_BUILD_SET,
+    O_BUILD_MAP,     // arg = pairs
+    O_BUILD_SLICE,   // arg = 2 or 3
+    O_BUILD_STRING,  // arg = parts
+    O_FORMAT,        // arg: conversion (0 r s a) | 0x100 when a spec is on the stack
+    O_LIST_APPEND,   // arg = depth of the list below TOS
+    O_SET_ADD,
+    O_MAP_ADD,       // TOS = value, TOS1 = key
+    O_LIST_EXTEND,   // TOS extended into the list below
+    O_LIST_TO_TUPLE,
+    O_SET_UPDATE,
+    O_DICT_UPDATE,   // TOS merged into the dict below
+    O_DICT_MERGE,    // same, for **kwargs (duplicate keys are an error)
+    O_UNPACK,        // arg = count
+    O_UNPACK_EX,     // arg = before | after << 8
+    O_JUMP,
+    O_JUMP_IF_FALSE, // pops
+    O_JUMP_IF_TRUE,  // pops
+    O_JUMP_IF_FALSE_OR_POP,
+    O_JUMP_IF_TRUE_OR_POP,
+    O_JUMP_IF_NOT_NONE, // pops
+    O_GET_ITER,
+    O_FOR_ITER,      // arg = exit target; pops the iterator at the end
+    O_RETURN,
+    O_YIELD,
+    O_YIELD_FROM,    // TOS = value sent, TOS1 = the subiterator
+    O_GEN_START,
+    O_SETUP_EXCEPT,  // arg = handler
+    O_SETUP_FINALLY, // arg = handler
+    O_POP_BLOCK,
+    O_POP_EXCEPT,    // leaves an except clause
+    O_RERAISE,       // re-raise TOS
+    O_RAISE,         // arg = 0 (re-raise), 1 (exc), 2 (exc from cause)
+    O_EXC_MATCH,     // TOS = type(s), TOS1 = exception -> bool
+    O_MAKE_FUNCTION, // arg flags: 1 defaults tuple, 2 kwdefaults dict, 4 annotations dict, 8 closure tuple; TOS = code
+    O_BUILD_CLASS,   // arg = argc like CALL_KW: function, name, bases..., keywords
+    O_IMPORT_NAME,   // names[arg]; TOS = fromlist, TOS1 = level
+    O_IMPORT_FROM,   // names[arg]
+    O_IMPORT_STAR,
+    O_WITH_ENTER,    // pushes __exit__ bound, then __enter__() result; sets up a finally block at arg
+    O_WITH_EXIT,     // TOS = exception or None; calls __exit__, may swallow
+    O_ASSERT_FAIL,   // arg = 1 with message on TOS
+    O_SETUP_ANNOTATIONS,
+    O_STORE_ANNOTATION, // names[arg]; TOS = annotation
+    O_LOAD_BUILD_CLASS,
+    O_PRINT_EXPR,
+    O_MATCH_CLASS,   // arg = positional count; TOS = keyword names tuple, TOS1 = class, TOS2 = subject -> attrs tuple or None
+    O_MATCH_MAPPING, // TOS -> bool (pushes, keeps subject)
+    O_MATCH_SEQUENCE,
+    O_MATCH_KEYS,    // TOS = keys tuple, TOS1 = subject -> values tuple or None
+    O_GET_LEN,
+    O_COPY_DICT_WITHOUT_KEYS, // TOS = keys tuple, TOS1 = subject -> dict
+    O_SETUP_CLASSCELL,
+    O_SEQ_SLICE_LIST, // arg = before | after << 16: list(TOS[before:len-after])
+    O_DEL_NAME_OPT,   // names[arg]: delete if bound (an except clause's name)
+    O_DEL_FAST_OPT,
+    O_DEL_DEREF_OPT,
+    O_END
+};
+
+struct Ins
+{
+    uint8_t op;
+    int32_t arg;
+    int32_t line;
+};
+
+enum CodeFlags
+{
+    CF_GENERATOR = 1,
+    CF_VARARGS = 2,
+    CF_VARKW = 4,
+    CF_CLASS = 8,    // a class body
+    CF_MODULE = 16,
+    CF_NEWLOCALS = 32,
+    CF_COMPREHENSION = 64,
+};
+
+struct Code : Obj
+{
+    std::string name, qualname, filename;
+    std::vector<Ins> ins;
+    std::vector<V> consts;
+    std::vector<Str *> names;
+    std::vector<Str *> varnames; // parameters first
+    std::vector<Str *> cellvars, freevars;
+    std::vector<int> cell2arg;   // per cellvar: the parameter it starts as, or -1
+    int argcount = 0, posonly = 0, kwonly = 0;
+    int flags = 0;
+    int firstline = 0;
+    int nlocals = 0;
+    V doc = nullptr; // the docstring, or nullptr
+    Code(Type *t) : Obj(t) {}
+};
+
+struct CellObj : Obj
+{
+    V v = nullptr;
+    CellObj(Type *t) : Obj(t) {}
+};
+
+struct Func : Obj
+{
+    Code *code;
+    Dict *globals;
+    std::vector<V> defaults;
+    Dict *kwdefaults = nullptr;
+    std::vector<CellObj *> closure;
+    V name, qualname, doc, module;
+    Dict *annotations = nullptr;
+    Func(Type *t) : Obj(t) {}
+};
+
+struct Kw
+{
+    std::vector<Str *> names;
+    std::vector<V> vals;
+};
+
+// A builtin: args[0] is self for methods
+typedef V (*NativeFn)(V *args, int n, Kw *kw);
+typedef std::function<V(V *args, int n, Kw *kw)> NativeClosure;
+
+struct NativeObj : Obj
+{
+    NativeFn fn = nullptr;
+    NativeClosure *closure = nullptr; // when not a plain function
+    const char *name = "";
+    V self = nullptr;     // bound receiver
+    bool method = false;  // binds when looked up through an instance
+    bool classMethod = false; // binds the class (dict.fromkeys and the like)
+    NativeObj(Type *t) : Obj(t) {}
+};
+
+struct MethodObj : Obj
+{
+    V func, self;
+    MethodObj(Type *t) : Obj(t) {}
+};
+
+struct WrapObj : Obj // classmethod / staticmethod
+{
+    V func;
+    WrapObj(Type *t) : Obj(t) {}
+};
+
+struct PropertyObj : Obj
+{
+    V fget = nullptr, fset = nullptr, fdel = nullptr, doc = nullptr;
+    PropertyObj(Type *t) : Obj(t) {}
+};
+
+struct SuperObj : Obj
+{
+    Type *start; // look after this class in the MRO
+    V self;      // instance or class
+    SuperObj(Type *t) : Obj(t) {}
+};
+
+// ── execution ──────────────────────────────────────────────────────────────
+
+struct Block
+{
+    uint8_t kind; // O_SETUP_EXCEPT or O_SETUP_FINALLY
+    int handler;
+    int level;    // stack depth
+    int excDepth; // depth of the handled-exception stack
+};
+
+struct GenObj;
+
+struct Frame
+{
+    Code *code;
+    Func *func = nullptr;
+    Dict *globals;
+    Dict *locals = nullptr; // module / class bodies
+    std::vector<V> fast;
+    std::vector<CellObj *> cells; // cellvars, then freevars
+    std::vector<V> stack;
+    std::vector<Block> blocks;
+    std::vector<V> handled; // exceptions being handled (sys.exc_info)
+    int ip = 0;
+    int line = 0;
+    Frame *back = nullptr;
+    GenObj *gen = nullptr;
+    bool yielded = false;        // runFrame returned at a yield
+    V pendingThrow = nullptr;    // raise this when resumed (generator.throw)
+};
+
+struct GenObj : Obj
+{
+    Frame *frame;
+    bool running = false, finished = false, started = false;
+    V name, qualname;
+    V yieldFrom = nullptr; // the subiterator being delegated to
+    GenObj(Type *t) : Obj(t) {}
+};
+
+struct ModuleObj : Obj
+{
+    std::string name;
+    ModuleObj(Type *t) : Obj(t) {}
+};
+
+struct ExcObj : Obj
+{
+    Tuple *args;
+    V cause = nullptr, context = nullptr;
+    bool suppressContext = false;
+    std::vector<int> tbLines; // where it passed through, innermost first
+    std::vector<std::string> notes;
+    ExcObj(Type *t) : Obj(t) {}
+};
+
+// An iterator implemented natively: next() fills `out` and returns true, or
+// returns false when exhausted
+struct IterObj : Obj
+{
+    std::function<bool(V &)> next;
+    std::function<int64_t()> lengthHint;
+    bool done = false;
+    IterObj(Type *t) : Obj(t) {}
+};
+
+struct DictView : Obj
+{
+    Dict *d;
+    int kind; // 0 keys, 1 values, 2 items
+    DictView(Type *t) : Obj(t) {}
+};
+
+// Native payload for library objects (compiled regex, match, ...)
+struct DataObj : Obj
+{
+    void *data = nullptr;
+    DataObj(Type *t) : Obj(t) {}
+};
+
+// ── types ──────────────────────────────────────────────────────────────────
+
+struct Type : Obj
+{
+    std::string name, qualname, module;
+    std::vector<Type *> bases, mro;
+    L layout = L::Object;
+    Type *base = nullptr; // the solid base (whose layout instances use)
+    bool builtin = false;
+    bool hasDict = true;       // instances carry an attribute dict
+    std::vector<Str *> slots;  // __slots__ when it restricts attributes
+    bool slotsRestrict = false;
+    bool abstract = false;
+    // cached special-method presence (refreshed when the class dict changes)
+    V (*alloc)(Type *t) = nullptr;
+    Type(Type *meta) : Obj(meta) {}
+};
+
+// A Python exception travelling through C++ frames
+struct PyThrow
+{
+    V exc;
+};
+
+// `sys.exit()` / SystemExit
+struct ExitThrow
+{
+    int status;
+};
+
+// ── globals ────────────────────────────────────────────────────────────────
+
+extern Type *tObject, *tType, *tInt, *tBool, *tFloat, *tComplex, *tStr, *tBytes, *tByteArray, *tTuple, *tList,
+    *tDict, *tSet, *tFrozenSet, *tRange, *tSlice, *tFunc, *tNative, *tMethod, *tClassMethod, *tStaticMethod,
+    *tProperty, *tCell, *tCode, *tGen, *tModule, *tNoneType, *tNotImplType, *tEllipsisType, *tIter, *tDictKeys,
+    *tDictValues, *tDictItems, *tSuper, *tData;
+
+extern Type *tBaseException, *tException, *tStopIteration, *tGeneratorExit, *tKeyboardInterrupt, *tSystemExit,
+    *tArithmeticError, *tZeroDivisionError, *tOverflowError, *tAssertionError, *tAttributeError, *tLookupError,
+    *tIndexError, *tKeyError, *tNameError, *tUnboundLocalError, *tRuntimeError, *tRecursionError,
+    *tNotImplementedError, *tTypeError, *tValueError, *tUnicodeError, *tImportError, *tModuleNotFoundError,
+    *tOSError, *tFileNotFoundError, *tEOFError, *tMemoryError, *tSyntaxError, *tStopAsyncIteration,
+    *tUnicodeDecodeError, *tUnicodeEncodeError, *tFloatingPointError, *tBufferError, *tWarning, *tUserWarning,
+    *tDeprecationWarning, *tRuntimeWarning, *tPermissionError, *tTimeoutError, *tIsADirectoryError,
+    *tExceptionGroup, *tBaseExceptionGroup, *tConnectionError, *tFileExistsError, *tIndentationError,
+    *tTabError, *tSystemError, *tReferenceError, *tProcessLookupError, *tChildProcessError, *tBrokenPipeError,
+    *tInterruptedError, *tBlockingIOError, *tUnicodeTranslateError, *tFutureWarning, *tPendingDeprecationWarning,
+    *tSyntaxWarning, *tImportWarning, *tUnicodeWarning, *tBytesWarning, *tResourceWarning, *tEncodingWarning,
+    *tNotADirectoryError, *tConnectionResetError, *tConnectionRefusedError, *tConnectionAbortedError;
+
+extern V None, True, False, NotImpl, EllipsisV;
+extern Dict *builtinsDict;
+extern Dict *modulesDict; // sys.modules
+extern std::string g_scriptPath;
+
+// ── object model (PyObj.sa) ────────────────────────────────────────────────
+
+inline Type *typeOf(V v) { return IS_SMALL(v) ? tInt : v->type; }
+bool issub(Type *a, Type *b);
+inline bool isinst(V v, Type *t) { return typeOf(v) == t || issub(typeOf(v), t); }
+Str *intern(const std::string &s);
+Str *newStr(const std::string &s);
+Str *newStrAscii(const std::string &s); // known ASCII
+V mkint(int64_t i);
+V mkfloat(double d);
+inline V mkbool(bool b) { return b ? True : False; }
+Tuple *newTuple(size_t n);
+Tuple *tupleOf(const std::vector<V> &items);
+List *newList(size_t n = 0);
+Dict *newDict();
+Set *newSet(Type *t = nullptr);
+V newObject(Type *t);
+
+[[noreturn]] void raise(Type *t, const std::string &msg);
+[[noreturn]] void raiseV(V exc);
+[[noreturn]] void raiseArgs(Type *t, V arg); // exception with one arbitrary argument (KeyError(key))
+V makeExc(Type *t, const std::string &msg);
+V excFromTypeOrInstance(V v);
+std::string excMessage(V exc); // str(exc)
+
+Type *newType(const std::string &name, Type *base, L layout);
+void computeMro(Type *t);
+V lookupMro(Type *t, Str *name);           // class attribute through the MRO, or nullptr
+V lookupMroAfter(Type *t, Type *after, Str *name);
+V getattr(V obj, Str *name);
+bool getattrOpt(V obj, Str *name, V &out); // false when missing (AttributeError)
+void setattr(V obj, Str *name, V val);
+void delattr(V obj, Str *name);
+bool hasattr(V obj, Str *name);
+V bindDescriptor(V attr, V obj, Type *type); // __get__ of what was found on the class
+V callMethodName(V obj, Str *name, V *args, int n, Kw *kw = nullptr);
+V call(V f, V *args, int n, Kw *kw = nullptr);
+inline V call0(V f) { return call(f, nullptr, 0); }
+V call1(V f, V a);
+V call2(V f, V a, V b);
+V callSpecial(V obj, Str *name, V *args, int n, bool &found); // type-level dunder lookup
+
+bool truthy(V v);
+int64_t lenOf(V v);
+std::string reprOf(V v);
+std::string strOf(V v);
+V reprV(V v);
+V strV(V v);
+int64_t hashOf(V v);
+bool eq(V a, V b);
+bool lt(V a, V b);
+V richCompare(V a, V b, Op op);
+V binaryOp(V a, V b, Op op);
+V inplaceOp(V a, V b, Op op);
+V unaryOp(V a, Op op);
+V getitem(V obj, V key);
+void setitem(V obj, V key, V val);
+void delitem(V obj, V key);
+bool contains(V container, V item);
+V getiter(V v);
+bool iterNext(V it, V &out);
+V iterNextOrNull(V it); // nullptr when exhausted
+std::vector<V> toVector(V iterable);
+std::string formatValue(V v, const std::string &spec);
+V makeNative(const char *name, NativeFn fn, bool method = false);
+V makeNativeClosure(const char *name, NativeClosure fn);
+V makeIter(std::function<bool(V &)> next);
+void defMethod(Type *t, const char *name, NativeFn fn);
+void defClassMethod(Type *t, const char *name, NativeFn fn);
+void defStatic(Type *t, const char *name, NativeFn fn);
+void defProperty(Type *t, const char *name, NativeFn getter);
+void setAttrStr(Dict *d, const char *name, V v);
+const char *typeName(V v);
+int64_t indexOf(V v); // __index__: an int for subscripts and the like
+bool isIntLike(V v);
+bool isStr(V v);
+inline Str *asStr(V v) { return static_cast<Str *>(v); }
+std::string argName(Kw *kw, int i);
+V kwArg(Kw *kw, const char *name); // nullptr when absent
+void checkArgs(const char *fname, int n, int min, int max);
+void noKw(const char *fname, Kw *kw);
+void initObjectModel();
+int64_t objectId(V v);
+
+// ── dict / set (PyColl.sa) ─────────────────────────────────────────────────
+
+V dictGet(Dict *d, V key);           // nullptr when missing
+V dictGetStr(Dict *d, Str *key);
+V dictGetC(Dict *d, const char *key);
+void dictSet(Dict *d, V key, V val);
+bool dictDel(Dict *d, V key);
+void dictClear(Dict *d);
+Dict *dictCopy(Dict *d);
+bool setAdd(Set *s, V key);
+bool setHas(Set *s, V key);
+bool setDiscard(Set *s, V key);
+void setUpdate(Set *s, V iterable);
+Set *setCopy(Set *s, Type *t);
+std::vector<V> setItems(Set *s);
+V dummyKey();
+void initCollections();
+V listSort(List *l, V key, bool reverse);
+std::string reprSeq(const std::vector<V> &items, const char *open, const char *close, bool tupleOne);
+std::vector<int64_t> sliceIndices(SliceObj *s, int64_t len, int64_t &count);
+
+// ── numbers (PyNum.sa) ─────────────────────────────────────────────────────
+
+Big toBig(V v);       // an int-like value
+V fromBig(const Big &b);
+V intFromString(const std::string &s, int base, bool &ok);
+std::string intToString(V v, int base = 10);
+bool intSmall(V v, int64_t &out); // int-like and fits 64 bits
+double intToDouble(V v);
+double toDouble(V v); // int or float (TypeError otherwise)
+std::string floatRepr(double d);
+V intBinary(V a, V b, Op op); // both int-like; nullptr when not handled
+V floatBinary(double a, double b, Op op);
+V intPow(V a, V b, V mod);
+int intCompare(V a, V b);
+int64_t hashInt(V v);
+int64_t hashDouble(double d);
+V intFromDouble(double d);
+int intSign(V v);
+void initNumbers();
+
+// ── strings (PyStr.sa) ─────────────────────────────────────────────────────
+
+std::string quoteStr(const std::string &s);
+uint32_t strCharAt(Str *s, int64_t i);
+Str *strSlice(Str *s, int64_t start, int64_t stop, int64_t step);
+std::string encodeUtf8(uint32_t c);
+std::vector<uint32_t> decodeUtf8(const std::string &s);
+int64_t utf8Length(const std::string &s, bool &ascii);
+std::string percentFormat(Str *fmt, V args);
+std::string strFormatMethod(const std::string &fmt, V *args, int n, Kw *kw);
+std::string formatStrSpec(const std::string &s, const std::string &spec);
+std::string formatIntSpec(V v, const std::string &spec);
+std::string formatFloatSpec(double d, const std::string &spec, bool isInt);
+bool isSpace(uint32_t c);
+bool isAlphaC(uint32_t c);
+bool isDigitC(uint32_t c);
+uint32_t toUpperC(uint32_t c);
+uint32_t toLowerC(uint32_t c);
+void initStrings();
+int64_t hashString(const std::string &s);
+
+// ── the interpreter (PyVm.sa) ──────────────────────────────────────────────
+
+V runFrame(Frame *f);                 // runs until return; for generators, until yield
+V callFunc(Func *fn, V *args, int n, Kw *kw);
+V genSend(GenObj *g, V value, bool &done);
+V genThrow(GenObj *g, V exc, bool &done);
+void genClose(GenObj *g);
+V execModuleCode(Code *code, Dict *globals);
+Frame *currentFrame();
+int currentLine();
+extern int g_depth;
+V buildClass(V func, V name, std::vector<V> &bases, Kw *kw);
+void initVm();
+
+// ── the compiler (PyCompile.sa) ────────────────────────────────────────────
+
+Code *compileModule(const std::vector<struct Node *> &body, const std::string &filename, const std::string &name);
+
+// ── builtins and modules (PyBuiltins.sa, PyLib.sa) ─────────────────────────
+
+void initBuiltins();
+V importModule(const std::string &name, int line);
+V builtinPrint(V *args, int n, Kw *kw);
+void flushOut();
+void writeOut(const std::string &s);
+void initRe(Dict *mod);
+void initMath(Dict *mod);
+std::string librarySource(const std::string &name, bool &found);
+void registerNativeModules();
+
+} // namespace py

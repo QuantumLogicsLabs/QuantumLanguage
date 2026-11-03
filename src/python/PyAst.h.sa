@@ -1,0 +1,185 @@
+// quantum: cpp
+#pragma once
+// Python front-end: the syntax tree. One node type for every construct, the
+// way Python's own `ast` module names them; which fields a kind uses is
+// listed next to it. Nodes are never freed: a program is parsed once.
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace py
+{
+
+enum class NK : uint8_t
+{
+    // ── expressions ──
+    Name,      // name
+    Int,       // ival, or name = decimal digits when it does not fit (flag)
+    Float,     // fval
+    Imag,      // fval: the imaginary part
+    Str,       // name = the value (UTF-8)
+    Bytes,     // name = the bytes
+    FStr,      // list = parts: Str nodes and FValue nodes
+    FValue,    // a = expression, ival = conversion ('r' 's' 'a' or 0), b = format spec (FStr) or null
+    None,
+    True,
+    False,
+    Ellipsis,
+    BinOp,     // a op b (op: Op)
+    UnaryOp,   // op a
+    BoolOp,    // list joined by op (OpAnd / OpOr)
+    Compare,   // a, then list2[i] compared with ops[i]
+    Call,      // a (callee), list = positional (Starred for *x), list2 = keyword values, names = keyword names ("" for **x)
+    Attribute, // a.name
+    Subscript, // a[b]
+    Slice,     // a:b:c (each may be null)
+    Starred,   // *a
+    List,      // list
+    Tuple,     // list
+    Set,       // list
+    Dict,      // list = keys (null for **v), list2 = values
+    ListComp,  // a = element, comps
+    SetComp,   // a = element, comps
+    GenExp,    // a = element, comps
+    DictComp,  // a = key, b = value, comps
+    Lambda,    // args, a = body
+    IfExp,     // b if a else c
+    NamedExpr, // name := a
+    Yield,     // a (may be null)
+    YieldFrom, // a
+    Await,     // a
+
+    // ── statements ──
+    FunctionDef, // name, args, body, decorators, a = returns
+    ClassDef,    // name, list = bases, list2 = keyword values, names = keyword names, body, decorators
+    Return,      // a
+    Delete,      // list = targets
+    Assign,      // list = targets, a = value
+    AugAssign,   // a op= b
+    AnnAssign,   // a: b = c (c may be null), flag = simple name
+    For,         // for a in b: body else orelse
+    While,       // while a: body else orelse
+    If,          // if a: body else orelse
+    With,        // list = context expressions, list2 = targets (null when none), body
+    Match,       // a = subject, cases
+    Raise,       // raise a from b
+    Try,         // body, handlers, orelse, finalbody
+    Assert,      // a, b
+    Import,      // names = modules, names2 = as-names ("" when none)
+    ImportFrom,  // name = module, ival = level, names, names2
+    Global,      // names
+    Nonlocal,    // names
+    ExprStmt,    // a
+    Pass,
+    Break,
+    Continue,
+
+    // ── match patterns ──
+    PValue,     // a = value expression
+    PSingleton, // a = None / True / False
+    PSequence,  // list = patterns
+    PStar,      // name ("" for *_)
+    PMapping,   // list = key expressions, list2 = patterns, name = **rest ("" when none)
+    PClass,     // a = class expression, list = positional patterns, names = keyword names, list2 = keyword patterns
+    PAs,        // b = pattern (null: capture or wildcard), name ("" for _)
+    POr,        // list = alternatives
+};
+
+enum Op : uint8_t
+{
+    OpAdd,
+    OpSub,
+    OpMul,
+    OpMatMul,
+    OpDiv,
+    OpFloorDiv,
+    OpMod,
+    OpPow,
+    OpLShift,
+    OpRShift,
+    OpBitOr,
+    OpBitXor,
+    OpBitAnd,
+    // unary
+    OpNot,
+    OpNeg,
+    OpPos,
+    OpInvert,
+    // boolean
+    OpAnd,
+    OpOr,
+    // comparisons
+    OpEq,
+    OpNe,
+    OpLt,
+    OpLe,
+    OpGt,
+    OpGe,
+    OpIn,
+    OpNotIn,
+    OpIs,
+    OpIsNot,
+};
+
+struct Node;
+
+struct Arg
+{
+    std::string name;
+    Node *annotation = nullptr;
+};
+
+// A parameter list: def f(a, /, b=1, *args, c, d=2, **kw)
+struct Params
+{
+    std::vector<Arg> posonly, args; // args: positional-or-keyword
+    std::vector<Node *> defaults;   // for the last posonly+args
+    Arg *vararg = nullptr;
+    std::vector<Arg> kwonly;
+    std::vector<Node *> kwDefaults; // null where a keyword-only one has none
+    Arg *kwarg = nullptr;
+};
+
+struct Comprehension
+{
+    Node *target = nullptr, *iter = nullptr;
+    std::vector<Node *> ifs;
+};
+
+struct Handler
+{
+    Node *type = nullptr; // null: bare except
+    std::string name;
+    std::vector<Node *> body;
+    int line = 0;
+};
+
+struct MatchCase
+{
+    Node *pattern = nullptr, *guard = nullptr;
+    std::vector<Node *> body;
+};
+
+struct Node
+{
+    NK kind;
+    int line = 0, col = 0;
+    Op op = OpAdd;
+    bool flag = false;
+    int64_t ival = 0;
+    double fval = 0;
+    std::string name;
+    Node *a = nullptr, *b = nullptr, *c = nullptr;
+    std::vector<Node *> list, list2;
+    std::vector<Op> ops;
+    std::vector<std::string> names, names2;
+    Params *args = nullptr;
+    std::vector<Comprehension> comps;
+    std::vector<Node *> body, orelse, finalbody, decorators;
+    std::vector<Handler> handlers;
+    std::vector<MatchCase> cases;
+
+    Node(NK k, int ln) : kind(k), line(ln) {}
+};
+
+} // namespace py

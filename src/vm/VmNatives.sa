@@ -1,6 +1,7 @@
 // quantum: cpp
 #include "../js/JsMain.h.sa"
 #include "../ruby/RubyMain.h.sa"
+#include "../python/PyMain.h.sa"
 #include "Vm.h.sa"
 #include "Error.h.sa"
 #include <iostream>
@@ -97,6 +98,21 @@ static std::string defaultTestInput(const std::vector<QuantumValue> &args)
     return "";
 }
 
+// The test runner's stand-in for a line of input (the Python front-end's input() too)
+std::string testModeInput(const std::string &prompt)
+{
+    std::vector<QuantumValue> args;
+    args.push_back(QuantumValue(prompt));
+    return defaultTestInput(args);
+}
+
+namespace py
+{
+// What the Python front-end asks the test runner
+bool testModeActive() { return g_testMode; }
+std::string testModeAnswer(const std::string &prompt) { return testModeInput(prompt); }
+} // namespace py
+
 static QuantumValue defaultTestInputValue(const std::vector<QuantumValue> &args, bool formatAware)
 {
     std::string prompt = args.empty() ? "" : args[0].toString();
@@ -132,6 +148,17 @@ void VM::registerNatives()
         {
         js::RunFailure failure;
         int status = js::runProgram(args[0].asString(), args[1].asString(), failure);
+        if (failure.failed)
+            throw QuantumError(failure.kind, failure.message, failure.line);
+        if (status != 0)
+            std::exit(status);
+        return QuantumValue(); });
+
+    // A Python program (applyDialect): the Python front-end runs it to its end
+    reg("__py_run__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        py::RunFailure failure;
+        int status = py::runProgram(args[0].asString(), args[1].asString(), failure);
         if (failure.failed)
             throw QuantumError(failure.kind, failure.message, failure.line);
         if (status != 0)

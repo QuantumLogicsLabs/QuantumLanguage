@@ -1,0 +1,122 @@
+"""Regular expressions (the engine is native: _re)."""
+
+import _re
+
+__all__ = ["match", "fullmatch", "search", "sub", "subn", "split", "findall", "finditer", "compile", "purge",
+           "escape", "error", "Pattern", "Match", "A", "I", "L", "M", "S", "X", "U", "ASCII", "IGNORECASE",
+           "LOCALE", "MULTILINE", "DOTALL", "VERBOSE", "UNICODE", "NOFLAG", "RegexFlag"]
+
+
+class RegexFlag(int):
+    _names = {256: "ASCII", 2: "IGNORECASE", 4: "LOCALE", 8: "MULTILINE", 16: "DOTALL", 32: "UNICODE", 64: "VERBOSE"}
+
+    def __new__(cls, value):
+        return int.__new__(cls, value)
+
+    def __or__(self, other):
+        if isinstance(other, int):
+            return RegexFlag(int(self) | int(other))
+        return NotImplemented
+
+    __ror__ = __or__
+
+    def __and__(self, other):
+        if isinstance(other, int):
+            return RegexFlag(int(self) & int(other))
+        return NotImplemented
+
+    __rand__ = __and__
+
+    def __invert__(self):
+        return RegexFlag(~int(self))
+
+    def __repr__(self):
+        v = int(self)
+        if v == 0:
+            return "re.NOFLAG"
+        parts = []
+        for bit, name in sorted(self._names.items()):
+            if v & bit:
+                parts.append("re." + name)
+                v &= ~bit
+        if v:
+            parts.append(hex(v))
+        return "|".join(parts)
+
+    __str__ = __repr__
+
+
+NOFLAG = RegexFlag(0)
+A = ASCII = RegexFlag(256)
+I = IGNORECASE = RegexFlag(2)
+L = LOCALE = RegexFlag(4)
+M = MULTILINE = RegexFlag(8)
+S = DOTALL = RegexFlag(16)
+U = UNICODE = RegexFlag(32)
+X = VERBOSE = RegexFlag(64)
+
+error = _re.error
+PatternError = error
+Pattern = _re.Pattern
+Match = _re.Match
+
+_cache = {}
+
+
+def _compile(pattern, flags):
+    if isinstance(pattern, Pattern):
+        if flags:
+            raise ValueError("cannot process flags argument with a compiled pattern")
+        return pattern
+    key = (type(pattern), pattern, int(flags))
+    p = _cache.get(key)
+    if p is None:
+        p = _re.compile(pattern, int(flags))
+        if len(_cache) > 512:
+            _cache.clear()
+        _cache[key] = p
+    return p
+
+
+def compile(pattern, flags=0):
+    return _compile(pattern, flags)
+
+
+def match(pattern, string, flags=0):
+    return _compile(pattern, flags).match(string)
+
+
+def fullmatch(pattern, string, flags=0):
+    return _compile(pattern, flags).fullmatch(string)
+
+
+def search(pattern, string, flags=0):
+    return _compile(pattern, flags).search(string)
+
+
+def sub(pattern, repl, string, count=0, flags=0):
+    return _compile(pattern, flags).sub(repl, string, count)
+
+
+def subn(pattern, repl, string, count=0, flags=0):
+    return _compile(pattern, flags).subn(repl, string, count)
+
+
+def split(pattern, string, maxsplit=0, flags=0):
+    return _compile(pattern, flags).split(string, maxsplit)
+
+
+def findall(pattern, string, flags=0):
+    return _compile(pattern, flags).findall(string)
+
+
+def finditer(pattern, string, flags=0):
+    return _compile(pattern, flags).finditer(string)
+
+
+def purge():
+    _cache.clear()
+
+
+def escape(pattern):
+    return _re.escape(pattern)
