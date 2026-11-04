@@ -445,6 +445,13 @@ static bool instanceCheck(V obj, V cls)
             if (ic && !(IS_SMALL(ic) || ic->type->layout == L::Native))
                 return truthy(call2(ic, cls, obj));
         }
+        if ((cls == tInt || cls == tFloat) && !typeOf(obj)->builtin)
+        {
+            // NumPy's int64 and the like are not Python ints (they only are here underneath)
+            V optOut = lookupMro(typeOf(obj), intern(cls == tInt ? "_not_python_int" : "_not_python_float"));
+            if (optOut && truthy(optOut))
+                return false;
+        }
         return isinst(obj, static_cast<Type *>(cls));
     }
     V ic;
@@ -473,6 +480,12 @@ static bool subclassCheck(V sub, V cls)
         }
         if (typeOf(sub)->layout != L::Type)
             raise(tTypeError, "issubclass() arg 1 must be a class");
+        if ((cls == tInt || cls == tFloat) && !static_cast<Type *>(sub)->builtin)
+        {
+            V optOut = lookupMro(static_cast<Type *>(sub), intern(cls == tInt ? "_not_python_int" : "_not_python_float"));
+            if (optOut && truthy(optOut))
+                return false;
+        }
         return issub(static_cast<Type *>(sub), static_cast<Type *>(cls));
     }
     V sc;

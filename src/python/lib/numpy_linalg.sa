@@ -1,0 +1,464 @@
+"""numpy.linalg: LU-based det/inv/solve the way NumPy's LAPACK calls do them."""
+
+import math as _math
+import builtins as _bi
+import numpy as _np
+
+
+class LinAlgError(ValueError):
+    pass
+
+
+LinAlgError.__module__ = "numpy.linalg"
+
+
+def _as_float_matrix(a, name="array"):
+    a = _np.asarray(a)
+    if a.ndim < 2:
+        raise LinAlgError(f"{a.ndim}-dimensional array given. Array must be at least two-dimensional")
+    if a.shape[-1] != a.shape[-2]:
+        raise LinAlgError("Last 2 dimensions of the array must be square")
+    return a
+
+
+def _lu(rows):
+    """In-place LU with partial pivoting (dgetrf): (rows, perm, sign, singular)."""
+    n = len(rows)
+    perm = list(range(n))
+    sign = 1.0
+    singular = False
+    for k in range(n):
+        p = k
+        best = _bi.abs(rows[k][k])
+        for i in range(k + 1, n):
+            v = _bi.abs(rows[i][k])
+            if v > best:
+                best = v
+                p = i
+        if p != k:
+            rows[k], rows[p] = rows[p], rows[k]
+            perm[k], perm[p] = perm[p], perm[k]
+            sign = -sign
+        piv = rows[k][k]
+        if piv == 0:
+            singular = True
+            continue
+        inv = 1.0 / piv
+        rk = rows[k]
+        for i in range(k + 1, n):
+            ri = rows[i]
+            f = ri[k] * inv
+            ri[k] = f
+            if f != 0:
+                for j in range(k + 1, n):
+                    ri[j] -= f * rk[j]
+    return rows, perm, sign, singular
+
+
+def _rows_of(m):
+    n = m.shape[-1]
+    vals = [_bi.float(v) for v in m._values()]
+    return [vals[i * n:(i + 1) * n] for i in range(m.shape[-2])]
+
+
+def _batched(a, fn):
+    if a.ndim == 2:
+        return fn(a)
+    parts = [fn(a[idx]) for idx in _np.ndindex(*a.shape[:-2])]
+    if isinstance(parts[0], _np.ndarray):
+        return _np.stack(parts).reshape(a.shape[:-2] + parts[0].shape)
+    return _np.array(parts).reshape(a.shape[:-2])
+
+
+def det(a):
+    a = _as_float_matrix(a)
+
+    def one(m):
+        rows, perm, sign, singular = _lu(_rows_of(m))
+        n = len(rows)
+        if singular:
+            return _np.float64(0.0)
+        logdet = 0.0
+        s = sign
+        for i in range(n):
+            u = rows[i][i]
+            if u < 0:
+                s = -s
+            logdet += _math.log(_bi.abs(u))
+        return _np.float64(s * _math.exp(logdet))
+    return _batched(a, one)
+
+
+def slogdet(a):
+    a = _as_float_matrix(a)
+    rows, perm, sign, singular = _lu(_rows_of(a))
+    from collections import namedtuple
+    SR = namedtuple("SlogdetResult", ["sign", "logabsdet"])
+    if singular:
+        return SR(_np.float64(0.0), _np.float64(-_math.inf))
+    logdet = 0.0
+    s = sign
+    for i in range(len(rows)):
+        u = rows[i][i]
+        if u < 0:
+            s = -s
+        logdet += _math.log(_bi.abs(u))
+    return SR(_np.float64(s), _np.float64(logdet))
+
+
+def _lu_solve(rows, perm, bcols):
+    n = len(rows)
+    out = []
+    for b in bcols:
+        x = [b[perm[i]] for i in range(n)]
+        for i in range(n):
+            s = x[i]
+            ri = rows[i]
+            for j in range(i):
+                s -= ri[j] * x[j]
+            x[i] = s
+        for i in range(n - 1, -1, -1):
+            s = x[i]
+            ri = rows[i]
+            for j in range(i + 1, n):
+                s -= ri[j] * x[j]
+            x[i] = s / ri[i]
+        out.append(x)
+    return out
+
+
+def solve(a, b):
+    a = _as_float_matrix(a)
+    b = _np.asarray(b)
+    rows, perm, sign, singular = _lu(_rows_of(a))
+    if singular:
+        raise LinAlgError("Singular matrix")
+    n = len(rows)
+    if b.ndim == 1:
+        if b.shape[0] != n:
+            raise ValueError(f"solve1: Input operand 1 has a mismatch in its core dimension 0, with gufunc signature (m,m),(m)->(m) (size {b.shape[0]} is different from {n})")
+        x = _lu_solve(rows, perm, [[_bi.float(v) for v in b._values()]])[0]
+        return _np.array(x)
+    if b.shape[0] != n:
+        raise ValueError(f"solve: Input operand 1 has a mismatch in its core dimension 0, with gufunc signature (m,m),(m,n)->(m,n) (size {b.shape[0]} is different from {n})")
+    bt = b.T
+    cols = [[_bi.float(v) for v in bt[j]._values()] for j in range(b.shape[1])]
+    xs = _lu_solve(rows, perm, cols)
+    return _np.array(xs).T.copy()
+
+
+def inv(a):
+    a = _as_float_matrix(a)
+
+    def one(m):
+        rows, perm, sign, singular = _lu(_rows_of(m))
+        if singular:
+            raise LinAlgError("Singular matrix")
+        n = len(rows)
+        cols = [[1.0 if i == j else 0.0 for i in range(n)] for j in range(n)]
+        xs = _lu_solve(rows, perm, cols)
+        return _np.array(xs).T.copy()
+    return _batched(a, one)
+
+
+def matrix_power(a, n):
+    a = _np.asarray(a)
+    if a.ndim < 2 or a.shape[-1] != a.shape[-2]:
+        raise LinAlgError("Last 2 dimensions of the array must be square")
+    n = _bi.int(n)
+    if n == 0:
+        r = _np.zeros_like(a)
+        for i in range(a.shape[-1]):
+            r[..., i, i] = 1
+        return r
+    if n < 0:
+        a = inv(a)
+        n = -n
+    if n == 1:
+        return a.copy()
+    if n == 2:
+        return _np.matmul(a, a)
+    if n == 3:
+        return _np.matmul(_np.matmul(a, a), a)
+    z = result = None
+    while n > 0:
+        z = a if z is None else _np.matmul(z, z)
+        n, bit = divmod(n, 2)
+        if bit:
+            result = z if result is None else _np.matmul(result, z)
+    return result
+
+
+def _vector_norm(vals, ord):
+    if ord is None or ord == 2:
+        s = 0.0
+        for v in vals:
+            s += v * v
+        return _math.sqrt(s)
+    if ord == _math.inf:
+        return _bi.max(_bi.abs(v) for v in vals)
+    if ord == -_math.inf:
+        return _bi.min(_bi.abs(v) for v in vals)
+    if ord == 0:
+        return _bi.float(_bi.sum(1 for v in vals if v != 0))
+    if ord == 1:
+        s = 0.0
+        for v in vals:
+            s += _bi.abs(v)
+        return s
+    s = 0.0
+    for v in vals:
+        s += _bi.abs(v) ** ord
+    return s ** (1.0 / ord)
+
+
+def norm(x, ord=None, axis=None, keepdims=False):
+    x = _np.asarray(x)
+    if x.dtype.kind != "f":
+        x = x.astype(_np.float64)
+    if axis is None:
+        if ord is None or (ord in ("f", "fro") and x.ndim == 2) or (ord == 2 and x.ndim == 1):
+            vals = x._values()
+            r = _np.float64(_math.sqrt(_bi.float(_np.dot(_np.array(vals), _np.array(vals)))))
+            if keepdims:
+                return _np.array(r).reshape((1,) * x.ndim)
+            return r
+        if x.ndim == 1:
+            return _np.float64(_vector_norm(x._values(), ord))
+        if x.ndim == 2:
+            return _matrix_norm(x, ord)
+        raise ValueError("Improper number of dimensions to norm.")
+    if isinstance(axis, (_bi.int, _np.integer)):
+        moved = _np.moveaxis(x, axis, -1)
+        rows = moved.reshape(-1, moved.shape[-1])
+        res = _np.array([_vector_norm(r._values(), ord) for r in rows]).reshape(moved.shape[:-1])
+        if keepdims:
+            res = _np.expand_dims(res, axis)
+        return res
+    if len(axis) == 2:
+        moved = _np.moveaxis(x, axis, (-2, -1))
+        if moved.ndim == 2:
+            return _matrix_norm(moved, ord)
+        parts = [_matrix_norm(moved[idx], ord) for idx in _np.ndindex(*moved.shape[:-2])]
+        return _np.array(parts).reshape(moved.shape[:-2])
+    raise ValueError("Improper number of dimensions to norm.")
+
+
+def _matrix_norm(m, ord):
+    rows = _rows_of(m)
+    if ord is None or ord in ("f", "fro"):
+        s = 0.0
+        for r in rows:
+            for v in r:
+                s += v * v
+        return _np.float64(_math.sqrt(s))
+    if ord == _math.inf:
+        return _np.float64(_bi.max(_bi.sum(_bi.abs(v) for v in r) for r in rows))
+    if ord == -_math.inf:
+        return _np.float64(_bi.min(_bi.sum(_bi.abs(v) for v in r) for r in rows))
+    ncols = len(rows[0])
+    colsums = [_bi.sum(_bi.abs(r[j]) for r in rows) for j in range(ncols)]
+    if ord == 1:
+        return _np.float64(_bi.max(colsums))
+    if ord == -1:
+        return _np.float64(_bi.min(colsums))
+    if ord in (2, -2, "nuc"):
+        s = _singular_values(rows)
+        if ord == 2:
+            return _np.float64(s[0])
+        if ord == -2:
+            return _np.float64(s[-1])
+        return _np.float64(_bi.sum(s))
+    raise ValueError("Invalid norm order for matrices.")
+
+
+def _singular_values(rows):
+    """Singular values by one-sided Jacobi rotations on the columns of A."""
+    m = len(rows)
+    n = len(rows[0]) if rows else 0
+    if m < n:
+        rows = [[rows[i][j] for i in range(m)] for j in range(n)]
+        m, n = n, m
+    cols = [[rows[i][j] for i in range(m)] for j in range(n)]
+    for _ in range(60):
+        rotated = False
+        for p in range(n):
+            for q in range(p + 1, n):
+                cp, cq = cols[p], cols[q]
+                alpha = _bi.sum(v * v for v in cp)
+                beta = _bi.sum(v * v for v in cq)
+                gamma = _bi.sum(x * y for x, y in zip(cp, cq))
+                if gamma == 0 or _bi.abs(gamma) <= 1e-15 * _math.sqrt(alpha * beta):
+                    continue
+                rotated = True
+                zeta = (beta - alpha) / (2 * gamma)
+                t = (1.0 if zeta >= 0 else -1.0) / (_bi.abs(zeta) + _math.sqrt(1 + zeta * zeta))
+                c = 1 / _math.sqrt(1 + t * t)
+                s = c * t
+                cols[p] = [c * x - s * y for x, y in zip(cp, cq)]
+                cols[q] = [s * x + c * y for x, y in zip(cp, cq)]
+        if not rotated:
+            break
+    return sorted((_math.sqrt(_bi.sum(v * v for v in c)) for c in cols), reverse=True)
+
+
+def _jacobi_eigenvalues(a):
+    n = len(a)
+    a = [row[:] for row in a]
+    for _ in range(100):
+        off = _bi.sum(a[i][j] ** 2 for i in range(n) for j in range(n) if i != j)
+        if off < 1e-30:
+            break
+        for p in range(n):
+            for q in range(p + 1, n):
+                if _bi.abs(a[p][q]) < 1e-300:
+                    continue
+                theta = (a[q][q] - a[p][p]) / (2 * a[p][q])
+                t = (1.0 if theta >= 0 else -1.0) / (_bi.abs(theta) + _math.sqrt(theta * theta + 1))
+                c = 1 / _math.sqrt(t * t + 1)
+                s = t * c
+                for k in range(n):
+                    akp, akq = a[k][p], a[k][q]
+                    a[k][p] = c * akp - s * akq
+                    a[k][q] = s * akp + c * akq
+                for k in range(n):
+                    apk, aqk = a[p][k], a[q][k]
+                    a[p][k] = c * apk - s * aqk
+                    a[q][k] = s * apk + c * aqk
+    return [a[i][i] for i in range(n)]
+
+
+def eigvalsh(a, UPLO="L"):
+    a = _as_float_matrix(a)
+    ev = sorted(_jacobi_eigenvalues(_rows_of(a)))
+    return _np.array(ev)
+
+
+def svdvals(x):
+    x = _np.asarray(x)
+    return _np.array(_singular_values(_rows_of(x.astype(_np.float64))))
+
+
+def matrix_rank(A, tol=None, hermitian=False, *, rtol=None):
+    A = _np.asarray(A)
+    if A.ndim < 2:
+        return _np.int64(int(not _np.all(A == 0)))
+    rows = _rows_of(A.astype(_np.float64))
+    s = _singular_values(rows)
+    if tol is None:
+        eps = 2.220446049250313e-16
+        tol = (s[0] if s else 0.0) * _bi.max(A.shape[-2:]) * eps
+    return _np.int64(_bi.sum(1 for v in s if v > tol))
+
+
+def cond(x, p=None):
+    x = _np.asarray(x).astype(_np.float64)
+    if p is None or p in (2, -2):
+        s = _singular_values(_rows_of(x))
+        r = s[0] / s[-1] if p != -2 else s[-1] / s[0]
+        return _np.float64(r)
+    return _np.float64(_bi.float(norm(x, p)) * _bi.float(norm(inv(x), p)))
+
+
+def multi_dot(arrays, *, out=None):
+    r = arrays[0]
+    for a in arrays[1:]:
+        r = _np.dot(r, a)
+    return r
+
+
+def pinv(a, rcond=None, hermitian=False, *, rtol=None):
+    a = _np.asarray(a).astype(_np.float64)
+    m, n = a.shape
+    if m >= n:
+        return solve(_np.matmul(a.T, a), a.T)
+    return solve(_np.matmul(a, a.T), a).T
+
+
+def lstsq(a, b, rcond=None):
+    a = _np.asarray(a).astype(_np.float64)
+    b = _np.asarray(b).astype(_np.float64)
+    x = solve(_np.matmul(a.T, a), _np.matmul(a.T, b))
+    resid = b - _np.matmul(a, x)
+    res = _np.array([_np.sum(resid * resid)]) if a.shape[0] > a.shape[1] else _np.array([])
+    return x, res, matrix_rank(a), _np.array(_singular_values(_rows_of(a)))
+
+
+def trace(x, offset=0, dtype=None):
+    return _np.trace(x, offset, dtype=dtype)
+
+
+def outer(x1, x2):
+    return _np.outer(x1, x2)
+
+
+def cross(x1, x2, axis=-1):
+    return _np.cross(x1, x2)
+
+
+def matmul(x1, x2):
+    return _np.matmul(x1, x2)
+
+
+def vecdot(x1, x2, axis=-1):
+    return _np.sum(_np.multiply(x1, x2), axis=axis)
+
+
+def tensordot(a, b, axes=2):
+    return _np.tensordot(a, b, axes)
+
+
+def diagonal(x, offset=0):
+    return _np.diagonal(x, offset, -2, -1)
+
+
+def vector_norm(x, ord=2, axis=None, keepdims=False):
+    if axis is None:
+        return norm(_np.asarray(x).ravel(), ord)
+    return norm(x, ord, axis, keepdims)
+
+
+def matrix_norm(x, ord="fro", keepdims=False):
+    return norm(x, ord, (-2, -1), keepdims)
+
+
+def eig(a):
+    raise LinAlgError("numpy.linalg.eig is not supported by this NumPy")
+
+
+def eigh(a, UPLO="L"):
+    raise LinAlgError("numpy.linalg.eigh is not supported by this NumPy")
+
+
+def eigvals(a):
+    raise LinAlgError("numpy.linalg.eigvals is not supported by this NumPy")
+
+
+def svd(a, full_matrices=True, compute_uv=True, hermitian=False):
+    if not compute_uv:
+        return svdvals(a)
+    raise LinAlgError("numpy.linalg.svd is not supported by this NumPy")
+
+
+def qr(a, mode="reduced"):
+    raise LinAlgError("numpy.linalg.qr is not supported by this NumPy")
+
+
+def cholesky(a, upper=False):
+    a = _as_float_matrix(a)
+    rows = _rows_of(a)
+    n = len(rows)
+    L = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1):
+            s = rows[i][j]
+            for k in range(j):
+                s -= L[i][k] * L[j][k]
+            if i == j:
+                if s <= 0:
+                    raise LinAlgError("Matrix is not positive definite")
+                L[i][j] = _math.sqrt(s)
+            else:
+                L[i][j] = s / L[j][j]
+    r = _np.array(L)
+    return r.T.copy() if upper else r

@@ -2295,6 +2295,44 @@ V os_abspath(V *a, int n, Kw *)
     return newStr(std::filesystem::absolute(std::filesystem::path(strOf(a[0])), ec).lexically_normal().string());
 }
 
+// ── _npcore: what numpy.sa cannot do in Python ─────────────────────────────
+
+// x rounded to float32
+V np_f32(V *a, int n, Kw *)
+{
+    checkArgs("f32", n, 1, 1);
+    return mkfloat((double)(float)toDouble(a[0]));
+}
+
+// the shortest repr that reads back as the same float32
+V np_f32repr(V *a, int n, Kw *)
+{
+    checkArgs("f32repr", n, 1, 1);
+    double d = toDouble(a[0]);
+    float f = (float)d;
+    if (d != d || d - d != 0 || d == 0)
+        return newStr(floatRepr(d));
+    char buf[64];
+    for (int prec = 1; prec <= 9; ++prec)
+    {
+        snprintf(buf, sizeof buf, "%.*e", prec - 1, (double)f);
+        if ((float)strtod(buf, nullptr) == f)
+            return newStr(floatRepr(strtod(buf, nullptr)));
+    }
+    return newStr(floatRepr((double)f));
+}
+
+V npcoreModule()
+{
+    ModuleObj *m = new ModuleObj(tModule);
+    m->name = "_npcore";
+    m->dict = newDict();
+    setAttrStr(m->dict, "__name__", newStr("_npcore"));
+    setAttrStr(m->dict, "f32", makeNative("f32", np_f32));
+    setAttrStr(m->dict, "f32repr", makeNative("f32repr", np_f32repr));
+    return m;
+}
+
 V osNativeModule()
 {
     ModuleObj *m = new ModuleObj(tModule);
@@ -2478,6 +2516,7 @@ void registerNativeModules()
     defProperty(tFile, "mode", file_mode);
     registerNativeModule("time", timeModule);
     registerNativeModule("_os", osNativeModule);
+    registerNativeModule("_npcore", npcoreModule);
 }
 
 } // namespace py

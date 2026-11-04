@@ -1,0 +1,2990 @@
+"""The second half of numpy: printing, reductions, shape functions, sorting,
+sets, statistics, polynomials. It sees the names numpy.sa defined first."""
+
+import numpy as _np
+globals().update({_k: _v for _k, _v in vars(_np).items() if not _k.startswith("__")})
+import math as _math
+import builtins as _bi
+
+
+# ═══════════════════════════════════ printing ═════════════════════════════════
+
+_print_opts = {"precision": 8, "threshold": 1000, "edgeitems": 3, "linewidth": 75, "suppress": False,
+               "nanstr": "nan", "infstr": "inf", "sign": "-", "floatmode": "maxprec", "legacy": False,
+               "formatter": None}
+
+
+def set_printoptions(precision=None, threshold=None, edgeitems=None, linewidth=None, suppress=None,
+                     nanstr=None, infstr=None, formatter=None, sign=None, floatmode=None, *, legacy=None,
+                     override_repr=None):
+    for k, v in (("precision", precision), ("threshold", threshold), ("edgeitems", edgeitems),
+                 ("linewidth", linewidth), ("suppress", suppress), ("nanstr", nanstr), ("infstr", infstr),
+                 ("sign", sign), ("floatmode", floatmode), ("formatter", formatter)):
+        if v is not None:
+            _print_opts[k] = v
+    if threshold is not None and threshold == _math.inf:
+        _print_opts["threshold"] = 9223372036854775807
+
+
+def get_printoptions():
+    return dict(_print_opts)
+
+
+class printoptions:
+    def __init__(self, **kw):
+        self._kw = kw
+
+    def __enter__(self):
+        self._saved = dict(_print_opts)
+        set_printoptions(**self._kw)
+        return get_printoptions()
+
+    def __exit__(self, *exc):
+        _print_opts.clear()
+        _print_opts.update(self._saved)
+        return False
+
+
+def _digits(x, f32):
+    """Shortest round-trip digits of x: (sign, digit string, decimal exponent)."""
+    s = _npcore.f32repr(x) if f32 else repr(_bi.float(x))
+    neg = s.startswith("-")
+    if neg:
+        s = s[1:]
+    if "e" in s:
+        mant, ex = s.split("e")
+        ex = _bi.int(ex)
+    else:
+        mant, ex = s, 0
+    if "." in mant:
+        ip, fp = mant.split(".")
+    else:
+        ip, fp = mant, ""
+    digits = (ip + fp).lstrip("0")
+    # position of the decimal point relative to the first significant digit
+    point = len(ip) + ex
+    lead = len(ip + fp) - len((ip + fp).lstrip("0"))
+    point -= lead
+    digits = digits.rstrip("0")
+    if not digits:
+        digits = "0"
+        point = 1
+    return neg, digits, point
+
+
+def _positional(x, precision, unique=True, trim=".", min_digits=0, f32=False):
+    """dragon4_positional: shortest digits, at most `precision` after the point."""
+    neg, digits, point = _digits(x, f32)
+    frac_len = _bi.max(0, len(digits) - point)
+    if precision is not None and frac_len > precision:
+        s = format(_bi.float(x), f".{precision}f")
+        neg = s.startswith("-")
+        if neg:
+            s = s[1:]
+        ip, fp = s.split(".") if "." in s else (s, "")
+        fp = fp.rstrip("0")
+    else:
+        if point <= 0:
+            ip = "0"
+            fp = "0" * (-point) + digits
+        elif point >= len(digits):
+            ip = digits + "0" * (point - len(digits))
+            fp = ""
+        else:
+            ip = digits[:point]
+            fp = digits[point:]
+        if digits == "0":
+            ip, fp = "0", ""
+    if len(fp) < min_digits:
+        fp = fp + "0" * (min_digits - len(fp))
+    if trim == "-" and not fp:
+        s = ip
+    elif trim == "0" and not fp:
+        s = ip + ".0"
+    else:
+        s = ip + "." + fp
+    return ("-" if neg else "") + s
+
+
+def _scientific(x, precision, unique=True, trim=".", min_digits=0, exp_digits=-1, f32=False):
+    neg, digits, point = _digits(x, f32)
+    exp = point - 1
+    mant = digits
+    if precision is not None and len(mant) - 1 > precision:
+        s = format(_bi.float(x), f".{precision}e")
+        neg = s.startswith("-")
+        if neg:
+            s = s[1:]
+        m, ex = s.split("e")
+        exp = _bi.int(ex)
+        mant = m.replace(".", "").rstrip("0") or "0"
+    if digits == "0":
+        exp = 0
+    fp = mant[1:]
+    if len(fp) < min_digits:
+        fp = fp + "0" * (min_digits - len(fp))
+    es = str(_bi.abs(exp))
+    width = _bi.max(2, exp_digits)
+    es = es.rjust(width, "0")
+    return ("-" if neg else "") + mant[0] + "." + fp + "e" + ("-" if exp < 0 else "+") + es
+
+
+class _FloatFormat:
+    def __init__(self, data, precision, floatmode, suppress, sign, f32):
+        self.precision = precision
+        self.floatmode = floatmode
+        self.suppress = suppress
+        self.sign = sign
+        self.f32 = f32
+        self.exp_format = False
+        self.large_exponent = False
+        finite = [v for v in data if v == v and v not in (inf, -inf)]
+        nz = [_bi.abs(v) for v in finite if v != 0]
+        if nz:
+            mx = _bi.max(nz)
+            mn = _bi.min(nz)
+            if mx >= 1.e8 or (not suppress and (mn < 0.0001 or mx / mn > 1000.)):
+                self.exp_format = True
+        if not finite:
+            self.pad_left = 0
+            self.pad_right = 0
+            self.trim = "."
+            self.exp_size = -1
+            self.unique = True
+            self.min_digits = None
+        elif self.exp_format:
+            trim, unique = ".", True
+            if floatmode == "fixed":
+                trim, unique = "k", False
+            strs = [_scientific(v, precision, unique, trim, f32=f32) for v in finite]
+            frac_strs = [s.partition("e")[0] for s in strs]
+            exp_strs = [s.partition("e")[2] for s in strs]
+            int_part = [s.split(".")[0] for s in frac_strs]
+            frac_part = [s.split(".")[1] for s in frac_strs]
+            self.exp_size = _bi.max(len(s) for s in exp_strs) - 1
+            self.trim = "k"
+            self.precision = _bi.max(len(s) for s in frac_part)
+            self.min_digits = self.precision
+            self.unique = unique
+            self.pad_left = _bi.max(len(s) for s in int_part)
+            self.pad_right = self.exp_size + 2 + self.precision
+        else:
+            trim, unique = ".", True
+            if floatmode == "fixed":
+                trim, unique = "k", False
+            strs = [_positional(v, precision, unique, trim, f32=f32) for v in finite]
+            int_part = [s.split(".")[0] for s in strs]
+            frac_part = [s.split(".")[1] if "." in s else "" for s in strs]
+            self.pad_left = _bi.max(len(s) for s in int_part)
+            self.pad_right = _bi.max(len(s) for s in frac_part)
+            self.exp_size = -1
+            self.unique = unique
+            if floatmode in ("fixed", "maxprec_equal"):
+                self.precision = self.min_digits = self.pad_right
+                self.trim = "k"
+            else:
+                self.trim = "."
+                self.min_digits = 0
+        if sign == " " and not _bi.any(_math.copysign(1.0, v) < 0 for v in finite):
+            self.pad_left += 1
+        if len(finite) != len(data):
+            neginf = sign != "-" or _bi.any(v == -inf for v in data)
+            offset = self.pad_right + 1
+            self.pad_left = _bi.max(self.pad_left, len(_print_opts["nanstr"]) - offset,
+                                    len(_print_opts["infstr"]) + neginf - offset)
+
+    def __call__(self, x):
+        if x != x or x in (inf, -inf):
+            if x != x:
+                ret = ("+" if self.sign == "+" else "") + _print_opts["nanstr"]
+            else:
+                ret = ("-" if x < 0 else "+" if self.sign == "+" else "") + _print_opts["infstr"]
+            return " " * (self.pad_left + self.pad_right + 1 - len(ret)) + ret
+        if self.exp_format:
+            s = _scientific(x, self.precision, self.unique, self.trim, self.min_digits, self.exp_size, self.f32)
+            if self.sign == "+" and not s.startswith("-"):
+                s = "+" + s
+            ip = s.split(".")[0]
+            return " " * (self.pad_left - len(ip)) + s
+        s = _positional(x, self.precision, self.unique, self.trim, self.min_digits or 0, self.f32)
+        if self.sign == "+" and not s.startswith("-"):
+            s = "+" + s
+        elif self.sign == " " and not s.startswith("-"):
+            s = " " + s
+        if "." in s:
+            ip, fp = s.split(".")
+        else:
+            ip, fp = s, None
+        left = " " * (self.pad_left - len(ip))
+        if fp is None:
+            right = " " * (self.pad_right + 1)
+        else:
+            right = " " * (self.pad_right - len(fp))
+        return left + s + right
+
+
+def _format_function(data, dt):
+    fmt = _print_opts.get("formatter")
+    if fmt:
+        key = {"b": "bool", "i": "int", "u": "int", "f": "float"}[dt.kind]
+        f = fmt.get(key) or fmt.get("all") or (fmt.get("int_kind") if dt.kind in "iu" else None) or (fmt.get("float_kind") if dt.kind == "f" else None)
+        if f:
+            return lambda v: f(_scalar(v, dt))
+    if dt.kind == "b":
+        return lambda v: " True" if v else "False"
+    if dt.kind in "iu":
+        if data:
+            width = _bi.max(len(str(_bi.max(data))), len(str(_bi.min(data))))
+        else:
+            width = 0
+        if _print_opts["sign"] == "+":
+            return lambda v: (("+" if v >= 0 else "") + str(v)).rjust(width + (1 if _bi.min(data) >= 0 else 0))
+        return lambda v: str(v).rjust(width)
+    return _FloatFormat(data, _print_opts["precision"], _print_opts["floatmode"], _print_opts["suppress"],
+                        _print_opts["sign"], dt.itemsize != 8)
+
+
+def _extend_line(s, line, word, line_width, next_line_prefix):
+    needs_wrap = len(line) + len(word) > line_width
+    if len(line) <= len(next_line_prefix):
+        needs_wrap = False
+    if needs_wrap:
+        s += line.rstrip() + "\n"
+        line = next_line_prefix
+    line += word
+    return s, line
+
+
+def _extend_line_pretty(s, line, word, line_width, next_line_prefix):
+    words = word.splitlines()
+    if len(words) == 1:
+        return _extend_line(s, line, word, line_width, next_line_prefix)
+    max_word_length = _bi.max(len(w) for w in words)
+    if len(line) + max_word_length > line_width and len(line) > len(next_line_prefix):
+        s += line.rstrip() + "\n"
+        line = next_line_prefix + words[0]
+        indent = next_line_prefix
+    else:
+        indent = len(line) * " "
+        line += words[0]
+    for w in words[1:]:
+        s += line.rstrip() + "\n"
+        line = indent + w
+    suffix_length = max_word_length - len(words[-1])
+    line += suffix_length * " "
+    return s, line
+
+
+def _format_array(a, fmt, line_width, next_line_prefix, separator, edge_items, summary_insert):
+    def recurser(index, hanging_indent, curr_width):
+        axis = len(index)
+        axes_left = a.ndim - axis
+        if axes_left == 0:
+            return fmt(a[index] if False else _elem(a, index))
+        next_hanging_indent = hanging_indent + " "
+        next_width = curr_width - len("]")
+        a_len = a.shape[axis]
+        show_summary = summary_insert and 2 * edge_items < a_len
+        if show_summary:
+            leading_items = edge_items
+            trailing_items = edge_items
+        else:
+            leading_items = 0
+            trailing_items = a_len
+        s = ""
+        if axes_left == 1:
+            elem_width = curr_width - _bi.max(len(separator.rstrip()), len("]"))
+            line = hanging_indent
+            for i in range(leading_items):
+                word = recurser(index + (i,), next_hanging_indent, next_width)
+                s, line = _extend_line_pretty(s, line, word, elem_width, hanging_indent)
+                line += separator
+            if show_summary:
+                s, line = _extend_line(s, line, summary_insert, elem_width, hanging_indent)
+                line += separator
+            for i in range(trailing_items, 1, -1):
+                word = recurser(index + (a_len - i,), next_hanging_indent, next_width)
+                s, line = _extend_line_pretty(s, line, word, elem_width, hanging_indent)
+                line += separator
+            word = recurser(index + (a_len - 1,), next_hanging_indent, next_width)
+            s, line = _extend_line_pretty(s, line, word, elem_width, hanging_indent)
+            s += line
+        else:
+            s = ""
+            line_sep = separator.rstrip() + "\n" * (axes_left - 1)
+            for i in range(leading_items):
+                nested = recurser(index + (i,), next_hanging_indent, next_width)
+                s += hanging_indent + nested + line_sep
+            if show_summary:
+                s += hanging_indent + summary_insert + line_sep
+            for i in range(trailing_items, 1, -1):
+                nested = recurser(index + (a_len - i,), next_hanging_indent, next_width)
+                s += hanging_indent + nested + line_sep
+            nested = recurser(index + (a_len - 1,), next_hanging_indent, next_width)
+            s += hanging_indent + nested
+        s = "[" + s[len(hanging_indent):] + "]"
+        return s
+    return recurser((), next_line_prefix, line_width)
+
+
+def _elem(a, index):
+    off = a._off
+    for i, st in zip(index, a._strides):
+        off += i * st
+    return a._buf[off]
+
+
+def _leading_trailing_values(a, edgeitems):
+    """The values the summarized printout shows (for the format widths)."""
+    if a.ndim == 0:
+        return a._values()
+    vals = []
+    shape = a.shape
+
+    def rec(index, axis):
+        if axis == a.ndim:
+            vals.append(_elem(a, index))
+            return
+        n = shape[axis]
+        if n > 2 * edgeitems:
+            idxs = list(range(edgeitems)) + list(range(n - edgeitems, n))
+        else:
+            idxs = range(n)
+        for i in idxs:
+            rec(index + (i,), axis + 1)
+    rec((), 0)
+    return vals
+
+
+def array2string(a, max_line_width=None, precision=None, suppress_small=None, separator=" ", prefix="",
+                 style=None, formatter=None, threshold=None, edgeitems=None, sign=None, floatmode=None,
+                 suffix="", *, legacy=None):
+    a = asarray(a)
+    saved = dict(_print_opts)
+    try:
+        for k, v in (("precision", precision), ("suppress", suppress_small), ("threshold", threshold),
+                     ("edgeitems", edgeitems), ("sign", sign), ("floatmode", floatmode),
+                     ("formatter", formatter)):
+            if v is not None:
+                _print_opts[k] = v
+        linewidth = _print_opts["linewidth"] if max_line_width is None else max_line_width
+        linewidth -= len(suffix)
+        if a.size == 0:
+            return "[]"
+        if a.size > _print_opts["threshold"]:
+            summary_insert = "..."
+            data = _leading_trailing_values(a, _print_opts["edgeitems"])
+        else:
+            summary_insert = ""
+            data = a._values()
+        fmt = _format_function(data, a.dtype)
+        next_line_prefix = " " + " " * len(prefix)
+        return _format_array(a, fmt, linewidth, next_line_prefix, separator, _print_opts["edgeitems"],
+                             summary_insert)
+    finally:
+        _print_opts.clear()
+        _print_opts.update(saved)
+
+
+def _dtype_is_implied(dt):
+    return dt.name in ("float64", "int64", "bool")
+
+
+def array_repr(arr, max_line_width=None, precision=None, suppress_small=None):
+    arr = asarray(arr)
+    if max_line_width is None:
+        max_line_width = _print_opts["linewidth"]
+    prefix = "array("
+    lst = array2string(arr, max_line_width, precision, suppress_small, ", ", prefix, suffix=")")
+    extras = []
+    if arr.size == 0 and arr.shape != (0,):
+        extras.append(f"shape={_shape_str(arr.shape)}")
+    if not _dtype_is_implied(arr.dtype) or arr.size == 0:
+        extras.append(f"dtype={arr.dtype.name}")
+    if not extras:
+        return prefix + lst + ")"
+    arr_str = prefix + lst + ","
+    extra_str = ", ".join(extras) + ")"
+    last_line_len = len(arr_str) - (arr_str.rfind("\n") + 1)
+    spacer = " "
+    if last_line_len + len(extra_str) + 1 > max_line_width:
+        spacer = "\n" + " " * len(prefix)
+    return arr_str + spacer + extra_str
+
+
+def array_str(a, max_line_width=None, precision=None, suppress_small=None):
+    a = asarray(a)
+    if a.ndim == 0:
+        return str(_scalar(a._buf[a._off], a.dtype))
+    return array2string(a, max_line_width, precision, suppress_small, " ", "")
+
+
+def format_float_positional(x, precision=None, unique=True, fractional=True, trim="k", sign=False,
+                            pad_left=None, pad_right=None, min_digits=None):
+    f32 = isinstance(x, float32)
+    s = _positional(_bi.float(x), precision, unique, "." if trim in "k." else trim, min_digits or 0, f32)
+    if trim == "k" and s.endswith("."):
+        s = s + "0" if False else s
+    if trim == "0" and s.endswith("."):
+        s += "0"
+    if trim == "-" and s.endswith("."):
+        s = s[:-1]
+    if sign and not s.startswith("-"):
+        s = "+" + s
+    if pad_left is not None:
+        ip = s.split(".")[0]
+        s = " " * (pad_left - len(ip)) + s
+    if pad_right is not None:
+        fp = s.split(".")[1] if "." in s else ""
+        s = s + " " * (pad_right - len(fp))
+    return s
+
+
+def format_float_scientific(x, precision=None, unique=True, trim="k", sign=False, pad_left=None,
+                            exp_digits=None, min_digits=None):
+    f32 = isinstance(x, float32)
+    s = _scientific(_bi.float(x), precision, unique, ".", min_digits or 0, exp_digits or -1, f32)
+    if trim == "0":
+        m, _, ex = s.partition("e")
+        if m.endswith("."):
+            s = m + "0e" + ex
+    if sign and not s.startswith("-"):
+        s = "+" + s
+    return s
+
+
+def base_repr(number, base=2, padding=0):
+    digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    num = _bi.abs(_bi.int(number))
+    res = []
+    while num:
+        res.append(digits[num % base])
+        num //= base
+    if padding:
+        res.append("0" * padding)
+    if number < 0:
+        res.append("-")
+    return "".join(reversed(res or ["0"]))
+
+
+def binary_repr(num, width=None):
+    num = _bi.int(num)
+    if num >= 0:
+        s = bin(num)[2:]
+        return s.zfill(width) if width else s
+    if width is None:
+        return "-" + bin(-num)[2:]
+    return bin((1 << width) + num)[2:].zfill(width)
+
+
+# ═════════════════════════════════ reductions ═════════════════════════════════
+
+def _pairwise(vals, lo, n):
+    if n < 8:
+        res = 0.0
+        for i in range(lo, lo + n):
+            res += vals[i]
+        return res
+    if n <= 128:
+        r0, r1, r2, r3, r4, r5, r6, r7 = vals[lo:lo + 8]
+        i = 8
+        end = n - (n % 8)
+        while i < end:
+            b = lo + i
+            r0 += vals[b]
+            r1 += vals[b + 1]
+            r2 += vals[b + 2]
+            r3 += vals[b + 3]
+            r4 += vals[b + 4]
+            r5 += vals[b + 5]
+            r6 += vals[b + 6]
+            r7 += vals[b + 7]
+            i += 8
+        res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+        while i < n:
+            res += vals[lo + i]
+            i += 1
+        return res
+    n2 = n // 2
+    n2 -= n2 % 8
+    return _pairwise(vals, lo, n2) + _pairwise(vals, lo + n2, n - n2)
+
+
+def _axes_of(axis, ndim):
+    if axis is None:
+        return tuple(range(ndim))
+    if isinstance(axis, (tuple, list)):
+        return tuple(sorted(_norm_axis(x, ndim) for x in axis))
+    return (_norm_axis(axis, ndim),)
+
+
+def _reduce_rows(a, axis):
+    """(rows, outshape): each row the values reduced into one output element.
+    For a reduction over the last axes the rows are contiguous runs; over
+    leading axes they are gathered in the order NumPy combines them."""
+    axes = _axes_of(axis, a.ndim)
+    keep = [d for d in range(a.ndim) if d not in axes]
+    outshape = tuple(a.shape[d] for d in keep)
+    perm = keep + list(axes)
+    t = a.transpose(perm)
+    n = _prod([a.shape[d] for d in axes])
+    vals = t._values()
+    rows = [vals[i * n:(i + 1) * n] for i in range(_prod(outshape))] if n else [[] for _ in range(_prod(outshape))]
+    return rows, outshape, axes
+
+
+def _finish(vals, outshape, dt, axes, keepdims, ndim, out=None):
+    if keepdims:
+        shape = []
+        it = iter(outshape)
+        for d in range(ndim):
+            shape.append(1 if d in axes else next(it))
+        outshape = tuple(shape)
+    if out is not None:
+        _assign(out, _make(vals, outshape, dt))
+        return out
+    if outshape == () and not keepdims:
+        return _scalar(vals[0], dt)
+    return _make(vals, outshape, dt)
+
+
+def _sum_dtype(dt, dtype):
+    if dtype is not None:
+        return _dtype_of(dtype)
+    if dt.kind == "b":
+        return _int64_dt
+    if dt.kind == "i" and dt.itemsize < 8:
+        return _int64_dt
+    if dt.kind == "u" and dt.itemsize < 8:
+        return _uint64_dt
+    return dt
+
+
+def _sum_row(row, dt, sequential):
+    if dt.kind == "f":
+        if sequential:
+            s = 0.0
+            for v in row:
+                s += v
+        else:
+            s = _pairwise(row, 0, len(row))
+        if dt.itemsize != 8:
+            s = _npcore.f32(s)
+        return s
+    s = 0
+    for v in row:
+        s += v
+    return _fix_int(s, dt.name)
+
+
+def sum(a, axis=None, dtype=None, out=None, keepdims=False, initial=None, where=None):
+    if not isinstance(a, ndarray):
+        if isinstance(a, generic) and axis is None:
+            return a
+        a = asarray(a)
+    rdt = _sum_dtype(a.dtype, dtype)
+    if where is not None and where is not True:
+        a = _where_fill(a, where, 0)
+    if a.ndim == 0:
+        v = _caster(rdt)(a._values()[0])
+        return _finish([v if initial is None else v + initial], (), rdt, (), keepdims, 0, out)
+    axes = _axes_of(axis, a.ndim)
+    conv = _caster(rdt)
+    if axis is None or axes == tuple(range(a.ndim)):
+        vals = [conv(v) for v in a._values()] if a.dtype is not rdt else a._values()
+        s = _sum_row(vals, rdt, False)
+        if initial is not None:
+            s = conv(s + initial)
+        return _finish([s], (), rdt, axes, keepdims, a.ndim, out)
+    # over trailing axes: pairwise per row; otherwise rows add one at a time
+    trailing = axes == tuple(range(a.ndim - len(axes), a.ndim))
+    rows, outshape, axes = _reduce_rows(a, axis)
+    res = []
+    for row in rows:
+        if a.dtype is not rdt:
+            row = [conv(v) for v in row]
+        s = _sum_row(row, rdt, not trailing)
+        if initial is not None:
+            s = conv(s + initial)
+        res.append(s)
+    return _finish(res, outshape, rdt, axes, keepdims, a.ndim, out)
+
+
+def _where_fill(a, where, fill):
+    w = _bvalues(asarray(where), a.shape)
+    return _make([v if m else fill for v, m in zip(a._values(), w)], a.shape, a.dtype)
+
+
+def prod(a, axis=None, dtype=None, out=None, keepdims=False, initial=None, where=None):
+    a = asarray(a)
+    rdt = _sum_dtype(a.dtype, dtype)
+    if where is not None and where is not True:
+        a = _where_fill(a, where, 1)
+    conv = _caster(rdt)
+    fixer = _wrapper_for(rdt)
+
+    def p(row):
+        r = 1.0 if rdt.kind == "f" else 1
+        for v in row:
+            r = r * conv(v)
+            if fixer:
+                r = fixer(r)
+        if initial is not None:
+            r = r * initial
+        return conv(r)
+    if a.ndim == 0:
+        return _finish([p(a._values())], (), rdt, (), keepdims, 0, out)
+    rows, outshape, axes = _reduce_rows(a, axis)
+    return _finish([p(r) for r in rows], outshape, rdt, axes, keepdims, a.ndim, out)
+
+
+def _minmax(a, axis, keepdims, initial, is_max, where, out, nan_skip=False):
+    a = asarray(a)
+    if where is not None and where is not True:
+        if initial is None:
+            raise ValueError("reduction operation 'maximum' does not have an identity, so to use a where mask one has to specify 'initial'")
+        a = _where_fill(a, where, initial)
+    name = "maximum" if is_max else "minimum"
+
+    def pick(row):
+        if not row:
+            if initial is not None:
+                return initial
+            raise ValueError(f"zero-size array to reduction operation {name} which has no identity")
+        best = row[0] if initial is None else initial
+        has_nan = False
+        for v in row:
+            if v != v:
+                has_nan = True
+                if not nan_skip:
+                    return v
+                continue
+            if best != best:
+                best = v
+            elif (v > best) if is_max else (v < best):
+                best = v
+        if nan_skip and has_nan and best != best:
+            return nan
+        return best
+    if a.ndim == 0:
+        return _finish([pick(a._values())], (), a.dtype, (), keepdims, 0, out)
+    rows, outshape, axes = _reduce_rows(a, axis)
+    return _finish([pick(r) for r in rows], outshape, a.dtype, axes, keepdims, a.ndim, out)
+
+
+def amax(a, axis=None, out=None, keepdims=False, initial=None, where=None):
+    return _minmax(a, axis, keepdims, initial, True, where, out)
+
+
+def amin(a, axis=None, out=None, keepdims=False, initial=None, where=None):
+    return _minmax(a, axis, keepdims, initial, False, where, out)
+
+
+max = amax
+min = amin
+
+
+def nanmax(a, axis=None, out=None, keepdims=False, initial=None, where=None):
+    return _minmax(a, axis, keepdims, initial, True, where, out, nan_skip=True)
+
+
+def nanmin(a, axis=None, out=None, keepdims=False, initial=None, where=None):
+    return _minmax(a, axis, keepdims, initial, False, where, out, nan_skip=True)
+
+
+def _argext(a, axis, is_max, keepdims=False, nan_skip=False):
+    a = asarray(a)
+
+    def pick(row):
+        if not row:
+            raise ValueError(f"attempt to get {'argmax' if is_max else 'argmin'} of an empty sequence")
+        best_i = -1
+        best = None
+        for i, v in enumerate(row):
+            if v != v:
+                if nan_skip:
+                    continue
+                return i
+            if best_i < 0 or ((v > best) if is_max else (v < best)):
+                best_i = i
+                best = v
+        if best_i < 0:
+            raise ValueError("All-NaN slice encountered")
+        return best_i
+    if axis is None:
+        r = pick(a._values())
+        if keepdims:
+            return _make([r], (1,) * a.ndim, _int64_dt)
+        return _scalar(r, _int64_dt)
+    axis = _norm_axis(axis, a.ndim)
+    rows, outshape, axes = _reduce_rows(a, axis)
+    return _finish([pick(r) for r in rows], outshape, _int64_dt, axes, keepdims, a.ndim)
+
+
+def argmax(a, axis=None, out=None, *, keepdims=False):
+    return _argext(a, axis, True, keepdims)
+
+
+def argmin(a, axis=None, out=None, *, keepdims=False):
+    return _argext(a, axis, False, keepdims)
+
+
+def nanargmax(a, axis=None, out=None, *, keepdims=False):
+    return _argext(a, axis, True, keepdims, True)
+
+
+def nanargmin(a, axis=None, out=None, *, keepdims=False):
+    return _argext(a, axis, False, keepdims, True)
+
+
+def _count(a, axis):
+    axes = _axes_of(axis, a.ndim)
+    return _prod([a.shape[d] for d in axes])
+
+
+def mean(a, axis=None, dtype=None, out=None, keepdims=False, *, where=None):
+    a = asarray(a)
+    rdt = _float64_dt if dtype is None and a.dtype.kind in "iub" else (a.dtype if dtype is None else _dtype_of(dtype))
+    if where is not None and where is not True:
+        w = asarray(where)
+        cnt = sum(broadcast_to(w, a.shape).astype(int64), axis=axis, keepdims=keepdims)
+        s = sum(a, axis=axis, dtype=rdt, keepdims=keepdims, where=where)
+        return true_divide(s, cnt)
+    n = _count(a, axis)
+    if n == 0:
+        _warn("invalid", "Mean of empty slice.")
+    s = sum(a, axis=axis, dtype=rdt, keepdims=keepdims)
+    if isinstance(s, ndarray):
+        r = true_divide(s, n)
+        r = r.astype(rdt) if r.dtype is not rdt else r
+        if out is not None:
+            _assign(out, r)
+            return out
+        return r
+    v = _fdiv(_bi.float(s), _bi.float(n)) if n else nan
+    if rdt.itemsize != 8:
+        v = _npcore.f32(v)
+    return _scalar(v, rdt)
+
+
+def var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *, where=None, mean=None, correction=None):
+    a = asarray(a)
+    if correction is not None:
+        ddof = correction
+    rdt = _float64_dt if a.dtype.kind in "iub" else a.dtype
+    m = _np.mean(a, axis=axis, keepdims=True)
+    x = subtract(a, m) if a.dtype.kind == "f" else subtract(a.astype(float64), m)
+    x = multiply(x, x)
+    s = sum(x, axis=axis, keepdims=keepdims)
+    n = _count(a, axis)
+    d = _bi.max(n - ddof, 0)
+    if isinstance(s, ndarray):
+        return true_divide(s, d)
+    return _scalar(_fdiv(_bi.float(s), _bi.float(d)), rdt)
+
+
+def std(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *, where=None, mean=None, correction=None):
+    v = var(a, axis=axis, dtype=dtype, ddof=ddof, keepdims=keepdims, correction=correction)
+    return sqrt(v)
+
+
+def ptp(a, axis=None, out=None, keepdims=False):
+    return subtract(amax(a, axis=axis, keepdims=keepdims), amin(a, axis=axis, keepdims=keepdims))
+
+
+def _nan_filled(a, fill):
+    a = asarray(a)
+    if a.dtype.kind != "f":
+        return a
+    return _make([fill if v != v else v for v in a._values()], a.shape, a.dtype)
+
+
+def nansum(a, axis=None, dtype=None, out=None, keepdims=False, initial=None, where=None):
+    return sum(_nan_filled(a, 0.0), axis=axis, dtype=dtype, keepdims=keepdims, initial=initial)
+
+
+def nanprod(a, axis=None, dtype=None, out=None, keepdims=False, initial=None, where=None):
+    return prod(_nan_filled(a, 1.0), axis=axis, dtype=dtype, keepdims=keepdims)
+
+
+def nanmean(a, axis=None, dtype=None, out=None, keepdims=False, *, where=None):
+    a = asarray(a)
+    if a.dtype.kind != "f":
+        return mean(a, axis=axis, keepdims=keepdims)
+    mask = ~isnan(a)
+    cnt = sum(mask, axis=axis, keepdims=keepdims)
+    tot = nansum(a, axis=axis, keepdims=keepdims)
+    return true_divide(tot, cnt)
+
+
+def nanvar(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *, where=None, mean=None, correction=None):
+    a = asarray(a)
+    if a.dtype.kind != "f":
+        return var(a, axis=axis, ddof=ddof, keepdims=keepdims)
+    mask = ~isnan(a)
+    cnt = sum(mask, axis=axis, keepdims=True)
+    avg = true_divide(nansum(a, axis=axis, keepdims=True), cnt)
+    x = subtract(a, avg)
+    x = _np.where(mask, x, 0.0)
+    sq = multiply(x, x)
+    s = sum(sq, axis=axis, keepdims=keepdims)
+    c = sum(mask, axis=axis, keepdims=keepdims)
+    return true_divide(s, maximum(subtract(c, ddof), 0))
+
+
+def nanstd(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *, where=None, mean=None, correction=None):
+    return sqrt(nanvar(a, axis=axis, ddof=ddof, keepdims=keepdims))
+
+
+def nancumsum(a, axis=None, dtype=None, out=None):
+    return cumsum(_nan_filled(a, 0.0), axis=axis, dtype=dtype)
+
+
+def nancumprod(a, axis=None, dtype=None, out=None):
+    return cumprod(_nan_filled(a, 1.0), axis=axis, dtype=dtype)
+
+
+def nanmedian(a, axis=None, out=None, overwrite_input=False, keepdims=False):
+    a = asarray(a)
+    if axis is None:
+        vals = [v for v in a._values() if v == v]
+        return median(array(vals, dtype=a.dtype))
+    a2 = moveaxis(a, axis, -1)
+    res = [median(array([v for v in row._values() if v == v], dtype=a.dtype)) for row in a2.reshape(-1, a2.shape[-1])]
+    r = array(res).reshape(a2.shape[:-1])
+    return expand_dims(r, axis) if keepdims else r
+
+
+def nanpercentile(a, q, axis=None, out=None, overwrite_input=False, method="linear", keepdims=False):
+    a = asarray(a)
+    if axis is None:
+        return percentile(array([v for v in a._values() if v == v], dtype=a.dtype), q, method=method)
+    a2 = moveaxis(a, axis, -1)
+    res = [percentile(array([v for v in row._values() if v == v], dtype=a.dtype), q, method=method)
+           for row in a2.reshape(-1, a2.shape[-1])]
+    return array(res).reshape(a2.shape[:-1] + asarray(q).shape)
+
+
+def nanquantile(a, q, axis=None, out=None, overwrite_input=False, method="linear", keepdims=False):
+    return nanpercentile(a, multiply(q, 100), axis=axis, method=method, keepdims=keepdims)
+
+
+def _cum(a, axis, dtype, is_sum):
+    a = asarray(a)
+    if axis is None:
+        a = a.ravel()
+        axis = 0
+    axis = _norm_axis(axis, a.ndim)
+    rdt = _sum_dtype(a.dtype, dtype)
+    conv = _caster(rdt)
+    fixer = _wrapper_for(rdt)
+    moved = moveaxis(a, axis, -1)
+    n = moved.shape[-1]
+    vals = moved._values()
+    out = []
+    for r in range(len(vals) // n if n else 0):
+        acc = 0 if is_sum else 1
+        if rdt.kind == "f":
+            acc = 0.0 if is_sum else 1.0
+        for v in vals[r * n:(r + 1) * n]:
+            v = conv(v)
+            acc = acc + v if is_sum else acc * v
+            if fixer:
+                acc = fixer(acc)
+            out.append(acc)
+    res = _make(out, moved.shape, rdt)
+    return moveaxis(res, -1, axis)
+
+
+def cumsum(a, axis=None, dtype=None, out=None):
+    return _cum(a, axis, dtype, True)
+
+
+def cumprod(a, axis=None, dtype=None, out=None):
+    return _cum(a, axis, dtype, False)
+
+
+cumulative_sum = cumsum
+cumulative_prod = cumprod
+
+
+def diff(a, n=1, axis=-1, prepend=None, append=None):
+    a = asarray(a)
+    if prepend is not None or append is not None:
+        parts = []
+        if prepend is not None:
+            p = asarray(prepend)
+            if p.ndim == 0:
+                shp = list(a.shape)
+                shp[axis] = 1
+                p = broadcast_to(p, tuple(shp))
+            parts.append(p)
+        parts.append(a)
+        if append is not None:
+            p = asarray(append)
+            if p.ndim == 0:
+                shp = list(a.shape)
+                shp[axis] = 1
+                p = broadcast_to(p, tuple(shp))
+            parts.append(p)
+        a = concatenate(parts, axis=axis)
+    for _ in range(n):
+        axis_n = _norm_axis(axis, a.ndim)
+        sl1 = [slice(None)] * a.ndim
+        sl2 = [slice(None)] * a.ndim
+        sl1[axis_n] = slice(1, None)
+        sl2[axis_n] = slice(None, -1)
+        if a.dtype.kind == "b":
+            a = not_equal(a[tuple(sl1)], a[tuple(sl2)])
+        else:
+            a = subtract(a[tuple(sl1)], a[tuple(sl2)])
+    return a
+
+
+def ediff1d(ary, to_end=None, to_begin=None):
+    a = asarray(ary).ravel()
+    d = diff(a)
+    parts = []
+    if to_begin is not None:
+        parts.append(asarray(to_begin).ravel())
+    parts.append(d)
+    if to_end is not None:
+        parts.append(asarray(to_end).ravel())
+    return concatenate(parts) if len(parts) > 1 else d
+
+
+def all(a, axis=None, out=None, keepdims=False, *, where=None):
+    a = asarray(a)
+    if a.ndim == 0 or axis is None:
+        r = _bi.all(_bi.bool(v) for v in a._values())
+        if keepdims:
+            return _make([r], (1,) * a.ndim, _bool_dt)
+        return bool_(r)
+    rows, outshape, axes = _reduce_rows(a, axis)
+    return _finish([_bi.all(_bi.bool(v) for v in r) for r in rows], outshape, _bool_dt, axes, keepdims, a.ndim)
+
+
+def any(a, axis=None, out=None, keepdims=False, *, where=None):
+    a = asarray(a)
+    if a.ndim == 0 or axis is None:
+        r = _bi.any(_bi.bool(v) for v in a._values())
+        if keepdims:
+            return _make([r], (1,) * a.ndim, _bool_dt)
+        return bool_(r)
+    rows, outshape, axes = _reduce_rows(a, axis)
+    return _finish([_bi.any(_bi.bool(v) for v in r) for r in rows], outshape, _bool_dt, axes, keepdims, a.ndim)
+
+
+alltrue = all
+sometrue = any
+
+
+def count_nonzero(a, axis=None, *, keepdims=False):
+    a = asarray(a)
+    if axis is None:
+        n = _bi.sum(1 for v in a._values() if v)
+        if keepdims:
+            return _make([n], (1,) * a.ndim, _int64_dt)
+        return n
+    rows, outshape, axes = _reduce_rows(a, axis)
+    return _finish([_bi.sum(1 for v in r if v) for r in rows], outshape, _int64_dt, axes, keepdims, a.ndim)
+
+
+def average(a, axis=None, weights=None, returned=False, *, keepdims=False):
+    a = asarray(a)
+    if weights is None:
+        avg = mean(a, axis=axis, keepdims=keepdims)
+        scl = _count(a, axis)
+        if returned:
+            return avg, float64(scl) if not isinstance(avg, ndarray) else full_like(avg, scl, dtype=float64)
+        return avg
+    w = asarray(weights)
+    rdt = result_type(a.dtype, w.dtype, 1.0) if a.dtype.kind != "f" or w.dtype.kind != "f" else promote_types(a.dtype, w.dtype)
+    if a.shape != w.shape:
+        if axis is None:
+            raise TypeError("Axis must be specified when shapes of a and weights differ.")
+        if w.ndim != 1:
+            raise TypeError("1D weights expected when shapes of a and weights differ.")
+        if w.shape[0] != a.shape[axis]:
+            raise ValueError("Length of weights not compatible with specified axis.")
+        shape = [1] * a.ndim
+        shape[_norm_axis(axis, a.ndim)] = w.shape[0]
+        w = broadcast_to(w.reshape(shape), a.shape)
+    scl = sum(w, axis=axis, dtype=rdt, keepdims=keepdims)
+    avg = true_divide(sum(multiply(a, w), axis=axis, dtype=rdt, keepdims=keepdims), scl)
+    if returned:
+        return avg, scl
+    return avg
+
+
+def _lerp(a, b, t):
+    diff_b_a = b - a
+    if t >= 0.5:
+        return b - diff_b_a * (1 - t)
+    return a + diff_b_a * t
+
+
+def _quantile_1d(vals, q, method):
+    n = len(vals)
+    if n == 0:
+        return nan
+    s = sorted(vals)
+    if any_nan(s):
+        return nan
+    if method == "linear":
+        virtual = (n - 1) * q
+    elif method == "lower":
+        return s[_math.floor((n - 1) * q)]
+    elif method == "higher":
+        return s[_math.ceil((n - 1) * q)]
+    elif method == "nearest":
+        v = (n - 1) * q
+        r = _bi.round(v)
+        return s[_bi.int(r)]
+    elif method == "midpoint":
+        v = (n - 1) * q
+        lo = s[_math.floor(v)]
+        hi = s[_math.ceil(v)]
+        return (lo + hi) / 2
+    else:
+        virtual = (n - 1) * q
+    prev = _math.floor(virtual)
+    nxt = prev + 1
+    gamma = virtual - prev
+    if prev < 0:
+        return s[0]
+    if prev >= n - 1:
+        return s[-1]
+    return _lerp(_bi.float(s[prev]), _bi.float(s[nxt]), gamma)
+
+
+def any_nan(vals):
+    for v in vals:
+        if v != v:
+            return True
+    return False
+
+
+def quantile(a, q, axis=None, out=None, overwrite_input=False, method="linear", keepdims=False, *, weights=None, interpolation=None):
+    if interpolation is not None:
+        method = interpolation
+    a = asarray(a)
+    qa = asarray(q, dtype=float64)
+    if qa.ndim == 0:
+        qs = [_bi.float(qa._values()[0])]
+    else:
+        qs = [_bi.float(v) for v in qa._values()]
+    for qq in qs:
+        if not 0 <= qq <= 1:
+            raise ValueError("Quantiles must be in the range [0, 1]")
+    rdt = a.dtype if a.dtype.kind == "f" and method not in ("lower", "higher", "nearest") else _float64_dt
+    if method in ("lower", "higher", "nearest") and a.dtype.kind in "iu":
+        rdt = a.dtype
+    if axis is None:
+        vals = a._values()
+        res = [_quantile_1d(vals, qq, method) for qq in qs]
+        if qa.ndim == 0:
+            r = _scalar(_caster(rdt)(res[0]), rdt)
+            if keepdims:
+                return _make([res[0]], (1,) * a.ndim, rdt)
+            return r
+        r = _make([_caster(rdt)(v) for v in res], qa.shape, rdt)
+        return r
+    axis_n = _norm_axis(axis, a.ndim)
+    moved = moveaxis(a, axis_n, -1)
+    rows = moved.reshape(-1, moved.shape[-1])
+    outshape = moved.shape[:-1]
+    per_q = []
+    for qq in qs:
+        vals = [_caster(rdt)(_quantile_1d(r._values(), qq, method)) for r in rows]
+        r = _make(vals, outshape, rdt)
+        if keepdims:
+            r = expand_dims(r, axis_n)
+        per_q.append(r)
+    if qa.ndim == 0:
+        return per_q[0]
+    return stack(per_q).reshape(qa.shape + per_q[0].shape)
+
+
+def percentile(a, q, axis=None, out=None, overwrite_input=False, method="linear", keepdims=False, *, weights=None, interpolation=None):
+    qa = true_divide(asarray(q, dtype=float64), 100)
+    if not isinstance(q, ndarray) and not isinstance(q, (list, tuple)):
+        qa = _bi.float(qa) if not isinstance(qa, ndarray) else qa
+    return quantile(a, qa, axis=axis, method=method if interpolation is None else interpolation, keepdims=keepdims)
+
+
+def median(a, axis=None, out=None, overwrite_input=False, keepdims=False):
+    a = asarray(a)
+
+    def med(vals):
+        n = len(vals)
+        if n == 0:
+            _warn("invalid", "Mean of empty slice.")
+            return nan
+        s = sorted(vals)
+        if a.dtype.kind == "f" and any_nan(vals):
+            return nan
+        if n % 2:
+            v = s[n // 2]
+            return _bi.float(v)
+        x, y = s[n // 2 - 1], s[n // 2]
+        if a.dtype.kind == "f":
+            return (x + y) / 2.0 if False else _np_mean_two(x, y)
+        return _np_mean_two(_bi.float(x), _bi.float(y))
+    rdt = a.dtype if a.dtype.kind == "f" else _float64_dt
+    if axis is None:
+        r = med(a._values())
+        if keepdims:
+            return _make([r], (1,) * a.ndim, rdt)
+        return _scalar(_caster(rdt)(r), rdt)
+    rows, outshape, axes = _reduce_rows(a, axis)
+    return _finish([_caster(rdt)(med(r)) for r in rows], outshape, rdt, axes, keepdims, a.ndim)
+
+
+def _np_mean_two(x, y):
+    # np.mean of two values: (x + y) / 2 with x + y summed from 0
+    return (0.0 + x + y) / 2.0
+
+
+def bincount(x, weights=None, minlength=0):
+    x = asarray(x)
+    vals = [_bi.int(v) for v in x.ravel()._values()]
+    if any(v < 0 for v in vals) if False else _bi.any(v < 0 for v in vals):
+        raise ValueError("'list' argument must have no negative elements")
+    n = _bi.max(_bi.max(vals) + 1 if vals else 0, minlength)
+    if weights is None:
+        counts = [0] * n
+        for v in vals:
+            counts[v] += 1
+        return _make(counts, (n,), _int64_dt)
+    w = [_bi.float(v) for v in asarray(weights).ravel()._values()]
+    sums = [0.0] * n
+    for v, ww in zip(vals, w):
+        sums[v] += ww
+    return _make(sums, (n,), _float64_dt)
+
+
+def histogram_bin_edges(a, bins=10, range=None, weights=None):
+    a = asarray(a).ravel()
+    if isinstance(bins, (_bi.int, integer)):
+        if range is None:
+            if a.size == 0:
+                first, last = 0.0, 1.0
+            else:
+                first, last = _bi.float(amin(a)), _bi.float(amax(a))
+        else:
+            first, last = _bi.float(range[0]), _bi.float(range[1])
+        if first == last:
+            first -= 0.5
+            last += 0.5
+        return linspace(first, last, _bi.int(bins) + 1, endpoint=True)
+    return asarray(bins)
+
+
+def histogram(a, bins=10, range=None, density=None, weights=None):
+    a = asarray(a).ravel()
+    vals = a._values()
+    w = None if weights is None else asarray(weights).ravel()._values()
+    if isinstance(bins, (_bi.int, integer)):
+        nb = _bi.int(bins)
+        edges = histogram_bin_edges(a, nb, range)
+        first, last = edges._values()[0], edges._values()[-1]
+        ev = edges._values()
+        counts = [0] * nb if w is None else [0.0] * nb
+        norm_den = last - first
+        for k, x in enumerate(vals):
+            x = _bi.float(x)
+            if x < first or x > last:
+                continue
+            f = ((x - first) / norm_den) * nb
+            i = _bi.int(f)
+            if i == nb:
+                i -= 1
+            if x < ev[i]:
+                i -= 1
+            elif i != nb - 1 and x >= ev[i + 1]:
+                i += 1
+            counts[i] += 1 if w is None else w[k]
+    else:
+        edges = asarray(bins)
+        ev = [_bi.float(v) for v in edges._values()]
+        nb = len(ev) - 1
+        counts = [0] * nb if w is None else [0.0] * nb
+        for k, x in enumerate(vals):
+            x = _bi.float(x)
+            if x < ev[0] or x > ev[-1]:
+                continue
+            if x == ev[-1]:
+                i = nb - 1
+            else:
+                lo, hi = 0, len(ev)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if ev[mid] <= x:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                i = lo - 1
+            counts[i] += 1 if w is None else w[k]
+    hist = _make(counts, (nb,), _int64_dt if w is None else _float64_dt)
+    if density:
+        widths = diff(edges.astype(float64))
+        hist = true_divide(true_divide(hist, widths), sum(hist))
+    return hist, edges
+
+
+def corrcoef(x, y=None, rowvar=True, *, dtype=None):
+    c = cov(x, y, rowvar)
+    if c.ndim == 0:
+        return true_divide(c, c)
+    d = diag(c)
+    stddev = sqrt(d)
+    c = true_divide(c, stddev[:, None])
+    c = true_divide(c, stddev[None, :])
+    c = clip(c, -1, 1)
+    return c
+
+
+def cov(m, y=None, rowvar=True, bias=False, ddof=None, fweights=None, aweights=None, *, dtype=None):
+    X = array(m, ndmin=2, dtype=float64)
+    if not rowvar and X.shape[0] != 1:
+        X = X.T
+    if y is not None:
+        Y = array(y, ndmin=2, dtype=float64)
+        if not rowvar and Y.shape[0] != 1:
+            Y = Y.T
+        X = concatenate((X, Y), axis=0)
+    if ddof is None:
+        ddof = 0 if bias else 1
+    avg = mean(X, axis=1)
+    fact = X.shape[1] - ddof
+    X = subtract(X, avg[:, None])
+    c = dot(X, X.T)
+    c = true_divide(c, fact)
+    if c.shape == (1, 1):
+        return c.reshape(())
+    return c
+
+
+# ═══════════════════════════════ shape functions ══════════════════════════════
+
+def reshape(a, shape=None, order="C", *, newshape=None, copy=None):
+    if shape is None:
+        shape = newshape
+    return asarray(a).reshape(shape, order=order)
+
+
+def ravel(a, order="C"):
+    return asarray(a).ravel(order)
+
+
+def transpose(a, axes=None):
+    a = asarray(a)
+    return a.transpose(axes) if axes is not None else a.transpose()
+
+
+def permute_dims(a, axes=None):
+    return transpose(a, axes)
+
+
+def swapaxes(a, axis1, axis2):
+    a = asarray(a)
+    perm = list(range(a.ndim))
+    i = _norm_axis(axis1, a.ndim)
+    j = _norm_axis(axis2, a.ndim)
+    perm[i], perm[j] = perm[j], perm[i]
+    return a.transpose(perm)
+
+
+def moveaxis(a, source, destination):
+    a = asarray(a)
+    if isinstance(source, (_bi.int, integer)):
+        source = [source]
+    if isinstance(destination, (_bi.int, integer)):
+        destination = [destination]
+    source = [_norm_axis(s, a.ndim) for s in source]
+    destination = [_norm_axis(d, a.ndim) for d in destination]
+    order = [n for n in range(a.ndim) if n not in source]
+    for dest, src in sorted(zip(destination, source)):
+        order.insert(dest, src)
+    return a.transpose(order)
+
+
+def rollaxis(a, axis, start=0):
+    a = asarray(a)
+    n = a.ndim
+    axis = _norm_axis(axis, n)
+    if start < 0:
+        start += n
+    if axis < start:
+        start -= 1
+    if axis == start:
+        return a
+    axes = list(range(n))
+    axes.remove(axis)
+    axes.insert(start, axis)
+    return a.transpose(axes)
+
+
+def expand_dims(a, axis):
+    a = asarray(a)
+    if isinstance(axis, (_bi.int, integer)):
+        axis = (axis,)
+    out_ndim = len(axis) + a.ndim
+    axis = sorted(_norm_axis(x, out_ndim) for x in axis)
+    shape = list(a.shape)
+    for ax in axis:
+        shape.insert(ax, 1)
+    return a.reshape(shape)
+
+
+def squeeze(a, axis=None):
+    a = asarray(a)
+    if axis is None:
+        keep = [d for d in range(a.ndim) if a.shape[d] != 1]
+    else:
+        axes = _axes_of(axis, a.ndim)
+        for d in axes:
+            if a.shape[d] != 1:
+                raise ValueError("cannot select an axis to squeeze out which has size not equal to one")
+        keep = [d for d in range(a.ndim) if d not in axes]
+    return _view_of(a, a._off, tuple(a.shape[d] for d in keep), tuple(a._strides[d] for d in keep))
+
+
+def atleast_1d(*arys):
+    res = []
+    for a in arys:
+        a = asarray(a)
+        res.append(a.reshape(1) if a.ndim == 0 else a)
+    return res[0] if len(res) == 1 else tuple(res)
+
+
+def atleast_2d(*arys):
+    res = []
+    for a in arys:
+        a = asarray(a)
+        if a.ndim == 0:
+            a = a.reshape(1, 1)
+        elif a.ndim == 1:
+            a = a[None, :]
+        res.append(a)
+    return res[0] if len(res) == 1 else tuple(res)
+
+
+def atleast_3d(*arys):
+    res = []
+    for a in arys:
+        a = asarray(a)
+        if a.ndim == 0:
+            a = a.reshape(1, 1, 1)
+        elif a.ndim == 1:
+            a = a[None, :, None]
+        elif a.ndim == 2:
+            a = a[:, :, None]
+        res.append(a)
+    return res[0] if len(res) == 1 else tuple(res)
+
+
+def concatenate(arrays, axis=0, out=None, dtype=None, casting="same_kind"):
+    arrs = [asarray(a) for a in arrays]
+    if not arrs:
+        raise ValueError("need at least one array to concatenate")
+    if axis is None:
+        arrs = [a.ravel() for a in arrs]
+        axis = 0
+    nd = arrs[0].ndim
+    if nd == 0:
+        raise ValueError("zero-dimensional arrays cannot be concatenated")
+    axis = _norm_axis(axis, nd)
+    for i, a in enumerate(arrs):
+        if a.ndim != nd:
+            raise ValueError(f"all the input array dimensions except for the concatenation axis must match exactly, but along dimension 0, the array at index 0 has {nd} dimension(s) and the array at index {i} has {a.ndim} dimension(s)" if False else
+                             f"all the input arrays must have same number of dimensions, but the array at index 0 has {nd} dimension(s) and the array at index {i} has {a.ndim} dimension(s)")
+        for d in range(nd):
+            if d != axis and a.shape[d] != arrs[0].shape[d]:
+                raise ValueError(f"all the input array dimensions except for the concatenation axis must match exactly, but along dimension {d}, the array at index 0 has size {arrs[0].shape[d]} and the array at index {i} has size {a.shape[d]}")
+    dt = arrs[0].dtype
+    for a in arrs[1:]:
+        dt = promote_types(dt, a.dtype)
+    if dtype is not None:
+        dt = _dtype_of(dtype)
+    conv = _caster(dt)
+    outer = _prod(arrs[0].shape[:axis])
+    chunks = []
+    for a in arrs:
+        vals = a._values()
+        if a.dtype is not dt:
+            vals = [conv(v) for v in vals]
+        inner = _prod(a.shape[axis:])
+        chunks.append((vals, inner))
+    out_vals = []
+    for o in range(outer):
+        for vals, inner in chunks:
+            out_vals.extend(vals[o * inner:(o + 1) * inner])
+    shape = list(arrs[0].shape)
+    shape[axis] = _bi.sum(a.shape[axis] for a in arrs)
+    res = _make(out_vals, tuple(shape), dt)
+    if out is not None:
+        _assign(out, res)
+        return out
+    return res
+
+
+concat = concatenate
+
+
+def stack(arrays, axis=0, out=None, *, dtype=None, casting="same_kind"):
+    arrs = [asarray(a) for a in arrays]
+    if not arrs:
+        raise ValueError("need at least one array to stack")
+    shape0 = arrs[0].shape
+    for a in arrs:
+        if a.shape != shape0:
+            raise ValueError("all input arrays must have the same shape")
+    axis = _norm_axis(axis, arrs[0].ndim + 1)
+    return concatenate([expand_dims(a, axis) for a in arrs], axis=axis, out=out, dtype=dtype)
+
+
+def vstack(tup, *, dtype=None, casting="same_kind"):
+    return concatenate([atleast_2d(a) for a in tup], axis=0, dtype=dtype)
+
+
+row_stack = vstack
+
+
+def hstack(tup, *, dtype=None, casting="same_kind"):
+    arrs = [atleast_1d(a) for a in tup]
+    if arrs and arrs[0].ndim == 1:
+        return concatenate(arrs, axis=0, dtype=dtype)
+    return concatenate(arrs, axis=1, dtype=dtype)
+
+
+def dstack(tup):
+    return concatenate([atleast_3d(a) for a in tup], axis=2)
+
+
+def column_stack(tup):
+    arrs = []
+    for v in tup:
+        a = asarray(v)
+        if a.ndim < 2:
+            a = array(a, copy=False, ndmin=2).T
+        arrs.append(a)
+    return concatenate(arrs, axis=1)
+
+
+def block(arrays):
+    def rec(x, depth):
+        if isinstance(x, list):
+            parts = [rec(v, depth + 1) for v in x]
+            nd = _bi.max(p.ndim for p in parts)
+            parts = [p.reshape((1,) * (nd - p.ndim) + p.shape) for p in parts]
+            return parts
+        return asarray(x)
+
+    def build(x):
+        if not isinstance(x, list):
+            return asarray(x)
+        built = [build(v) for v in x]
+        nd = _bi.max(_bi.max(b.ndim for b in built), _depth(x))
+        built = [b.reshape((1,) * (nd - b.ndim) + b.shape) for b in built]
+        return concatenate(built, axis=-(_depth(x)))
+
+    def _depth(x):
+        d = 0
+        while isinstance(x, list):
+            d += 1
+            x = x[0]
+        return d
+    return build(arrays)
+
+
+def _split_points(n, sections):
+    if isinstance(sections, (_bi.int, integer)):
+        k = _bi.int(sections)
+        each, extra = _bi.divmod(n, k)
+        sizes = [each + 1] * extra + [each] * (k - extra)
+        pts = [0]
+        for s in sizes:
+            pts.append(pts[-1] + s)
+        return pts
+    pts = [0] + [_bi.int(x) for x in sections] + [n]
+    return pts
+
+
+def array_split(ary, indices_or_sections, axis=0):
+    a = asarray(ary)
+    axis = _norm_axis(axis, a.ndim)
+    n = a.shape[axis]
+    pts = _split_points(n, indices_or_sections)
+    res = []
+    for i in range(len(pts) - 1):
+        sl = [slice(None)] * a.ndim
+        sl[axis] = slice(pts[i], pts[i + 1])
+        res.append(a[tuple(sl)])
+    return res
+
+
+def split(ary, indices_or_sections, axis=0):
+    a = asarray(ary)
+    if isinstance(indices_or_sections, (_bi.int, integer)):
+        n = a.shape[_norm_axis(axis, a.ndim)]
+        if n % _bi.int(indices_or_sections):
+            raise ValueError("array split does not result in an equal division")
+    return array_split(a, indices_or_sections, axis)
+
+
+def hsplit(ary, indices_or_sections):
+    a = asarray(ary)
+    return split(a, indices_or_sections, 1 if a.ndim > 1 else 0)
+
+
+def vsplit(ary, indices_or_sections):
+    return split(ary, indices_or_sections, 0)
+
+
+def dsplit(ary, indices_or_sections):
+    return split(ary, indices_or_sections, 2)
+
+
+def append(arr, values, axis=None):
+    arr = asarray(arr)
+    values = asarray(values)
+    if axis is None:
+        return concatenate((arr.ravel(), values.ravel()))
+    return concatenate((arr, values), axis=axis)
+
+
+def insert(arr, obj, values, axis=None):
+    arr = asarray(arr)
+    if axis is None:
+        arr = arr.ravel()
+        axis = 0
+    axis = _norm_axis(axis, arr.ndim)
+    n = arr.shape[axis]
+    vals = asarray(values, dtype=arr.dtype) if not isinstance(values, ndarray) else values.astype(arr.dtype)
+    if isinstance(obj, slice):
+        obj = list(range(*obj.indices(n)))
+    if isinstance(obj, (_bi.int, integer)):
+        idx = _bi.int(obj)
+        if idx < 0:
+            idx += n
+        if not 0 <= idx <= n:
+            raise IndexError(f"index {obj} is out of bounds for axis {axis} with size {n}")
+        shape = list(arr.shape)
+        shape[axis] = 1
+        if vals.ndim == arr.ndim and vals.shape[axis] > 1:
+            ins = vals
+        else:
+            ins_shape = list(arr.shape)
+            if vals.ndim == arr.ndim:
+                ins_shape[axis] = vals.shape[axis]
+            else:
+                ins_shape[axis] = 1
+                vals = expand_dims(vals, axis) if vals.ndim == arr.ndim - 1 and vals.ndim > 0 else vals
+            ins = broadcast_to(vals, tuple(ins_shape))
+        before = take(arr, list(range(idx)), axis=axis)
+        after = take(arr, list(range(idx, n)), axis=axis)
+        return concatenate((before, ins, after), axis=axis)
+    idxs = [_bi.int(i) + (n if _bi.int(i) < 0 else 0) for i in asarray(obj).ravel()._values()]
+    vlist = _bvalues(vals, (len(idxs),)) if arr.ndim == 1 else None
+    if arr.ndim == 1:
+        order = sorted(range(len(idxs)), key=lambda k: (idxs[k], k))
+        res = []
+        src = arr._values()
+        pos = 0
+        for k in order:
+            while pos < idxs[k]:
+                res.append(src[pos])
+                pos += 1
+            res.append(vlist[k])
+        res.extend(src[pos:])
+        return _make(res, (len(res),), arr.dtype)
+    r = arr
+    for off, i in enumerate(sorted(idxs)):
+        r = insert(r, i + off, values, axis)
+    return r
+
+
+def delete(arr, obj, axis=None):
+    arr = asarray(arr)
+    if axis is None:
+        arr = arr.ravel()
+        axis = 0
+    axis = _norm_axis(axis, arr.ndim)
+    n = arr.shape[axis]
+    if isinstance(obj, slice):
+        drop = set(range(*obj.indices(n)))
+    else:
+        o = asarray(obj)
+        if o.dtype.kind == "b":
+            drop = {i for i, v in enumerate(o.ravel()._values()) if v}
+        else:
+            drop = set()
+            for i in o.ravel()._values():
+                i = _bi.int(i)
+                if i < -n or i >= n:
+                    raise IndexError(f"index {i} is out of bounds for axis {axis} with size {n}")
+                drop.add(i + n if i < 0 else i)
+    keep = [i for i in range(n) if i not in drop]
+    return take(arr, keep, axis=axis)
+
+
+def resize(a, new_shape):
+    a = asarray(a)
+    shape = _norm_shape(new_shape)
+    vals = a._values()
+    n = _prod(shape)
+    if not vals:
+        return zeros(shape, a.dtype)
+    out = [vals[i % len(vals)] for i in range(n)]
+    return _make(out, shape, a.dtype)
+
+
+def trim_zeros(filt, trim="fb"):
+    a = asarray(filt)
+    vals = a._values()
+    lo, hi = 0, len(vals)
+    if "f" in trim:
+        while lo < hi and vals[lo] == 0:
+            lo += 1
+    if "b" in trim:
+        while hi > lo and vals[hi - 1] == 0:
+            hi -= 1
+    return a[lo:hi]
+
+
+def pad(array_, pad_width, mode="constant", **kwargs):
+    a = asarray(array_)
+    pw = asarray(pad_width).tolist()
+    if isinstance(pw, _bi.int):
+        pw = [[pw, pw]] * a.ndim
+    elif len(pw) and isinstance(pw[0], _bi.int):
+        if len(pw) == 1:
+            pw = [[pw[0], pw[0]]] * a.ndim
+        else:
+            pw = [pw] * a.ndim
+    elif len(pw) == 1:
+        pw = pw * a.ndim
+    cv = kwargs.get("constant_values", 0)
+    cva = asarray(cv).tolist()
+    if not isinstance(cva, list):
+        cva = [[cva, cva]] * a.ndim
+    elif cva and not isinstance(cva[0], list):
+        cva = [cva] * a.ndim if len(cva) == 2 else [[cva[0], cva[0]]] * a.ndim
+    elif len(cva) == 1:
+        cva = cva * a.ndim
+    res = a
+    for ax in range(a.ndim):
+        before, after = pw[ax]
+        n = res.shape[ax]
+        parts = []
+        if mode == "constant":
+            if before:
+                shp = list(res.shape)
+                shp[ax] = before
+                parts.append(full(tuple(shp), cva[ax][0], dtype=a.dtype))
+            parts.append(res)
+            if after:
+                shp = list(res.shape)
+                shp[ax] = after
+                parts.append(full(tuple(shp), cva[ax][1], dtype=a.dtype))
+        else:
+            if mode == "edge":
+                idx = [0] * before + list(range(n)) + [n - 1] * after
+            elif mode == "reflect":
+                idx = [abs_reflect(i, n) for i in range(-before, n + after)]
+            elif mode == "symmetric":
+                idx = [sym_reflect(i, n) for i in range(-before, n + after)]
+            elif mode == "wrap":
+                idx = [i % n for i in range(-before, n + after)]
+            else:
+                raise ValueError(f"mode '{mode}' is not supported")
+            parts.append(take(res, idx, axis=ax))
+        res = concatenate(parts, axis=ax) if len(parts) > 1 else parts[0]
+    return res
+
+
+def abs_reflect(i, n):
+    if n == 1:
+        return 0
+    period = 2 * (n - 1)
+    i %= period
+    return i if i < n else period - i
+
+
+def sym_reflect(i, n):
+    period = 2 * n
+    i %= period
+    return i if i < n else period - 1 - i
+
+
+def flip(m, axis=None):
+    m = asarray(m)
+    axes = _axes_of(axis, m.ndim)
+    key = [slice(None)] * m.ndim
+    for ax in axes:
+        key[ax] = slice(None, None, -1)
+    return m[tuple(key)]
+
+
+def fliplr(m):
+    return flip(m, 1)
+
+
+def flipud(m):
+    return flip(m, 0)
+
+
+def rot90(m, k=1, axes=(0, 1)):
+    m = asarray(m)
+    k %= 4
+    a0, a1 = axes
+    if k == 0:
+        return m[:]
+    if k == 2:
+        return flip(flip(m, a0), a1)
+    perm = list(range(m.ndim))
+    perm[a0], perm[a1] = perm[a1], perm[a0]
+    if k == 1:
+        return transpose(flip(m, a1), perm)
+    return flip(transpose(m, perm), a1)
+
+
+def roll(a, shift, axis=None):
+    a = asarray(a)
+    if axis is None:
+        flat = a.ravel()
+        return roll(flat, shift, 0).reshape(a.shape)
+    if isinstance(axis, (tuple, list)):
+        shifts = shift if isinstance(shift, (tuple, list)) else [shift] * len(axis)
+        r = a
+        for s, ax in zip(shifts, axis):
+            r = roll(r, s, ax)
+        return r
+    axis = _norm_axis(axis, a.ndim)
+    n = a.shape[axis]
+    if n == 0:
+        return a.copy()
+    s = _bi.int(shift) % n
+    idx = [(i - s) % n for i in range(n)]
+    return take(a, idx, axis=axis)
+
+
+def take(a, indices, axis=None, out=None, mode="raise"):
+    a = asarray(a)
+    if axis is None:
+        a = a.ravel()
+        axis = 0
+    axis = _norm_axis(axis, a.ndim)
+    ind = asarray(indices) if not isinstance(indices, (_bi.int, integer)) else None
+    n = a.shape[axis]
+    if ind is None:
+        i = _bi.int(indices)
+        if mode == "wrap":
+            i %= n
+        elif mode == "clip":
+            i = _bi.max(0, _bi.min(n - 1, i))
+        key = [slice(None)] * a.ndim
+        key[axis] = i
+        r = a[tuple(key)]
+        return r.copy() if isinstance(r, ndarray) else r
+    idx = [_bi.int(v) for v in ind.ravel()._values()]
+    if mode == "wrap":
+        idx = [i % n for i in idx]
+    elif mode == "clip":
+        idx = [_bi.max(0, _bi.min(n - 1, i)) for i in idx]
+    else:
+        for i in idx:
+            if i < -n or i >= n:
+                raise IndexError(f"index {i} is out of bounds for axis {axis} with size {n}")
+        idx = [i + n if i < 0 else i for i in idx]
+    moved = moveaxis(a, axis, 0)
+    inner = _prod(moved.shape[1:])
+    vals = moved._values()
+    out_vals = []
+    for i in idx:
+        out_vals.extend(vals[i * inner:(i + 1) * inner])
+    res = _make(out_vals, (len(idx),) + moved.shape[1:], a.dtype)
+    res = moveaxis(res, 0, axis).copy() if axis else res
+    if ind.ndim != 1:
+        shape = a.shape[:axis] + ind.shape + a.shape[axis + 1:]
+        res = res.reshape(shape)
+    return res
+
+
+def take_along_axis(arr, indices, axis):
+    arr = asarray(arr)
+    indices = asarray(indices)
+    if axis is None:
+        return arr.ravel()[indices.ravel()]
+    axis = _norm_axis(axis, arr.ndim)
+    shape = indices.shape
+    out = []
+    for idx in ndindex(*shape):
+        j = _bi.int(indices[idx])
+        full_idx = list(idx)
+        full_idx[axis] = j
+        out.append(_elem_value(arr, tuple(full_idx)))
+    return _make(out, shape, arr.dtype)
+
+
+def put_along_axis(arr, indices, values, axis):
+    indices = asarray(indices)
+    vals = _bvalues(asarray(values), indices.shape)
+    for k, idx in enumerate(ndindex(*indices.shape)):
+        full_idx = list(idx)
+        full_idx[axis] = _bi.int(indices[idx])
+        arr[tuple(full_idx)] = vals[k]
+
+
+def _elem_value(a, idx):
+    off = a._off
+    for d, (i, st) in enumerate(zip(idx, a._strides)):
+        if i < 0:
+            i += a.shape[d]
+        off += i * st
+    return a._buf[off]
+
+
+def put(a, ind, v, mode="raise"):
+    idx = list(a._indices())
+    ii = [_bi.int(i) for i in asarray(ind).ravel()._values()]
+    vv = asarray(v).ravel()._values()
+    conv = _caster(a.dtype)
+    for k, i in enumerate(ii):
+        n = len(idx)
+        if mode == "wrap":
+            i %= n
+        elif mode == "clip":
+            i = _bi.max(0, _bi.min(n - 1, i))
+        a._buf[idx[i]] = conv(vv[k % len(vv)])
+
+
+def place(arr, mask, vals):
+    m = asarray(mask).ravel()._values()
+    vv = asarray(vals).ravel()._values()
+    idx = [i for i, keep in zip(arr._indices(), m) if keep]
+    conv = _caster(arr.dtype)
+    for k, i in enumerate(idx):
+        arr._buf[i] = conv(vv[k % len(vv)])
+
+
+def putmask(a, mask, values):
+    m = _bvalues(asarray(mask), a.shape)
+    vv = asarray(values).ravel()._values()
+    conv = _caster(a.dtype)
+    for k, (i, keep) in enumerate(zip(a._indices(), m)):
+        if keep:
+            a._buf[i] = conv(vv[k % len(vv)])
+
+
+def copyto(dst, src, casting="same_kind", where=True):
+    if where is True:
+        _assign(dst, asarray(src))
+    else:
+        r = _np.where(where, src, dst)
+        _assign(dst, r)
+
+
+# ═══════════════════════════ selection and searching ══════════════════════════
+
+def where(condition, x=None, y=None):
+    if x is None and y is None:
+        return nonzero(condition)
+    if x is None or y is None:
+        raise ValueError("either both or neither of x and y should be given")
+    c = asarray(condition)
+    xa, kx = _as_operand(x)
+    ya, ky = _as_operand(y)
+    dt = _binary_dtype(xa, kx, ya, ky)
+    shape = _broadcast_shapes(c.shape, xa.shape, ya.shape)
+    cv = _bvalues(c, shape)
+    xv = _bvalues(xa, shape)
+    yv = _bvalues(ya, shape)
+    conv = _caster(dt)
+    return _make([conv(a) if m else conv(b) for m, a, b in zip(cv, xv, yv)], shape, dt)
+
+
+def nonzero(a):
+    a = asarray(a)
+    if a.ndim == 0:
+        raise ValueError("Calling nonzero on 0d arrays is not allowed. Use np.atleast_1d(scalar).nonzero() instead. If the context of this error is of the form `arr[nonzero(cond)]`, just use `arr[cond]`.")
+    vals = a._values()
+    coords = [[] for _ in range(a.ndim)]
+    shape = a.shape
+    strides = _c_strides(shape)
+    for flat, v in enumerate(vals):
+        if v:
+            r = flat
+            for d in range(a.ndim):
+                q, r = _bi.divmod(r, strides[d])
+                coords[d].append(q)
+    return tuple(_make(c, (len(c),), _int64_dt) for c in coords)
+
+
+def flatnonzero(a):
+    return nonzero(ravel(a))[0]
+
+
+def argwhere(a):
+    a = asarray(a)
+    if a.ndim == 0:
+        a = a.reshape(1)
+        nz = nonzero(a)
+        return _make([], (len(nz[0]), 0), _int64_dt)
+    nz = nonzero(a)
+    n = len(nz[0]._values())
+    vals = []
+    cols = [c._values() for c in nz]
+    for i in range(n):
+        for c in cols:
+            vals.append(c[i])
+    return _make(vals, (n, a.ndim), _int64_dt)
+
+
+def ix_(*args):
+    out = []
+    nd = len(args)
+    for k, new in enumerate(args):
+        new = asarray(new)
+        if new.dtype.kind == "b":
+            new = nonzero(new)[0]
+        if new.size == 0:
+            new = new.astype(int64)
+        out.append(new.reshape((1,) * k + (new.size,) + (1,) * (nd - k - 1)))
+    return tuple(out)
+
+
+def extract(condition, arr):
+    c = asarray(condition).ravel()._values()
+    a = asarray(arr).ravel()
+    vals = a._values()
+    res = [v for v, m in zip(vals, c) if m]
+    return _make(res, (len(res),), a.dtype)
+
+
+def compress(condition, a, axis=None, out=None):
+    a = asarray(a)
+    c = asarray(condition).ravel()._values()
+    if axis is None:
+        a = a.ravel()
+        axis = 0
+    idx = [i for i, m in enumerate(c) if m]
+    return take(a, idx, axis=axis)
+
+
+def select(condlist, choicelist, default=0):
+    if len(condlist) != len(choicelist):
+        raise ValueError("list of cases must be same length as list of conditions")
+    conds = [asarray(c) for c in condlist]
+    choices = [asarray(c) for c in choicelist]
+    dt = result_type(*choices, default) if choices else asarray(default).dtype
+    shape = _broadcast_shapes(*([c.shape for c in conds] + [c.shape for c in choices] + [asarray(default).shape]))
+    res = _bvalues(asarray(default), shape)
+    cv = [_bvalues(c, shape) for c in conds]
+    chv = [_bvalues(c, shape) for c in choices]
+    conv = _caster(dt)
+    out = []
+    for i in range(len(res)):
+        v = res[i]
+        for c, ch in zip(cv, chv):
+            if c[i]:
+                v = ch[i]
+                break
+        out.append(conv(v))
+    return _make(out, shape, dt)
+
+
+def choose(a, choices, out=None, mode="raise"):
+    a = asarray(a)
+    ch = [asarray(c) for c in choices]
+    shape = _broadcast_shapes(a.shape, *[c.shape for c in ch])
+    av = _bvalues(a, shape)
+    cv = [_bvalues(c, shape) for c in ch]
+    dt = ch[0].dtype
+    for c in ch[1:]:
+        dt = promote_types(dt, c.dtype)
+    return _make([cv[_bi.int(i)][k] for k, i in enumerate(av)], shape, dt)
+
+
+def piecewise(x, condlist, funclist, *args, **kw):
+    x = asarray(x)
+    if isinstance(condlist, ndarray) and condlist.dtype.kind == "b" or not isinstance(condlist, (list, tuple)):
+        condlist = [condlist]
+    condlist = [asarray(c) for c in condlist]
+    if len(funclist) == len(condlist) + 1:
+        rest = ~any(stack(condlist), axis=0) if condlist else ones(x.shape, bool)
+        condlist = condlist + [rest]
+    y = zeros_like(x)
+    for cond, func in zip(condlist, funclist):
+        if not callable(func):
+            y[cond] = func
+        else:
+            vals = x[cond]
+            if vals.size:
+                y[cond] = func(vals, *args, **kw)
+    return y
+
+
+def isin(element, test_elements, assume_unique=False, invert=False, *, kind=None):
+    e = asarray(element)
+    t = set(_py(v) for v in asarray(test_elements).ravel()._values())
+    vals = [(_py(v) in t) != invert for v in e._values()]
+    return _make(vals, e.shape, _bool_dt)
+
+
+def in1d(ar1, ar2, assume_unique=False, invert=False, *, kind=None):
+    return isin(asarray(ar1).ravel(), ar2, invert=invert)
+
+
+def searchsorted(a, v, side="left", sorter=None):
+    a = asarray(a)
+    vals = a._values()
+    if sorter is not None:
+        order = [_bi.int(i) for i in asarray(sorter)._values()]
+        vals = [vals[i] for i in order]
+
+    def find(x):
+        lo, hi = 0, len(vals)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if (vals[mid] < x) if side == "left" else (vals[mid] <= x):
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+    if isinstance(v, (ndarray, list, tuple)):
+        va = asarray(v)
+        return _make([find(x) for x in va._values()], va.shape, _int64_dt)
+    return _scalar(find(_py(v)), _int64_dt)
+
+
+def digitize(x, bins, right=False):
+    xa = asarray(x)
+    b = asarray(bins)._values()
+    increasing = len(b) < 2 or b[-1] >= b[0]
+    out = []
+    for v in xa._values():
+        if increasing:
+            lo, hi = 0, len(b)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if (b[mid] < v) if right else (b[mid] <= v):
+                    lo = mid + 1
+                else:
+                    hi = mid
+            out.append(lo)
+        else:
+            rb = b[::-1]
+            lo, hi = 0, len(rb)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if (rb[mid] <= v) if not right else (rb[mid] < v):
+                    lo = mid + 1
+                else:
+                    hi = mid
+            out.append(len(b) - lo)
+    if not isinstance(x, (ndarray, list, tuple)):
+        return _scalar(out[0], _int64_dt)
+    return _make(out, xa.shape, _int64_dt)
+
+
+# ════════════════════════════════════ sorting ═════════════════════════════════
+
+def _sort_key(v):
+    # NaN sorts to the end, as NumPy does
+    return (1, 0) if v != v else (0, v)
+
+
+def sort(a, axis=-1, kind=None, order=None, *, stable=None):
+    a = asarray(a)
+    if axis is None:
+        a = a.ravel()
+        axis = 0
+    if a.ndim == 0:
+        return a.copy()
+    axis = _norm_axis(axis, a.ndim)
+    moved = moveaxis(a, axis, -1)
+    n = moved.shape[-1]
+    vals = moved._values()
+    out = []
+    f = a.dtype.kind == "f"
+    for r in range(len(vals) // n if n else 0):
+        row = vals[r * n:(r + 1) * n]
+        out.extend(sorted(row, key=_sort_key) if f else sorted(row))
+    res = _make(out, moved.shape, a.dtype)
+    return moveaxis(res, -1, axis).copy()
+
+
+def argsort(a, axis=-1, kind=None, order=None, *, stable=None):
+    a = asarray(a)
+    if axis is None:
+        a = a.ravel()
+        axis = 0
+    axis = _norm_axis(axis, a.ndim)
+    moved = moveaxis(a, axis, -1)
+    n = moved.shape[-1]
+    vals = moved._values()
+    out = []
+    f = a.dtype.kind == "f"
+    for r in range(len(vals) // n if n else 0):
+        row = vals[r * n:(r + 1) * n]
+        if f:
+            out.extend(sorted(range(n), key=lambda i: _sort_key(row[i])))
+        else:
+            out.extend(sorted(range(n), key=lambda i: row[i]))
+    res = _make(out, moved.shape, _int64_dt)
+    return moveaxis(res, -1, axis).copy()
+
+
+def lexsort(keys, axis=-1):
+    ks = [asarray(k) for k in keys]
+    n = ks[0].shape[-1]
+    cols = [k._values() for k in ks]
+    order = sorted(range(n), key=lambda i: tuple(_sort_key(c[i]) for c in reversed(cols)))
+    return _make(order, (n,), _int64_dt)
+
+
+def partition(a, kth, axis=-1, kind="introselect", order=None):
+    return sort(a, axis=axis)
+
+
+def argpartition(a, kth, axis=-1, kind="introselect", order=None):
+    return argsort(a, axis=axis, kind="stable")
+
+
+def sort_complex(a):
+    return sort(a)
+
+
+def msort(a):
+    return sort(a, axis=0)
+
+
+# ═════════════════════════════════════ sets ═══════════════════════════════════
+
+def unique(ar, return_index=False, return_inverse=False, return_counts=False, axis=None, *, equal_nan=True, sorted=True):
+    a = asarray(ar)
+    if axis is not None:
+        axis = _norm_axis(axis, a.ndim)
+        moved = moveaxis(a, axis, 0)
+        rows = [tuple(moved[i].ravel()._values()) for i in range(moved.shape[0])]
+        keys = _bi.sorted(set(rows))
+        res = array([list(k) for k in keys], dtype=a.dtype).reshape((len(keys),) + moved.shape[1:])
+        res = moveaxis(res, 0, axis)
+        extra = []
+        if return_index:
+            extra.append(_make([rows.index(k) for k in keys], (len(keys),), _int64_dt))
+        if return_inverse:
+            pos = {k: i for i, k in enumerate(keys)}
+            extra.append(_make([pos[r] for r in rows], (len(rows),), _int64_dt))
+        if return_counts:
+            extra.append(_make([rows.count(k) for k in keys], (len(keys),), _int64_dt))
+        return (res,) + tuple(extra) if extra else res
+    vals = a._values()
+    f = a.dtype.kind == "f"
+    order = _bi.sorted(range(len(vals)), key=(lambda i: _sort_key(vals[i])) if f else (lambda i: vals[i]))
+    uniq = []
+    first = []
+    counts = []
+    inverse = [0] * len(vals)
+    for i in order:
+        v = vals[i]
+        if uniq and (uniq[-1] == v or (f and v != v and uniq[-1] != uniq[-1])):
+            counts[-1] += 1
+        else:
+            uniq.append(v)
+            first.append(i)
+            counts.append(1)
+        inverse[i] = len(uniq) - 1
+    res = _make(uniq, (len(uniq),), a.dtype)
+    extra = []
+    if return_index:
+        extra.append(_make(first, (len(first),), _int64_dt))
+    if return_inverse:
+        inv = _make(inverse, (len(inverse),), _int64_dt)
+        if a.ndim > 1:
+            inv = inv.reshape(a.shape)
+        extra.append(inv)
+    if return_counts:
+        extra.append(_make(counts, (len(counts),), _int64_dt))
+    if extra:
+        return (res,) + tuple(extra)
+    return res
+
+
+class _UniqueAll:
+    pass
+
+
+def unique_values(x):
+    return unique(x)
+
+
+def unique_counts(x):
+    from collections import namedtuple
+    r = unique(x, return_counts=True)
+    UC = namedtuple("UniqueCountsResult", ["values", "counts"])
+    return UC(*r)
+
+
+def intersect1d(ar1, ar2, assume_unique=False, return_indices=False):
+    a1 = unique(ar1) if not assume_unique else asarray(ar1).ravel()
+    a2 = unique(ar2) if not assume_unique else asarray(ar2).ravel()
+    s2 = set(a2._values())
+    vals = [v for v in a1._values() if v in s2]
+    dt = promote_types(a1.dtype, a2.dtype)
+    res = _make([_caster(dt)(v) for v in vals], (len(vals),), dt)
+    if return_indices:
+        o1 = asarray(ar1).ravel()._values()
+        o2 = asarray(ar2).ravel()._values()
+        i1 = _make([o1.index(v) for v in vals], (len(vals),), _int64_dt)
+        i2 = _make([o2.index(v) for v in vals], (len(vals),), _int64_dt)
+        return res, i1, i2
+    return res
+
+
+def union1d(ar1, ar2):
+    return unique(concatenate((asarray(ar1).ravel(), asarray(ar2).ravel())))
+
+
+def setdiff1d(ar1, ar2, assume_unique=False):
+    a1 = unique(ar1) if not assume_unique else asarray(ar1).ravel()
+    s2 = set(asarray(ar2).ravel()._values())
+    vals = [v for v in a1._values() if v not in s2]
+    return _make(vals, (len(vals),), a1.dtype)
+
+
+def setxor1d(ar1, ar2, assume_unique=False):
+    a1 = unique(ar1)
+    a2 = unique(ar2)
+    s1 = set(a1._values())
+    s2 = set(a2._values())
+    allv = unique(concatenate((a1, a2)))
+    vals = [v for v in allv._values() if (v in s1) != (v in s2)]
+    return _make(vals, (len(vals),), allv.dtype)
+
+
+# ═══════════════════════════════ linear products ══════════════════════════════
+
+def _dot_vals(x, y, dt):
+    if dt.kind == "f":
+        s = 0.0
+        for a, b in zip(x, y):
+            s += a * b
+        return s
+    if dt.kind == "b":
+        return _bi.any(a and b for a, b in zip(x, y))
+    s = 0
+    for a, b in zip(x, y):
+        s += a * b
+    return _fix_int(s, dt.name)
+
+
+def _matmul2(a, b):
+    """(n,k) @ (k,m) with NumPy's result dtype."""
+    dt = promote_types(a.dtype, b.dtype)
+    conv = _caster(dt)
+    n, k = a.shape
+    k2, m = b.shape
+    if k != k2:
+        raise ValueError(f"matmul: Input operand 1 has a mismatch in its core dimension 0, with gufunc signature (n?,k),(k,m?)->(n?,m?) (size {k2} is different from {k})")
+    av = a._values()
+    bv = b._values()
+    if a.dtype is not dt:
+        av = [conv(v) for v in av]
+    if b.dtype is not dt:
+        bv = [conv(v) for v in bv]
+    cols = [[bv[r * m + j] for r in range(k)] for j in range(m)]
+    out = []
+    for i in range(n):
+        row = av[i * k:(i + 1) * k]
+        for j in range(m):
+            out.append(_dot_vals(row, cols[j], dt))
+    if dt.kind == "f" and dt.itemsize != 8:
+        out = [_npcore.f32(v) for v in out]
+    return _make(out, (n, m), dt)
+
+
+def matmul(x1, x2, out=None, **kw):
+    a = asarray(x1)
+    b = asarray(x2)
+    if a.ndim == 0 or b.ndim == 0:
+        raise ValueError("matmul: Input operand 0 does not have enough dimensions (has 0, gufunc core with signature (n?,k),(k,m?)->(n?,m?) requires 1)")
+    a1 = a.ndim == 1
+    b1 = b.ndim == 1
+    A = a.reshape(1, -1) if a1 else a
+    B = b.reshape(-1, 1) if b1 else b
+    if A.ndim == 2 and B.ndim == 2:
+        r = _matmul2(A, B)
+    else:
+        batch = _broadcast_shapes(A.shape[:-2], B.shape[:-2])
+        Ab = broadcast_to(A, batch + A.shape[-2:])
+        Bb = broadcast_to(B, batch + B.shape[-2:])
+        parts = [_matmul2(Ab[idx], Bb[idx]) for idx in ndindex(*batch)]
+        r = stack(parts).reshape(batch + parts[0].shape) if parts else zeros(batch + (A.shape[-2], B.shape[-1]))
+    if a1 and b1:
+        res = r.reshape(())
+        return _scalar(res._values()[0], res.dtype) if out is None else res
+    if a1:
+        r = r.reshape(r.shape[:-2] + (r.shape[-1],))
+    elif b1:
+        r = r.reshape(r.shape[:-1])
+    if out is not None:
+        _assign(out, r)
+        return out
+    return r
+
+
+def dot(a, b, out=None):
+    a2 = asarray(a)
+    b2 = asarray(b)
+    if a2.ndim == 0 or b2.ndim == 0:
+        return multiply(a, b)
+    if a2.ndim <= 2 and b2.ndim <= 2:
+        return matmul(a2, b2)
+    # sum over the last axis of a and the second-to-last of b
+    bm = moveaxis(b2, -2, 0) if b2.ndim > 1 else b2
+    res = tensordot(a2, b2, axes=([-1], [-2 if b2.ndim > 1 else 0]))
+    return res
+
+
+def vdot(a, b):
+    a = asarray(a).ravel()
+    b = asarray(b).ravel()
+    dt = promote_types(a.dtype, b.dtype)
+    conv = _caster(dt)
+    return _scalar(_dot_vals([conv(v) for v in a._values()], [conv(v) for v in b._values()], dt), dt)
+
+
+def inner(a, b):
+    a = asarray(a)
+    b = asarray(b)
+    if a.ndim == 0 or b.ndim == 0:
+        return multiply(a, b)
+    return tensordot(a, b, axes=([-1], [-1]))
+
+
+def outer(a, b, out=None):
+    a = asarray(a).ravel()
+    b = asarray(b).ravel()
+    return multiply(a[:, None], b[None, :], out=out) if out is not None else multiply(a[:, None], b[None, :])
+
+
+def tensordot(a, b, axes=2):
+    a = asarray(a)
+    b = asarray(b)
+    if isinstance(axes, (_bi.int, integer)):
+        axes_a = list(range(a.ndim - axes, a.ndim))
+        axes_b = list(range(axes))
+    else:
+        axes_a, axes_b = axes
+        if isinstance(axes_a, (_bi.int, integer)):
+            axes_a = [axes_a]
+        if isinstance(axes_b, (_bi.int, integer)):
+            axes_b = [axes_b]
+    axes_a = [_norm_axis(x, a.ndim) for x in axes_a]
+    axes_b = [_norm_axis(x, b.ndim) for x in axes_b]
+    free_a = [d for d in range(a.ndim) if d not in axes_a]
+    free_b = [d for d in range(b.ndim) if d not in axes_b]
+    at = a.transpose(free_a + axes_a)
+    bt = b.transpose(axes_b + free_b)
+    k = _prod([a.shape[d] for d in axes_a])
+    m1 = _prod([a.shape[d] for d in free_a])
+    m2 = _prod([b.shape[d] for d in free_b])
+    A = at.reshape(m1, k)
+    B = bt.reshape(k, m2)
+    r = _matmul2(A, B)
+    shape = tuple(a.shape[d] for d in free_a) + tuple(b.shape[d] for d in free_b)
+    if shape == ():
+        return _scalar(r._values()[0], r.dtype)
+    return r.reshape(shape)
+
+
+def kron(a, b):
+    a = asarray(a)
+    b = asarray(b)
+    if a.ndim == 1 and b.ndim == 1:
+        return outer(a, b).ravel()
+    A = atleast_2d(a)
+    B = atleast_2d(b)
+    r = multiply(A[:, None, :, None], B[None, :, None, :])
+    return r.reshape(A.shape[0] * B.shape[0], A.shape[1] * B.shape[1])
+
+
+def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):
+    a = asarray(a)
+    b = asarray(b)
+    if a.shape[-1] == 2 and b.shape[-1] == 2:
+        return subtract(multiply(a[..., 0], b[..., 1]), multiply(a[..., 1], b[..., 0]))
+    if a.shape[-1] == 2:
+        a = concatenate([a, zeros(a.shape[:-1] + (1,), dtype=a.dtype)], axis=-1)
+    if b.shape[-1] == 2:
+        b = concatenate([b, zeros(b.shape[:-1] + (1,), dtype=b.dtype)], axis=-1)
+    a0, a1, a2 = a[..., 0], a[..., 1], a[..., 2]
+    b0, b1, b2 = b[..., 0], b[..., 1], b[..., 2]
+    c0 = subtract(multiply(a1, b2), multiply(a2, b1))
+    c1 = subtract(multiply(a2, b0), multiply(a0, b2))
+    c2 = subtract(multiply(a0, b1), multiply(a1, b0))
+    return stack([c0, c1, c2], axis=-1)
+
+
+def trace(a, offset=0, axis1=0, axis2=1, dtype=None, out=None):
+    d = diagonal(asarray(a), offset, axis1, axis2)
+    return sum(d, axis=-1, dtype=dtype)
+
+
+def einsum(subscripts, *operands, out=None, dtype=None, order="K", casting="safe", optimize=False):
+    ops = [asarray(o) for o in operands]
+    subscripts = subscripts.replace(" ", "")
+    if "->" in subscripts:
+        ins, outs = subscripts.split("->")
+    else:
+        ins = subscripts
+        counts = {}
+        for ch in ins.replace(",", ""):
+            counts[ch] = counts.get(ch, 0) + 1
+        outs = "".join(_bi.sorted(c for c, n in counts.items() if n == 1))
+    in_specs = ins.split(",")
+    if len(in_specs) != len(ops):
+        raise ValueError("more operands provided to einstein sum function than specified in the subscripts string")
+    sizes = {}
+    for spec, op in zip(in_specs, ops):
+        if len(spec) != op.ndim:
+            raise ValueError(f"operand has more dimensions than subscripts given in einstein sum, but no '...' ellipsis provided to broadcast the extra dimensions.")
+        for ch, n in zip(spec, op.shape):
+            if sizes.get(ch, n) != n and n != 1:
+                raise ValueError(f"operands could not be broadcast together with remapped shapes")
+            sizes[ch] = _bi.max(sizes.get(ch, 1), n)
+    letters = list(outs) + [c for c in _bi.sorted(sizes) if c not in outs]
+    dt = ops[0].dtype
+    for op in ops[1:]:
+        dt = promote_types(dt, op.dtype)
+    if dtype is not None:
+        dt = _dtype_of(dtype)
+    out_shape = tuple(sizes[c] for c in outs)
+    sum_letters = [c for c in letters if c not in outs]
+    sum_shape = [sizes[c] for c in sum_letters]
+    res = []
+    for oidx in ndindex(*out_shape):
+        env = dict(zip(outs, oidx))
+        acc = 0.0 if dt.kind == "f" else 0
+        for sidx in ndindex(*sum_shape):
+            env.update(zip(sum_letters, sidx))
+            term = 1.0 if dt.kind == "f" else 1
+            for spec, op in zip(in_specs, ops):
+                idx = tuple(env[c] if op.shape[k] != 1 else 0 for k, c in enumerate(spec))
+                term = term * _elem(op, idx) if True else term
+            acc += term
+        res.append(_caster(dt)(acc))
+    r = _make(res, out_shape, dt)
+    if out_shape == ():
+        return _scalar(res[0], dt)
+    if out is not None:
+        _assign(out, r)
+        return out
+    return r
+
+
+# ════════════════════════════════ polynomials ═════════════════════════════════
+
+def polyval(p, x):
+    p = asarray(p)
+    x_is_arr = isinstance(x, (ndarray, list, tuple))
+    x = asarray(x)
+    y = zeros_like(x) if p.dtype.kind != "f" and x.dtype.kind != "f" else zeros(x.shape, dtype=promote_types(x.dtype, p.dtype))
+    for pv in p._values():
+        y = add(multiply(y, x), pv)
+    if not x_is_arr:
+        return y[()] if isinstance(y, ndarray) else y
+    return y
+
+
+def polyadd(a1, a2):
+    a1 = atleast_1d(asarray(a1))
+    a2 = atleast_1d(asarray(a2))
+    diff_ = len(a2) - len(a1)
+    if diff_ == 0:
+        return add(a1, a2)
+    if diff_ > 0:
+        return add(concatenate((zeros(diff_, a1.dtype), a1)), a2)
+    return add(a1, concatenate((zeros(-diff_, a2.dtype), a2)))
+
+
+def polysub(a1, a2):
+    return polyadd(a1, negative(asarray(a2)))
+
+
+def polymul(a1, a2):
+    return convolve(a1, a2)
+
+
+def polyder(p, m=1):
+    p = asarray(p)
+    for _ in range(m):
+        n = len(p) - 1
+        if n <= 0:
+            return array([0], dtype=p.dtype) if False else zeros(1, p.dtype)[:0] if False else multiply(p[:-1], arange(n, 0, -1))
+        p = multiply(p[:-1], arange(n, 0, -1))
+    return p
+
+
+def polyint(p, m=1, k=None):
+    p = asarray(p)
+    if k is None:
+        k = [0] * m
+    elif not isinstance(k, (list, tuple, ndarray)):
+        k = [k] * m
+    for i in range(m):
+        n = len(p)
+        p = concatenate((true_divide(p, arange(n, 0, -1)), array([k[i]], dtype=float64)))
+    return p
+
+
+def polydiv(u, v):
+    u = atleast_1d(asarray(u)) + 0.0
+    v = atleast_1d(asarray(v)) + 0.0
+    w = u[0] + v[0]
+    m = len(u) - 1
+    n = len(v) - 1
+    scale = 1. / v[0]
+    q = zeros((_bi.max(m - n + 1, 1),), w.dtype)
+    r = u.astype(w.dtype)
+    for k in range(0, m - n + 1):
+        d = scale * r[k]
+        q[k] = d
+        r[k:k + n + 1] -= d * v
+    while allclose(r[0], 0, rtol=1e-14) and (r.shape[-1] > 1):
+        r = r[1:]
+    return q, r
+
+
+def poly(seq_of_zeros):
+    z = atleast_1d(asarray(seq_of_zeros))
+    a = ones((1,), dtype=float64)
+    for root in z._values():
+        a = convolve(a, array([1, -root], dtype=float64))
+    return a
+
+
+def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
+    x = asarray(x, dtype=float64)
+    y = asarray(y, dtype=float64)
+    V = vander(x, deg + 1)
+    lhs = dot(V.T, V)
+    rhs = dot(V.T, y)
+    return linalg.solve(lhs, rhs)
+
+
+def roots(p):
+    raise NotImplementedError("np.roots needs eigenvalues, which are not supported")
+
+
+def convolve(a, v, mode="full"):
+    a = atleast_1d(asarray(a))
+    v = atleast_1d(asarray(v))
+    if len(v) > len(a):
+        a, v = v, a
+    n, m = len(a), len(v)
+    dt = promote_types(a.dtype, v.dtype)
+    av = [_caster(dt)(x) for x in a._values()]
+    vv = [_caster(dt)(x) for x in v._values()]
+    full_len = n + m - 1
+    out = []
+    for k in range(full_len):
+        s = 0.0 if dt.kind == "f" else 0
+        for j in range(_bi.max(0, k - n + 1), _bi.min(k, m - 1) + 1):
+            s += av[k - j] * vv[j]
+        out.append(s)
+    res = _make(out, (full_len,), dt)
+    if mode == "full":
+        return res
+    if mode == "same":
+        start = (m - 1) // 2
+        return res[start:start + n]
+    if mode == "valid":
+        return res[m - 1:n]
+    raise ValueError(f"mode must be one of 'full', 'same', or 'valid' (got {mode!r})")
+
+
+def correlate(a, v, mode="valid"):
+    v = asarray(v)
+    return convolve(a, v[::-1], mode)
+
+
+def interp(x, xp, fp, left=None, right=None, period=None):
+    xa = asarray(x, dtype=float64)
+    xpv = [_bi.float(v) for v in asarray(xp)._values()]
+    fpv = [_bi.float(v) for v in asarray(fp)._values()]
+    lv = fpv[0] if left is None else left
+    rv = fpv[-1] if right is None else right
+    out = []
+    for v in xa._values():
+        if v < xpv[0]:
+            out.append(lv)
+        elif v > xpv[-1]:
+            out.append(rv)
+        elif v == xpv[-1]:
+            out.append(fpv[-1])
+        else:
+            lo, hi = 0, len(xpv)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if xpv[mid] <= v:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            j = lo - 1
+            slope = (fpv[j + 1] - fpv[j]) / (xpv[j + 1] - xpv[j])
+            out.append(slope * (v - xpv[j]) + fpv[j])
+    if not isinstance(x, (ndarray, list, tuple)):
+        return float64(out[0])
+    return _make(out, xa.shape, _float64_dt)
+
+
+def trapezoid(y, x=None, dx=1.0, axis=-1):
+    y = asarray(y)
+    if x is None:
+        d = dx
+    else:
+        d = diff(asarray(x))
+    n = y.shape[axis]
+    sl1 = [slice(None)] * y.ndim
+    sl2 = [slice(None)] * y.ndim
+    sl1[axis] = slice(1, None)
+    sl2[axis] = slice(None, -1)
+    return sum(multiply(d, true_divide(add(y[tuple(sl1)], y[tuple(sl2)]), 2.0)), axis=axis)
+
+
+trapz = trapezoid
+
+
+def gradient(f, *varargs, axis=None, edge_order=1):
+    f = asarray(f).astype(float64) if asarray(f).dtype.kind != "f" else asarray(f)
+    if f.ndim != 1:
+        return [gradient(moveaxis(f, ax, -1).reshape(-1, f.shape[ax])[0]) for ax in range(f.ndim)]
+    h = _bi.float(varargs[0]) if varargs else 1.0
+    v = f._values()
+    n = len(v)
+    out = [0.0] * n
+    out[0] = (v[1] - v[0]) / h
+    out[-1] = (v[-1] - v[-2]) / h
+    for i in range(1, n - 1):
+        out[i] = (v[i + 1] - v[i - 1]) / (2.0 * h)
+    return _make(out, (n,), _float64_dt)
+
+
+def modf(x, out=None):
+    a, k = _as_operand(x)
+    frac = []
+    whole = []
+    for v in a._values():
+        v = _bi.float(v)
+        f, w = _math.modf(v)
+        frac.append(f)
+        whole.append(w)
+    rdt = a.dtype if a.dtype.kind == "f" else _float64_dt
+    if not isinstance(x, ndarray):
+        return _scalar(frac[0], rdt), _scalar(whole[0], rdt)
+    return _make(frac, a.shape, rdt), _make(whole, a.shape, rdt)
+
+
+def frexp(x):
+    a, k = _as_operand(x)
+    m = []
+    e_ = []
+    for v in a._values():
+        mm, ee = _math.frexp(_bi.float(v))
+        m.append(mm)
+        e_.append(ee)
+    if not isinstance(x, ndarray):
+        return _scalar(m[0], _float64_dt), _scalar(e_[0], _int32_dt)
+    return _make(m, a.shape, _float64_dt), _make(e_, a.shape, _int32_dt)
+
+
+def ldexp(x1, x2):
+    return multiply(x1, power(2.0, x2))
+
+
+def unravel_index(indices, shape, order="C"):
+    shape = _norm_shape(shape)
+    ind = asarray(indices)
+    total = _prod(shape)
+    strides = _c_strides(shape)
+    out = [[] for _ in shape]
+    for v in ind.ravel()._values():
+        v = _bi.int(v)
+        if not 0 <= v < total:
+            raise ValueError(f"index {v} is out of bounds for array with size {total}")
+        for d in range(len(shape)):
+            q, v = _bi.divmod(v, strides[d])
+            out[d].append(q)
+    if ind.ndim == 0:
+        return tuple(_scalar(o[0], _int64_dt) for o in out)
+    return tuple(_make(o, ind.shape, _int64_dt) for o in out)
+
+
+def ravel_multi_index(multi_index, dims, mode="raise", order="C"):
+    dims = _norm_shape(dims)
+    arrs = [asarray(m) for m in multi_index]
+    shape = _broadcast_shapes(*[a.shape for a in arrs])
+    vals = [_bvalues(a, shape) for a in arrs]
+    strides = _c_strides(dims)
+    out = []
+    for k in range(_prod(shape)):
+        flat = 0
+        for d in range(len(dims)):
+            i = _bi.int(vals[d][k])
+            if mode == "wrap":
+                i %= dims[d]
+            elif mode == "clip":
+                i = _bi.max(0, _bi.min(dims[d] - 1, i))
+            elif not 0 <= i < dims[d]:
+                raise ValueError("invalid entry in coordinates array")
+            flat += i * strides[d]
+        out.append(flat)
+    if shape == ():
+        return _scalar(out[0], _int64_dt)
+    return _make(out, shape, _int64_dt)
+
+
+class _IndexExpression:
+    def __init__(self, maketuple):
+        self.maketuple = maketuple
+
+    def __getitem__(self, item):
+        if self.maketuple and not isinstance(item, tuple):
+            return (item,)
+        return item
+
+
+index_exp = _IndexExpression(maketuple=True)
+s_ = _IndexExpression(maketuple=False)
+
+
+class _RClass:
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        parts = []
+        for k in key:
+            if isinstance(k, slice):
+                step = k.step
+                if isinstance(step, complex):
+                    parts.append(linspace(k.start or 0, k.stop, _bi.int(_bi.abs(step))))
+                else:
+                    parts.append(arange(k.start or 0, k.stop, step or 1))
+            else:
+                parts.append(atleast_1d(asarray(k)))
+        return concatenate(parts)
+
+
+r_ = _RClass()
+
+
+class _CClass:
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        return column_stack([asarray(k) for k in key])
+
+
+c_ = _CClass()
+
+
+class _MGrid:
+    def __init__(self, sparse):
+        self.sparse = sparse
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        axes = [arange(k.start or 0, k.stop, k.step or 1) for k in key]
+        if len(axes) == 1:
+            return axes[0]
+        return array(meshgrid(*axes, indexing="ij", sparse=self.sparse)) if not self.sparse else meshgrid(*axes, indexing="ij", sparse=True)
+
+
+mgrid = _MGrid(False)
+ogrid = _MGrid(True)
+
+
+def tril_indices(n, k=0, m=None):
+    m = n if m is None else m
+    rows, cols = [], []
+    for i in range(n):
+        for j in range(m):
+            if j <= i + k:
+                rows.append(i)
+                cols.append(j)
+    return _make(rows, (len(rows),), _int64_dt), _make(cols, (len(cols),), _int64_dt)
+
+
+def triu_indices(n, k=0, m=None):
+    m = n if m is None else m
+    rows, cols = [], []
+    for i in range(n):
+        for j in range(m):
+            if j >= i + k:
+                rows.append(i)
+                cols.append(j)
+    return _make(rows, (len(rows),), _int64_dt), _make(cols, (len(cols),), _int64_dt)
+
+
+def diag_indices(n, ndim=2):
+    idx = arange(n)
+    return (idx,) * ndim
+
+
+def fill_diagonal(a, val, wrap=False):
+    n = _bi.min(a.shape)
+    vals = asarray(val).ravel()._values()
+    for i in range(n):
+        a[(i,) * a.ndim] = vals[i % len(vals)]
+
+
+# ══════════════════════════════════ odds and ends ═════════════════════════════
+
+class iinfo:
+    def __init__(self, int_type):
+        dt = _dtype_of(int_type) if not isinstance(int_type, (ndarray, generic)) else int_type.dtype
+        if dt.kind not in "iub":
+            raise ValueError(f"Invalid integer data type '{dt.kind}'.")
+        self.dtype = dt
+        self.kind = dt.kind
+        self.bits = dt.itemsize * 8
+        self.min, self.max = _INT_RANGE[dt.name] if dt.kind != "b" else (0, 1)
+
+    def __repr__(self):
+        return f"iinfo(min={self.min}, max={self.max}, dtype={self.dtype.name})"
+
+    def __str__(self):
+        line = "-" * 63
+        return (f"Machine parameters for {self.dtype.name}\n{line}\nmin = {self.min}\nmax = {self.max}\n{line}\n")
+
+
+class finfo:
+    _params = {
+        "float64": dict(bits=64, eps=2.220446049250313e-16, max=1.7976931348623157e+308, min=-1.7976931348623157e+308,
+                        tiny=2.2250738585072014e-308, smallest_normal=2.2250738585072014e-308, resolution=1e-15,
+                        precision=15, nmant=52, nexp=11, maxexp=1024, minexp=-1022, machep=-52, negep=-53,
+                        epsneg=1.1102230246251565e-16, smallest_subnormal=5e-324),
+        "float32": dict(bits=32, eps=1.1920929e-07, max=3.4028235e+38, min=-3.4028235e+38, tiny=1.1754944e-38,
+                        smallest_normal=1.1754944e-38, resolution=1e-06, precision=6, nmant=23, nexp=8,
+                        maxexp=128, minexp=-126, machep=-23, negep=-24, epsneg=5.9604645e-08,
+                        smallest_subnormal=1e-45),
+        "float16": dict(bits=16, eps=0.000977, max=65500.0, min=-65500.0, tiny=6.104e-05, smallest_normal=6.104e-05,
+                        resolution=0.001, precision=3, nmant=10, nexp=5, maxexp=16, minexp=-14, machep=-10,
+                        negep=-11, epsneg=0.0004883, smallest_subnormal=6e-08),
+    }
+
+    def __init__(self, dtype_):
+        dt = _dtype_of(dtype_) if not isinstance(dtype_, (ndarray, generic)) else dtype_.dtype
+        if dt.kind != "f":
+            dt = _float64_dt
+        self.dtype = dt
+        p = self._params[dt.name]
+        for k, v in p.items():
+            if isinstance(v, _bi.float) and k not in ("precision",):
+                v = dt.type(v)
+            setattr(self, k, v)
+
+    def __repr__(self):
+        return (f"finfo(resolution={self.resolution}, min={self.min}, max={self.max}, dtype={self.dtype.name})")
+
+
+def shape(a):
+    return asarray(a).shape
+
+
+def ndim(a):
+    return asarray(a).ndim
+
+
+def size(a, axis=None):
+    a = asarray(a)
+    return a.size if axis is None else a.shape[axis]
+
+
+def isscalar(element):
+    return isinstance(element, (generic, _bi.int, _bi.float, _bi.bool, complex, str, bytes))
+
+
+def iterable(y):
+    try:
+        iter(y)
+    except TypeError:
+        return False
+    return True
+
+
+def may_share_memory(a, b, max_work=None):
+    return isinstance(a, ndarray) and isinstance(b, ndarray) and a._buf is b._buf
+
+
+def shares_memory(a, b, max_work=None):
+    if not (isinstance(a, ndarray) and isinstance(b, ndarray)) or a._buf is not b._buf:
+        return False
+    return bool(set(a._indices()) & set(b._indices()))
+
+
+def isreal(x):
+    return ones_like(asarray(x), dtype=bool)
+
+
+def iscomplex(x):
+    return zeros_like(asarray(x), dtype=bool)
+
+
+def isrealobj(x):
+    return True
+
+
+def iscomplexobj(x):
+    return False
+
+
+def isneginf(x):
+    return logical_and(isinf(x), signbit(x))
+
+
+def isposinf(x):
+    return logical_and(isinf(x), ~signbit(x))
+
+
+def asmatrix(*a, **k):
+    raise NotImplementedError("np.matrix is not supported")
+
+
+def info(*a, **k):
+    print("numpy info is not available")
+
+
+def show_config():
+    print("numpy for the Quantum compiler (pure Python)")
+
+
+def __getattr__(name):
+    raise AttributeError(f"module 'numpy' has no attribute '{name}'")
+
+
+def _getattr_hook(name):
+    return __getattr__(name)
+
+
+typecodes = {"Character": "c", "Integer": "bhilqnp", "UnsignedInteger": "BHILQNP", "Float": "efdg",
+             "Complex": "FDG", "AllInteger": "bBhHiIlLqQnNpP", "AllFloat": "efdgFDG", "Datetime": "Mm",
+             "All": "?bhilqnpBHILQNPefdgFDGSUVOMm"}
+sctypeDict = {}
+little_endian = True
+False_ = _np.False_
+True_ = _np.True_
+
+
+class _NoValueType:
+    def __repr__(self):
+        return "<no value>"
+
+
+_NoValue = _NoValueType()

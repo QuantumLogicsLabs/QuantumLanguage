@@ -3611,7 +3611,17 @@ static void defCommonDunders(Type *t)
     dictSet(t->dict, s___hash__, h);
 }
 
-static V num_bool(V *a, int, Kw *) { return mkbool(truthy(a[0])); }
+static V num_bool(V *a, int, Kw *)
+{
+    V x = a[0];
+    if (IS_SMALL(x))
+        return mkbool(SMALLV(x) != 0);
+    if (x->type->layout == L::Int)
+        return mkbool(intSign(x) != 0);
+    if (x->type->layout == L::Float)
+        return mkbool(static_cast<FloatObj *>(x)->v != 0);
+    return mkbool(truthy(x));
+}
 static V num_neg(V *a, int, Kw *)
 {
     if (typeOf(a[0])->layout == L::Int)
