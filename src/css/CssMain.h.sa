@@ -1,0 +1,45 @@
+// quantum: cpp
+#pragma once
+// CSS front-end: what the rest of the compiler sees of it. A stylesheet is
+// checked the way a validator checks it (syntax, property names, the values
+// of the common properties, selectors) and compiled to the stylesheet a
+// browser keeps: one declaration per line, comments gone, and whatever the
+// browser would drop (an unknown property, an invalid value) left out.
+#include <string>
+#include <vector>
+
+namespace css
+{
+
+// A problem in a stylesheet: where (1-based line and column of the
+// stylesheet's own text; `width` characters to underline) and what
+struct Problem
+{
+    int line = 1, col = 1, width = 1;
+    bool error = true;   // false: a warning
+    bool syntax = false; // the text does not even parse as CSS there
+    std::string message;
+};
+
+// Checks a whole stylesheet into `problems`; the result is the stylesheet
+// as a browser keeps it
+std::string compileStylesheet(const std::string &text, std::vector<Problem> &problems);
+
+// Checks the declarations of a style="..." attribute
+void checkDeclarations(const std::string &text, std::vector<Problem> &problems);
+
+// Whether `text` is a stylesheet: CSS rules with no syntax error (unknown
+// properties and bad values allowed). How a .sa file holding CSS is told
+// apart from a program.
+bool looksLikeStylesheet(const std::string &text);
+
+// A .css file as qrun compiles it: the compiled stylesheet, gcc-style
+// diagnostics, and whether any of them is an error
+struct Result
+{
+    std::string output, report;
+    bool failed = false;
+};
+Result compile(const std::string &source, const std::string &path);
+
+} // namespace css

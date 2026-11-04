@@ -1,0 +1,14 @@
+// quantum: cpp
+#pragma once
+// The named character references of HTML (generated/HtmlEntityData.sa):
+// kEntities[2 * k] is a name as it follows "&" ("amp;", or "amp" for the
+// legacy ones a browser also reads without ";"), kEntities[2 * k + 1] its
+// text in UTF-8.
+
+namespace html
+{
+
+extern const int kEntityCount;
+extern const char *const kEntities[];
+
+} // namespace html

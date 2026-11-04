@@ -336,7 +336,7 @@ static void collectTestFilesRecursive(const fs::path &dir, std::vector<fs::path>
 static void collectTestFiles(const fs::path &dir, std::vector<fs::path> &out)
 {
     // Any file type the compiler runs natively is testable:
-    // .sa .js .py .rb .c .cpp — all share the same multi-syntax pipeline.
+    // .sa .js .py .rb .c .cpp .java .html .css — whatever hasSupportedExt() accepts.
     if (!fs::exists(dir) || !fs::is_directory(dir))
         return;
     collectTestFilesRecursive(dir, out);
@@ -477,7 +477,7 @@ int runTestExamples(const std::string &dir)
     collectTestFiles(d, files);
     if (files.empty())
     {
-        std::cout << "No testable files found (.sa .js .py .rb .c .cpp).\n";
+        std::cout << "No testable files found (.sa .js .py .rb .c .cpp .java .html .css).\n";
         return 0;
     }
     std::sort(files.begin(), files.end());

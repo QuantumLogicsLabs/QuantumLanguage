@@ -2,6 +2,8 @@
 #include "../js/JsMain.h.sa"
 #include "../ruby/RubyMain.h.sa"
 #include "../python/PyMain.h.sa"
+#include "../html/HtmlMain.h.sa"
+#include "../css/CssMain.h.sa"
 #include "Dialect.h.sa"
 #include "Error.h.sa"
 
@@ -11,10 +13,13 @@
 #include <iostream>
 #include <regex>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
 extern bool g_strictMode; // Pipeline.sa: qrun --strict
+extern bool g_testMode;   // Pipeline.sa: the test runner is running
+extern std::vector<std::string> g_scriptArgv; // Pipeline.sa: the script, then its arguments
 
 // multi-syntax front-end — no node/python/gcc/g++ required.
 
@@ -28,8 +33,8 @@ std::string fileExtLower(const std::string &path)
 bool hasSupportedExt(const std::string &path)
 {
     std::string ext = fileExtLower(path);
-    return ext == ".sa" || ext == ".js" || ext == ".py" ||
-           ext == ".rb" || ext == ".c" || ext == ".cpp" || ext == ".java";
+    return ext == ".sa" || ext == ".js" || ext == ".py" || ext == ".rb" || ext == ".c" || ext == ".cpp" ||
+           ext == ".java" || ext == ".html" || ext == ".htm" || ext == ".css";
 }
 
 bool isMarkedCppSource(const std::string &source)
@@ -74,6 +79,19 @@ static std::string quantumStringLiteral(const std::string &text)
     return out + "\"";
 }
 
+// A page or stylesheet the web front-ends compiled: the program writes it
+// out. Its errors are compile errors under --strict and in the test runner;
+// otherwise they are reported and the page is written anyway, the way a
+// browser shows a page with mistakes in it.
+static std::string webProgram(const std::string &output, const std::string &report, bool failed)
+{
+    if (failed && (g_strictMode || g_testMode))
+        throw CompileError(report);
+    std::cerr << report;
+    std::cerr.flush();
+    return "print(" + quantumStringLiteral(output) + ")\n";
+}
+
 std::string applyDialect(std::string source, const std::string &path)
 {
     std::string ext = fileExtLower(path);
@@ -85,6 +103,22 @@ std::string applyDialect(std::string source, const std::string &path)
     if (source.size() >= 3 && (unsigned char)source[0] == 0xEF &&
         (unsigned char)source[1] == 0xBB && (unsigned char)source[2] == 0xBF)
         source.erase(0, 3);
+
+    // HTML and CSS (src/html, src/css): a .html / .css file, or a .sa file
+    // that holds a page or a stylesheet
+    if (ext == ".html" || ext == ".htm" || (ext == ".sa" && html::looksLikePage(source)))
+    {
+        std::vector<std::string> sheets; // qrun page.html extra.css: applied as well
+        if (!g_scriptArgv.empty() && g_scriptArgv[0] == path)
+            sheets.assign(g_scriptArgv.begin() + 1, g_scriptArgv.end());
+        html::Result r = html::compile(source, path, sheets);
+        return webProgram(r.output, r.report, r.failed);
+    }
+    if (ext == ".css" || (ext == ".sa" && css::looksLikeStylesheet(source)))
+    {
+        css::Result r = css::compile(source, path);
+        return webProgram(r.output, r.report, r.failed);
+    }
 
     // C++ project structure first (local #includes, namespaces, out-of-class
     // member definitions), so the spliced-in files see every later pass.

@@ -1,0 +1,833 @@
+// quantum: cpp
+// CSS front-end: what a validator checks. Property names against the CSS
+// properties browsers know, the values of the common properties (keywords,
+// colors, lengths, numbers), and selectors (syntax, pseudo-classes and
+// pseudo-elements). A typo gets a "Did you mean" from the same lists.
+#include "CssInternal.h.sa"
+
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <set>
+#include <sstream>
+
+namespace css
+{
+
+namespace
+{
+
+std::set<std::string> words(const char *text)
+{
+    std::set<std::string> out;
+    std::istringstream in(text);
+    std::string w;
+    while (in >> w)
+        out.insert(w);
+    return out;
+}
+
+const std::set<std::string> &properties()
+{
+    static const std::set<std::string> s = words(
+        "accent-color align-content align-items align-self align-tracks alignment-baseline all anchor-name "
+        "anchor-scope animation animation-composition animation-delay animation-direction animation-duration "
+        "animation-fill-mode animation-iteration-count animation-name animation-play-state animation-range "
+        "animation-range-end animation-range-start animation-timeline animation-timing-function appearance "
+        "aspect-ratio backdrop-filter backface-visibility background background-attachment background-blend-mode "
+        "background-clip background-color background-image background-origin background-position "
+        "background-position-x background-position-y background-repeat background-size baseline-shift "
+        "baseline-source block-size border border-block border-block-color border-block-end border-block-end-color "
+        "border-block-end-style border-block-end-width border-block-start border-block-start-color "
+        "border-block-start-style border-block-start-width border-block-style border-block-width border-bottom "
+        "border-bottom-color border-bottom-left-radius border-bottom-right-radius border-bottom-style "
+        "border-bottom-width border-collapse border-color border-end-end-radius border-end-start-radius "
+        "border-image border-image-outset border-image-repeat border-image-slice border-image-source "
+        "border-image-width border-inline border-inline-color border-inline-end border-inline-end-color "
+        "border-inline-end-style border-inline-end-width border-inline-start border-inline-start-color "
+        "border-inline-start-style border-inline-start-width border-inline-style border-inline-width border-left "
+        "border-left-color border-left-style border-left-width border-radius border-right border-right-color "
+        "border-right-style border-right-width border-spacing border-start-end-radius border-start-start-radius "
+        "border-style border-top border-top-color border-top-left-radius border-top-right-radius border-top-style "
+        "border-top-width border-width bottom box-decoration-break box-shadow box-sizing break-after break-before "
+        "break-inside caption-side caret caret-animation caret-color caret-shape clear clip clip-path clip-rule "
+        "color color-interpolation color-interpolation-filters color-rendering color-scheme column-count "
+        "column-fill column-gap column-rule column-rule-color column-rule-style column-rule-width column-span "
+        "column-width columns contain contain-intrinsic-block-size contain-intrinsic-height "
+        "contain-intrinsic-inline-size contain-intrinsic-size contain-intrinsic-width container container-name "
+        "container-type content content-visibility counter-increment counter-reset counter-set cursor cx cy d "
+        "direction display dominant-baseline dynamic-range-limit empty-cells field-sizing fill fill-opacity "
+        "fill-rule filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap float "
+        "flood-color flood-opacity font font-family font-feature-settings font-kerning font-language-override "
+        "font-optical-sizing font-palette font-size font-size-adjust font-smooth font-stretch font-style "
+        "font-synthesis font-synthesis-position font-synthesis-small-caps font-synthesis-style "
+        "font-synthesis-weight font-variant font-variant-alternates font-variant-caps font-variant-east-asian "
+        "font-variant-emoji font-variant-ligatures font-variant-numeric font-variant-position "
+        "font-variation-settings font-weight font-width forced-color-adjust gap grid grid-area grid-auto-columns "
+        "grid-auto-flow grid-auto-rows grid-column grid-column-end grid-column-gap grid-column-start grid-gap "
+        "grid-row grid-row-end grid-row-gap grid-row-start grid-template grid-template-areas "
+        "grid-template-columns grid-template-rows hanging-punctuation height hyphenate-character "
+        "hyphenate-limit-chars hyphens image-orientation image-rendering image-resolution ime-mode initial-letter "
+        "inline-size inset inset-area inset-block inset-block-end inset-block-start inset-inline inset-inline-end "
+        "inset-inline-start interactivity interest-delay interest-delay-end interest-delay-start interpolate-size "
+        "isolation justify-content justify-items justify-self justify-tracks left letter-spacing lighting-color "
+        "line-break line-clamp line-height line-height-step list-style list-style-image list-style-position "
+        "list-style-type margin margin-block margin-block-end margin-block-start margin-bottom margin-inline "
+        "margin-inline-end margin-inline-start margin-left margin-right margin-top margin-trim marker marker-end "
+        "marker-mid marker-start mask mask-border mask-border-mode mask-border-outset mask-border-repeat "
+        "mask-border-slice mask-border-source mask-border-width mask-clip mask-composite mask-image mask-mode "
+        "mask-origin mask-position mask-repeat mask-size mask-type masonry-auto-flow math-depth math-shift "
+        "math-style max-block-size max-height max-inline-size max-lines max-width min-block-size min-height "
+        "min-inline-size min-width mix-blend-mode object-fit object-position object-view-box offset "
+        "offset-anchor offset-distance offset-path offset-position offset-rotate opacity order orphans outline "
+        "outline-color outline-offset outline-style outline-width overflow overflow-anchor overflow-block "
+        "overflow-clip-margin overflow-inline overflow-wrap overflow-x overflow-y overlay overscroll-behavior "
+        "overscroll-behavior-block overscroll-behavior-inline overscroll-behavior-x overscroll-behavior-y padding "
+        "padding-block padding-block-end padding-block-start padding-bottom padding-inline padding-inline-end "
+        "padding-inline-start padding-left padding-right padding-top page page-break-after page-break-before "
+        "page-break-inside paint-order perspective perspective-origin place-content place-items place-self "
+        "pointer-events position position-anchor position-area position-try position-try-fallbacks "
+        "position-try-order position-visibility print-color-adjust quotes r reading-flow reading-order resize "
+        "right rotate row-gap ruby-align ruby-merge ruby-overhang ruby-position rx ry scale scroll-behavior "
+        "scroll-initial-target scroll-margin scroll-margin-block scroll-margin-block-end scroll-margin-block-start "
+        "scroll-margin-bottom scroll-margin-inline scroll-margin-inline-end scroll-margin-inline-start "
+        "scroll-margin-left scroll-margin-right scroll-margin-top scroll-marker-group scroll-padding "
+        "scroll-padding-block scroll-padding-block-end scroll-padding-block-start scroll-padding-bottom "
+        "scroll-padding-inline scroll-padding-inline-end scroll-padding-inline-start scroll-padding-left "
+        "scroll-padding-right scroll-padding-top scroll-snap-align scroll-snap-stop scroll-snap-type "
+        "scroll-target-group scroll-timeline scroll-timeline-axis scroll-timeline-name scrollbar-color "
+        "scrollbar-gutter scrollbar-width shape-image-threshold shape-margin shape-outside shape-rendering speak "
+        "speak-as stop-color stop-opacity stroke stroke-dasharray stroke-dashoffset stroke-linecap "
+        "stroke-linejoin stroke-miterlimit stroke-opacity stroke-width tab-size table-layout text-align "
+        "text-align-last text-anchor text-autospace text-box text-box-edge text-box-trim text-combine-upright "
+        "text-decoration text-decoration-color text-decoration-inset text-decoration-line text-decoration-skip "
+        "text-decoration-skip-ink text-decoration-style text-decoration-thickness text-emphasis "
+        "text-emphasis-color text-emphasis-position text-emphasis-style text-indent text-justify text-orientation "
+        "text-overflow text-rendering text-shadow text-size-adjust text-spacing-trim text-transform "
+        "text-underline-offset text-underline-position text-wrap text-wrap-mode text-wrap-style timeline-scope "
+        "top touch-action transform transform-box transform-origin transform-style transition "
+        "transition-behavior transition-delay transition-duration transition-property transition-timing-function "
+        "translate unicode-bidi user-modify user-select vector-effect vertical-align view-timeline "
+        "view-timeline-axis view-timeline-inset view-timeline-name view-transition-class view-transition-name "
+        "visibility white-space white-space-collapse widows width will-change word-break word-spacing word-wrap "
+        "writing-mode x y z-index zoom");
+    return s;
+}
+
+const std::set<std::string> &namedColors()
+{
+    static const std::set<std::string> s = words(
+        "aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue blueviolet brown "
+        "burlywood cadetblue chartreuse chocolate coral cornflowerblue cornsilk crimson cyan darkblue darkcyan "
+        "darkgoldenrod darkgray darkgreen darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid "
+        "darkred darksalmon darkseagreen darkslateblue darkslategray darkslategrey darkturquoise darkviolet "
+        "deeppink deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro "
+        "ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki "
+        "lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan lightgoldenrodyellow "
+        "lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen lightskyblue lightslategray "
+        "lightslategrey lightsteelblue lightyellow lime limegreen linen magenta maroon mediumaquamarine "
+        "mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen mediumturquoise "
+        "mediumvioletred midnightblue mintcream mistyrose moccasin navajowhite navy oldlace olive olivedrab "
+        "orange orangered orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru "
+        "pink plum powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown "
+        "seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen steelblue tan "
+        "teal thistle tomato turquoise violet wheat white whitesmoke yellow yellowgreen "
+        "transparent currentcolor "
+        "accentcolor accentcolortext activetext buttonborder buttonface buttontext canvas canvastext field "
+        "fieldtext graytext highlight highlighttext linktext mark marktext selecteditem selecteditemtext "
+        "visitedtext activeborder activecaption appworkspace background buttonhighlight buttonshadow captiontext "
+        "inactiveborder inactivecaption inactivecaptiontext infobackground infotext menu menutext scrollbar "
+        "threeddarkshadow threedface threedhighlight threedlightshadow threedshadow window windowframe "
+        "windowtext");
+    return s;
+}
+
+const std::set<std::string> &colorFunctions()
+{
+    static const std::set<std::string> s =
+        words("rgb rgba hsl hsla hwb lab lch oklab oklch color color-mix light-dark contrast-color device-cmyk");
+    return s;
+}
+
+const std::set<std::string> &lengthUnits()
+{
+    static const std::set<std::string> s = words(
+        "px em rem ex rex ch rch cap rcap ic ric lh rlh vw vh vi vb vmin vmax svw svh svi svb svmin svmax lvw "
+        "lvh lvi lvb lvmin lvmax dvw dvh dvi dvb dvmin dvmax cqw cqh cqi cqb cqmin cqmax cm mm q in pt pc");
+    return s;
+}
+
+const std::set<std::string> &otherUnits()
+{
+    static const std::set<std::string> s = words("deg grad rad turn s ms hz khz dpi dpcm dppx x fr");
+    return s;
+}
+
+const std::set<std::string> &pseudoClasses()
+{
+    static const std::set<std::string> s = words(
+        "active active-view-transition active-view-transition-type any-link autofill blank buffering checked "
+        "closed current default defined dir disabled empty enabled first first-child first-of-type focus "
+        "focus-visible focus-within fullscreen future has has-slotted heading host host-context hover in-range "
+        "indeterminate invalid is lang last-child last-of-type left link local-link modal muted not nth-child "
+        "nth-col nth-last-child nth-last-col nth-last-of-type nth-of-type only-child only-of-type open optional "
+        "out-of-range past paused picture-in-picture placeholder-shown playing popover-open read-only read-write "
+        "required right root scope seeking stalled state target target-current target-within user-invalid "
+        "user-valid valid visited volume-locked where xr-overlay "
+        // pseudo-elements that also take one colon (CSS 2)
+        "before after first-line first-letter");
+    return s;
+}
+
+const std::set<std::string> &pseudoElements()
+{
+    static const std::set<std::string> s = words(
+        "after backdrop before checkmark column cue cue-region details-content file-selector-button first-letter "
+        "first-line grammar-error highlight marker part picker picker-icon placeholder scroll-button scroll-marker "
+        "scroll-marker-group search-text selection slotted spelling-error target-text view-transition "
+        "view-transition-group view-transition-image-pair view-transition-new view-transition-old");
+    return s;
+}
+
+bool prefixed(const std::string &name)
+{
+    return name.compare(0, 8, "-webkit-") == 0 || name.compare(0, 5, "-moz-") == 0 ||
+           name.compare(0, 4, "-ms-") == 0 || name.compare(0, 3, "-o-") == 0;
+}
+
+bool globalKeyword(const std::string &v)
+{
+    return v == "inherit" || v == "initial" || v == "unset" || v == "revert" || v == "revert-layer";
+}
+
+// Damerau-Levenshtein (optimal string alignment): a swapped pair costs one
+int distance(const std::string &a, const std::string &b)
+{
+    size_t n = a.size(), m = b.size();
+    std::vector<std::vector<int>> d(n + 1, std::vector<int>(m + 1, 0));
+    for (size_t x = 0; x <= n; ++x)
+        d[x][0] = (int)x;
+    for (size_t y = 0; y <= m; ++y)
+        d[0][y] = (int)y;
+    for (size_t x = 1; x <= n; ++x)
+        for (size_t y = 1; y <= m; ++y)
+        {
+            int cost = a[x - 1] == b[y - 1] ? 0 : 1;
+            int v = std::min(std::min(d[x - 1][y] + 1, d[x][y - 1] + 1), d[x - 1][y - 1] + cost);
+            if (x > 1 && y > 1 && a[x - 1] == b[y - 2] && a[x - 2] == b[y - 1])
+                v = std::min(v, d[x - 2][y - 2] + 1);
+            d[x][y] = v;
+        }
+    return d[n][m];
+}
+
+// " Did you mean "x"?" for the closest name in `names`, or ""
+std::string suggest(const std::string &word, const std::set<std::string> &names)
+{
+    std::string best;
+    int bestD = word.size() < 5 ? 2 : 3;
+    for (const std::string &name : names)
+    {
+        if (name.size() + 3 < word.size() || word.size() + 3 < name.size())
+            continue;
+        int dd = distance(word, name);
+        if (dd < bestD)
+        {
+            bestD = dd;
+            best = name;
+        }
+    }
+    return best.empty() ? "" : " Did you mean \"" + best + "\"?";
+}
+
+// ── values ───────────────────────────────────────────────────────────────
+
+enum RuleKind
+{
+    R_KEYWORDS, // one or more keywords from a list
+    R_COLOR,    // colors
+    R_LENGTH,   // lengths, percentages and keywords
+    R_INTEGER,  // whole numbers and keywords
+    R_NUMBER,   // numbers (and percentages) and keywords
+    R_WEIGHT    // font-weight
+};
+
+struct Rule
+{
+    int kind = R_KEYWORDS;
+    std::set<std::string> keywords;
+    int maxItems = 1;
+    bool negative = true; // negative numbers allowed
+    bool unitless = false; // a number with no unit is allowed (line-height)
+    bool slash = false;    // "/" between values (border-radius)
+    bool commas = false;   // a comma-separated list (background-repeat)
+    bool urls = false;     // url() values too (cursor, fill)
+    bool strings = false;  // quoted strings too (text-overflow)
+};
+
+const std::map<std::string, Rule> &rules()
+{
+    static std::map<std::string, Rule> m;
+    if (!m.empty())
+        return m;
+    auto add = [](const char *names, const Rule &r) {
+        std::istringstream in(names);
+        std::string w;
+        while (in >> w)
+            m[w] = r;
+    };
+    auto kw = [](const char *list, int maxItems, bool commas) {
+        Rule r;
+        r.kind = R_KEYWORDS;
+        r.keywords = words(list);
+        r.maxItems = maxItems;
+        r.commas = commas;
+        return r;
+    };
+    auto len = [](const char *list, int maxItems, bool negative) {
+        Rule r;
+        r.kind = R_LENGTH;
+        r.keywords = words(list);
+        r.maxItems = maxItems;
+        r.negative = negative;
+        return r;
+    };
+    auto color = [](int maxItems, const char *extra) {
+        Rule r;
+        r.kind = R_COLOR;
+        r.maxItems = maxItems;
+        r.keywords = words(extra);
+        return r;
+    };
+
+    add("display",
+        kw("block inline inline-block flex inline-flex grid inline-grid flow flow-root none contents table "
+           "table-row table-cell table-column table-column-group table-header-group table-footer-group "
+           "table-row-group table-caption inline-table list-item run-in ruby ruby-base ruby-text "
+           "ruby-base-container ruby-text-container math masonry inline-masonry grid-lanes inline-grid-lanes",
+           3, false));
+    add("position", kw("static relative absolute fixed sticky", 1, false));
+    add("float", kw("left right none inline-start inline-end", 1, false));
+    add("clear", kw("left right both none inline-start inline-end", 1, false));
+    add("visibility", kw("visible hidden collapse", 1, false));
+    add("text-align", kw("left right center justify start end match-parent justify-all", 1, false));
+    add("text-transform", kw("none capitalize uppercase lowercase full-width full-size-kana math-auto", 2, false));
+    add("white-space", kw("normal pre nowrap pre-wrap pre-line break-spaces collapse discard preserve "
+                          "preserve-breaks preserve-spaces wrap",
+                          2, false));
+    add("overflow", kw("visible hidden clip scroll auto overlay", 2, false));
+    add("overflow-x overflow-y overflow-block overflow-inline", kw("visible hidden clip scroll auto overlay", 1, false));
+    add("box-sizing", kw("content-box border-box", 1, false));
+    add("flex-direction", kw("row row-reverse column column-reverse", 1, false));
+    add("flex-wrap", kw("nowrap wrap wrap-reverse", 1, false));
+    add("border-collapse", kw("collapse separate", 1, false));
+    add("table-layout", kw("auto fixed", 1, false));
+    add("border-style", kw("none hidden dotted dashed solid double groove ridge inset outset", 4, false));
+    add("border-top-style border-right-style border-bottom-style border-left-style border-block-start-style "
+        "border-block-end-style border-inline-start-style border-inline-end-style column-rule-style",
+        kw("none hidden dotted dashed solid double groove ridge inset outset", 1, false));
+    add("border-block-style border-inline-style",
+        kw("none hidden dotted dashed solid double groove ridge inset outset", 2, false));
+    add("outline-style", kw("auto none hidden dotted dashed solid double groove ridge inset outset", 1, false));
+    add("resize", kw("none both horizontal vertical block inline", 1, false));
+    add("object-fit", kw("fill contain cover none scale-down", 1, false));
+    add("user-select", kw("auto text none contain all", 1, false));
+    add("direction", kw("ltr rtl", 1, false));
+    add("word-break", kw("normal break-all keep-all break-word auto-phrase", 1, false));
+    add("overflow-wrap word-wrap", kw("normal break-word anywhere", 1, false));
+    add("list-style-position", kw("inside outside", 1, false));
+    add("background-attachment", kw("scroll fixed local", 8, true));
+    add("background-repeat", kw("repeat repeat-x repeat-y no-repeat space round", 16, true));
+    add("text-decoration-style", kw("solid double dotted dashed wavy", 1, false));
+    add("text-decoration-line", kw("none underline overline line-through blink spelling-error grammar-error", 4, false));
+    add("isolation", kw("auto isolate", 1, false));
+    add("mix-blend-mode", kw("normal multiply screen overlay darken lighten color-dodge color-burn hard-light "
+                             "soft-light difference exclusion hue saturation color luminosity plus-darker "
+                             "plus-lighter",
+                             1, false));
+    add("backface-visibility", kw("visible hidden", 1, false));
+    add("scroll-behavior", kw("auto smooth", 1, false));
+    add("caption-side", kw("top bottom block-start block-end inline-start inline-end", 1, false));
+    add("empty-cells", kw("show hide", 1, false));
+    add("font-kerning", kw("auto normal none", 1, false));
+    add("text-rendering", kw("auto optimizespeed optimizelegibility geometricprecision", 1, false));
+    add("image-rendering", kw("auto smooth high-quality pixelated crisp-edges optimizespeed optimizequality", 1, false));
+    add("pointer-events", kw("auto none visiblepainted visiblefill visiblestroke visible painted fill stroke all "
+                             "bounding-box",
+                             1, false));
+    add("hyphens", kw("none manual auto", 1, false));
+    add("box-decoration-break", kw("slice clone", 1, false));
+    add("break-inside page-break-inside", kw("auto avoid avoid-page avoid-column avoid-region", 1, false));
+    add("break-before break-after page-break-before page-break-after",
+        kw("auto avoid always all avoid-page page left right recto verso avoid-column column avoid-region region",
+           1, false));
+    add("column-fill", kw("auto balance balance-all", 1, false));
+    add("column-span", kw("none all", 1, false));
+    add("transform-style", kw("flat preserve-3d", 1, false));
+    add("transform-box", kw("content-box border-box fill-box stroke-box view-box", 1, false));
+    {
+        Rule r = kw("clip ellipsis fade", 2, false);
+        r.strings = true;
+        add("text-overflow", r);
+    }
+    add("text-orientation", kw("mixed upright sideways sideways-right use-glyph-orientation", 1, false));
+    add("writing-mode", kw("horizontal-tb vertical-rl vertical-lr sideways-rl sideways-lr lr lr-tb rl rl-tb tb tb-rl", 1, false));
+    add("unicode-bidi", kw("normal embed isolate bidi-override isolate-override plaintext", 1, false));
+    add("content-visibility", kw("visible auto hidden", 1, false));
+    add("forced-color-adjust print-color-adjust", kw("auto none exact economy preserve-parent-color", 1, false));
+    add("scrollbar-width", kw("auto thin none", 1, false));
+    add("align-items align-self align-content justify-content justify-items justify-self place-items "
+        "place-self place-content",
+        kw("normal stretch center start end flex-start flex-end self-start self-end baseline first last left "
+           "right space-between space-around space-evenly safe unsafe auto legacy anchor-center",
+           4, false));
+    {
+        Rule r = kw("auto default none context-menu help pointer progress wait cell crosshair text vertical-text "
+                    "alias copy move no-drop not-allowed grab grabbing all-scroll col-resize row-resize n-resize "
+                    "e-resize s-resize w-resize ne-resize nw-resize se-resize sw-resize ew-resize ns-resize "
+                    "nesw-resize nwse-resize zoom-in zoom-out",
+                    32, true);
+        r.urls = true;
+        add("cursor", r);
+    }
+    {
+        Rule r = kw("normal italic oblique left right", 2, false);
+        add("font-style", r);
+    }
+
+    add("color background-color outline-color text-decoration-color text-emphasis-color caret-color "
+        "accent-color column-rule-color border-top-color border-right-color border-bottom-color "
+        "border-left-color border-block-start-color border-block-end-color border-inline-start-color "
+        "border-inline-end-color stop-color flood-color lighting-color",
+        color(1, "auto"));
+    add("border-color", color(4, ""));
+    add("border-block-color border-inline-color", color(2, ""));
+    add("scrollbar-color", color(2, "auto"));
+    {
+        Rule r = color(2, "none context-fill context-stroke");
+        r.urls = true;
+        add("fill stroke", r);
+    }
+
+    const char *sizes = "auto none min-content max-content fit-content stretch contain";
+    add("width height min-width min-height max-width max-height block-size inline-size min-block-size "
+        "min-inline-size max-block-size max-inline-size",
+        len(sizes, 1, false));
+    add("margin", len("auto", 4, true));
+    add("margin-top margin-right margin-bottom margin-left margin-block-start margin-block-end "
+        "margin-inline-start margin-inline-end",
+        len("auto", 1, true));
+    add("margin-block margin-inline", len("auto", 2, true));
+    add("padding", len("", 4, false));
+    add("padding-top padding-right padding-bottom padding-left padding-block-start padding-block-end "
+        "padding-inline-start padding-inline-end",
+        len("", 1, false));
+    add("padding-block padding-inline", len("", 2, false));
+    add("top right bottom left inset-block-start inset-block-end inset-inline-start inset-inline-end",
+        len("auto", 1, true));
+    add("inset", len("auto", 4, true));
+    add("inset-block inset-inline", len("auto", 2, true));
+    add("font-size", len("xx-small x-small small medium large x-large xx-large xxx-large smaller larger math", 1, false));
+    add("border-width", len("thin medium thick", 4, false));
+    add("border-top-width border-right-width border-bottom-width border-left-width border-block-start-width "
+        "border-block-end-width border-inline-start-width border-inline-end-width outline-width "
+        "column-rule-width",
+        len("thin medium thick", 1, false));
+    add("border-block-width border-inline-width", len("thin medium thick", 2, false));
+    {
+        Rule r = len("", 9, false);
+        r.slash = true;
+        add("border-radius", r);
+        add("border-top-left-radius border-top-right-radius border-bottom-left-radius border-bottom-right-radius "
+            "border-start-start-radius border-start-end-radius border-end-start-radius border-end-end-radius",
+            len("", 2, false));
+    }
+    add("gap grid-gap", len("normal", 2, false));
+    add("row-gap column-gap grid-row-gap grid-column-gap", len("normal", 1, false));
+    add("letter-spacing word-spacing", len("normal", 1, true));
+    {
+        Rule r = len("normal", 1, false);
+        r.unitless = true;
+        add("line-height", r);
+    }
+    add("text-indent", len("each-line hanging", 3, true));
+    add("flex-basis", len("auto content max-content min-content fit-content", 1, false));
+    add("outline-offset", len("", 1, true));
+    add("text-underline-offset", len("auto", 1, true));
+    add("text-decoration-thickness", len("auto from-font", 1, false));
+    add("border-spacing", len("", 2, false));
+    add("perspective", len("none", 1, false));
+    add("column-width", len("auto", 1, false));
+    add("vertical-align", len("baseline sub super text-top text-bottom middle top bottom", 1, true));
+    add("scroll-margin", len("", 4, true));
+    add("scroll-padding", len("auto", 4, false));
+    {
+        Rule r = len("", 1, false);
+        r.unitless = true;
+        add("tab-size", r);
+    }
+
+    {
+        Rule r;
+        r.kind = R_INTEGER;
+        r.keywords = words("auto");
+        add("z-index order", r);
+        Rule c = r;
+        c.negative = false;
+        add("column-count", c);
+        Rule o;
+        o.kind = R_INTEGER;
+        o.negative = false;
+        add("orphans widows", o);
+    }
+    {
+        Rule r;
+        r.kind = R_NUMBER;
+        r.negative = false;
+        add("flex-grow flex-shrink", r);
+        Rule o = r;
+        o.unitless = true; // a percentage too
+        o.negative = true;
+        add("opacity fill-opacity stroke-opacity stop-opacity flood-opacity", o);
+    }
+    {
+        Rule r;
+        r.kind = R_WEIGHT;
+        r.keywords = words("normal bold bolder lighter");
+        add("font-weight", r);
+    }
+    return m;
+}
+
+// the text of a value item for a message: "10px", "#ff0", "bleu"
+std::string itemText(const Tok &t)
+{
+    std::ostringstream os;
+    switch (t.type)
+    {
+    case T_IDENT: return t.value;
+    case T_HASH: return "#" + t.value;
+    case T_STR: return "\"" + t.value + "\"";
+    case T_FUNC: return t.value + "()";
+    case T_NUM:
+    case T_PCT:
+    case T_DIM:
+        if (t.integer)
+            os << (long long)t.number;
+        else
+            os << t.number;
+        if (t.type == T_PCT)
+            os << "%";
+        if (t.type == T_DIM)
+            os << t.value;
+        return os.str();
+    default: return t.value;
+    }
+}
+
+// one keyframe selector: "from", "to", "50%", "entry 10%"
+bool keyframeSelector(const std::vector<Tok> &toks, const std::vector<size_t> &part, const Tok &end,
+                      std::vector<Problem> &problems)
+{
+    static const std::set<std::string> ranges =
+        words("normal cover contain entry exit entry-crossing exit-crossing scroll view");
+    bool good = false;
+    if (part.size() == 1)
+    {
+        const Tok &t = toks[part[0]];
+        std::string v = lower(t.value);
+        good = (t.type == T_IDENT && (v == "from" || v == "to")) ||
+               (t.type == T_PCT && t.number >= 0 && t.number <= 100);
+    }
+    else if (part.size() == 2)
+        good = toks[part[0]].type == T_IDENT && ranges.count(lower(toks[part[0]].value)) &&
+               toks[part[1]].type == T_PCT;
+    if (!good)
+    {
+        const Tok &t = part.empty() ? end : toks[part[0]];
+        syntaxAt(problems, t, "\"" + (part.empty() ? std::string("") : itemText(t)) +
+                                  "\" is not a valid keyframe selector: use from, to or a percentage.");
+    }
+    return good;
+}
+
+bool hexColor(const std::string &v)
+{
+    if (v.size() != 3 && v.size() != 4 && v.size() != 6 && v.size() != 8)
+        return false;
+    for (char c : v)
+        if (!std::isxdigit((unsigned char)c))
+            return false;
+    return true;
+}
+
+} // namespace
+
+bool checkDeclaration(const std::vector<Tok> &toks, const Tok &nameTok, const std::string &name, size_t from,
+                      size_t to, std::vector<Problem> &problems)
+{
+    if (name.compare(0, 2, "--") == 0 || prefixed(name))
+        return true;
+    if (!properties().count(name))
+    {
+        problemAt(problems, nameTok, "Unknown property \"" + name + "\"." + suggest(name, properties()));
+        return false;
+    }
+    // the values at the top level: a function or a bracketed block is one
+    std::vector<size_t> items;
+    for (size_t k = from; k < to;)
+    {
+        int t = toks[k].type;
+        if (t == T_WS)
+        {
+            ++k;
+            continue;
+        }
+        if (t == T_FUNC)
+        {
+            std::string f = lower(toks[k].value);
+            if (f == "var" || f == "env" || f == "attr" || f == "if" || f == "inherit")
+                return true; // known only when the page runs
+        }
+        items.push_back(k);
+        k = (t == T_FUNC || t == T_LPAREN || t == T_LBRACK || t == T_LBRACE) ? blockEnd(toks, k) : k + 1;
+    }
+    if (items.size() == 1 && toks[items[0]].type == T_IDENT && globalKeyword(lower(toks[items[0]].value)))
+        return true;
+    for (size_t k : items)
+        if (toks[k].type == T_IDENT && globalKeyword(lower(toks[k].value)))
+        {
+            problemAt(problems, toks[k], "\"" + toks[k].value + "\" must be the only value of \"" + name + "\".");
+            return false;
+        }
+    auto found = rules().find(name);
+    if (found == rules().end())
+        return true;
+    const Rule &rule = found->second;
+
+    int count = 0;
+    for (size_t k : items)
+    {
+        const Tok &t = toks[k];
+        if (t.type == T_COMMA && rule.commas)
+            continue;
+        if (t.type == T_DELIM && t.value == "/" && rule.slash)
+            continue;
+        ++count;
+        std::string v = lower(t.value);
+        bool ok = false;
+        std::string why;
+        if (t.type == T_IDENT && (rule.keywords.count(v) || prefixed(v)))
+            ok = true;
+        else if (t.type == T_FUNC && rule.kind != R_COLOR && rule.kind != R_KEYWORDS)
+            ok = true; // calc(), min(), clamp(), fit-content() ...
+        else if ((t.type == T_URL || (t.type == T_FUNC && v == "url")) && rule.urls)
+            ok = true;
+        else if (t.type == T_STR && rule.strings)
+            ok = true;
+        else
+            switch (rule.kind)
+            {
+            case R_KEYWORDS:
+                if (rule.urls && (t.type == T_NUM))
+                    ok = true; // cursor hotspot
+                else if (name == "font-style" && t.type == T_DIM && otherUnits().count(lower(t.value)))
+                    ok = true; // oblique 10deg
+                else if (t.type == T_IDENT)
+                    why = suggest(v, rule.keywords);
+                break;
+            case R_COLOR:
+                if (t.type == T_IDENT && namedColors().count(v))
+                    ok = true;
+                else if (t.type == T_HASH && hexColor(t.value))
+                    ok = true;
+                else if (t.type == T_FUNC && (colorFunctions().count(v) || prefixed(v)))
+                    ok = true;
+                if (!ok)
+                {
+                    std::string hint = t.type == T_IDENT ? suggest(v, namedColors()) : "";
+                    problemAt(problems, t, "\"" + itemText(t) + "\" is not a valid color." + hint);
+                    return false;
+                }
+                break;
+            case R_LENGTH:
+                if (t.type == T_NUM && (t.number == 0 || rule.unitless))
+                    ok = true;
+                else if (t.type == T_NUM)
+                {
+                    problemAt(problems, t, "\"" + itemText(t) + "\" needs a unit, like \"" + itemText(t) + "px\".");
+                    return false;
+                }
+                else if (t.type == T_PCT)
+                    ok = true;
+                else if (t.type == T_DIM && lengthUnits().count(v))
+                    ok = true;
+                else if (t.type == T_DIM && !otherUnits().count(v))
+                {
+                    problemAt(problems, t, "Unknown unit \"" + t.value + "\" in \"" + itemText(t) + "\"." +
+                                               suggest(v, lengthUnits()));
+                    return false;
+                }
+                else if (t.type == T_IDENT)
+                    why = suggest(v, rule.keywords);
+                if (ok && t.number < 0 && !rule.negative)
+                {
+                    problemAt(problems, t, "Negative values are not allowed for \"" + name + "\".");
+                    return false;
+                }
+                break;
+            case R_INTEGER:
+                if (t.type == T_NUM && t.integer)
+                    ok = t.number >= 0 || rule.negative;
+                else if (t.type == T_NUM)
+                    why = " It must be a whole number.";
+                break;
+            case R_NUMBER:
+                if (t.type == T_NUM || (t.type == T_PCT && rule.unitless))
+                    ok = t.number >= 0 || rule.negative;
+                break;
+            case R_WEIGHT:
+                if (t.type == T_NUM)
+                    ok = t.number >= 1 && t.number <= 1000;
+                else if (t.type == T_IDENT)
+                    why = suggest(v, rule.keywords);
+                break;
+            }
+        if (!ok)
+        {
+            problemAt(problems, t, "\"" + itemText(t) + "\" is not a valid value for \"" + name + "\"." + why);
+            return false;
+        }
+    }
+    if (count > rule.maxItems)
+    {
+        problemAt(problems, nameTok, "Too many values for \"" + name + "\" (at most " +
+                                         std::to_string(rule.maxItems) + ").");
+        return false;
+    }
+    return true;
+}
+
+bool checkSelector(const std::vector<Tok> &toks, size_t from, size_t to, const Tok &brace,
+                   std::vector<Problem> &problems)
+{
+    bool any = false, empty = true, ok = true;
+    for (size_t k = from; k < to;)
+    {
+        const Tok &t = toks[k];
+        switch (t.type)
+        {
+        case T_WS:
+            ++k;
+            continue;
+        case T_COMMA:
+            if (empty)
+            {
+                syntaxAt(problems, t, "Empty selector in the selector list.");
+                return false;
+            }
+            empty = true;
+            ++k;
+            continue;
+        case T_IDENT:
+        case T_HASH:
+            break;
+        case T_DELIM:
+            if (t.value == ".")
+            {
+                if (k + 1 >= to || toks[k + 1].type != T_IDENT)
+                {
+                    syntaxAt(problems, t, "Expected a class name after \".\".");
+                    return false;
+                }
+                ++k;
+            }
+            else if (t.value != "*" && t.value != ">" && t.value != "+" && t.value != "~" && t.value != "&" &&
+                     t.value != "|")
+            {
+                syntaxAt(problems, t, "Invalid selector: unexpected \"" + t.value + "\".");
+                return false;
+            }
+            break;
+        case T_LBRACK:
+            k = blockEnd(toks, k);
+            any = true;
+            empty = false;
+            continue;
+        case T_COLON:
+        {
+            bool element = k + 1 < to && toks[k + 1].type == T_COLON;
+            size_t nk = element ? k + 2 : k + 1;
+            if (nk >= to || (toks[nk].type != T_IDENT && toks[nk].type != T_FUNC))
+            {
+                syntaxAt(problems, t, element ? "Expected a pseudo-element name after \"::\"."
+                                              : "Expected a pseudo-class name after \":\".");
+                return false;
+            }
+            const Tok &nt = toks[nk];
+            std::string nm = lower(nt.value);
+            if (!prefixed(nm))
+            {
+                const std::set<std::string> &known = element ? pseudoElements() : pseudoClasses();
+                if (!known.count(nm))
+                {
+                    problemAt(problems, nt, std::string(element ? "Unknown pseudo-element \"::" : "Unknown pseudo-class \":") +
+                                                nt.value + "\"." + suggest(nm, known));
+                    ok = false;
+                }
+            }
+            k = nt.type == T_FUNC ? blockEnd(toks, nk) : nk + 1;
+            any = true;
+            empty = false;
+            continue;
+        }
+        default:
+        {
+            std::string text = t.type == T_FUNC ? t.value + "(" : itemText(t);
+            syntaxAt(problems, t, "Invalid selector: unexpected \"" + text + "\".");
+            return false;
+        }
+        }
+        any = true;
+        empty = false;
+        ++k;
+    }
+    if (!any)
+    {
+        syntaxAt(problems, brace, "Missing selector before \"{\".");
+        return false;
+    }
+    if (empty)
+    {
+        syntaxAt(problems, brace, "Empty selector in the selector list.");
+        return false;
+    }
+    return ok;
+}
+
+bool checkKeyframeSelector(const std::vector<Tok> &toks, size_t from, size_t to, const Tok &brace,
+                           std::vector<Problem> &problems)
+{
+    // the selectors between commas, as token indexes; `ends` is where each stops
+    std::vector<std::vector<size_t>> parts(1);
+    std::vector<const Tok *> ends;
+    for (size_t k = from; k < to; ++k)
+    {
+        if (toks[k].type == T_WS)
+            continue;
+        if (toks[k].type == T_COMMA)
+        {
+            ends.push_back(&toks[k]);
+            parts.push_back(std::vector<size_t>());
+            continue;
+        }
+        parts.back().push_back(k);
+    }
+    ends.push_back(&brace);
+    for (size_t p = 0; p < parts.size(); ++p)
+        if (!keyframeSelector(toks, parts[p], *ends[p], problems))
+            return false;
+    return true;
+}
+
+} // namespace css
