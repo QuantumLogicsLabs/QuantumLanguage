@@ -4,6 +4,7 @@
 // as they are declared (by assignment or as parameters).
 #include "RubyLex.h.sa"
 #include "RubyMain.h.sa"
+#include "Diagnostics.h.sa"
 
 #include <set>
 
@@ -3205,6 +3206,19 @@ bool canRun(const std::string &source, const std::string &path, std::string &why
         return false;
     }
     return true;
+}
+
+std::string syntaxReport(const std::string &source, const std::string &path)
+{
+    try
+    {
+        parseProgram(source, path);
+    }
+    catch (const SyntaxError &e)
+    {
+        return diag::ruby(path, source, e.line, e.message);
+    }
+    return "";
 }
 
 } // namespace ruby

@@ -415,7 +415,7 @@ struct Interp
     void preempt();
     V vStdoutOrig = Qnil;
     bool failed = false; // the program ended with an uncaught exception
-    std::string failKind, failMessage;
+    std::string failKind, failMessage, failReport;
     int failLine = 0;
     uint64_t randState = 0;
     bool randSeeded = false;

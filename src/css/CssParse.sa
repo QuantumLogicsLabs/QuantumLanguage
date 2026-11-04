@@ -1,0 +1,935 @@
+// quantum: cpp
+// CSS front-end: the tokenizer (CSS Syntax Level 3), the parser for
+// stylesheets, nested rules and at-rules, and the formatter that writes the
+// stylesheet back the way a browser keeps it.
+#include "CssInternal.h.sa"
+#include "Diagnostics.h.sa"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <set>
+
+namespace css
+{
+
+std::string lower(const std::string &s)
+{
+    std::string out = s;
+    for (char &c : out)
+        c = (char)std::tolower((unsigned char)c);
+    return out;
+}
+
+void problemAt(std::vector<Problem> &problems, const Tok &t, const std::string &message, bool error)
+{
+    Problem p;
+    p.line = t.line;
+    p.col = t.col;
+    p.width = std::max(1, t.end - t.start);
+    p.error = error;
+    p.message = message;
+    problems.push_back(p);
+}
+
+void syntaxAt(std::vector<Problem> &problems, const Tok &t, const std::string &message)
+{
+    problemAt(problems, t, message);
+    problems.back().syntax = true;
+}
+
+// ── tokenizer ────────────────────────────────────────────────────────────
+
+namespace
+{
+
+bool isWs(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
+bool isNameStart(unsigned char c) { return std::isalpha(c) || c == '_' || c >= 0x80; }
+bool isNameChar(unsigned char c) { return isNameStart(c) || std::isdigit(c) || c == '-'; }
+
+class Lexer
+{
+public:
+    Lexer(const std::string &text, std::vector<Problem> &problems) : s(text), n(text.size()), problems(problems)
+    {
+        lineStarts.push_back(0);
+        for (size_t k = 0; k < n; ++k)
+            if (s[k] == '\n')
+                lineStarts.push_back((int)k + 1);
+    }
+
+    std::vector<Tok> run()
+    {
+        std::vector<Tok> out;
+        while (true)
+        {
+            Tok t = next();
+            out.push_back(t);
+            if (t.type == T_EOF)
+                break;
+        }
+        return out;
+    }
+
+private:
+    const std::string &s;
+    size_t n;
+    size_t i = 0;
+    std::vector<Problem> &problems;
+    std::vector<int> lineStarts;
+
+    char at(size_t k) const { return k < n ? s[k] : '\0'; }
+
+    void place(Tok &t, size_t start)
+    {
+        t.start = (int)start;
+        t.end = (int)i;
+        size_t idx = (size_t)(std::upper_bound(lineStarts.begin(), lineStarts.end(), (int)start) - lineStarts.begin()) - 1;
+        t.line = (int)idx + 1;
+        t.col = (int)start - lineStarts[idx] + 1;
+    }
+
+    void problem(size_t start, size_t end, const std::string &message)
+    {
+        Tok t;
+        size_t saved = i;
+        i = end;
+        place(t, start);
+        i = saved;
+        syntaxAt(problems, t, message);
+    }
+
+    // "\" starting a valid escape
+    bool escapeAt(size_t k) const { return at(k) == '\\' && at(k + 1) != '\n' && k + 1 < n; }
+
+    bool identStartsAt(size_t k) const
+    {
+        char c = at(k);
+        if (c == '-')
+            return isNameStart((unsigned char)at(k + 1)) || at(k + 1) == '-' || escapeAt(k + 1);
+        return isNameStart((unsigned char)c) || escapeAt(k);
+    }
+
+    bool numberStartsAt(size_t k) const
+    {
+        char c = at(k);
+        if (c == '+' || c == '-')
+        {
+            ++k;
+            c = at(k);
+        }
+        if (std::isdigit((unsigned char)c))
+            return true;
+        return c == '.' && std::isdigit((unsigned char)at(k + 1));
+    }
+
+    // a name: letters, digits, "-", "_", non-ASCII and escapes
+    std::string name()
+    {
+        std::string out;
+        while (i < n)
+        {
+            if (escapeAt(i))
+            {
+                ++i;
+                if (std::isxdigit((unsigned char)at(i)))
+                {
+                    size_t k = 0;
+                    while (k < 6 && std::isxdigit((unsigned char)at(i)))
+                    {
+                        out += at(i);
+                        ++i;
+                        ++k;
+                    }
+                    if (isWs(at(i)))
+                        ++i;
+                }
+                else
+                    out += s[i++];
+            }
+            else if (isNameChar((unsigned char)s[i]))
+                out += s[i++];
+            else
+                break;
+        }
+        return out;
+    }
+
+    Tok number(size_t start)
+    {
+        Tok t;
+        size_t k = i;
+        if (at(k) == '+' || at(k) == '-')
+            ++k;
+        bool integer = true;
+        while (std::isdigit((unsigned char)at(k)))
+            ++k;
+        if (at(k) == '.' && std::isdigit((unsigned char)at(k + 1)))
+        {
+            integer = false;
+            k += 2;
+            while (std::isdigit((unsigned char)at(k)))
+                ++k;
+        }
+        if ((at(k) == 'e' || at(k) == 'E') &&
+            (std::isdigit((unsigned char)at(k + 1)) ||
+             ((at(k + 1) == '+' || at(k + 1) == '-') && std::isdigit((unsigned char)at(k + 2)))))
+        {
+            integer = false;
+            k += 2;
+            while (std::isdigit((unsigned char)at(k)))
+                ++k;
+        }
+        t.number = std::atof(s.substr(i, k - i).c_str());
+        t.integer = integer;
+        i = k;
+        if (identStartsAt(i))
+        {
+            t.type = T_DIM;
+            t.value = name();
+        }
+        else if (at(i) == '%')
+        {
+            t.type = T_PCT;
+            ++i;
+        }
+        else
+            t.type = T_NUM;
+        place(t, start);
+        return t;
+    }
+
+    Tok identLike(size_t start)
+    {
+        Tok t;
+        std::string nm = name();
+        if (at(i) == '(')
+        {
+            ++i;
+            if (lower(nm) == "url")
+            {
+                size_t k = i;
+                while (isWs(at(k)))
+                    ++k;
+                if (at(k) != '"' && at(k) != '\'')
+                    return url(start, k);
+            }
+            t.type = T_FUNC;
+        }
+        else
+            t.type = T_IDENT;
+        t.value = nm;
+        place(t, start);
+        return t;
+    }
+
+    // url( without quotes: everything up to ")"
+    Tok url(size_t start, size_t k)
+    {
+        Tok t;
+        t.type = T_URL;
+        i = k;
+        while (i < n && s[i] != ')')
+        {
+            char c = s[i];
+            if (isWs(c))
+            {
+                size_t j = i;
+                while (isWs(at(j)))
+                    ++j;
+                if (at(j) == ')' || j >= n)
+                {
+                    i = j;
+                    break;
+                }
+                t.type = T_BADURL;
+            }
+            else if (c == '"' || c == '\'' || c == '(')
+                t.type = T_BADURL;
+            else
+                t.value += c;
+            ++i;
+        }
+        if (i >= n)
+            problem(start, n, "Unclosed \"url(\".");
+        else
+            ++i;
+        place(t, start);
+        if (t.type == T_BADURL)
+            syntaxAt(problems, t, "Bad URL: quote it, as in url(\"...\"), when it holds spaces, quotes or \"(\".");
+        return t;
+    }
+
+    Tok string(size_t start)
+    {
+        Tok t;
+        t.type = T_STR;
+        char quote = s[i++];
+        while (true)
+        {
+            if (i >= n)
+            {
+                problem(start, n, "Unterminated string.");
+                break;
+            }
+            char c = s[i];
+            if (c == quote)
+            {
+                ++i;
+                break;
+            }
+            if (c == '\n')
+            {
+                t.type = T_BADSTR;
+                problem(start, i, "Unterminated string: a string cannot hold a line break.");
+                break;
+            }
+            if (c == '\\')
+            {
+                if (at(i + 1) == '\n')
+                    i += 2;
+                else if (i + 1 < n)
+                {
+                    t.value += s[i + 1];
+                    i += 2;
+                }
+                else
+                    ++i;
+                continue;
+            }
+            t.value += c;
+            ++i;
+        }
+        place(t, start);
+        return t;
+    }
+
+    Tok simple(int type, size_t start, size_t len)
+    {
+        Tok t;
+        t.type = type;
+        t.value = s.substr(start, len);
+        i = start + len;
+        place(t, start);
+        return t;
+    }
+
+    Tok next()
+    {
+        // comments are not tokens
+        while (at(i) == '/' && at(i + 1) == '*')
+        {
+            size_t close = s.find("*/", i + 2);
+            if (close == std::string::npos)
+            {
+                problem(i, i + 2, "Unterminated comment.");
+                i = n;
+            }
+            else
+                i = close + 2;
+        }
+        size_t start = i;
+        if (i >= n)
+        {
+            Tok t;
+            t.type = T_EOF;
+            place(t, n);
+            return t;
+        }
+        char c = s[i];
+        if (isWs(c))
+        {
+            while (isWs(at(i)))
+                ++i;
+            Tok t;
+            t.type = T_WS;
+            place(t, start);
+            return t;
+        }
+        if (c == '"' || c == '\'')
+            return string(start);
+        if (c == '#')
+        {
+            if (isNameChar((unsigned char)at(i + 1)) || escapeAt(i + 1))
+            {
+                ++i;
+                Tok t;
+                t.type = T_HASH;
+                t.value = name();
+                place(t, start);
+                return t;
+            }
+            return simple(T_DELIM, start, 1);
+        }
+        switch (c)
+        {
+        case '(': return simple(T_LPAREN, start, 1);
+        case ')': return simple(T_RPAREN, start, 1);
+        case '[': return simple(T_LBRACK, start, 1);
+        case ']': return simple(T_RBRACK, start, 1);
+        case '{': return simple(T_LBRACE, start, 1);
+        case '}': return simple(T_RBRACE, start, 1);
+        case ',': return simple(T_COMMA, start, 1);
+        case ':': return simple(T_COLON, start, 1);
+        case ';': return simple(T_SEMI, start, 1);
+        default: break;
+        }
+        if (c == '+' || c == '.')
+            return numberStartsAt(i) ? number(start) : simple(T_DELIM, start, 1);
+        if (c == '-')
+        {
+            if (numberStartsAt(i))
+                return number(start);
+            if (at(i + 1) == '-' && at(i + 2) == '>')
+                return simple(T_CDC, start, 3);
+            if (identStartsAt(i))
+                return identLike(start);
+            return simple(T_DELIM, start, 1);
+        }
+        if (c == '<' && s.compare(i, 4, "<!--") == 0)
+            return simple(T_CDO, start, 4);
+        if (c == '@')
+        {
+            if (identStartsAt(i + 1))
+            {
+                ++i;
+                Tok t;
+                t.type = T_AT;
+                t.value = name();
+                place(t, start);
+                return t;
+            }
+            return simple(T_DELIM, start, 1);
+        }
+        if (std::isdigit((unsigned char)c))
+            return number(start);
+        if (identStartsAt(i))
+            return identLike(start);
+        return simple(T_DELIM, start, 1);
+    }
+};
+
+} // namespace
+
+std::vector<Tok> tokenize(const std::string &text, std::vector<Problem> &problems)
+{
+    Lexer lexer(text, problems);
+    return lexer.run();
+}
+
+size_t blockEnd(const std::vector<Tok> &toks, size_t k)
+{
+    std::vector<int> closers;
+    for (; k < toks.size(); ++k)
+    {
+        int t = toks[k].type;
+        if (t == T_FUNC || t == T_LPAREN)
+            closers.push_back(T_RPAREN);
+        else if (t == T_LBRACK)
+            closers.push_back(T_RBRACK);
+        else if (t == T_LBRACE)
+            closers.push_back(T_RBRACE);
+        else if (t == T_EOF)
+            return k;
+        else if (!closers.empty() && t == closers.back())
+        {
+            closers.pop_back();
+            if (closers.empty())
+                return k + 1;
+        }
+    }
+    return toks.size() - 1;
+}
+
+// ── parser and formatter ─────────────────────────────────────────────────
+
+namespace
+{
+
+// What a block holds: rules (a stylesheet, @media), declarations and nested
+// rules (a style rule), or descriptors (@font-face: names not checked)
+enum BlockKind
+{
+    B_RULES,
+    B_STYLE,
+    B_DESCRIPTORS
+};
+
+class Parser
+{
+public:
+    Parser(const std::string &text, std::vector<Problem> &problems)
+        : src(text), problems(problems), toks(tokenize(text, problems))
+    {
+    }
+
+    int rules = 0; // style rules and at-rules read
+
+    std::string stylesheet()
+    {
+        std::vector<std::string> items;
+        bool otherRules = false; // @import must come before them
+        while (true)
+        {
+            skip(true);
+            const Tok &t = toks[i];
+            if (t.type == T_EOF)
+                break;
+            if (t.type == T_RBRACE)
+            {
+                syntaxAt(problems, t, "Unexpected \"}\": there is no open block to close.");
+                ++i;
+                continue;
+            }
+            std::string item;
+            if (t.type == T_AT)
+            {
+                std::string name = lower(t.value);
+                bool early = name == "import" || name == "charset" || name == "namespace" || name == "layer";
+                if ((name == "import" || name == "charset") && otherRules)
+                {
+                    problemAt(problems, t, "\"@" + name + "\" must come before all other rules; a browser ignores it here.");
+                    atRule(0, false);
+                    continue;
+                }
+                item = atRule(0, false);
+                if (!early)
+                    otherRules = true;
+            }
+            else
+            {
+                item = qualifiedRule(0, false);
+                otherRules = true;
+            }
+            if (!item.empty())
+                items.push_back(item);
+        }
+        std::string out;
+        for (size_t k = 0; k < items.size(); ++k)
+            out += (k ? "\n\n" : "") + items[k];
+        return out;
+    }
+
+    void declarationsOnly()
+    {
+        std::vector<std::string> items;
+        Tok none;
+        block(1, B_STYLE, none, true, items);
+    }
+
+private:
+    const std::string &src;
+    std::vector<Problem> &problems;
+    std::vector<Tok> toks;
+    size_t i = 0;
+
+    static std::string indent(int depth) { return std::string((size_t)depth * 2, ' '); }
+
+    void skip(bool cdo)
+    {
+        while (toks[i].type == T_WS || (cdo && (toks[i].type == T_CDO || toks[i].type == T_CDC)))
+            ++i;
+    }
+
+    bool opens(int type) const { return type == T_FUNC || type == T_LPAREN || type == T_LBRACK || type == T_LBRACE; }
+
+    std::string textOf(const Tok &t) const { return src.substr((size_t)t.start, (size_t)(t.end - t.start)); }
+
+    // tokens [from, to) as text: whitespace collapsed, ", " after commas,
+    // and in a selector " > " around combinators
+    std::string render(size_t from, size_t to, bool selector) const
+    {
+        std::string out;
+        bool space = false;
+        int depth = 0;
+        for (size_t k = from; k < to; ++k)
+        {
+            const Tok &t = toks[k];
+            if (t.type == T_WS)
+            {
+                space = true;
+                continue;
+            }
+            if (t.type == T_COMMA)
+            {
+                out += ",";
+                space = true;
+                continue;
+            }
+            std::string text = textOf(t);
+            if (selector && depth == 0 && t.type == T_DELIM && (text == ">" || text == "+" || text == "~"))
+            {
+                while (!out.empty() && out.back() == ' ')
+                    out.pop_back();
+                out += (out.empty() ? "" : " ") + text;
+                space = true;
+                continue;
+            }
+            if (t.type == T_RPAREN || t.type == T_RBRACK)
+                space = false;
+            if (space && !out.empty() && out.back() != '(' && out.back() != '[')
+                out += " ";
+            space = false;
+            out += text;
+            if (t.type == T_FUNC || t.type == T_LPAREN || t.type == T_LBRACK)
+                ++depth;
+            else if ((t.type == T_RPAREN || t.type == T_RBRACK) && depth > 0)
+                --depth;
+        }
+        return out;
+    }
+
+    std::string wrap(int depth, const std::string &head, const std::vector<std::string> &items) const
+    {
+        if (items.empty())
+            return indent(depth) + head + " {}";
+        std::string out = indent(depth) + head + " {\n";
+        for (const std::string &item : items)
+            out += item + "\n";
+        return out + indent(depth) + "}";
+    }
+
+    // Skips a declaration that cannot be read: past the next ";", or up to
+    // (not past) the "}" closing the block
+    void skipDeclaration()
+    {
+        while (true)
+        {
+            int t = toks[i].type;
+            if (t == T_EOF || t == T_RBRACE)
+                return;
+            if (t == T_SEMI)
+            {
+                ++i;
+                return;
+            }
+            i = opens(t) ? blockEnd(toks, i) : i + 1;
+        }
+    }
+
+    // Whether a "{" comes before the next ";" or "}": the item is a nested rule
+    bool ruleAhead() const
+    {
+        size_t k = i;
+        while (true)
+        {
+            int t = toks[k].type;
+            if (t == T_LBRACE)
+                return true;
+            if (t == T_EOF || t == T_SEMI || t == T_RBRACE)
+                return false;
+            k = (t == T_FUNC || t == T_LPAREN || t == T_LBRACK) ? blockEnd(toks, k) : k + 1;
+        }
+    }
+
+    // A style rule: selectors, then its block. "" when a browser drops it.
+    std::string qualifiedRule(int depth, bool nested)
+    {
+        size_t from = i;
+        while (true)
+        {
+            const Tok &t = toks[i];
+            if (t.type == T_EOF)
+            {
+                syntaxAt(problems, toks[from], "Expected \"{\" after the selector.");
+                return "";
+            }
+            if (t.type == T_LBRACE)
+                break;
+            if (t.type == T_SEMI && !nested)
+            {
+                syntaxAt(problems, toks[from],
+                         "Unexpected \";\": a declaration must be inside a rule, like \"body { color: red; }\".");
+                ++i;
+                return "";
+            }
+            if (t.type == T_RBRACE && nested)
+                return "";
+            i = opens(t.type) ? blockEnd(toks, i) : i + 1;
+        }
+        size_t to = i;
+        const Tok &brace = toks[i++];
+        ++rules;
+        bool ok = checkSelector(toks, from, to, brace, problems);
+        std::string selectors = render(from, to, true);
+        std::vector<std::string> items;
+        block(depth + 1, B_STYLE, brace, false, items);
+        return ok ? wrap(depth, selectors, items) : "";
+    }
+
+    // The contents of a block, through its "}" (or the end of the text when
+    // `toEnd`), into `items`
+    void block(int depth, int kind, const Tok &brace, bool toEnd, std::vector<std::string> &items)
+    {
+        while (true)
+        {
+            skip(false);
+            const Tok &t = toks[i];
+            if (t.type == T_EOF)
+            {
+                if (!toEnd)
+                    syntaxAt(problems, brace, "Unclosed block: expected \"}\".");
+                return;
+            }
+            if (t.type == T_RBRACE)
+            {
+                if (toEnd)
+                {
+                    syntaxAt(problems, t, "Unexpected \"}\".");
+                    ++i;
+                    continue;
+                }
+                ++i;
+                return;
+            }
+            if (t.type == T_SEMI)
+            {
+                ++i;
+                continue;
+            }
+            std::string item;
+            if (t.type == T_AT)
+                item = atRule(depth, kind != B_RULES);
+            else if (kind == B_RULES)
+                item = qualifiedRule(depth, false);
+            else if (t.type == T_IDENT && t.value.compare(0, 2, "--") == 0)
+                item = declaration(depth, kind);
+            else if (kind == B_STYLE && ruleAhead())
+                item = qualifiedRule(depth, true);
+            else if (t.type == T_IDENT)
+                item = declaration(depth, kind);
+            else
+            {
+                syntaxAt(problems, t, "Unexpected \"" + textOf(t) + "\" in a declaration block.");
+                skipDeclaration();
+            }
+            if (!item.empty())
+                items.push_back(item);
+        }
+    }
+
+    // "name: value [!important];" — "" when a browser drops it
+    std::string declaration(int depth, int kind)
+    {
+        const Tok &nameTok = toks[i++];
+        bool custom = nameTok.value.compare(0, 2, "--") == 0;
+        std::string name = custom ? nameTok.value : lower(nameTok.value);
+        skip(false);
+        if (toks[i].type != T_COLON)
+        {
+            syntaxAt(problems, nameTok, "Expected \":\" after \"" + nameTok.value + "\".");
+            skipDeclaration();
+            return "";
+        }
+        ++i;
+        size_t from = i;
+        while (true)
+        {
+            int t = toks[i].type;
+            if (t == T_EOF || t == T_SEMI || t == T_RBRACE)
+                break;
+            i = opens(t) ? blockEnd(toks, i) : i + 1;
+        }
+        size_t to = i;
+        if (toks[i].type == T_SEMI)
+            ++i;
+        // "!important" at the end
+        bool important = false;
+        size_t end = to;
+        while (end > from && toks[end - 1].type == T_WS)
+            --end;
+        if (end > from && toks[end - 1].type == T_IDENT && lower(toks[end - 1].value) == "important")
+        {
+            size_t bang = end - 1;
+            while (bang > from && toks[bang - 1].type == T_WS)
+                --bang;
+            if (bang > from && toks[bang - 1].type == T_DELIM && toks[bang - 1].value == "!")
+            {
+                important = true;
+                end = bang - 1;
+            }
+        }
+        if (!custom)
+            for (size_t k = from; k < end; ++k)
+                if (toks[k].type == T_DELIM && toks[k].value == "!")
+                {
+                    syntaxAt(problems, toks[k], "Expected \"important\" after \"!\".");
+                    return "";
+                }
+        std::string value = render(from, end, false);
+        if (value.empty() && !custom)
+        {
+            problemAt(problems, nameTok, "Missing value for \"" + name + "\".");
+            return "";
+        }
+        if (kind == B_STYLE && !checkDeclaration(toks, nameTok, name, from, end, problems))
+            return "";
+        return indent(depth) + name + ": " + value + (important ? " !important" : "") + ";";
+    }
+
+    // An at-rule, from its "@name"; `inStyle`: inside a style rule, where
+    // @media and friends hold declarations
+    std::string atRule(int depth, bool inStyle)
+    {
+        const Tok &at = toks[i++];
+        std::string name = lower(at.value);
+        size_t from = i;
+        while (true)
+        {
+            int t = toks[i].type;
+            if (t == T_EOF || t == T_SEMI || t == T_LBRACE || t == T_RBRACE)
+                break;
+            i = opens(t) ? blockEnd(toks, i) : i + 1;
+        }
+        std::string prelude = render(from, i, false);
+        std::string head = "@" + name + (prelude.empty() ? "" : " " + prelude);
+        ++rules;
+
+        static const std::set<std::string> statements = {"import", "charset", "namespace"};
+        static const std::set<std::string> groups = {"media", "supports", "layer", "container", "scope",
+                                                     "starting-style", "document", "-moz-document"};
+        static const std::set<std::string> descriptors = {
+            "font-face", "page", "property", "counter-style", "font-palette-values", "font-feature-values",
+            "view-transition", "position-try", "top-left-corner", "top-left", "top-center", "top-right",
+            "top-right-corner", "bottom-left-corner", "bottom-left", "bottom-center", "bottom-right",
+            "bottom-right-corner", "left-top", "left-middle", "left-bottom", "right-top", "right-middle",
+            "right-bottom", "swash", "annotation", "ornaments", "stylistic", "styleset", "character-variant"};
+        bool keyframes = name == "keyframes" || name == "-webkit-keyframes" || name == "-moz-keyframes" ||
+                         name == "-o-keyframes";
+        bool prefixed = name[0] == '-';
+        bool known = statements.count(name) || groups.count(name) || descriptors.count(name) || keyframes;
+        if (!known && !prefixed)
+            syntaxAt(problems, at, "Unknown at-rule \"@" + at.value + "\".");
+
+        if (toks[i].type != T_LBRACE)
+        {
+            // a statement: "@import url(x.css);"
+            if (toks[i].type == T_SEMI)
+                ++i;
+            if (!known)
+                return "";
+            if (!statements.count(name) && name != "layer")
+            {
+                syntaxAt(problems, at, "Expected \"{\" after \"" + head + "\".");
+                return "";
+            }
+            if (name == "import")
+            {
+                size_t k = from;
+                while (toks[k].type == T_WS)
+                    ++k;
+                int t = toks[k].type;
+                bool url = t == T_STR || t == T_URL || (t == T_FUNC && lower(toks[k].value) == "url");
+                if (!url)
+                {
+                    problemAt(problems, at, "Expected a URL after \"@import\", like @import url(\"other.css\");.");
+                    return "";
+                }
+            }
+            return indent(depth) + head + ";";
+        }
+        const Tok &brace = toks[i++];
+        std::vector<std::string> items;
+        if (statements.count(name))
+        {
+            syntaxAt(problems, at, "\"@" + name + "\" cannot have a block.");
+            i = blockEnd(toks, i - 1);
+            return "";
+        }
+        if (!known)
+        {
+            i = blockEnd(toks, i - 1);
+            return "";
+        }
+        if (keyframes)
+            keyframeBlock(depth + 1, brace, items);
+        else if (groups.count(name))
+            block(depth + 1, inStyle ? B_STYLE : B_RULES, brace, false, items);
+        else
+            block(depth + 1, name == "page" ? B_STYLE : B_DESCRIPTORS, brace, false, items);
+        return wrap(depth, head, items);
+    }
+
+    void keyframeBlock(int depth, const Tok &brace, std::vector<std::string> &items)
+    {
+        while (true)
+        {
+            skip(false);
+            const Tok &t = toks[i];
+            if (t.type == T_EOF)
+            {
+                syntaxAt(problems, brace, "Unclosed block: expected \"}\".");
+                return;
+            }
+            if (t.type == T_RBRACE)
+            {
+                ++i;
+                return;
+            }
+            size_t from = i;
+            while (toks[i].type != T_LBRACE && toks[i].type != T_EOF && toks[i].type != T_RBRACE &&
+                   toks[i].type != T_SEMI)
+                i = opens(toks[i].type) ? blockEnd(toks, i) : i + 1;
+            if (toks[i].type != T_LBRACE)
+            {
+                syntaxAt(problems, toks[from], "Expected \"{\" after the keyframe selector.");
+                if (toks[i].type == T_SEMI)
+                    ++i;
+                continue;
+            }
+            size_t to = i;
+            const Tok &open = toks[i++];
+            bool ok = checkKeyframeSelector(toks, from, to, open, problems);
+            std::vector<std::string> decls;
+            block(depth + 1, B_STYLE, open, false, decls);
+            if (ok)
+                items.push_back(wrap(depth, render(from, to, false), decls));
+        }
+    }
+};
+
+} // namespace
+
+std::string compileStylesheet(const std::string &text, std::vector<Problem> &problems)
+{
+    Parser parser(text, problems);
+    return parser.stylesheet();
+}
+
+void checkDeclarations(const std::string &text, std::vector<Problem> &problems)
+{
+    Parser parser(text, problems);
+    parser.declarationsOnly();
+}
+
+bool looksLikeStylesheet(const std::string &text)
+{
+    std::vector<Problem> problems;
+    Parser parser(text, problems);
+    parser.stylesheet();
+    if (parser.rules == 0)
+        return false;
+    for (const Problem &p : problems)
+        if (p.syntax)
+            return false;
+    return true;
+}
+
+Result compile(const std::string &source, const std::string &path)
+{
+    Result r;
+    std::vector<Problem> problems;
+    r.output = compileStylesheet(source, problems);
+    std::stable_sort(problems.begin(), problems.end(), [](const Problem &a, const Problem &b) {
+        return a.line != b.line ? a.line < b.line : a.col < b.col;
+    });
+    for (const Problem &p : problems)
+    {
+        r.report += diag::gcc(path, source, p.line, p.col, p.message, p.width, p.error ? "error" : "warning");
+        if (p.error)
+            r.failed = true;
+    }
+    return r;
+}
+
+} // namespace css

@@ -1,0 +1,81 @@
+// quantum: cpp
+#pragma once
+// CSS front-end internals: the tokens of CSS Syntax Level 3 (CssParse.sa)
+// and the checks the parser runs on selectors and declarations (CssCheck.sa).
+#include "CssMain.h.sa"
+
+#include <string>
+#include <vector>
+
+namespace css
+{
+
+enum TokType
+{
+    T_WS,
+    T_IDENT,
+    T_FUNC, // name(
+    T_AT,   // @name
+    T_HASH, // #name
+    T_STR,
+    T_BADSTR,
+    T_URL, // url(unquoted)
+    T_BADURL,
+    T_DELIM,
+    T_NUM,
+    T_PCT,
+    T_DIM,
+    T_CDO,
+    T_CDC,
+    T_COLON,
+    T_SEMI,
+    T_COMMA,
+    T_LBRACK,
+    T_RBRACK,
+    T_LPAREN,
+    T_RPAREN,
+    T_LBRACE,
+    T_RBRACE,
+    T_EOF
+};
+
+struct Tok
+{
+    int type = T_EOF;
+    // IDENT / FUNC / AT / HASH: the name (without "(", "@" or "#");
+    // STR: its contents; DELIM: the character; DIM: the unit
+    std::string value;
+    double number = 0; // NUM / PCT / DIM
+    bool integer = false;
+    int start = 0, end = 0; // its text: [start, end) of the stylesheet
+    int line = 1, col = 1;
+};
+
+// The tokens of `text`, ending with T_EOF; comments are left out
+std::vector<Tok> tokenize(const std::string &text, std::vector<Problem> &problems);
+
+// The index just past the block or function opened at toks[k] (a FUNC,
+// "(", "[" or "{"); toks.size() - 1 (the T_EOF) when it is never closed
+size_t blockEnd(const std::vector<Tok> &toks, size_t k);
+
+std::string lower(const std::string &s);
+
+// A problem at a token; syntaxAt: a syntax error there
+void problemAt(std::vector<Problem> &problems, const Tok &t, const std::string &message, bool error = true);
+void syntaxAt(std::vector<Problem> &problems, const Tok &t, const std::string &message);
+
+// Checks a declaration: `name` is the property (lowercase), its value is
+// tokens [from, to) without "!important". False when a browser would drop it.
+bool checkDeclaration(const std::vector<Tok> &toks, const Tok &nameTok, const std::string &name,
+                      size_t from, size_t to, std::vector<Problem> &problems);
+
+// Checks the selector list of a rule, tokens [from, to); `brace` is the
+// "{" after it. False when a browser would drop the rule.
+bool checkSelector(const std::vector<Tok> &toks, size_t from, size_t to, const Tok &brace,
+                   std::vector<Problem> &problems);
+
+// Checks the selectors of a keyframe ("from", "to", "50%", "entry 10%")
+bool checkKeyframeSelector(const std::vector<Tok> &toks, size_t from, size_t to, const Tok &brace,
+                           std::vector<Problem> &problems);
+
+} // namespace css

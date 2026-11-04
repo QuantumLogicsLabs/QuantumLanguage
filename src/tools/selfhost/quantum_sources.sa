@@ -150,6 +150,14 @@
 #pragma quantum_tu
 #include "../../generated/PyLibData.sa"
 #pragma quantum_tu
+#include "../../css/CssParse.sa"
+#pragma quantum_tu
+#include "../../css/CssCheck.sa"
+#pragma quantum_tu
+#include "../../html/Html.sa"
+#pragma quantum_tu
+#include "../../generated/HtmlEntityData.sa"
+#pragma quantum_tu
 #include "../../dialect/RubyDialect.sa"
 #pragma quantum_tu
 #include "../../dialect/RubyStdlib.sa"

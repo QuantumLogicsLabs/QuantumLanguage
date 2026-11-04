@@ -561,6 +561,9 @@ V evalNode(Node *n, Frame *f);
 void execNode(Node *n, Frame *f);
 V callFunc(JFunc *fn, V thisV, V *args, int argc, V newTarget);
 FuncNode *parseProgramSource(const std::string &utf8, const std::string &file, Scope *evalParent, bool strictEval, bool isWrapper, const std::vector<std::string> *wrapperParams);
+// Whether a program (as runProgram wraps it) fails to parse: the message and
+// where (col 1-based)
+bool findSyntaxError(const std::string &source, const std::string &path, std::string &why, int &line, int &col);
 V makeClosure(FuncNode *node, Env *env, Frame *f);
 V directEval(V src, Frame *f, bool strictCaller);
 V indirectEval(V src);

@@ -4,6 +4,7 @@
 #include "JsRt.h.sa"
 #include "JsInternal.h.sa"
 #include "JsMain.h.sa"
+#include "Diagnostics.h.sa"
 
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,8 @@
 #include <unordered_map>
 
 namespace fs = std::filesystem;
+
+extern std::vector<std::string> g_scriptArgv; // Pipeline.sa: the script, then its arguments
 
 namespace js
 {
@@ -473,6 +476,15 @@ V inScriptPath(V, V *, int)
     return str(g_scriptPath);
 }
 
+// the arguments after the script on the command line (process.argv.slice(2))
+V inScriptArgs(V, V *, int)
+{
+    JArray *out = newArray();
+    for (size_t i = 1; i < g_scriptArgv.size(); ++i)
+        arrayPush(out, str(g_scriptArgv[i]));
+    return objv(out);
+}
+
 V inReadFile(V, V *args, int argc)
 {
     std::string path = toUtf8V(argOr(args, argc, 0));
@@ -697,6 +709,7 @@ void initNodeBuiltins()
     defFn(in, "cwd", inCwd, 0);
     defFn(in, "getEnv", inGetEnv, 1);
     defFn(in, "scriptPath", inScriptPath, 0);
+    defFn(in, "scriptArgs", inScriptArgs, 0);
     defFn(in, "readFile", inReadFile, 1);
     defFn(in, "readStdin", inReadStdin, 0);
     defFn(in, "writeFile", inWriteFile, 3);
@@ -800,6 +813,18 @@ void reportUnhandledRejection(V reason, V promise)
     V e = makeError(E_ERROR, "This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason \"" + inspectBrief(reason) + "\".");
     makeNodeError(e, "ERR_UNHANDLED_REJECTION");
     reportUncaught(e);
+}
+
+std::string syntaxReport(const std::string &source, const std::string &path)
+{
+    std::string why;
+    int line = 0, col = 0;
+    if (!findSyntaxError(source, path, why, line, col))
+        return "";
+    // node names the script by its absolute path, as runProgram does
+    std::error_code ec;
+    fs::path abs = fs::absolute(fs::path(path), ec);
+    return diag::node(ec ? path : abs.string(), source, line, col, why) + "\nNode.js v20.20.2\n";
 }
 
 // ── a program, start to finish ───────────────────────────────────────────

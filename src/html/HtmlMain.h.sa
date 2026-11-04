@@ -1,0 +1,29 @@
+// quantum: cpp
+#pragma once
+// HTML front-end: what the rest of the compiler sees of it. A page is read
+// the way a browser reads it, checked the way a validator checks it (its CSS
+// by src/css), and compiled to the document as a browser holds it, with the
+// local stylesheets it links inlined.
+#include <string>
+#include <vector>
+
+namespace html
+{
+
+// A page as qrun compiles it: the document, gcc-style diagnostics, and
+// whether any of them is an error
+struct Result
+{
+    std::string output, report;
+    bool failed = false;
+};
+
+// Compiles the page at `path`; `extraSheets` are stylesheet files applied as
+// well (qrun page.html extra.css), unless the page links them already
+Result compile(const std::string &source, const std::string &path, const std::vector<std::string> &extraSheets);
+
+// Whether a .sa file holds a page: it starts with a doctype, an HTML comment
+// or an HTML element's tag
+bool looksLikePage(const std::string &source);
+
+} // namespace html

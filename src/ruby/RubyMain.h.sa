@@ -12,6 +12,7 @@ struct RunFailure
     bool failed = false;
     std::string kind, message;
     int line = 0;
+    std::string report; // what ruby prints for it ("main.rb:1:in '<main>': boom (RuntimeError)")
 };
 
 // Runs a Ruby program to its end; the result is the exit status
@@ -19,5 +20,9 @@ int runProgram(const std::string &source, const std::string &path, RunFailure &f
 
 // Whether this front-end can parse the source (`why`: the syntax error if not)
 bool canRun(const std::string &source, const std::string &path, std::string &why);
+
+// What ruby prints when it cannot parse the source (qrun --strict reports it
+// as a compile error), or "" when the source parses
+std::string syntaxReport(const std::string &source, const std::string &path);
 
 } // namespace ruby
