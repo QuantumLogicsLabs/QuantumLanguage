@@ -1246,9 +1246,10 @@ void Interp::initLib()
 #endif
     setConst(cObject, intern("RUBY_ENGINE"), strFrozen("ruby"));
     setConst(cObject, intern("RUBY_ENGINE_VERSION"), strFrozen("3.4.9"));
+    // ARGV: the arguments after the script ($0 is the script)
     V argv = ary();
-    for (const std::string &arg : g_scriptArgv)
-        aref(argv).push_back(str(arg));
+    for (size_t i = 1; i < g_scriptArgv.size(); ++i)
+        aref(argv).push_back(str(g_scriptArgv[i]));
     setConst(cObject, intern("ARGV"), argv);
     V env = newObject(cObject);
     RClass *envClass = singletonOf(env);
@@ -1351,6 +1352,7 @@ int runProgram(const std::string &source, const std::string &path, RunFailure &f
         failure.kind = I->failKind;
         failure.message = I->failMessage;
         failure.line = I->failLine;
+        failure.report = I->failReport;
     }
     return status;
 }

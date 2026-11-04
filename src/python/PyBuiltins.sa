@@ -5,11 +5,15 @@
 #include "PyRt.h.sa"
 #include "PyAst.h.sa"
 #include "PyParse.h.sa"
+#include "Diagnostics.h.sa"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+
+extern std::vector<std::string> g_scriptArgv; // Pipeline.sa: the script, then its arguments
 
 namespace py
 {
@@ -864,26 +868,39 @@ static V b_locals(V *, int, Kw *)
 bool testModeActive();
 std::string testModeAnswer(const std::string &prompt);
 
+// The next line of standard input with its "\n" (a last line may have none;
+// "\r\n" reads as "\n"), false at end of input. Read from std::cin, as the
+// VM's own input() and the Ruby and JavaScript front-ends read it (C stdio's
+// stdin gets nothing in qrun).
+static bool stdinLine(std::string &line)
+{
+    flushOut();
+    line.clear();
+    char c;
+    while (std::cin.get(c))
+    {
+        if (c == '\n')
+        {
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            line += '\n';
+            return true;
+        }
+        line += c;
+    }
+    return !line.empty();
+}
+
 static V b_input(V *a, int n, Kw *)
 {
     if (testModeActive())
         return newStr(testModeAnswer(n > 0 ? strOf(a[0]) : ""));
     if (n > 0)
         writeOut(strOf(a[0]));
-    flushOut();
     std::string line;
-    int ch;
-    bool any = false;
-    while ((ch = fgetc(stdin)) != EOF)
-    {
-        any = true;
-        if (ch == '\n')
-            break;
-        line += (char)ch;
-    }
-    if (!any)
+    if (!stdinLine(line))
         raise(tEOFError, "EOF when reading a line");
-    if (!line.empty() && line.back() == '\r')
+    if (!line.empty() && line.back() == '\n')
         line.pop_back();
     return newStr(line);
 }
@@ -1261,6 +1278,39 @@ static V stream_flush(V *, int, Kw *)
     return None;
 }
 
+static V stdin_readline(V *, int, Kw *)
+{
+    std::string line;
+    return newStr(stdinLine(line) ? line : "");
+}
+
+static V stdin_read(V *, int, Kw *)
+{
+    std::string all, line;
+    while (stdinLine(line))
+        all += line;
+    return newStr(all);
+}
+
+static V stdin_readlines(V *, int, Kw *)
+{
+    List *lines = newList();
+    std::string line;
+    while (stdinLine(line))
+        lines->items.push_back(newStr(line));
+    return lines;
+}
+
+static V stdin_iter(V *a, int, Kw *) { return a[0]; }
+
+static V stdin_next(V *, int, Kw *)
+{
+    std::string line;
+    if (!stdinLine(line))
+        raiseV(makeExc(tStopIteration, ""));
+    return newStr(line);
+}
+
 static V sys_exit(V *a, int n, Kw *) { return b_exit(a, n, nullptr); }
 static int g_recursionLimit = 1000;
 static V sys_getrecursionlimit(V *, int, Kw *) { return mkint(g_recursionLimit); }
@@ -1307,9 +1357,19 @@ static V sysModule()
     setAttrStr(d, "stderr", sysStderr);
     setAttrStr(d, "__stdout__", sysStdout);
     setAttrStr(d, "__stderr__", sysStderr);
-    setAttrStr(d, "stdin", None);
+    Type *stdinType = newType("TextIOWrapper", tObject, L::Object);
+    defMethod(stdinType, "readline", stdin_readline);
+    defMethod(stdinType, "read", stdin_read);
+    defMethod(stdinType, "readlines", stdin_readlines);
+    defMethod(stdinType, "__iter__", stdin_iter);
+    defMethod(stdinType, "__next__", stdin_next);
+    Obj *sysStdin = new Obj(stdinType);
+    setAttrStr(d, "stdin", sysStdin);
+    setAttrStr(d, "__stdin__", sysStdin);
     List *argv = newList();
     argv->items.push_back(newStr(g_scriptPath));
+    for (size_t i = 1; i < g_scriptArgv.size(); ++i)
+        argv->items.push_back(newStr(g_scriptArgv[i]));
     setAttrStr(d, "argv", argv);
     setAttrStr(d, "maxsize", mkint(INT64_MAX));
     setAttrStr(d, "byteorder", newStr("little"));
@@ -2485,6 +2545,25 @@ bool canRun(const std::string &source, const std::string &path, std::string &why
     {
         why = e.message;
         return false;
+    }
+}
+
+std::string syntaxReport(const std::string &source, const std::string &path)
+{
+    try
+    {
+        parseModule(source);
+        return "";
+    }
+    catch (SyntaxErr &e)
+    {
+        const std::string &m = e.message;
+        bool unexpectedIndent = m.rfind("unexpected indent", 0) == 0;
+        bool indent = unexpectedIndent || m.rfind("expected an indented block", 0) == 0 ||
+                      m.rfind("unindent does not match", 0) == 0;
+        // e.col is 0-based; python shows no caret for an unexpected indent
+        return diag::python(path, source, e.line, unexpectedIndent ? 0 : e.col + 1,
+                            indent ? "IndentationError" : "SyntaxError", m);
     }
 }
 

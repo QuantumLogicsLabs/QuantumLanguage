@@ -3886,7 +3886,7 @@ FuncNode *parseFunctionText(const std::string &text, const std::string &file)
     return parseProgramSource(text, file, nullptr, false, false, nullptr);
 }
 
-bool canRun(const std::string &source, const std::string &path, std::string &why)
+bool findSyntaxError(const std::string &source, const std::string &path, std::string &why, int &line, int &col)
 {
     static bool ready = false;
     if (!ready)
@@ -3898,13 +3898,21 @@ bool canRun(const std::string &source, const std::string &path, std::string &why
     try
     {
         parseProgramSource(source, path, nullptr, false, true, &params);
-        return true;
+        return false;
     }
     catch (ParseError &e)
     {
         why = e.message;
-        return false;
+        line = e.line;
+        col = e.col;
+        return true;
     }
+}
+
+bool canRun(const std::string &source, const std::string &path, std::string &why)
+{
+    int line = 0, col = 0;
+    return !findSyntaxError(source, path, why, line, col);
 }
 
 } // namespace js

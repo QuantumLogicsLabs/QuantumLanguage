@@ -4443,7 +4443,7 @@ Object.assign(process, {
   arch: 'x64',
   platform: 'win32',
   release: { name: 'node', lts: 'Iron' },
-  argv: ['node', internal.scriptPath()],
+  argv: ['node', internal.scriptPath(), ...internal.scriptArgs()],
   execArgv: [],
   env,
   pid: 4242,

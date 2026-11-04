@@ -1102,6 +1102,14 @@ int Interp::run(const std::string &src, const std::string &path)
         {
             failMessage = "";
         }
+        try
+        {
+            failReport = uncaughtMessage(exc);
+        }
+        catch (...)
+        {
+            failReport = failMessage + " (" + failKind + ")\n";
+        }
         V bt = ivarGet(exc, s.bt);
         failLine = 0;
         if (isAry(bt) && !aref(bt).empty())

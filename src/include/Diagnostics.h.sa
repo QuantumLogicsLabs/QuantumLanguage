@@ -1,8 +1,9 @@
 // quantum: cpp
 #pragma once
-// Compiler-style error reports for the strict front-ends (C/C++ under
-// --strict, Java), laid out the way the real compilers print them so that
-// output from `qrun --strict` reads like gcc / javac output.
+// Compiler-style error reports for the strict front-ends (C/C++, Python,
+// JavaScript and Ruby under --strict; Java), laid out the way the real tools
+// print them so that output from `qrun --strict` reads like gcc / javac /
+// python / node / ruby output.
 
 #include <string>
 #include <vector>
@@ -37,5 +38,28 @@ std::string gcc(const std::string &file, const std::string &source, int line, in
 // ("  symbol:   variable y", "  location: class Main").
 std::string javac(const std::string &file, const std::string &source, int line, int col,
                   const std::string &msg, const std::vector<std::string> &notes = {});
+
+// python (a syntax error; `kind` is SyntaxError or IndentationError):
+//     File "main.py", line 2
+//       if x
+//           ^
+//   SyntaxError: expected ':'
+// The line is shown without its indentation. `col` 0 = unknown (no caret).
+std::string python(const std::string &file, const std::string &source, int line, int col,
+                   const std::string &kind, const std::string &msg);
+
+// node (a syntax error):
+//   /home/me/main.js:1
+//   let x = ;
+//           ^
+//
+//   SyntaxError: Unexpected token ';'
+std::string node(const std::string &file, const std::string &source, int line, int col,
+                 const std::string &msg);
+
+// ruby (a syntax error, the parse.y layout; no column, so no caret):
+//   main.rb:2: syntax error, unexpected end-of-input (SyntaxError)
+//     puts 1
+std::string ruby(const std::string &file, const std::string &source, int line, const std::string &msg);
 
 } // namespace diag

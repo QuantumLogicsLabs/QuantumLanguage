@@ -121,4 +121,48 @@ std::string javac(const std::string &file, const std::string &source, int line, 
     return os.str();
 }
 
+std::string python(const std::string &file, const std::string &source, int line, int col,
+                   const std::string &kind, const std::string &msg)
+{
+    std::ostringstream os;
+    os << "  File \"" << file << "\", line " << (line > 0 ? line : 1) << "\n";
+    std::string code = sourceLine(source, line);
+    size_t lead = code.find_first_not_of(" \t\f");
+    if (line > 0 && lead != std::string::npos && code.size() < 400)
+    {
+        size_t last = code.find_last_not_of(" \t\f");
+        os << "    " << code.substr(lead, last + 1 - lead) << "\n";
+        if (col > (int)lead)
+            os << "    " << std::string(col - 1 - lead, ' ') << "^\n";
+    }
+    os << kind << ": " << msg << "\n";
+    return os.str();
+}
+
+std::string node(const std::string &file, const std::string &source, int line, int col,
+                 const std::string &msg)
+{
+    std::ostringstream os;
+    os << file << ":" << (line > 0 ? line : 1) << "\n";
+    std::string code = sourceLine(source, line);
+    if (line > 0 && code.size() < 400)
+    {
+        os << code << "\n";
+        if (col > 0)
+            os << caretPad(code, col) << "^\n";
+    }
+    os << "\nSyntaxError: " << msg << "\n";
+    return os.str();
+}
+
+std::string ruby(const std::string &file, const std::string &source, int line, const std::string &msg)
+{
+    std::ostringstream os;
+    os << file << ":" << (line > 0 ? line : 1) << ": " << msg << " (SyntaxError)\n";
+    std::string code = sourceLine(source, line);
+    if (line > 0 && code.find_first_not_of(" \t") != std::string::npos && code.size() < 400)
+        os << code << "\n";
+    return os.str();
+}
+
 } // namespace diag

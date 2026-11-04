@@ -27,6 +27,7 @@
 namespace fs = std::filesystem;
 
 extern bool g_testMode;
+extern bool g_strictMode; // Pipeline.sa: qrun --strict
 extern std::vector<std::string> g_scriptArgv;
 
 #ifndef M_PI
@@ -154,23 +155,31 @@ void VM::registerNatives()
             std::exit(status);
         return QuantumValue(); });
 
-    // A Python program (applyDialect): the Python front-end runs it to its end
+    // A Python program (applyDialect): the Python front-end runs it to its end.
+    // It has printed the traceback; under --strict that is the whole report,
+    // as from python.
     reg("__py_run__", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         py::RunFailure failure;
         int status = py::runProgram(args[0].asString(), args[1].asString(), failure);
-        if (failure.failed)
+        if (failure.failed && !g_strictMode)
             throw QuantumError(failure.kind, failure.message, failure.line);
         if (status != 0)
             std::exit(status);
         return QuantumValue(); });
 
-    // A Ruby program (applyDialect): the Ruby front-end runs it to its end
+    // A Ruby program (applyDialect): the Ruby front-end runs it to its end.
+    // Under --strict an uncaught exception is reported the way ruby reports it.
     reg("__ruby_run__", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         ruby::RunFailure failure;
         int status = ruby::runProgram(args[0].asString(), args[1].asString(), failure);
-        if (failure.failed)
+        if (failure.failed && g_strictMode)
+        {
+            std::cerr << failure.report;
+            std::cerr.flush();
+        }
+        else if (failure.failed)
             throw QuantumError(failure.kind, failure.message, failure.line);
         if (status != 0)
             std::exit(status);

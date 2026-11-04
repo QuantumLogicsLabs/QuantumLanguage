@@ -3,6 +3,7 @@
 #include "../ruby/RubyMain.h.sa"
 #include "../python/PyMain.h.sa"
 #include "Dialect.h.sa"
+#include "Error.h.sa"
 
 #include <algorithm>
 #include <cstdlib>
@@ -12,6 +13,8 @@
 #include <string>
 
 namespace fs = std::filesystem;
+
+extern bool g_strictMode; // Pipeline.sa: qrun --strict
 
 // multi-syntax front-end — no node/python/gcc/g++ required.
 
@@ -102,12 +105,25 @@ std::string applyDialect(std::string source, const std::string &path)
             std::cerr << "----- Java-style pass -----\n" << source << "----- end -----\n";
     }
 
+    // Under --strict a .py/.js/.rb file is that language and nothing else: a
+    // program its front-end cannot parse is a compile error, reported the way
+    // python / node / ruby report it, instead of going to the mixed-syntax
+    // pipeline below.
+    if (g_strictMode && (ext == ".py" || ext == ".js" || ext == ".rb"))
+    {
+        std::string report = ext == ".py"   ? py::syntaxReport(source, path)
+                             : ext == ".js" ? js::syntaxReport(source, path)
+                                            : ruby::syntaxReport(source, path);
+        if (!report.empty())
+            throw CompileError(report);
+    }
+
     if (ext == ".py")
     {
         // A .py file runs on the Python front-end (src/python) when it can
         // parse it; the program travels inside the chunk as a string
         std::string why;
-        if (py::canRun(source, path, why))
+        if (g_strictMode || py::canRun(source, path, why))
             return "__py_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
     }
 
@@ -116,7 +132,7 @@ std::string applyDialect(std::string source, const std::string &path)
         // A .js file runs on the JavaScript front-end (src/js) when it can
         // parse it; the program travels inside the chunk as a string
         std::string why;
-        if (js::canRun(source, path, why))
+        if (g_strictMode || js::canRun(source, path, why))
             return "__js_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
     }
 
@@ -125,7 +141,7 @@ std::string applyDialect(std::string source, const std::string &path)
         // A .rb file runs on the Ruby front-end (src/ruby) when it can parse
         // it; the program travels inside the chunk as a string
         std::string why;
-        if (ruby::canRun(source, path, why))
+        if (g_strictMode || ruby::canRun(source, path, why))
             return "__ruby_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
         source = applyRubyDialect(source, /*strict=*/true);
     }
