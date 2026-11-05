@@ -1,0 +1,96 @@
+{
+  "comment": "Additions and corrections applied on top of mdn-data by src/tools/gen_css_data.py. Each entry fills a gap in mdn-data (a production its grammars use but do not define, a unit or pseudo-class it does not list) or corrects a grammar that disagrees with the specification named in its comment.",
+
+  "types": {
+    "top": { "syntax": "<length> | auto", "comment": "rect() for 'clip' (CSS 2.1 11.1.2)" },
+    "right": { "syntax": "<length> | auto", "comment": "rect() for 'clip' (CSS 2.1 11.1.2)" },
+    "bottom": { "syntax": "<length> | auto", "comment": "rect() for 'clip' (CSS 2.1 11.1.2)" },
+    "left": { "syntax": "<length> | auto", "comment": "rect() for 'clip' (CSS 2.1 11.1.2)" },
+    "x": { "syntax": "<number>", "comment": "a cursor's hotspot (CSS UI 4)" },
+    "y": { "syntax": "<number>", "comment": "a cursor's hotspot (CSS UI 4)" },
+    "url": { "syntax": "url( <string> <url-modifier>* ) | src( <string> <url-modifier>* ) | <url-token>", "comment": "CSS Values 4, 4.5.1" },
+    "url-modifier": { "syntax": "<ident> | <function-token> <any-value> )", "comment": "CSS Values 4, 4.5.1" },
+    "attr-name": { "syntax": "<wq-name>", "comment": "CSS Values 5, attr()" },
+    "attr-unit": { "syntax": "<ident>", "comment": "CSS Values 5, attr(): a unit name or %" },
+    "autospace": { "syntax": "no-autospace | [ ideograph-alpha || ideograph-numeric || punctuation ] || [ insert | replace ]", "comment": "CSS Text 4, text-autospace" },
+    "intrinsic-size-keyword": { "syntax": "min-content | max-content | fit-content", "comment": "CSS Sizing 4" },
+    "declaration": { "syntax": "<ident-token> : <declaration-value>? [ '!' important ]?", "comment": "CSS Syntax 3 (as used by @supports)" },
+    "declaration-list": { "syntax": "[ <declaration>? ';' ]* <declaration>?", "comment": "CSS Syntax 3" },
+    "syntax": { "syntax": "<string>", "comment": "@property's syntax descriptor (CSS Properties and Values API)" },
+    "unicode-range": { "syntax": "<urange>#", "comment": "@font-face's unicode-range (CSS Fonts 4): the old production name" },
+    "unicode-range-token": { "syntax": "<urange>", "comment": "CSS Syntax 3 <urange>" },
+    "language-code": { "syntax": "[ <ident> | <string> ]#", "comment": ":lang() takes a list of language ranges (Selectors 4, 7.2)" }
+  },
+
+  "properties": {},
+
+  "units": {
+    "comment": "CSS Values 4, 6 (Distance, other units) and CSS Values 5; units.json lists only some",
+    "length": "em rem ex rex cap rcap ch rch ic ric lh rlh vw svw lvw dvw vh svh lvh dvh vi svi lvi dvi vb svb lvb dvb vmin svmin lvmin dvmin vmax svmax lvmax dvmax cqw cqh cqi cqb cqmin cqmax cm mm q in pt pc px",
+    "angle": "deg grad rad turn",
+    "time": "s ms",
+    "frequency": "hz khz",
+    "resolution": "dpi dpcm dppx x",
+    "flex": "fr",
+    "decibel": "db",
+    "semitones": "st"
+  },
+
+  "pseudoClasses": {
+    "comment": "Selectors 4 and 5, CSS Overflow 5, HTML: pseudo-classes selectors.json does not list",
+    "heading": "",
+    "heading()": "<an+b>#",
+    "nth-col()": "<an+b>",
+    "nth-last-col()": "<an+b>",
+    "current()": "<complex-selector-list>",
+    "target-current": "",
+    "has-slotted": "",
+    "-webkit-autofill": ""
+  },
+
+  "pseudoElements": {
+    "comment": "CSS Overflow 5, CSS Multi-column 2, CSS Pseudo 4: pseudo-elements selectors.json does not list",
+    "scroll-button()": "[ '*' | up | down | left | right | block-start | block-end | inline-start | inline-end ]",
+    "column": "",
+    "search-text": "",
+    "picker()": "<ident>+",
+    "view-transition-group()": "[ '*' | <custom-ident> ]",
+    "view-transition-image-pair()": "[ '*' | <custom-ident> ]",
+    "view-transition-new()": "[ '*' | <custom-ident> ]",
+    "view-transition-old()": "[ '*' | <custom-ident> ]"
+  },
+
+  "atrules": {
+    "comment": "The prelude grammar of each at-rule (the text between its name and its block or ';'), written from the at-rule's mdn-data syntax, and what its block holds: 'group' (rules; declarations inside a style rule), 'descriptors', 'page', 'keyframes', 'feature-values', 'declarations', or 'none' (a statement)",
+    "charset": { "prelude": "<string>", "block": "none" },
+    "import": { "prelude": "[ <string> | <url> ] [ layer | layer( <layer-name> ) ]? [ supports( [ <supports-condition> | <declaration> ] ) ]? <media-query-list>?", "block": "none" },
+    "namespace": { "prelude": "<namespace-prefix>? [ <string> | <url> ]", "block": "none" },
+    "media": { "prelude": "<media-query-list>", "block": "group" },
+    "supports": { "prelude": "<supports-condition>", "block": "group" },
+    "container": { "prelude": "<container-condition>#", "block": "group" },
+    "layer": { "prelude": "<layer-name>#", "blockPrelude": "<layer-name>?", "block": "group-or-none" },
+    "scope": { "prelude": "[ ( <any-value> ) ]? [ to ( <any-value> ) ]?", "block": "group" },
+    "starting-style": { "prelude": "", "block": "group" },
+    "document": { "prelude": "[ <url> | url-prefix( <string> ) | domain( <string> ) | media-document( <string> ) | regexp( <string> ) ]#", "block": "group" },
+    "keyframes": { "prelude": "<keyframes-name>", "block": "keyframes" },
+    "font-face": { "prelude": "", "block": "descriptors" },
+    "font-feature-values": { "prelude": "<family-name>#", "block": "feature-values" },
+    "font-palette-values": { "prelude": "<dashed-ident>", "block": "descriptors" },
+    "counter-style": { "prelude": "<counter-style-name>", "block": "descriptors" },
+    "property": { "prelude": "<custom-property-name>", "block": "descriptors" },
+    "page": { "prelude": "<page-selector-list>", "block": "page" },
+    "position-try": { "prelude": "<dashed-ident>", "block": "declarations" },
+    "view-transition": { "prelude": "", "block": "descriptors" }
+  },
+
+  "descriptors": {
+    "comment": "Descriptors at-rules.json does not list",
+    "font-face": {
+      "font-named-instance": "auto | <string>",
+      "font-language-override": "normal | <string>"
+    },
+    "font-feature-values": {
+      "font-display": "auto | block | swap | fallback | optional"
+    }
+  }
+}

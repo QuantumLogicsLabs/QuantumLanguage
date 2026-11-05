@@ -255,9 +255,9 @@ std::string javaFormat(const std::string &fmt, const std::vector<QV> &args, cons
         QV a = args[argIdx];
         if (a.isInstance())
         {
-            // a Long / Short / Byte box: its value
+            // a Long / Short / Byte / Float box: its value
             const std::string &cn = a.asInstance()->klass->name;
-            if (cn == "java.lang.Long" || cn == "java.lang.Short" || cn == "java.lang.Byte")
+            if (cn == "java.lang.Long" || cn == "java.lang.Short" || cn == "java.lang.Byte" || cn == "java.lang.Float")
             {
                 auto it = a.asInstance()->fields.find("value");
                 if (it != a.asInstance()->fields.end())

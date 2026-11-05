@@ -722,7 +722,7 @@ bool javaInstanceOf(const QV &v, const std::string &desc)
         return name == "java.lang.Integer" || name == "java.lang.Number" || name == "java.lang.Comparable" ||
                name == "java.io.Serializable" || name == "java.lang.constant.Constable";
     if (v.isNumber())
-        return name == "java.lang.Double" || name == "java.lang.Float" || name == "java.lang.Number" ||
+        return name == "java.lang.Double" || name == "java.lang.Number" ||
                name == "java.lang.Comparable" || name == "java.io.Serializable";
     if (v.isBool())
         return name == "java.lang.Boolean" || name == "java.lang.Comparable" || name == "java.io.Serializable";
@@ -1233,6 +1233,22 @@ void javaFlushSoon()
 
 QV VM::javaBox(int op, const QV &v)
 {
+    if (op == jop::BOXF)
+    {
+        if (!v.isNumber())
+            return v; // already a box (or null)
+        if (!javaBoxClass_[4])
+        {
+            QV c = globals->get("java.lang.Float");
+            if (!c.isClass())
+                return v; // the class is not part of the program: keep the number
+            javaBoxClass_[4] = c.asClass();
+        }
+        auto inst = std::make_shared<QuantumInstance>();
+        inst->klass = javaBoxClass_[4];
+        inst->fields["value"] = v.isLong() ? QV((double)v.asLong()) : v;
+        return QV(inst);
+    }
     if (!v.isLong())
         return v; // already a box (or null)
     static const char *names[4] = {"java.lang.Long", "java.lang.Short", "java.lang.Byte", "java.lang.Character"};

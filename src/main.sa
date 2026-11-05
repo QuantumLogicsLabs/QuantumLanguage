@@ -21,6 +21,7 @@
 #include "Vm.h.sa"
 #include "Error.h.sa"
 #include "native/Native.h.sa"
+#include "html/HtmlMain.h.sa"
 
 #include <fstream>
 #include <iostream>
@@ -157,6 +158,27 @@ int main(int argc, char *argv[])
         return dumpTokens(argv[2]);
     if (a1 == "--dump-ast" && argc >= 3)
         return dumpAst(argv[2]);
+    // HTML parser conformance: the web-platform-tests tree construction
+    // tests (.dat files; -v prints each failure), one page's tree, and a
+    // batch of html5lib tokenizer tests (written by conformance/html_tokenizer.py)
+    if (a1 == "--html-test" && argc >= 3)
+    {
+        std::vector<std::string> files;
+        bool verbose = false;
+        for (int k = 2; k < argc; ++k)
+        {
+            std::string a = argv[k];
+            if (a == "-v")
+                verbose = true;
+            else
+                files.push_back(a);
+        }
+        return html::runTreeTests(files, verbose);
+    }
+    if (a1 == "--html-dump" && argc >= 3)
+        return html::dumpTreeFile(argv[2], !(argc >= 4 && std::string(argv[3]) == "--script-off"));
+    if (a1 == "--html-tokens" && argc >= 3)
+        return html::runTokenizerBatch(argv[2]);
     if (a1 == "--emit-qbc" && argc >= 4)
         return emitBytecodeFile(argv[2], argv[3]);
     if (a1 == "--emit-qbc-core" && argc >= 4)

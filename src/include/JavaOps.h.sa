@@ -67,7 +67,8 @@ enum Un : int32_t
     SLEN,                // String.length() (NullPointerException)
     BOXJ, BOXS, BOXB,    // long / short / byte -> Long / Short / Byte box (valueOf: cached for -128..127)
     BOXC,                // char -> Character box (valueOf: cached for 0..127)
-    UNBOXN,              // Long / Short / Byte box -> its value (NullPointerException)
+    UNBOXN,              // Long / Short / Byte / Float box -> its value (NullPointerException)
+    BOXF,                // float -> Float box (never cached)
 };
 
 } // namespace jop

@@ -1,12 +1,14 @@
 // quantum: cpp
-// HTML front-end: reads a page the way a browser does (the WHATWG tokenizer;
-// tree construction with implied and optional tags, raw-text elements,
-// tables and SVG/MathML, simplified from the standard), checks it the way a
-// validator does (messages worded as the W3C checker words them), checks its
-// CSS (src/css), and writes the document back out as a browser holds it,
-// with the local stylesheets it links inlined.
+// HTML front-end: compiles a page. HtmlTokenizer.sa and HtmlTree.sa parse it
+// exactly as the WHATWG HTML standard says, so the document is the tree a
+// browser builds; this file checks that document the way a validator does
+// (messages worded as the W3C checker words them), checks its CSS (src/css),
+// inlines the local stylesheets it links, and writes the document back out
+// with the standard's serialization algorithm (13.3). It also runs the
+// web-platform-tests tree construction tests and the html5lib tokenizer
+// tests (hidden qrun flags), which is how the parser is held to the standard.
 #include "HtmlMain.h.sa"
-#include "HtmlEntities.h.sa"
+#include "HtmlDom.h.sa"
 #include "../css/CssMain.h.sa"
 #include "Diagnostics.h.sa"
 
@@ -14,6 +16,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <set>
 #include <sstream>
@@ -46,10 +49,11 @@ std::string lower(const std::string &s)
     return out;
 }
 
+// elements that serialize as void (13.3)
 const std::set<std::string> &voidElements()
 {
     static const std::set<std::string> s =
-        words("area base br col embed hr img input link meta source track wbr param keygen basefont bgsound frame");
+        words("area base br col embed hr img input link meta source track wbr basefont bgsound frame keygen param");
     return s;
 }
 
@@ -90,1682 +94,11 @@ const std::map<std::string, std::string> &obsoleteElements()
         m["noembed"] = "Use the \"object\" element instead.";
         m["rb"] = m["rtc"] = "Mark up the base text directly in the \"ruby\" element.";
         m["strike"] = "Use the \"del\" or \"s\" element instead.";
-        m["image"] = "Use the \"img\" element instead.";
     }
     return m;
 }
 
-const std::set<std::string> &specialElements()
-{
-    static const std::set<std::string> s = words(
-        "address applet area article aside base basefont bgsound blockquote body br button caption center col "
-        "colgroup dd details dir div dl dt embed fieldset figcaption figure footer form frame frameset h1 h2 h3 "
-        "h4 h5 h6 head header hgroup hr html iframe img input keygen li link listing main marquee menu meta nav "
-        "noembed noframes noscript object ol p param plaintext pre script search section select source style "
-        "summary table tbody td template textarea tfoot th thead title tr track ul wbr xmp");
-    return s;
-}
-
-// start tags that close an open "p"
-const std::set<std::string> &closesP()
-{
-    static const std::set<std::string> s = words(
-        "address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer "
-        "header hgroup main menu nav ol p search section summary ul h1 h2 h3 h4 h5 h6 pre listing form "
-        "plaintext table hr xmp li dd dt");
-    return s;
-}
-
-// end tags closed by scope (the "address, article, ..." group of the standard)
-const std::set<std::string> &blockEnds()
-{
-    static const std::set<std::string> s = words(
-        "address article aside blockquote button center details dialog dir div dl fieldset figcaption figure "
-        "footer header hgroup listing main menu nav ol pre search section summary ul");
-    return s;
-}
-
-// elements whose end tag may be left out
-const std::set<std::string> &impliedEnd()
-{
-    static const std::set<std::string> s = words("dd dt li optgroup option p rb rp rt rtc");
-    return s;
-}
-
-// elements that may still be open when the body ends
-const std::set<std::string> &openAtEndOk()
-{
-    static const std::set<std::string> s = words(
-        "dd dt li optgroup option p rb rp rt rtc tbody td tfoot th thead tr body html head caption colgroup");
-    return s;
-}
-
-const std::set<std::string> &tableParts()
-{
-    static const std::set<std::string> s = words("caption colgroup col tbody thead tfoot tr td th");
-    return s;
-}
-
-// HTML start tags that end SVG / MathML content
-const std::set<std::string> &breakout()
-{
-    static const std::set<std::string> s = words(
-        "b big blockquote body br center code dd div dl dt em embed h1 h2 h3 h4 h5 h6 head hr i img li listing "
-        "menu meta nobr ol p pre ruby s small span strong strike sub sup table tt u ul var");
-    return s;
-}
-
-// elements whose text is not markup (style, script) — written back as it is
-const std::set<std::string> &rawText()
-{
-    static const std::set<std::string> s = words("style script xmp iframe noembed noframes plaintext");
-    return s;
-}
-
-bool heading(const std::string &n) { return n.size() == 2 && n[0] == 'h' && n[1] >= '1' && n[1] <= '6'; }
-
-void appendUtf8(std::string &out, unsigned cp)
-{
-    if (cp < 0x80)
-        out += (char)cp;
-    else if (cp < 0x800)
-    {
-        out += (char)(0xC0 | (cp >> 6));
-        out += (char)(0x80 | (cp & 0x3F));
-    }
-    else if (cp < 0x10000)
-    {
-        out += (char)(0xE0 | (cp >> 12));
-        out += (char)(0x80 | ((cp >> 6) & 0x3F));
-        out += (char)(0x80 | (cp & 0x3F));
-    }
-    else
-    {
-        out += (char)(0xF0 | (cp >> 18));
-        out += (char)(0x80 | ((cp >> 12) & 0x3F));
-        out += (char)(0x80 | ((cp >> 6) & 0x3F));
-        out += (char)(0x80 | (cp & 0x3F));
-    }
-}
-
-// what a browser makes of &#128; .. &#159; (Windows-1252)
-unsigned windows1252(unsigned cp)
-{
-    static const unsigned table[32] = {0x20AC, 0x81,   0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-                                       0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D,   0x017D, 0x8F,
-                                       0x90,   0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-                                       0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D,   0x017E, 0x0178};
-    return table[cp - 0x80];
-}
-
-const std::map<std::string, std::string> &entityMap()
-{
-    static std::map<std::string, std::string> m;
-    if (m.empty())
-        for (int k = 0; k < kEntityCount; ++k)
-            m[kEntities[2 * k]] = kEntities[2 * k + 1];
-    return m;
-}
-
-struct Attr
-{
-    std::string name, value;
-    std::string rawName; // as written (SVG keeps its case: viewBox)
-    int pos = 0;       // offset of the name
-    int valuePos = -1; // offset of the value's first character
-};
-
-struct Node
-{
-    bool element = true; // else text, or a comment when `comment`
-    bool comment = false;
-    std::string name;
-    std::vector<Attr> attrs;
-    std::string text;
-    std::vector<Node *> kids;
-    Node *parent = nullptr;
-    bool foreign = false; // SVG or MathML
-    bool implied = false; // made by the parser: no tag in the source
-    int pos = 0;          // offset of its start tag
-    int contentPos = -1;  // a raw-text element: offset of its text
-};
-
-const Attr *findAttr(const Node *e, const std::string &name)
-{
-    for (const Attr &a : e->attrs)
-        if (a.name == name)
-            return &a;
-    return nullptr;
-}
-
-struct Token
-{
-    enum Type
-    {
-        START,
-        END,
-        TEXT,
-        COMMENT,
-        DOCTYPE,
-        END_OF_FILE
-    };
-    Type type = END_OF_FILE;
-    std::string name;    // tag name (lowercase), doctype name
-    std::string rawName; // as written (SVG keeps its case)
-    std::vector<Attr> attrs;
-    bool selfClosing = false;
-    std::string data; // text, comment, what follows the doctype name
-    int pos = 0;
-};
-
-struct Diag
-{
-    int line = 1, col = 1, width = 1;
-    bool error = true;
-    std::string message;
-};
-
-enum Mode
-{
-    INITIAL,
-    BEFORE_HTML,
-    BEFORE_HEAD,
-    IN_HEAD,
-    AFTER_HEAD,
-    IN_BODY,
-    AFTER_BODY,
-    AFTER_AFTER_BODY
-};
-
-enum Scope
-{
-    S_DEFAULT,
-    S_BUTTON,
-    S_LIST,
-    S_TABLE
-};
-
-class Parser
-{
-public:
-    explicit Parser(const std::string &source) : s(source), n(source.size())
-    {
-        lineStarts.push_back(0);
-        for (size_t k = 0; k < n; ++k)
-            if (s[k] == '\n')
-                lineStarts.push_back((int)k + 1);
-    }
-
-    std::vector<Diag> diags;
-    Node *doc = nullptr, *htmlEl = nullptr, *headEl = nullptr, *bodyEl = nullptr;
-    bool hasDoctype = false, explicitHtml = false, explicitHead = false;
-    std::string doctypeName;
-
-    void lineCol(int off, int &line, int &col) const
-    {
-        size_t idx = (size_t)(std::upper_bound(lineStarts.begin(), lineStarts.end(), off) - lineStarts.begin()) - 1;
-        line = (int)idx + 1;
-        col = off - lineStarts[idx] + 1;
-    }
-
-    void report(int pos, int width, bool error, const std::string &msg)
-    {
-        Diag d;
-        lineCol(pos, d.line, d.col);
-        d.width = std::max(1, width);
-        d.error = error;
-        d.message = msg;
-        diags.push_back(d);
-    }
-
-    Node *parse()
-    {
-        doc = new Node();
-        doc->name = "#document";
-        Token t;
-        while (true)
-        {
-            readToken(t);
-            while (!step(t))
-            {
-            }
-            if (t.type == Token::END_OF_FILE)
-                break;
-        }
-        finish();
-        return doc;
-    }
-
-private:
-    const std::string &s;
-    size_t n;
-    size_t i = 0;
-    std::vector<int> lineStarts;
-    std::vector<Node *> open; // the stack of open elements
-    std::set<Node *> reported; // already reported as unclosed
-    int mode = INITIAL;
-    Node *rawNode = nullptr;  // the open raw-text element (style, script, title ...)
-    std::string rawEnd;       // inside a raw-text element: its name
-    bool rcdata = false;      // ... whose character references are read (title, textarea)
-    bool plaintext = false;   // the rest of the file is text
-    bool skipNewline = false; // right after <pre>, <listing>, <textarea>
-
-    static int tagWidth(const Token &t) { return (int)t.name.size() + 1; }
-
-    // ── tokenizer ────────────────────────────────────────────────────────
-
-    void readToken(Token &t)
-    {
-        while (true)
-        {
-            t = Token();
-            t.pos = (int)i;
-            if (i >= n)
-            {
-                t.type = Token::END_OF_FILE;
-                break;
-            }
-            if (plaintext)
-            {
-                t.type = Token::TEXT;
-                t.data = s.substr(i);
-                i = n;
-                break;
-            }
-            if (!rawEnd.empty())
-            {
-                readRaw(t);
-                break;
-            }
-            int got = s[i] == '<' ? readTag(t) : 0;
-            if (got == 1)
-                break;
-            if (got == 2)
-                continue;
-            readText(t);
-            break;
-        }
-        if (skipNewline)
-        {
-            skipNewline = false;
-            if (t.type == Token::TEXT && !t.data.empty() && t.data[0] == '\n')
-                t.data.erase(0, 1);
-        }
-    }
-
-    void readText(Token &t)
-    {
-        t.type = Token::TEXT;
-        std::string out;
-        if (i < n && s[i] == '<')
-            out += s[i++]; // a "<" that starts no tag
-        while (i < n && s[i] != '<')
-        {
-            char c = s[i];
-            if (c == '&')
-            {
-                charRef(out, false);
-                continue;
-            }
-            if (c == '\r')
-            {
-                out += '\n';
-                ++i;
-                if (i < n && s[i] == '\n')
-                    ++i;
-                continue;
-            }
-            if (c == '\0')
-            {
-                report((int)i, 1, true, "Saw U+0000 in the text.");
-                ++i;
-                continue;
-            }
-            out += c;
-            ++i;
-        }
-        t.data = out;
-    }
-
-    // the text of a raw-text element, up to its end tag
-    void readRaw(Token &t)
-    {
-        t.type = Token::TEXT;
-        size_t end = n;
-        for (size_t j = i;;)
-        {
-            size_t k = s.find("</", j);
-            if (k == std::string::npos)
-                break;
-            size_t m = k + 2;
-            if (m + rawEnd.size() <= n && lower(s.substr(m, rawEnd.size())) == rawEnd)
-            {
-                char after = m + rawEnd.size() < n ? s[m + rawEnd.size()] : '>';
-                if (isWs(after) || after == '/' || after == '>')
-                {
-                    end = k;
-                    break;
-                }
-            }
-            j = k + 2;
-        }
-        std::string out;
-        while (i < end)
-        {
-            if (rcdata && s[i] == '&')
-            {
-                charRef(out, false);
-                continue;
-            }
-            if (s[i] == '\r')
-            {
-                out += '\n';
-                ++i;
-                if (i < end && s[i] == '\n')
-                    ++i;
-                continue;
-            }
-            out += s[i++];
-        }
-        i = end;
-        if (end == n)
-            report((int)n, 1, true, "End of file seen when expecting text or an end tag.");
-        t.data = out;
-        rawEnd.clear();
-        rcdata = false;
-    }
-
-    // From "<": a token (1), nothing to keep (2), or a "<" that is text (0)
-    int readTag(Token &t)
-    {
-        size_t start = i;
-        char c1 = i + 1 < n ? s[i + 1] : '\0';
-        if (c1 == '!')
-        {
-            if (s.compare(i, 4, "<!--") == 0)
-            {
-                comment(t);
-                return 1;
-            }
-            if (i + 9 <= n && lower(s.substr(i, 9)) == "<!doctype")
-            {
-                doctype(t);
-                return 1;
-            }
-            if (s.compare(i, 9, "<![CDATA[") == 0)
-            {
-                size_t close = s.find("]]>", i + 9);
-                size_t stop = close == std::string::npos ? n : close;
-                if (current()->foreign)
-                {
-                    t.type = Token::TEXT;
-                    t.data = s.substr(i + 9, stop - (i + 9));
-                    i = close == std::string::npos ? n : close + 3;
-                    return 1;
-                }
-                report((int)start, 9, true, "Saw \"<![CDATA[\" in HTML: CDATA sections are only allowed in SVG and MathML.");
-                bogusComment(t, i + 2);
-                return 1;
-            }
-            report((int)start, 2, true, "Bogus comment.");
-            bogusComment(t, i + 2);
-            return 1;
-        }
-        if (c1 == '/')
-        {
-            char c2 = i + 2 < n ? s[i + 2] : '\0';
-            if (std::isalpha((unsigned char)c2))
-                return endTag(t) ? 1 : 2;
-            if (c2 == '>')
-            {
-                report((int)start, 3, true,
-                       "Saw \"</>\". Probable causes: Unescaped \"<\" (escape as \"&lt;\") or mistyped end tag.");
-                i += 3;
-                return 2;
-            }
-            if (i + 2 >= n)
-            {
-                report((int)start, 2, true, "End of file seen after \"</\".");
-                return 0;
-            }
-            report((int)start, 2, true,
-                   "Garbage after \"</\". Probable causes: Unescaped \"<\" (escape as \"&lt;\") or mistyped end tag.");
-            bogusComment(t, i + 2);
-            return 1;
-        }
-        if (c1 == '?')
-        {
-            report((int)start, 2, true,
-                   "Saw \"<?\". Probable cause: Attempt to use an XML processing instruction in HTML. (XML "
-                   "processing instructions are not supported in HTML.)");
-            bogusComment(t, i + 1);
-            return 1;
-        }
-        if (std::isalpha((unsigned char)c1))
-            return startTag(t) ? 1 : 2;
-        if (i + 1 >= n)
-            report((int)start, 1, true, "End of file after \"<\".");
-        else if ((unsigned char)c1 < 0x80 && !isWs(c1))
-            report((int)start, 2, true,
-                   std::string("Bad character \"") + c1 +
-                       "\" after \"<\". Probable cause: Unescaped \"<\". Try escaping it as \"&lt;\".");
-        else
-            report((int)start, 1, true, "Bad character after \"<\". Probable cause: Unescaped \"<\". Try escaping it as \"&lt;\".");
-        return 0;
-    }
-
-    void bogusComment(Token &t, size_t from)
-    {
-        size_t close = s.find('>', from);
-        size_t stop = close == std::string::npos ? n : close;
-        t.type = Token::COMMENT;
-        t.data = s.substr(from, stop - from);
-        i = close == std::string::npos ? n : close + 1;
-    }
-
-    void comment(Token &t)
-    {
-        size_t start = i, j = i + 4;
-        t.type = Token::COMMENT;
-        if (s.compare(j, 1, ">") == 0 || s.compare(j, 2, "->") == 0)
-        {
-            report((int)start, 4, true, "Premature end of comment. Use \"-->\" to end a comment properly.");
-            i = j + (s[j] == '>' ? 1 : 2);
-            return;
-        }
-        size_t close = s.find("-->", j);
-        size_t bang = s.find("--!>", j);
-        if (bang != std::string::npos && (close == std::string::npos || bang < close))
-        {
-            report((int)bang, 4, true, "The comment ended with \"--!>\": use \"-->\".");
-            t.data = s.substr(j, bang - j);
-            i = bang + 4;
-            return;
-        }
-        if (close == std::string::npos)
-        {
-            report((int)start, 4, true, "End of file inside comment.");
-            t.data = s.substr(j);
-            i = n;
-            return;
-        }
-        t.data = s.substr(j, close - j);
-        size_t nested = t.data.find("<!--");
-        if (nested != std::string::npos)
-            report((int)(j + nested), 4, true, "Saw \"<!--\" within a comment. Probable cause: Nested comment (not allowed).");
-        i = close + 3;
-    }
-
-    void doctype(Token &t)
-    {
-        size_t start = i;
-        size_t close = s.find('>', i);
-        if (close == std::string::npos)
-        {
-            report((int)start, 9, true, "End of file inside doctype.");
-            close = n;
-        }
-        std::string body = s.substr(i + 9, close - (i + 9));
-        std::istringstream in(body);
-        std::string name, rest;
-        in >> name;
-        std::getline(in, rest);
-        size_t a = rest.find_first_not_of(" \t\r\n\f");
-        t.type = Token::DOCTYPE;
-        t.name = lower(name);
-        t.data = a == std::string::npos ? "" : rest.substr(a);
-        i = close < n ? close + 1 : n;
-    }
-
-    bool endTag(Token &t)
-    {
-        size_t start = i, j = i + 2;
-        while (j < n && !isWs(s[j]) && s[j] != '/' && s[j] != '>')
-            ++j;
-        t.type = Token::END;
-        t.rawName = s.substr(i + 2, j - i - 2);
-        t.name = lower(t.rawName);
-        size_t close = s.find('>', j);
-        if (close == std::string::npos)
-        {
-            report((int)start, (int)(j - start), true, "End of file seen inside an end tag. Ignoring tag.");
-            i = n;
-            return false;
-        }
-        for (size_t k = j; k < close; ++k)
-            if (!isWs(s[k]) && s[k] != '/')
-            {
-                report((int)k, 1, true, "End tag had attributes.");
-                break;
-            }
-        i = close + 1;
-        return true;
-    }
-
-    bool startTag(Token &t)
-    {
-        size_t start = i, j = i + 1;
-        while (j < n && !isWs(s[j]) && s[j] != '/' && s[j] != '>')
-            ++j;
-        t.type = Token::START;
-        t.rawName = s.substr(i + 1, j - i - 1);
-        t.name = lower(t.rawName);
-        i = j;
-        bool afterValue = false; // right after a quoted value: a space must come next
-        while (true)
-        {
-            bool space = false;
-            while (i < n && isWs(s[i]))
-            {
-                ++i;
-                space = true;
-            }
-            if (i >= n)
-            {
-                report((int)start, tagWidth(t), true, "End of file inside a tag. Ignoring tag.");
-                return false;
-            }
-            char c = s[i];
-            if (c == '>')
-            {
-                ++i;
-                return true;
-            }
-            if (c == '/')
-            {
-                if (i + 1 < n && s[i + 1] == '>')
-                {
-                    t.selfClosing = true;
-                    i += 2;
-                    return true;
-                }
-                report((int)i, 1, true, "A slash was not immediately followed by \">\".");
-                ++i;
-                afterValue = false;
-                continue;
-            }
-            if (afterValue && !space)
-                report((int)i, 1, true, "No space between attributes.");
-            afterValue = false;
-            Attr a;
-            a.pos = (int)i;
-            size_t k = i;
-            if (s[k] == '=')
-            {
-                report((int)k, 1, true, "\"=\" at the start of an attribute name. Probable cause: Stray \"=\".");
-                ++k;
-            }
-            while (k < n && !isWs(s[k]) && s[k] != '/' && s[k] != '>' && s[k] != '=')
-            {
-                if (s[k] == '"' || s[k] == '\'')
-                    report((int)k, 1, true, "Quote in attribute name. Probable cause: Matching quote missing somewhere earlier.");
-                else if (s[k] == '<')
-                    report((int)k, 1, true, "\"<\" in attribute name. Probable cause: \">\" missing immediately before.");
-                ++k;
-            }
-            a.rawName = s.substr(i, k - i);
-            a.name = lower(a.rawName);
-            i = k;
-            size_t afterName = i;
-            while (i < n && isWs(s[i]))
-                ++i;
-            if (i < n && s[i] == '=')
-            {
-                ++i;
-                while (i < n && isWs(s[i]))
-                    ++i;
-                if (i >= n)
-                {
-                    report((int)start, tagWidth(t), true, "End of file inside a tag. Ignoring tag.");
-                    return false;
-                }
-                if (s[i] == '"' || s[i] == '\'')
-                {
-                    char q = s[i++];
-                    a.valuePos = (int)i;
-                    while (i < n && s[i] != q)
-                    {
-                        if (s[i] == '&')
-                        {
-                            charRef(a.value, true);
-                            continue;
-                        }
-                        if (s[i] == '\r')
-                        {
-                            a.value += '\n';
-                            ++i;
-                            if (i < n && s[i] == '\n')
-                                ++i;
-                            continue;
-                        }
-                        a.value += s[i++];
-                    }
-                    if (i >= n)
-                    {
-                        report((int)start, tagWidth(t), true, "End of file inside a tag. Ignoring tag.");
-                        return false;
-                    }
-                    ++i;
-                    afterValue = true;
-                }
-                else if (s[i] == '>')
-                {
-                    report((int)i, 1, true, "Attribute value missing.");
-                    a.valuePos = (int)i;
-                }
-                else
-                {
-                    a.valuePos = (int)i;
-                    bool warned = false;
-                    while (i < n && !isWs(s[i]) && s[i] != '>')
-                    {
-                        char v = s[i];
-                        if (!warned && (v == '"' || v == '\'' || v == '<' || v == '=' || v == '`'))
-                        {
-                            report((int)i, 1, true,
-                                   std::string("\"") + v +
-                                       "\" in an unquoted attribute value. Probable causes: Attributes running "
-                                       "together or a URL query string in an unquoted attribute value.");
-                            warned = true;
-                        }
-                        if (v == '&')
-                        {
-                            charRef(a.value, true);
-                            continue;
-                        }
-                        a.value += v;
-                        ++i;
-                    }
-                }
-            }
-            else
-                i = afterName; // no value
-            bool duplicate = false;
-            for (const Attr &b : t.attrs)
-                if (b.name == a.name)
-                    duplicate = true;
-            if (duplicate)
-                report(a.pos, (int)a.name.size(), true, "Duplicate attribute \"" + a.name + "\".");
-            else
-                t.attrs.push_back(a);
-        }
-    }
-
-    void charRef(std::string &out, bool inAttr)
-    {
-        size_t start = i;
-        if (i + 1 < n && s[i + 1] == '#')
-        {
-            size_t j = i + 2;
-            bool hex = j < n && (s[j] == 'x' || s[j] == 'X');
-            if (hex)
-                ++j;
-            size_t digits = j;
-            unsigned long long v = 0;
-            while (j < n && (hex ? std::isxdigit((unsigned char)s[j]) : std::isdigit((unsigned char)s[j])))
-            {
-                int d = std::isdigit((unsigned char)s[j]) ? s[j] - '0' : std::tolower((unsigned char)s[j]) - 'a' + 10;
-                if (v <= 0x10FFFF)
-                    v = v * (hex ? 16 : 10) + (unsigned long long)d;
-                ++j;
-            }
-            if (j == digits)
-            {
-                report((int)start, (int)(j - start), true,
-                       "No digits in a numeric character reference. (\"&\" probably should have been escaped as \"&amp;\".)");
-                out += '&';
-                ++i;
-                return;
-            }
-            if (j < n && s[j] == ';')
-                ++j;
-            else
-                report((int)start, (int)(j - start), true, "Character reference was not terminated by a semicolon.");
-            int width = (int)(j - start);
-            unsigned cp = (unsigned)v;
-            if (v == 0)
-            {
-                report((int)start, width, true, "Character reference expands to zero.");
-                cp = 0xFFFD;
-            }
-            else if (v > 0x10FFFF)
-            {
-                report((int)start, width, true, "Character reference outside the permissible Unicode range.");
-                cp = 0xFFFD;
-            }
-            else if (v >= 0xD800 && v <= 0xDFFF)
-            {
-                report((int)start, width, true, "Character reference expands to a surrogate.");
-                cp = 0xFFFD;
-            }
-            else if (v >= 0x80 && v <= 0x9F)
-            {
-                report((int)start, width, true, "A numeric character reference expanded to the C1 controls range.");
-                cp = windows1252(cp);
-            }
-            else if ((v < 0x20 && v != '\t' && v != '\n' && v != '\f') || v == 0x7F)
-                report((int)start, width, true, "Character reference expands to a control character.");
-            appendUtf8(out, cp);
-            i = j;
-            return;
-        }
-        const std::map<std::string, std::string> &table = entityMap();
-        size_t j = i + 1, best = 0;
-        for (size_t len = 1; len <= 32 && j + len <= n; ++len)
-        {
-            char c = s[j + len - 1];
-            if (c == ';')
-            {
-                if (table.count(s.substr(j, len)))
-                    best = len;
-                break;
-            }
-            if (!std::isalnum((unsigned char)c))
-                break;
-            if (table.count(s.substr(j, len)))
-                best = len;
-        }
-        if (best == 0)
-        {
-            size_t k = j;
-            while (k < n && std::isalnum((unsigned char)s[k]))
-                ++k;
-            if (k > j && k < n && s[k] == ';')
-                report((int)start, (int)(k + 1 - start), true,
-                       "\"" + s.substr(start, k + 1 - start) +
-                           "\" is not a character reference. (\"&\" probably should have been escaped as \"&amp;\".)");
-            out += '&';
-            ++i;
-            return;
-        }
-        std::string name = s.substr(j, best);
-        if (name.back() != ';')
-        {
-            char next = j + best < n ? s[j + best] : '\0';
-            if (inAttr && (next == '=' || std::isalnum((unsigned char)next)))
-            {
-                out += '&'; // "?a=1&copy=2" in a URL stays as it is
-                ++i;
-                return;
-            }
-            report((int)start, (int)best + 1, true,
-                   "Named character reference was not terminated by a semicolon. (Or \"&\" should have been escaped as \"&amp;\".)");
-        }
-        out += table.at(name);
-        i = j + best;
-    }
-
-    // ── tree construction ────────────────────────────────────────────────
-
-    Node *current() const { return open.empty() ? (htmlEl ? htmlEl : doc) : open.back(); }
-
-    static void append(Node *parent, Node *child)
-    {
-        child->parent = parent;
-        parent->kids.push_back(child);
-    }
-
-    static void appendText(Node *parent, const std::string &text)
-    {
-        if (text.empty())
-            return;
-        if (!parent->kids.empty() && !parent->kids.back()->element && !parent->kids.back()->comment)
-        {
-            parent->kids.back()->text += text;
-            return;
-        }
-        Node *t = new Node();
-        t->element = false;
-        t->text = text;
-        append(parent, t);
-    }
-
-    Node *insert(const Token &t, bool foreign)
-    {
-        Node *e = new Node();
-        e->name = foreign ? t.rawName : t.name;
-        e->attrs = t.attrs;
-        if (foreign)
-            for (Attr &a : e->attrs)
-                a.name = a.rawName;
-        e->foreign = foreign;
-        e->pos = t.pos;
-        append(current(), e);
-        return e;
-    }
-
-    Node *insertImplied(const std::string &name, int pos)
-    {
-        Node *e = new Node();
-        e->name = name;
-        e->implied = true;
-        e->pos = pos;
-        append(current(), e);
-        open.push_back(e);
-        return e;
-    }
-
-    // the element's text is raw text up to its end tag
-    void startRaw(Node *e, bool readRefs)
-    {
-        rawNode = e;
-        rawEnd = e->name;
-        rcdata = readRefs;
-        e->contentPos = (int)i;
-    }
-
-    void mergeAttrs(Node *e, const Token &t)
-    {
-        if (!e)
-            return;
-        for (const Attr &a : t.attrs)
-            if (!findAttr(e, a.name))
-                e->attrs.push_back(a);
-    }
-
-    // a text token's leading whitespace: kept in `into` (or dropped); true
-    // when nothing else is left
-    static bool leadingSpace(Token &t, Node *into)
-    {
-        size_t k = 0;
-        while (k < t.data.size() && isWs(t.data[k]))
-            ++k;
-        if (into && k)
-            appendText(into, t.data.substr(0, k));
-        t.data.erase(0, k);
-        t.pos += (int)k;
-        return t.data.empty();
-    }
-
-    static bool integrationPoint(const Node *e)
-    {
-        if (!e->foreign)
-            return false;
-        std::string nm = lower(e->name);
-        return nm == "foreignobject" || nm == "desc" || nm == "title" || nm == "mi" || nm == "mo" || nm == "mn" ||
-               nm == "ms" || nm == "mtext" || nm == "annotation-xml";
-    }
-
-    bool boundary(const Node *e, int scope) const
-    {
-        if (e->foreign)
-            return integrationPoint(e);
-        const std::string &nm = e->name;
-        if (scope == S_TABLE)
-            return nm == "html" || nm == "table" || nm == "template";
-        if (nm == "applet" || nm == "caption" || nm == "html" || nm == "table" || nm == "td" || nm == "th" ||
-            nm == "marquee" || nm == "object" || nm == "template")
-            return true;
-        if (scope == S_BUTTON)
-            return nm == "button";
-        if (scope == S_LIST)
-            return nm == "ol" || nm == "ul";
-        return false;
-    }
-
-    // the index of the open element `name` in scope, or -1
-    int inScope(const std::string &name, int scope) const
-    {
-        for (size_t k = open.size(); k-- > 0;)
-        {
-            const Node *e = open[k];
-            if (!e->foreign && e->name == name)
-                return (int)k;
-            if (boundary(e, scope))
-                return -1;
-        }
-        return -1;
-    }
-
-    void unclosed(Node *e)
-    {
-        if (reported.count(e))
-            return;
-        reported.insert(e);
-        report(e->pos, (int)e->name.size() + 1, true, "Unclosed element \"" + e->name + "\".");
-    }
-
-    // Closes open[k] and everything above it: what may be left open closes
-    // silently, anything else is reported as unclosed
-    void closeAt(size_t k, const Token &t, bool tableOk)
-    {
-        bool any = false;
-        for (size_t m = open.size(); m-- > k + 1;)
-        {
-            Node *x = open[m];
-            bool optional = x->implied || (!x->foreign && (impliedEnd().count(x->name) ||
-                                                           (tableOk && tableParts().count(x->name))));
-            if (!optional)
-            {
-                if (!any)
-                    report(t.pos, tagWidth(t) + 1, true, "End tag \"" + t.name + "\" seen, but there were open elements.");
-                any = true;
-                unclosed(x);
-            }
-        }
-        open.resize(k);
-    }
-
-    // what is still open where the body ends
-    void openAtEnd(int pos, const std::string &message)
-    {
-        bool any = false;
-        for (size_t k = open.size(); k-- > 0;)
-        {
-            Node *x = open[k];
-            if (x->implied || reported.count(x) || (!x->foreign && openAtEndOk().count(x->name)))
-                continue;
-            if (!any)
-                report(pos, 1, true, message);
-            any = true;
-            unclosed(x);
-        }
-    }
-
-    // a start tag implies the end of an open "p"
-    void closeP(const Token &t)
-    {
-        int k = inScope("p", S_BUTTON);
-        if (k < 0)
-            return;
-        for (size_t m = open.size(); m-- > (size_t)k + 1;)
-        {
-            Node *x = open[m];
-            if (!x->implied && !(!x->foreign && impliedEnd().count(x->name)))
-            {
-                report(t.pos, tagWidth(t), true, "Start tag \"" + t.name + "\" implied the end of \"p\", but there were open elements.");
-                unclosed(x);
-            }
-        }
-        open.resize((size_t)k);
-    }
-
-    // ends the head: what is still open in it (a noscript) is unclosed
-    void closeHead()
-    {
-        while (!open.empty() && open.back() != headEl)
-        {
-            unclosed(open.back());
-            open.pop_back();
-        }
-        if (!open.empty())
-            open.pop_back();
-        mode = AFTER_HEAD;
-    }
-
-    void strayEnd(const Token &t) { report(t.pos, tagWidth(t) + 1, true, "Stray end tag \"" + t.name + "\"."); }
-
-    void strayStart(const Token &t) { report(t.pos, tagWidth(t), true, "Stray start tag \"" + t.name + "\"."); }
-
-    bool tableContext(const Node *e) const
-    {
-        return !e->foreign && (e->name == "table" || e->name == "tbody" || e->name == "thead" ||
-                               e->name == "tfoot" || e->name == "tr");
-    }
-
-    // Processes a token in the current insertion mode; false to process it
-    // again in the mode it switched to
-    bool step(Token &t)
-    {
-        if (rawNode)
-        {
-            // the text of a raw-text element, then its end tag
-            if (t.type == Token::TEXT)
-            {
-                appendText(rawNode, t.data);
-                return true;
-            }
-            bool closes = t.type == Token::END && t.name == rawNode->name;
-            if (!open.empty() && open.back() == rawNode)
-                open.pop_back();
-            rawNode = nullptr;
-            if (closes)
-                return true;
-        }
-        if (t.type == Token::TEXT && t.data.empty())
-            return true;
-        if (t.type == Token::DOCTYPE)
-        {
-            if (mode != INITIAL)
-            {
-                report(t.pos, 9, true, "Stray doctype.");
-                return true;
-            }
-            hasDoctype = true;
-            doctypeName = t.name;
-            bool legacy = !t.data.empty() && lower(t.data).find("about:legacy-compat") == std::string::npos;
-            if (t.name.empty())
-                report(t.pos, 9, true, "Missing doctype name. Expected \"<!DOCTYPE html>\".");
-            else if (t.name != "html" || legacy)
-                report(t.pos, 9, true, "Obsolete doctype. Expected \"<!DOCTYPE html>\".");
-            mode = BEFORE_HTML;
-            return true;
-        }
-        if (t.type == Token::COMMENT)
-        {
-            Node *c = new Node();
-            c->element = false;
-            c->comment = true;
-            c->text = t.data;
-            if (mode == INITIAL || mode == BEFORE_HTML || mode == AFTER_AFTER_BODY)
-                append(doc, c);
-            else if (mode == AFTER_BODY)
-                append(htmlEl, c);
-            else
-                append(current(), c);
-            return true;
-        }
-        const bool start = t.type == Token::START, end = t.type == Token::END;
-        const std::string &nm = t.name;
-        switch (mode)
-        {
-        case INITIAL:
-            if (t.type == Token::TEXT && leadingSpace(t, nullptr))
-                return true;
-            if (t.type == Token::TEXT)
-                report(t.pos, 1, false, "Non-space characters found without seeing a doctype first. Expected \"<!DOCTYPE html>\".");
-            else if (start)
-                report(t.pos, tagWidth(t), false, "Start tag seen without seeing a doctype first. Expected \"<!DOCTYPE html>\".");
-            else if (end)
-                report(t.pos, tagWidth(t), false, "End tag seen without seeing a doctype first. Expected \"<!DOCTYPE html>\".");
-            mode = BEFORE_HTML;
-            return false;
-
-        case BEFORE_HTML:
-            if (t.type == Token::TEXT && leadingSpace(t, nullptr))
-                return true;
-            if (start && nm == "html")
-            {
-                htmlEl = insert(t, false);
-                open.push_back(htmlEl);
-                explicitHtml = true;
-                mode = BEFORE_HEAD;
-                return true;
-            }
-            if (end && nm != "head" && nm != "body" && nm != "html" && nm != "br")
-            {
-                strayEnd(t);
-                return true;
-            }
-            htmlEl = insertImplied("html", t.pos);
-            mode = BEFORE_HEAD;
-            return false;
-
-        case BEFORE_HEAD:
-            if (t.type == Token::TEXT && leadingSpace(t, nullptr))
-                return true;
-            if (start && nm == "html")
-            {
-                strayStart(t);
-                mergeAttrs(htmlEl, t);
-                return true;
-            }
-            if (start && nm == "head")
-            {
-                headEl = insert(t, false);
-                open.push_back(headEl);
-                explicitHead = true;
-                mode = IN_HEAD;
-                return true;
-            }
-            if (end && nm != "head" && nm != "body" && nm != "html" && nm != "br")
-            {
-                strayEnd(t);
-                return true;
-            }
-            headEl = insertImplied("head", t.pos);
-            mode = IN_HEAD;
-            return false;
-
-        case IN_HEAD:
-            if (t.type == Token::TEXT && leadingSpace(t, current()))
-                return true;
-            if (start)
-            {
-                if (nm == "html")
-                {
-                    strayStart(t);
-                    mergeAttrs(htmlEl, t);
-                    return true;
-                }
-                if (nm == "base" || nm == "basefont" || nm == "bgsound" || nm == "link" || nm == "meta")
-                {
-                    obsoleteCheck(t);
-                    insert(t, false);
-                    return true;
-                }
-                if (nm == "title" || nm == "style" || nm == "script" || nm == "noframes")
-                {
-                    obsoleteCheck(t);
-                    Node *e = insert(t, false);
-                    open.push_back(e);
-                    startRaw(e, nm == "title");
-                    return true;
-                }
-                if (nm == "noscript" || nm == "template")
-                {
-                    open.push_back(insert(t, false));
-                    return true;
-                }
-                if (nm == "head")
-                {
-                    report(t.pos, tagWidth(t), true, "Start tag \"head\" seen but an element of the same type was already open.");
-                    return true;
-                }
-            }
-            if (end)
-            {
-                if (nm == "head")
-                {
-                    closeHead();
-                    return true;
-                }
-                if (current() != headEl && current()->name == nm)
-                {
-                    open.pop_back();
-                    return true;
-                }
-                if (nm != "body" && nm != "html" && nm != "br")
-                {
-                    strayEnd(t);
-                    return true;
-                }
-            }
-            closeHead();
-            return false;
-
-        case AFTER_HEAD:
-            if (t.type == Token::TEXT && leadingSpace(t, current()))
-                return true;
-            if (start)
-            {
-                if (nm == "html")
-                {
-                    strayStart(t);
-                    mergeAttrs(htmlEl, t);
-                    return true;
-                }
-                if (nm == "body")
-                {
-                    bodyEl = insert(t, false);
-                    open.push_back(bodyEl);
-                    mode = IN_BODY;
-                    return true;
-                }
-                if (nm == "base" || nm == "basefont" || nm == "bgsound" || nm == "link" || nm == "meta" ||
-                    nm == "noframes" || nm == "script" || nm == "style" || nm == "template" || nm == "title")
-                {
-                    report(t.pos, tagWidth(t), true, "\"" + nm + "\" element between \"head\" and \"body\".");
-                    open.push_back(headEl);
-                    mode = IN_HEAD;
-                    return false;
-                }
-                if (nm == "head")
-                {
-                    strayStart(t);
-                    return true;
-                }
-            }
-            if (end && nm != "body" && nm != "html" && nm != "br")
-            {
-                strayEnd(t);
-                return true;
-            }
-            bodyEl = insertImplied("body", t.pos);
-            mode = IN_BODY;
-            return false;
-
-        case IN_BODY:
-            return inBody(t);
-
-        case AFTER_BODY:
-        case AFTER_AFTER_BODY:
-            if (t.type == Token::TEXT)
-            {
-                if (leadingSpace(t, bodyEl ? bodyEl : current()))
-                    return true;
-                report(t.pos, 1, true, "Non-space character after body.");
-                mode = IN_BODY;
-                return false;
-            }
-            if (t.type == Token::END_OF_FILE)
-                return true;
-            if (start && nm == "html")
-                return inBody(t);
-            if (end && nm == "html" && mode == AFTER_BODY)
-            {
-                mode = AFTER_AFTER_BODY;
-                return true;
-            }
-            if (start)
-                strayStart(t);
-            else
-                strayEnd(t);
-            mode = IN_BODY;
-            return false;
-        }
-        return true;
-    }
-
-    void obsoleteCheck(const Token &t)
-    {
-        auto o = obsoleteElements().find(t.name);
-        if (o != obsoleteElements().end())
-            report(t.pos, tagWidth(t), false, "The \"" + t.name + "\" element is obsolete. " + o->second);
-    }
-
-    bool inBody(Token &t)
-    {
-        Node *cur = current();
-        bool foreignContext = cur->foreign && !integrationPoint(cur);
-        switch (t.type)
-        {
-        case Token::TEXT:
-            if (!foreignContext && tableContext(cur) && t.data.find_first_not_of(" \t\n\r\f") != std::string::npos)
-                report(t.pos, 1, true, "Misplaced non-space characters inside a table.");
-            appendText(cur, t.data);
-            return true;
-        case Token::END_OF_FILE:
-            openAtEnd((int)n, "End of file seen and there were open elements.");
-            return true;
-        case Token::START:
-            return foreignContext ? foreignStart(t) : bodyStart(t);
-        case Token::END:
-            return cur->foreign ? foreignEnd(t) : bodyEnd(t);
-        default:
-            return true;
-        }
-    }
-
-    bool foreignStart(Token &t)
-    {
-        bool out = breakout().count(t.name) > 0;
-        if (t.name == "font")
-            for (const Attr &a : t.attrs)
-                if (a.name == "color" || a.name == "face" || a.name == "size")
-                    out = true;
-        if (out)
-        {
-            report(t.pos, tagWidth(t), true, "HTML start tag \"" + t.name + "\" in a foreign namespace context.");
-            while (!open.empty() && open.back()->foreign && !integrationPoint(open.back()))
-                open.pop_back();
-            return false;
-        }
-        Node *e = insert(t, true);
-        if (!t.selfClosing)
-            open.push_back(e);
-        return true;
-    }
-
-    bool foreignEnd(Token &t)
-    {
-        for (size_t k = open.size(); k-- > 0;)
-        {
-            Node *e = open[k];
-            if (!e->foreign)
-                return bodyEnd(t);
-            if (lower(e->name) == t.name)
-            {
-                closeAt(k, t, false);
-                return true;
-            }
-        }
-        return true;
-    }
-
-    int tableIndex() const
-    {
-        for (size_t k = open.size(); k-- > 0;)
-        {
-            const Node *x = open[k];
-            if (!x->foreign && x->name == "table")
-                return (int)k;
-            if (!x->foreign && (x->name == "html" || x->name == "template"))
-                return -1;
-        }
-        return -1;
-    }
-
-    // pops what is above the table back to an element named in `stop`
-    void popInTable(int table, const std::set<std::string> &stop)
-    {
-        while ((int)open.size() - 1 > table)
-        {
-            Node *x = open.back();
-            if (!x->foreign && stop.count(x->name))
-                return;
-            if (!x->implied && (x->foreign || !(tableParts().count(x->name) || impliedEnd().count(x->name))))
-                unclosed(x);
-            open.pop_back();
-        }
-    }
-
-    bool tableStart(const Token &t)
-    {
-        const std::string &nm = t.name;
-        int table = tableIndex();
-        if (table < 0)
-        {
-            strayStart(t);
-            return true;
-        }
-        static const std::set<std::string> none;
-        static const std::set<std::string> colgroup = words("colgroup");
-        static const std::set<std::string> sections = words("tbody thead tfoot");
-        static const std::set<std::string> rows = words("tr tbody thead tfoot");
-        if (nm == "caption" || nm == "colgroup" || nm == "tbody" || nm == "thead" || nm == "tfoot")
-        {
-            popInTable(table, none);
-            open.push_back(insert(t, false));
-            return true;
-        }
-        if (nm == "col")
-        {
-            popInTable(table, colgroup);
-            if (current()->name != "colgroup")
-                insertImplied("colgroup", t.pos);
-            insert(t, false);
-            return true;
-        }
-        if (nm == "tr")
-        {
-            popInTable(table, sections);
-            if (current()->name == "table")
-                insertImplied("tbody", t.pos);
-            open.push_back(insert(t, false));
-            return true;
-        }
-        // td, th
-        popInTable(table, rows);
-        if (current()->name == "table")
-            insertImplied("tbody", t.pos);
-        if (current()->name != "tr")
-            insertImplied("tr", t.pos);
-        open.push_back(insert(t, false));
-        return true;
-    }
-
-    bool bodyStart(Token &t)
-    {
-        std::string nm = t.name;
-        if (nm == "html")
-        {
-            strayStart(t);
-            mergeAttrs(htmlEl, t);
-            return true;
-        }
-        if (nm == "body")
-        {
-            report(t.pos, tagWidth(t), true, "Start tag \"body\" seen but an element of the same type was already open.");
-            mergeAttrs(bodyEl, t);
-            return true;
-        }
-        if (nm == "head" || nm == "frameset")
-        {
-            strayStart(t);
-            return true;
-        }
-        if (nm == "title" || nm == "base")
-            report(t.pos, tagWidth(t), true, "Element \"" + nm + "\" not allowed as child of element \"body\" in this context.");
-        if (tableParts().count(nm))
-            return tableStart(t);
-        if (nm == "table" && !current()->foreign && current()->name == "table")
-        {
-            report(t.pos, tagWidth(t), true, "Start tag \"table\" seen but the previous \"table\" is still open.");
-            open.pop_back();
-        }
-        if (nm == "li" || nm == "dd" || nm == "dt")
-            closeListItem(t);
-        if (closesP().count(nm))
-            closeP(t);
-        if (heading(nm) && !current()->foreign && heading(current()->name))
-        {
-            report(t.pos, tagWidth(t), true, "Heading cannot be a child of another heading.");
-            open.pop_back();
-        }
-        if (nm == "a" || nm == "nobr")
-            for (size_t k = open.size(); k-- > 0;)
-            {
-                Node *x = open[k];
-                if (!x->foreign && x->name == nm)
-                {
-                    report(t.pos, tagWidth(t), true, "An \"" + nm + "\" start tag seen but an element of the same type was already open.");
-                    open.resize(k);
-                    break;
-                }
-                if (!x->foreign && (x->name == "table" || x->name == "td" || x->name == "th" ||
-                                    x->name == "caption" || x->name == "html" || x->name == "template"))
-                    break;
-            }
-        if (nm == "form")
-            for (const Node *x : open)
-                if (!x->foreign && x->name == "form")
-                {
-                    report(t.pos, tagWidth(t), true,
-                           "Saw a \"form\" start tag, but there was already an active \"form\" element. Nested forms "
-                           "are not allowed. Ignoring the tag.");
-                    return true;
-                }
-        if (nm == "button")
-        {
-            int k = inScope("button", S_DEFAULT);
-            if (k >= 0)
-            {
-                report(t.pos, tagWidth(t), true, "Start tag \"button\" seen but an element of the same type was already open.");
-                open.resize((size_t)k);
-            }
-        }
-        if (nm == "option" && current()->name == "option")
-            open.pop_back();
-        if (nm == "optgroup")
-        {
-            if (current()->name == "option")
-                open.pop_back();
-            if (current()->name == "optgroup")
-                open.pop_back();
-        }
-        if (nm == "rb" || nm == "rtc" || nm == "rp" || nm == "rt")
-            while (!current()->foreign && impliedEnd().count(current()->name) &&
-                   !((nm == "rp" || nm == "rt") && current()->name == "rtc"))
-                open.pop_back();
-        if (nm == "image")
-        {
-            obsoleteCheck(t);
-            t.name = nm = "img";
-        }
-        if (nm == "svg" || nm == "math")
-        {
-            Node *e = insert(t, true);
-            if (!t.selfClosing)
-                open.push_back(e);
-            return true;
-        }
-        if (!knownElements().count(nm) && nm.find('-') == std::string::npos)
-            report(t.pos, tagWidth(t), true,
-                   "Unknown element \"" + nm + "\". (A custom element's name must contain a hyphen, like \"my-" + nm + "\".)");
-        else
-            obsoleteCheck(t);
-        if (tableContext(current()) && nm != "script" && nm != "style" && nm != "template" && nm != "form" &&
-            nm != "input")
-            report(t.pos, tagWidth(t), true, "Start tag \"" + nm + "\" seen in \"" + current()->name + "\".");
-        bool isVoid = voidElements().count(nm) > 0;
-        if (t.selfClosing && !isVoid)
-            report(t.pos, tagWidth(t), true,
-                   "Self-closing syntax (\"/>\") used on a non-void HTML element. Ignoring the slash and treating as a "
-                   "start tag.");
-        Node *e = insert(t, false);
-        if (isVoid)
-            return true;
-        open.push_back(e);
-        if (rawText().count(nm))
-            startRaw(e, false);
-        if (nm == "plaintext")
-            plaintext = true;
-        if (nm == "title" || nm == "textarea")
-            startRaw(e, true);
-        if (nm == "pre" || nm == "listing" || nm == "textarea")
-            skipNewline = true;
-        return true;
-    }
-
-    // <li> ends an open li; <dd> and <dt> end an open dd or dt
-    void closeListItem(const Token &t)
-    {
-        for (size_t k = open.size(); k-- > 0;)
-        {
-            Node *x = open[k];
-            bool match = !x->foreign && (t.name == "li" ? x->name == "li" : (x->name == "dd" || x->name == "dt"));
-            if (match)
-            {
-                for (size_t m = open.size(); m-- > k + 1;)
-                    if (!open[m]->implied && !(!open[m]->foreign && impliedEnd().count(open[m]->name)))
-                    {
-                        report(t.pos, tagWidth(t), true, "Start tag \"" + t.name + "\" implied the end of \"" + x->name +
-                                                             "\", but there were open elements.");
-                        unclosed(open[m]);
-                    }
-                open.resize(k);
-                return;
-            }
-            if (!x->foreign && specialElements().count(x->name) && x->name != "address" && x->name != "div" &&
-                x->name != "p")
-                return;
-        }
-    }
-
-    bool bodyEnd(Token &t)
-    {
-        const std::string &nm = t.name;
-        if (nm == "body" || nm == "html")
-        {
-            if (inScope("body", S_DEFAULT) < 0)
-            {
-                strayEnd(t);
-                return true;
-            }
-            openAtEnd(t.pos, "End tag for \"body\" seen, but there were unclosed elements.");
-            mode = AFTER_BODY;
-            return nm == "body";
-        }
-        if (nm == "p")
-        {
-            int k = inScope("p", S_BUTTON);
-            if (k < 0)
-            {
-                report(t.pos, tagWidth(t) + 1, true, "No \"p\" element in scope but a \"p\" end tag seen.");
-                insertImplied("p", t.pos);
-                k = (int)open.size() - 1;
-            }
-            closeAt((size_t)k, t, false);
-            return true;
-        }
-        if (nm == "li" || nm == "dd" || nm == "dt")
-        {
-            int k = inScope(nm, nm == "li" ? S_LIST : S_DEFAULT);
-            if (k < 0)
-            {
-                report(t.pos, tagWidth(t) + 1, true,
-                       "No \"" + nm + "\" element in " + (nm == "li" ? "list " : "") + "scope but a \"" + nm + "\" end tag seen.");
-                return true;
-            }
-            closeAt((size_t)k, t, false);
-            return true;
-        }
-        if (heading(nm))
-        {
-            for (size_t k = open.size(); k-- > 0;)
-            {
-                Node *x = open[k];
-                if (!x->foreign && heading(x->name))
-                {
-                    closeAt(k, t, false);
-                    return true;
-                }
-                if (boundary(x, S_DEFAULT))
-                    break;
-            }
-            strayEnd(t);
-            return true;
-        }
-        if (nm == "br")
-        {
-            report(t.pos, 4, true, "End tag \"br\".");
-            Token br = t;
-            br.type = Token::START;
-            br.attrs.clear();
-            insert(br, false);
-            return true;
-        }
-        if (voidElements().count(nm))
-        {
-            strayEnd(t);
-            return true;
-        }
-        if (nm == "table" || tableParts().count(nm))
-        {
-            int k = inScope(nm, S_TABLE);
-            if (k < 0)
-                strayEnd(t);
-            else
-                closeAt((size_t)k, t, true);
-            return true;
-        }
-        if (blockEnds().count(nm) || nm == "form" || nm == "applet" || nm == "marquee" || nm == "object")
-        {
-            int k = inScope(nm, S_DEFAULT);
-            if (k < 0)
-                strayEnd(t);
-            else
-                closeAt((size_t)k, t, false);
-            return true;
-        }
-        for (size_t k = open.size(); k-- > 0;)
-        {
-            Node *x = open[k];
-            if (!x->foreign && x->name == nm)
-            {
-                closeAt(k, t, false);
-                return true;
-            }
-            if (!x->foreign && specialElements().count(x->name))
-                break;
-        }
-        strayEnd(t);
-        return true;
-    }
-
-    // html, head and body exist even when the page left their tags out
-    void finish()
-    {
-        if (!htmlEl)
-        {
-            htmlEl = new Node();
-            htmlEl->name = "html";
-            htmlEl->implied = true;
-            htmlEl->pos = (int)n;
-            append(doc, htmlEl);
-        }
-        if (!headEl)
-        {
-            headEl = new Node();
-            headEl->name = "head";
-            headEl->implied = true;
-            headEl->pos = (int)n;
-            headEl->parent = htmlEl;
-            htmlEl->kids.insert(htmlEl->kids.begin(), headEl);
-        }
-        if (!bodyEl)
-        {
-            bodyEl = new Node();
-            bodyEl->name = "body";
-            bodyEl->implied = true;
-            bodyEl->pos = (int)n;
-            append(htmlEl, bodyEl);
-        }
-    }
-};
-
-// ── the page: checks, stylesheets, output ────────────────────────────────
+// ── serialization (13.3) ─────────────────────────────────────────────────
 
 void escape(std::string &out, const std::string &text, bool attr)
 {
@@ -1790,39 +123,144 @@ void escape(std::string &out, const std::string &text, bool attr)
     }
 }
 
-void serialize(std::string &out, const Node *x)
+std::string attrName(const Attr &a)
 {
-    if (x->comment)
+    if (a.ns == AN_XML)
+        return "xml:" + a.name;
+    if (a.ns == AN_XMLNS)
+        return a.name == "xmlns" ? a.name : "xmlns:" + a.name;
+    if (a.ns == AN_XLINK)
+        return "xlink:" + a.name;
+    return a.name;
+}
+
+bool servesVoid(const Node *x) { return x->ns == NS_HTML && voidElements().count(x->name) > 0; }
+
+void serializeChildren(std::string &out, const Node *x, bool scripting);
+
+void serializeNode(std::string &out, const Node *x, bool scripting)
+{
+    switch (x->type)
     {
-        out += "<!--" + x->text + "-->";
+    case N_ELEMENT:
+        out += "<" + x->name;
+        for (const Attr &a : x->attrs)
+        {
+            out += " " + attrName(a) + "=\"";
+            escape(out, a.value, true);
+            out += "\"";
+        }
+        out += ">";
+        if (servesVoid(x))
+            return;
+        serializeChildren(out, x, scripting);
+        out += "</" + x->name + ">";
         return;
-    }
-    if (!x->element)
+    case N_TEXT:
     {
         const Node *p = x->parent;
-        if (p && !p->foreign && rawText().count(p->name))
-            out += x->text;
+        bool literal = p && p->type == N_ELEMENT && p->ns == NS_HTML &&
+                       (p->name == "style" || p->name == "script" || p->name == "xmp" || p->name == "iframe" ||
+                        p->name == "noembed" || p->name == "noframes" || p->name == "plaintext" ||
+                        (p->name == "noscript" && scripting));
+        if (literal)
+            out += x->data;
         else
-            escape(out, x->text, false);
+            escape(out, x->data, false);
         return;
     }
-    out += "<" + x->name;
-    for (const Attr &a : x->attrs)
-    {
-        out += " " + a.name + "=\"";
-        escape(out, a.value, true);
-        out += "\"";
-    }
-    out += ">";
-    if (!x->foreign && voidElements().count(x->name))
+    case N_COMMENT:
+        out += "<!--" + x->data + "-->";
         return;
-    if (!x->foreign && (x->name == "pre" || x->name == "textarea" || x->name == "listing") && !x->kids.empty() &&
-        !x->kids[0]->element && !x->kids[0]->comment && !x->kids[0]->text.empty() && x->kids[0]->text[0] == '\n')
-        out += "\n";
-    for (const Node *k : x->kids)
-        serialize(out, k);
-    out += "</" + x->name + ">";
+    case N_PI:
+        out += "<?" + x->name + " " + x->data + "?>";
+        return;
+    case N_DOCTYPE:
+        out += "<!DOCTYPE " + x->name + ">";
+        return;
+    default:
+        serializeChildren(out, x, scripting);
+    }
 }
+
+void serializeChildren(std::string &out, const Node *x, bool scripting)
+{
+    if (x->type == N_ELEMENT && servesVoid(x))
+        return;
+    const Node *from = x->content ? x->content : x;
+    for (const Node *k : from->kids)
+        serializeNode(out, k, scripting);
+}
+
+// ── the html5lib / web-platform-tests tree format ────────────────────────
+
+void dumpNode(std::string &out, const Node *x, int depth)
+{
+    std::string pad = "| " + std::string((size_t)depth * 2, ' ');
+    switch (x->type)
+    {
+    case N_DOCTYPE:
+        out += pad + "<!DOCTYPE " + x->name;
+        if (!x->data.empty() || !x->systemId.empty())
+            out += " \"" + x->data + "\" \"" + x->systemId + "\"";
+        out += ">\n";
+        return;
+    case N_TEXT:
+        out += pad + "\"" + x->data + "\"\n";
+        return;
+    case N_COMMENT:
+        out += pad + "<!-- " + x->data + " -->\n";
+        return;
+    case N_PI:
+        out += pad + "<?" + x->name + " " + x->data + "?>\n";
+        return;
+    case N_ELEMENT:
+    {
+        std::string prefix = x->ns == NS_SVG ? "svg " : x->ns == NS_MATHML ? "math " : "";
+        out += pad + "<" + prefix + x->name + ">\n";
+        std::vector<std::pair<std::string, std::string>> attrs;
+        for (const Attr &a : x->attrs)
+        {
+            std::string name = a.name;
+            if (a.ns == AN_XLINK)
+                name = "xlink " + a.name;
+            else if (a.ns == AN_XML)
+                name = "xml " + a.name;
+            else if (a.ns == AN_XMLNS)
+                name = "xmlns " + a.name;
+            attrs.push_back(std::make_pair(name, a.value));
+        }
+        std::sort(attrs.begin(), attrs.end());
+        std::string apad = "| " + std::string((size_t)depth * 2 + 2, ' ');
+        for (size_t k = 0; k < attrs.size(); ++k)
+            out += apad + attrs[k].first + "=\"" + attrs[k].second + "\"\n";
+        if (x->content)
+        {
+            out += apad + "content\n";
+            for (const Node *k : x->content->kids)
+                dumpNode(out, k, depth + 2);
+        }
+        for (const Node *k : x->kids)
+            dumpNode(out, k, depth + 1);
+        return;
+    }
+    default:
+        for (const Node *k : x->kids)
+            dumpNode(out, k, depth);
+    }
+}
+
+std::string dumpTree(const Node *root)
+{
+    std::string out;
+    for (const Node *k : root->kids)
+        dumpNode(out, k, 0);
+    if (!out.empty())
+        out.pop_back();
+    return out;
+}
+
+// ── files ────────────────────────────────────────────────────────────────
 
 bool readFile(const fs::path &file, std::string &text)
 {
@@ -1832,10 +270,14 @@ bool readFile(const fs::path &file, std::string &text)
     std::ostringstream ss;
     ss << in.rdbuf();
     text = ss.str();
+    return true;
+}
+
+void dropBom(std::string &text)
+{
     if (text.size() >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB &&
         (unsigned char)text[2] == 0xBF)
         text.erase(0, 3);
-    return true;
 }
 
 std::string newlines(const std::string &text)
@@ -1855,21 +297,34 @@ std::string newlines(const std::string &text)
 
 std::string pathKey(const fs::path &p) { return lower(p.lexically_normal().generic_string()); }
 
+// ── the page: checks, stylesheets, output ────────────────────────────────
+
+struct Diag
+{
+    int line = 1, col = 1, width = 1;
+    bool error = true;
+    std::string message;
+};
+
+bool diagBefore(const Diag &a, const Diag &b) { return a.line != b.line ? a.line < b.line : a.col < b.col; }
+
 class Page
 {
 public:
-    Page(const std::string &source, const std::string &path) : source(source), path(path), parser(source) {}
+    Page(const std::string &source, const std::string &path) : source(source), path(path), parser(source, true) {}
 
     Result run(const std::vector<std::string> &extraSheets)
     {
         Node *doc = parser.parse();
-        if (parser.explicitHtml && !findAttr(parser.htmlEl, "lang"))
-            parser.report(parser.htmlEl->pos, 5, false,
-                          "Consider adding a \"lang\" attribute to the \"html\" start tag to declare the language of "
-                          "this document.");
-        if ((parser.hasDoctype || parser.explicitHead) && !hasChild(parser.headEl, "title"))
-            parser.report(parser.headEl->pos, parser.headEl->implied ? 1 : 5, false,
-                          "Element \"head\" is missing a required instance of child element \"title\".");
+        Node *htmlEl = parser.htmlEl;
+        Node *headEl = parser.headEl;
+        if (htmlEl && parser.explicitHtml && !findAttr(htmlEl, "lang"))
+            warn(htmlEl->pos, 5,
+                 "Consider adding a \"lang\" attribute to the \"html\" start tag to declare the language of this "
+                 "document.");
+        if (headEl && (parser.hasDoctype || parser.explicitHead) && !hasChild(headEl, "title"))
+            warn(headEl->pos, headEl->implied ? 1 : 5,
+                 "Element \"head\" is missing a required instance of child element \"title\".");
         visit(doc);
         for (const std::string &sheet : extraSheets)
         {
@@ -1883,25 +338,34 @@ public:
                 failed = true;
                 continue;
             }
+            dropBom(text);
             std::vector<css::Problem> problems;
             css::compileStylesheet(text, problems);
             sheetReport(file.generic_string(), text, problems);
+            if (!headEl)
+                continue;
             Node *style = new Node();
             style->name = "style";
-            style->parent = parser.headEl;
+            style->parent = headEl;
             Node *t = new Node();
-            t->element = false;
-            t->text = newlines(text);
+            t->type = N_TEXT;
+            t->data = newlines(text);
             t->parent = style;
             style->kids.push_back(t);
-            parser.headEl->kids.push_back(style);
+            headEl->kids.push_back(style);
         }
 
+        for (const ParseProblem &p : parser.problems)
+        {
+            Diag d;
+            parser.lineCol(p.pos, d.line, d.col);
+            d.width = p.width;
+            d.error = p.error;
+            d.message = p.message;
+            diags.push_back(d);
+        }
+        std::stable_sort(diags.begin(), diags.end(), diagBefore);
         Result r;
-        std::vector<Diag> diags = parser.diags;
-        std::stable_sort(diags.begin(), diags.end(), [](const Diag &a, const Diag &b) {
-            return a.line != b.line ? a.line < b.line : a.col < b.col;
-        });
         for (const Diag &d : diags)
         {
             r.report += diag::gcc(path, source, d.line, d.col, d.message, d.width, d.error ? "error" : "warning");
@@ -1910,13 +374,11 @@ public:
         }
         r.report += sheetReports;
         r.failed = failed;
-        if (parser.hasDoctype)
-            r.output = "<!DOCTYPE " + (parser.doctypeName.empty() ? std::string("html") : parser.doctypeName) + ">\n";
         for (size_t k = 0; k < doc->kids.size(); ++k)
         {
             if (k)
                 r.output += "\n";
-            serialize(r.output, doc->kids[k]);
+            serializeNode(r.output, doc->kids[k], true);
         }
         return r;
     }
@@ -1925,15 +387,19 @@ private:
     const std::string &source;
     std::string path;
     Parser parser;
+    std::vector<Diag> diags;
     std::set<std::string> ids;
     std::set<std::string> linked; // stylesheets inlined so far
     std::string sheetReports;
     bool failed = false;
 
+    void add(int pos, int width, bool error, const std::string &message) { parser.report(pos, width, error, message); }
+    void warn(int pos, int width, const std::string &message) { add(pos, width, false, message); }
+
     static bool hasChild(const Node *e, const std::string &name)
     {
         for (const Node *k : e->kids)
-            if (k->element && !k->foreign && k->name == name)
+            if (isHtml(k, name.c_str()))
                 return true;
         return false;
     }
@@ -1951,7 +417,7 @@ private:
             d.width = p.width;
             d.error = p.error;
             d.message = p.message;
-            parser.diags.push_back(d);
+            diags.push_back(d);
         }
     }
 
@@ -1969,43 +435,64 @@ private:
     {
         std::string out;
         for (const Node *k : e->kids)
-            if (!k->element && !k->comment)
-                out += k->text;
+            if (k->type == N_TEXT)
+                out += k->data;
         return out;
+    }
+
+    void checkElement(Node *x)
+    {
+        // elements the parser made (implied tags, reconstructed formatting
+        // elements, copies) were checked as the tags they came from
+        if (x->implied)
+            return;
+        int width = (int)x->name.size() + 1;
+        for (const Attr &a : x->attrs)
+        {
+            if (a.name == "id" && a.ns == AN_NONE && !a.value.empty() && x->ns == NS_HTML)
+            {
+                if (ids.count(a.value))
+                    add(a.pos, 2, true, "Duplicate ID \"" + a.value + "\".");
+                ids.insert(a.value);
+            }
+            if (a.name == "style" && a.ns == AN_NONE && a.valuePos >= 0)
+            {
+                std::vector<css::Problem> problems;
+                css::checkDeclarations(a.value, problems);
+                cssInPage(problems, a.valuePos);
+            }
+        }
+        if (x->name == "style" && x->ns != NS_MATHML)
+        {
+            std::vector<css::Problem> problems;
+            css::compileStylesheet(textOf(x), problems);
+            cssInPage(problems, x->contentPos >= 0 ? x->contentPos : x->pos);
+        }
+        // the rest concerns HTML elements
+        if (x->ns != NS_HTML)
+            return;
+        const std::string &nm = x->name;
+        if (!knownElements().count(nm) && nm.find('-') == std::string::npos)
+            add(x->pos, width, true,
+                "Unknown element \"" + nm + "\". (A custom element's name must contain a hyphen, like \"my-" + nm + "\".)");
+        auto o = obsoleteElements().find(nm);
+        if (o != obsoleteElements().end())
+            warn(x->pos, width, "The \"" + nm + "\" element is obsolete. " + o->second);
+        if ((nm == "title" || nm == "base") && x->parent && x->parent->type == N_ELEMENT && !isHtml(x->parent, "head"))
+            add(x->pos, width, true,
+                "Element \"" + nm + "\" not allowed as child of element \"" + x->parent->name + "\" in this context.");
+        if (nm == "img" && !findAttr(x, "alt"))
+            warn(x->pos, 4, "An \"img\" element must have an \"alt\" attribute, except under certain conditions.");
+        if (nm == "link")
+            inlineStylesheet(x);
     }
 
     void visit(Node *x)
     {
-        if (!x->element)
-            return;
-        if (x->name != "#document")
-        {
-            for (const Attr &a : x->attrs)
-            {
-                if (a.name == "id" && !a.value.empty() && !x->foreign)
-                {
-                    if (ids.count(a.value))
-                        parser.report(a.pos, 2, true, "Duplicate ID \"" + a.value + "\".");
-                    ids.insert(a.value);
-                }
-                if (a.name == "style" && a.valuePos >= 0)
-                {
-                    std::vector<css::Problem> problems;
-                    css::checkDeclarations(a.value, problems);
-                    cssInPage(problems, a.valuePos);
-                }
-            }
-            if (!x->foreign && x->name == "img" && !findAttr(x, "alt"))
-                parser.report(x->pos, 4, false, "An \"img\" element must have an \"alt\" attribute, except under certain conditions.");
-            if (lower(x->name) == "style")
-            {
-                std::vector<css::Problem> problems;
-                css::compileStylesheet(textOf(x), problems);
-                cssInPage(problems, x->contentPos >= 0 ? x->contentPos : x->pos);
-            }
-            if (!x->foreign && x->name == "link")
-                inlineStylesheet(x);
-        }
+        if (x->type == N_ELEMENT)
+            checkElement(x);
+        if (x->content)
+            visit(x->content);
         for (size_t k = 0; k < x->kids.size(); ++k)
             visit(x->kids[k]);
     }
@@ -2023,7 +510,7 @@ private:
         while (in >> token)
             if (token == "stylesheet")
                 sheet = true;
-        const std::string &url = href->value;
+        const std::string url = href->value;
         if (!sheet || url.find("://") != std::string::npos || url.compare(0, 2, "//") == 0 ||
             url.compare(0, 5, "data:") == 0)
             return;
@@ -2031,9 +518,10 @@ private:
         std::string text;
         if (!readFile(file, text))
         {
-            parser.report(x->pos, 5, true, "Stylesheet \"" + url + "\" not found.");
+            add(x->pos, 5, true, "Stylesheet \"" + url + "\" not found.");
             return;
         }
+        dropBom(text);
         linked.insert(pathKey(file));
         std::vector<css::Problem> problems;
         css::compileStylesheet(text, problems);
@@ -2045,19 +533,221 @@ private:
         x->name = "style";
         x->attrs = keep;
         Node *t = new Node();
-        t->element = false;
-        t->text = newlines(text);
+        t->type = N_TEXT;
+        t->data = newlines(text);
         t->parent = x;
         x->kids.clear();
         x->kids.push_back(t);
     }
 };
 
+// ── the tree construction tests ──────────────────────────────────────────
+
+struct TreeTest
+{
+    std::string data, context, expected;
+    int line = 0;             // where the test starts in its file
+    int scripting = -1;       // -1 either, 0 off, 1 on
+};
+
+std::vector<TreeTest> readTreeTests(const std::string &text)
+{
+    std::vector<std::string> lines;
+    size_t at = 0;
+    while (at <= text.size())
+    {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos)
+        {
+            if (at < text.size())
+                lines.push_back(text.substr(at));
+            break;
+        }
+        lines.push_back(text.substr(at, nl - at));
+        at = nl + 1;
+    }
+    std::vector<TreeTest> tests;
+    size_t k = 0;
+    while (k < lines.size())
+    {
+        if (lines[k] != "#data")
+        {
+            ++k;
+            continue;
+        }
+        TreeTest t;
+        t.line = (int)k + 1;
+        ++k;
+        std::string data;
+        bool first = true;
+        while (k < lines.size() && lines[k] != "#errors")
+        {
+            if (!first)
+                data += "\n";
+            data += lines[k++];
+            first = false;
+        }
+        t.data = data;
+        while (k < lines.size() && lines[k] != "#document")
+        {
+            if (lines[k] == "#document-fragment" && k + 1 < lines.size())
+            {
+                t.context = lines[k + 1];
+                ++k;
+            }
+            else if (lines[k] == "#script-on")
+                t.scripting = 1;
+            else if (lines[k] == "#script-off")
+                t.scripting = 0;
+            ++k;
+        }
+        ++k;
+        std::vector<std::string> doc;
+        while (k < lines.size() && lines[k] != "#data" && lines[k] != "#description")
+            doc.push_back(lines[k++]);
+        // the blank line between tests (a blank line inside a text node is
+        // followed by more of it, never by the next "#data")
+        if (!doc.empty() && doc.back().empty())
+            doc.pop_back();
+        for (size_t m = 0; m < doc.size(); ++m)
+        {
+            if (m)
+                t.expected += "\n";
+            t.expected += doc[m];
+        }
+        tests.push_back(t);
+    }
+    return tests;
+}
+
+std::string parseForTest(const TreeTest &t, bool scripting)
+{
+    Parser p(t.data, scripting);
+    if (!t.context.empty())
+    {
+        std::string name = t.context;
+        int ns = NS_HTML;
+        if (name.compare(0, 4, "svg ") == 0)
+        {
+            ns = NS_SVG;
+            name = name.substr(4);
+        }
+        else if (name.compare(0, 5, "math ") == 0)
+        {
+            ns = NS_MATHML;
+            name = name.substr(5);
+        }
+        p.setFragmentContext(name, ns);
+    }
+    return dumpTree(p.parse());
+}
+
+// ── the tokenizer tests ──────────────────────────────────────────────────
+
+void jsonString(std::string &out, const std::string &s)
+{
+    out += '"';
+    for (char ch : s)
+    {
+        unsigned char c = (unsigned char)ch;
+        if (c == '"' || c == '\\')
+        {
+            out += '\\';
+            out += (char)c;
+        }
+        else if (c < 0x20 || c == 0x7F)
+        {
+            static const char *const hex = "0123456789abcdef";
+            out += "\\u00";
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+        else
+            out += (char)c;
+    }
+    out += '"';
+}
+
+std::string tokenJson(const Token &t)
+{
+    std::string out = "[";
+    switch (t.type)
+    {
+    case Token::DOCTYPE:
+        out += "\"DOCTYPE\",";
+        if (t.hasName)
+            jsonString(out, t.name);
+        else
+            out += "null";
+        out += ",";
+        if (t.hasPublic)
+            jsonString(out, t.publicId);
+        else
+            out += "null";
+        out += ",";
+        if (t.hasSystem)
+            jsonString(out, t.systemId);
+        else
+            out += "null";
+        out += t.forceQuirks ? ",false" : ",true";
+        break;
+    case Token::START:
+        out += "\"StartTag\",";
+        jsonString(out, t.name);
+        out += ",{";
+        for (size_t k = 0; k < t.attrs.size(); ++k)
+        {
+            if (k)
+                out += ",";
+            jsonString(out, t.attrs[k].name);
+            out += ":";
+            jsonString(out, t.attrs[k].value);
+        }
+        out += "}";
+        if (t.selfClosing)
+            out += ",true";
+        break;
+    case Token::END:
+        out += "\"EndTag\",";
+        jsonString(out, t.name);
+        break;
+    case Token::COMMENT:
+        out += "\"Comment\",";
+        jsonString(out, t.data);
+        break;
+    case Token::PI:
+        out += "\"ProcessingInstruction\",";
+        jsonString(out, t.name);
+        out += ",";
+        jsonString(out, t.data);
+        break;
+    default:
+        out += "\"Character\",";
+        jsonString(out, t.data);
+    }
+    return out + "]";
+}
+
+int hexValue(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return 0;
+}
+
 } // namespace
+
+// ── public ───────────────────────────────────────────────────────────────
 
 Result compile(const std::string &source, const std::string &path, const std::vector<std::string> &extraSheets)
 {
-    Page page(source, path);
+    std::string text = source;
+    dropBom(text);
+    Page page(text, path);
     return page.run(extraSheets);
 }
 
@@ -2080,6 +770,140 @@ bool looksLikePage(const std::string &source)
         ++j;
     std::string name = lower(source.substr(k + 1, j - k - 1));
     return !name.empty() && std::isalpha((unsigned char)name[0]) && knownElements().count(name) > 0;
+}
+
+int runTreeTests(const std::vector<std::string> &files, bool verbose)
+{
+    int passed = 0, failed = 0;
+    for (const std::string &file : files)
+    {
+        std::string text;
+        if (!readFile(file, text))
+        {
+            std::cerr << file << ": cannot read the file\n";
+            return 2;
+        }
+        // tests that run scripts (document.write) need a script engine
+        if (file.find("scripted_") != std::string::npos)
+        {
+            std::cout << file << ": skipped (the tests run scripts)\n";
+            continue;
+        }
+        std::vector<TreeTest> tests = readTreeTests(text);
+        int filePassed = 0, fileFailed = 0;
+        for (const TreeTest &t : tests)
+        {
+            for (int mode = 0; mode < 2; ++mode)
+            {
+                if (t.scripting >= 0 && t.scripting != mode)
+                    continue;
+                std::string got = parseForTest(t, mode == 1);
+                if (got == t.expected)
+                {
+                    ++filePassed;
+                    continue;
+                }
+                ++fileFailed;
+                std::cout << "FAIL " << file << ":" << t.line << " (scripting " << (mode ? "on" : "off") << ")\n";
+                if (verbose)
+                {
+                    std::cout << "#data\n" << t.data << "\n";
+                    if (!t.context.empty())
+                        std::cout << "#document-fragment\n" << t.context << "\n";
+                    std::cout << "#expected\n" << t.expected << "\n#got\n" << got << "\n\n";
+                }
+            }
+        }
+        std::cout << file << ": " << filePassed << " passed, " << fileFailed << " failed\n";
+        passed += filePassed;
+        failed += fileFailed;
+    }
+    std::cout << "tree construction: " << passed << " passed, " << failed << " failed\n";
+    return failed ? 1 : 0;
+}
+
+int dumpTreeFile(const std::string &path, bool scripting)
+{
+    std::string text;
+    if (!readFile(path, text))
+    {
+        std::cerr << path << ": cannot read the file\n";
+        return 2;
+    }
+    Parser p(text, scripting);
+    std::cout << dumpTree(p.parse()) << "\n";
+    for (const ParseProblem &e : p.problems)
+    {
+        int line, col;
+        p.lineCol(e.pos, line, col);
+        std::cout << "# " << line << ":" << col << (e.error ? " error: " : " warning: ") << e.message << "\n";
+    }
+    return 0;
+}
+
+// Each line of the batch: the initial state's number, the last start tag
+// ("-" for none), and the input in hex (UTF-8). Each line of the output:
+// {"tokens": [...], "errors": [[code, line, column], ...]}, columns counted
+// in characters
+int runTokenizerBatch(const std::string &path)
+{
+    std::string text;
+    if (!readFile(path, text))
+    {
+        std::cerr << path << ": cannot read the file\n";
+        return 2;
+    }
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        std::istringstream fields(line);
+        int state = 0;
+        std::string last, hex;
+        fields >> state >> last >> hex;
+        if (last == "-")
+            last.clear();
+        if (hex == "-")
+            hex.clear();
+        std::string input;
+        for (size_t k = 0; k + 1 < hex.size(); k += 2)
+            input += (char)(hexValue(hex[k]) * 16 + hexValue(hex[k + 1]));
+        Parser p(input, false);
+        std::vector<Token> tokens = p.tokenizeAll(state, last);
+        std::string out = "{\"tokens\":[";
+        bool first = true;
+        for (const Token &t : tokens)
+        {
+            if (t.type == Token::END_OF_FILE)
+                continue;
+            if (!first)
+                out += ",";
+            out += tokenJson(t);
+            first = false;
+        }
+        out += "],\"errors\":[";
+        first = true;
+        for (const ParseProblem &e : p.problems)
+        {
+            if (e.code.empty())
+                continue;
+            int line = 1, col = 1;
+            p.cpLineCol(e.at, line, col);
+            if (!first)
+                out += ",";
+            out += "[";
+            jsonString(out, e.code);
+            out += "," + std::to_string(line) + "," + std::to_string(col) + "]";
+            first = false;
+        }
+        out += "]}";
+        std::cout << out << "\n";
+    }
+    return 0;
 }
 
 } // namespace html

@@ -1,0 +1,1378 @@
+// quantum: cpp
+// CSS front-end: value grammars. Property values, at-rule preludes,
+// descriptors and the arguments of functional pseudo-classes are matched
+// against the grammars MDN's CSS data gives them (generated/CssData.sa),
+// written in the CSS value definition syntax (CSS Values 4, 2): keywords,
+// <types> (with ranges, <length [0,inf]>), <'property'> references,
+// functions, the combinators (juxtaposition, &&, ||, |), [ groups ], the
+// multipliers (* + ? {A} {A,} {A,B} # !), and the rule that lets a comma
+// between omitted items be left out. Math functions (calc() ...) stand for
+// any number, length, angle and so on, as they do in a browser.
+#include "CssInternal.h.sa"
+#include "CssData.h.sa"
+
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <set>
+
+namespace css
+{
+
+namespace
+{
+
+enum GKind
+{
+    G_KEYWORD,  // auto
+    G_TOKEN,    // ',' '/' ':' ...
+    G_TYPE,     // <length>
+    G_PROP,     // <'margin-top'>
+    G_FUNC,     // rgb( ... )
+    G_PARENS,   // ( ... )
+    G_BRACKETS, // '[' ... ']'
+    G_ANYFUNC,  // <function-token> <any-value>? )
+    G_SEQ,      // a b c
+    G_ALL,      // a && b
+    G_ANY,      // a || b
+    G_ONE       // a | b
+};
+
+struct GNode
+{
+    int kind = G_SEQ;
+    std::string name; // keyword, token, type, property or function name
+    std::vector<GNode *> kids;
+    int min = 1, max = 1;  // the multiplier; max < 0: no limit
+    bool comma = false;    // '#': the items are separated by commas
+    bool notEmpty = false; // '!'
+    bool loSet = false, hiSet = false;
+    double lo = 0, hi = 0; // a range: <number [0,1]>
+    int id = 0;
+};
+
+int g_nextId = 1;
+
+GNode *newNode(int kind)
+{
+    GNode *n = new GNode();
+    n->kind = kind;
+    n->id = g_nextId++;
+    return n;
+}
+
+bool plain(const GNode *n) { return n->min == 1 && n->max == 1 && !n->comma && !n->notEmpty; }
+
+bool startsAt(const std::string &s, size_t i, const char *t)
+{
+    size_t k = 0;
+    while (t[k])
+    {
+        if (i + k >= s.size() || s[i + k] != t[k])
+            return false;
+        ++k;
+    }
+    return true;
+}
+
+bool nameChar(char c) { return std::isalnum((unsigned char)c) || c == '-' || c == '_' || c == '@'; }
+
+// ── the value definition syntax ──────────────────────────────────────────
+
+class GrammarParser
+{
+public:
+    explicit GrammarParser(const std::string &text) : s(text) {}
+
+    GNode *parse()
+    {
+        GNode *g = alternatives();
+        return g;
+    }
+
+private:
+    const std::string &s;
+    size_t i = 0;
+
+    void ws()
+    {
+        while (i < s.size() && s[i] == ' ')
+            ++i;
+    }
+
+    bool at(const char *t)
+    {
+        ws();
+        return startsAt(s, i, t);
+    }
+
+    GNode *combine(int kind, std::vector<GNode *> &parts)
+    {
+        if (parts.size() == 1)
+            return parts[0];
+        GNode *n = newNode(kind);
+        n->kids = parts;
+        return n;
+    }
+
+    GNode *alternatives()
+    {
+        std::vector<GNode *> parts;
+        parts.push_back(anyOf());
+        while (at("|") && !at("||"))
+        {
+            ++i;
+            parts.push_back(anyOf());
+        }
+        return combine(G_ONE, parts);
+    }
+
+    GNode *anyOf()
+    {
+        std::vector<GNode *> parts;
+        parts.push_back(allOf());
+        while (at("||"))
+        {
+            i += 2;
+            parts.push_back(allOf());
+        }
+        return combine(G_ANY, parts);
+    }
+
+    GNode *allOf()
+    {
+        std::vector<GNode *> parts;
+        parts.push_back(sequence());
+        while (at("&&"))
+        {
+            i += 2;
+            parts.push_back(sequence());
+        }
+        return combine(G_ALL, parts);
+    }
+
+    bool termAhead()
+    {
+        ws();
+        if (i >= s.size())
+            return false;
+        char c = s[i];
+        if (c == '|' || c == ']' || c == ')' || c == '}')
+            return false;
+        if (c == '&' && i + 1 < s.size() && s[i + 1] == '&')
+            return false;
+        return true;
+    }
+
+    GNode *sequence()
+    {
+        std::vector<GNode *> parts;
+        while (termAhead())
+        {
+            size_t before = i;
+            GNode *t = term();
+            if (!t)
+            {
+                if (i == before)
+                    ++i; // skip what cannot be read
+                continue;
+            }
+            parts.push_back(t);
+        }
+        // <function-token> <any-value>? ')' : any function
+        for (size_t k = 0; k < parts.size(); ++k)
+        {
+            if (parts[k]->kind != G_TYPE || parts[k]->name != "function-token")
+                continue;
+            size_t m = k + 1;
+            if (m < parts.size() && parts[m]->kind == G_TYPE && parts[m]->name == "any-value")
+                ++m;
+            if (m < parts.size() && parts[m]->kind == G_TOKEN && parts[m]->name == ")")
+            {
+                GNode *f = newNode(G_ANYFUNC);
+                f->min = parts[k]->min;
+                f->max = parts[k]->max;
+                parts.erase(parts.begin() + (long)k, parts.begin() + (long)m + 1);
+                parts.insert(parts.begin() + (long)k, f);
+            }
+        }
+        if (parts.empty())
+            return newNode(G_SEQ);
+        return combine(G_SEQ, parts);
+    }
+
+    double number(bool &isSet)
+    {
+        ws();
+        size_t start = i;
+        if (startsAt(s, i, "inf") || startsAt(s, i, "+inf"))
+        {
+            i += s[i] == '+' ? 4 : 3;
+            isSet = false;
+            return 0;
+        }
+        if (startsAt(s, i, "-inf"))
+        {
+            i += 4;
+            isSet = false;
+            return 0;
+        }
+        while (i < s.size() && (std::isdigit((unsigned char)s[i]) || s[i] == '.' || s[i] == '-' || s[i] == '+'))
+            ++i;
+        std::string digits = s.substr(start, i - start);
+        bool unit = false;
+        while (i < s.size() && std::isalpha((unsigned char)s[i]))
+        {
+            ++i;
+            unit = true;
+        }
+        isSet = !digits.empty() && !unit; // a bound with a unit (180deg) is not checked
+        return digits.empty() ? 0 : std::atof(digits.c_str());
+    }
+
+    GNode *angle()
+    {
+        // after "<"
+        GNode *n = nullptr;
+        if (i < s.size() && s[i] == '\'')
+        {
+            size_t end = s.find('\'', i + 1);
+            if (end == std::string::npos)
+                end = s.size();
+            n = newNode(G_PROP);
+            n->name = s.substr(i + 1, end - i - 1);
+            i = end + 1;
+        }
+        else
+        {
+            size_t start = i;
+            while (i < s.size() && s[i] != ' ' && s[i] != '>' && s[i] != '[')
+                ++i;
+            n = newNode(G_TYPE);
+            n->name = s.substr(start, i - start);
+            ws();
+            if (i < s.size() && s[i] == '[')
+            {
+                ++i;
+                n->lo = number(n->loSet);
+                ws();
+                if (i < s.size() && s[i] == ',')
+                    ++i;
+                n->hi = number(n->hiSet);
+                ws();
+                if (i < s.size() && s[i] == ']')
+                    ++i;
+            }
+        }
+        while (i < s.size() && s[i] != '>')
+            ++i;
+        if (i < s.size())
+            ++i;
+        return n;
+    }
+
+    GNode *term()
+    {
+        ws();
+        char c = s[i];
+        GNode *n = nullptr;
+        if (c == '[')
+        {
+            ++i;
+            GNode *inner = alternatives();
+            if (at("]"))
+                ++i;
+            n = newNode(G_SEQ);
+            n->kids.push_back(inner);
+        }
+        else if (c == '<')
+        {
+            ++i;
+            n = angle();
+        }
+        else if (c == '\'')
+        {
+            size_t end = s.find('\'', i + 1);
+            if (end == std::string::npos)
+                end = s.size();
+            std::string text = s.substr(i + 1, end - i - 1);
+            i = end + 1;
+            if (text == "[")
+            {
+                // '[' ... ']' : a [ ] block
+                n = newNode(G_BRACKETS);
+                std::vector<GNode *> parts;
+                while (termAhead() && !at("']'"))
+                {
+                    size_t before = i;
+                    GNode *t = term();
+                    if (t)
+                        parts.push_back(t);
+                    else if (i == before)
+                        ++i;
+                }
+                if (at("']'"))
+                    i += 3;
+                GNode *inner = newNode(G_SEQ);
+                inner->kids = parts;
+                n->kids.push_back(inner);
+            }
+            else
+            {
+                n = newNode(G_TOKEN);
+                n->name = text;
+            }
+        }
+        else if (c == '(')
+        {
+            ++i;
+            GNode *inner = at(")") ? newNode(G_SEQ) : alternatives();
+            if (at(")"))
+                ++i;
+            n = newNode(G_PARENS);
+            n->kids.push_back(inner);
+        }
+        else if (c == ',' || c == '/' || c == ':' || c == ';' || c == '=' || c == '{')
+        {
+            ++i;
+            n = newNode(G_TOKEN);
+            n->name = std::string(1, c);
+        }
+        else if (nameChar(c))
+        {
+            size_t start = i;
+            while (i < s.size() && nameChar(s[i]))
+                ++i;
+            std::string word = s.substr(start, i - start);
+            if (i < s.size() && s[i] == '(')
+            {
+                ++i;
+                GNode *inner = at(")") ? newNode(G_SEQ) : alternatives();
+                if (at(")"))
+                    ++i;
+                n = newNode(G_FUNC);
+                n->name = lower(word);
+                n->kids.push_back(inner);
+            }
+            else
+            {
+                n = newNode(G_KEYWORD);
+                n->name = lower(word);
+            }
+        }
+        else
+        {
+            ++i;
+            return nullptr;
+        }
+        multipliers(n);
+        return n;
+    }
+
+    int integer()
+    {
+        int v = 0;
+        while (i < s.size() && std::isdigit((unsigned char)s[i]))
+            v = v * 10 + (s[i++] - '0');
+        return v;
+    }
+
+    // {A} {A,} {A,B} after a term
+    bool braces(int &lo, int &hi)
+    {
+        if (i >= s.size() || s[i] != '{')
+            return false;
+        ++i;
+        lo = integer();
+        hi = lo;
+        if (i < s.size() && s[i] == ',')
+        {
+            ++i;
+            hi = (i < s.size() && std::isdigit((unsigned char)s[i])) ? integer() : -1;
+        }
+        if (i < s.size() && s[i] == '}')
+            ++i;
+        return true;
+    }
+
+    GNode *wrap(GNode *&n)
+    {
+        if (plain(n))
+            return n;
+        GNode *w = newNode(G_SEQ);
+        w->kids.push_back(n);
+        n = w;
+        return w;
+    }
+
+    void multipliers(GNode *&n)
+    {
+        while (i < s.size())
+        {
+            char c = s[i];
+            int lo = 0, hi = 0;
+            if (c == '*' || c == '+' || c == '?')
+            {
+                ++i;
+                wrap(n);
+                n->min = c == '+' ? 1 : 0;
+                n->max = c == '?' ? 1 : -1;
+            }
+            else if (c == '#')
+            {
+                ++i;
+                wrap(n);
+                n->comma = true;
+                n->min = 1;
+                n->max = -1;
+                if (braces(lo, hi))
+                {
+                    n->min = lo;
+                    n->max = hi;
+                }
+            }
+            else if (c == '{' && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1]))
+            {
+                braces(lo, hi);
+                wrap(n);
+                n->min = lo;
+                n->max = hi;
+            }
+            else if (c == '!')
+            {
+                ++i;
+                if (n->notEmpty || !(n->min == 1 && n->max == 1 && !n->comma))
+                    wrap(n);
+                n->notEmpty = true;
+            }
+            else
+                return;
+        }
+    }
+};
+
+// ── the data ─────────────────────────────────────────────────────────────
+
+struct PropertyEntry
+{
+    std::string grammar, status;
+    GNode *node = nullptr;
+};
+
+std::map<std::string, PropertyEntry> &propertyTable()
+{
+    static std::map<std::string, PropertyEntry> m;
+    if (m.empty())
+        for (int k = 0; data::kProperties[k]; k += 3)
+        {
+            PropertyEntry e;
+            e.grammar = data::kProperties[k + 1];
+            e.status = data::kProperties[k + 2];
+            m[data::kProperties[k]] = e;
+        }
+    return m;
+}
+
+std::map<std::string, std::string> &typeTable()
+{
+    static std::map<std::string, std::string> m;
+    if (m.empty())
+        for (int k = 0; data::kTypes[k]; k += 2)
+            m[data::kTypes[k]] = data::kTypes[k + 1];
+    return m;
+}
+
+std::map<std::string, std::string> &unitTable()
+{
+    static std::map<std::string, std::string> m;
+    if (m.empty())
+        for (int k = 0; data::kUnits[k]; k += 2)
+            m[data::kUnits[k]] = data::kUnits[k + 1];
+    return m;
+}
+
+GNode *parseGrammar(const std::string &text)
+{
+    static std::map<std::string, GNode *> cache;
+    auto found = cache.find(text);
+    if (found != cache.end())
+        return found->second;
+    GrammarParser p(text);
+    GNode *g = p.parse();
+    cache[text] = g;
+    return g;
+}
+
+GNode *typeNode(const std::string &name)
+{
+    std::map<std::string, std::string> &types = typeTable();
+    auto found = types.find(name);
+    if (found == types.end())
+        return nullptr;
+    return parseGrammar(found->second);
+}
+
+GNode *propertyNode(const std::string &name)
+{
+    std::map<std::string, PropertyEntry> &props = propertyTable();
+    auto found = props.find(name);
+    if (found == props.end())
+        return nullptr;
+    if (!found->second.node)
+        found->second.node = parseGrammar(found->second.grammar);
+    return found->second.node;
+}
+
+bool ieq(const std::string &a, const std::string &b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (size_t k = 0; k < a.size(); ++k)
+        if (std::tolower((unsigned char)a[k]) != std::tolower((unsigned char)b[k]))
+            return false;
+    return true;
+}
+
+bool cssWide(const std::string &v)
+{
+    std::string l = lower(v);
+    return l == "inherit" || l == "initial" || l == "unset" || l == "revert" || l == "revert-layer";
+}
+
+bool mathFunction(const std::string &name)
+{
+    static const char *const names[] = {"calc", "-webkit-calc", "-moz-calc", "min", "max", "clamp", "round", "mod",
+                                        "rem", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "pow", "sqrt",
+                                        "hypot", "log", "exp", "abs", "sign", "progress", "random", "sibling-index",
+                                        "sibling-count", nullptr};
+    std::string l = lower(name);
+    for (int k = 0; names[k]; ++k)
+        if (l == names[k])
+            return true;
+    return false;
+}
+
+bool numericType(const std::string &t)
+{
+    return t == "number" || t == "integer" || t == "percentage" || t == "length" || t == "angle" || t == "time" ||
+           t == "frequency" || t == "resolution" || t == "flex" || t == "dimension" || t == "decibel" ||
+           t == "semitones";
+}
+
+bool hexDigits(const std::string &v)
+{
+    if (v.size() != 3 && v.size() != 4 && v.size() != 6 && v.size() != 8)
+        return false;
+    for (char c : v)
+        if (!std::isxdigit((unsigned char)c))
+            return false;
+    return true;
+}
+
+// a production made of numeric ones (<length-percentage> is <length> | <percentage>)
+bool numericComposite(const std::string &t)
+{
+    static const char *const parts[] = {"length", "percentage", "number", "integer", "angle", "time", "frequency",
+                                        "resolution", "flex", nullptr};
+    for (int k = 0; parts[k]; ++k)
+        if (t.find(parts[k]) != std::string::npos)
+            return true;
+    return false;
+}
+
+// A copy of `g` whose numeric productions take the range of `r`: the range
+// of <length-percentage [0,inf]> holds for its <length> and its <percentage>
+GNode *copyWithRange(GNode *g, const GNode *r, int depth)
+{
+    GNode *c = newNode(g->kind);
+    c->name = g->name;
+    c->min = g->min;
+    c->max = g->max;
+    c->comma = g->comma;
+    c->notEmpty = g->notEmpty;
+    c->loSet = g->loSet;
+    c->hiSet = g->hiSet;
+    c->lo = g->lo;
+    c->hi = g->hi;
+    if (g->kind == G_TYPE && !g->loSet && !g->hiSet)
+    {
+        if (numericType(g->name))
+        {
+            c->loSet = r->loSet;
+            c->lo = r->lo;
+            c->hiSet = r->hiSet;
+            c->hi = r->hi;
+        }
+        else if (numericComposite(g->name) && depth < 4 && typeNode(g->name))
+        {
+            c->kind = G_SEQ;
+            c->name.clear();
+            c->kids.push_back(copyWithRange(typeNode(g->name), r, depth + 1));
+            return c;
+        }
+    }
+    for (GNode *k : g->kids)
+        c->kids.push_back(copyWithRange(k, r, depth));
+    return c;
+}
+
+GNode *rangedType(GNode *g)
+{
+    static std::map<std::string, GNode *> cache;
+    std::string key = g->name + "|" + (g->loSet ? std::to_string(g->lo) : "") + "|" +
+                      (g->hiSet ? std::to_string(g->hi) : "");
+    auto found = cache.find(key);
+    if (found != cache.end())
+        return found->second;
+    GNode *base = typeNode(g->name);
+    GNode *copy = base ? copyWithRange(base, g, 0) : nullptr;
+    cache[key] = copy;
+    return copy;
+}
+
+// ── matching ─────────────────────────────────────────────────────────────
+
+struct CV
+{
+    const Tok *tok = nullptr;
+    const Tok *close = nullptr; // a block's ")" "]" "}" (nullptr: never closed)
+    bool ws = false;            // whitespace before it
+    int kids = -1;              // a block's contents: an index of `lists`
+};
+
+class Matcher
+{
+public:
+    Matcher(const std::vector<Tok> &toks, size_t from, size_t to)
+    {
+        endOffset = to < toks.size() ? toks[to].start : (toks.empty() ? 0 : toks.back().end);
+        if (to > from && to <= toks.size())
+            endOffset = toks[to - 1].end;
+        root = build(toks, from, to);
+    }
+
+    // whether the whole value matches `g`; if not, where it stops
+    bool matches(GNode *g, Mismatch &why)
+    {
+        std::vector<int> ends;
+        match(g, root, 0, ends);
+        int size = (int)lists[(size_t)root].size();
+        for (int e : ends)
+            if (e == size)
+                return true;
+        int maxEnd = -1;
+        for (int e : ends)
+            maxEnd = std::max(maxEnd, e);
+        why = Mismatch();
+        why.at = failTok;
+        if (maxEnd >= 0 && maxEnd < size)
+        {
+            const Tok *t = cvs[(size_t)lists[(size_t)root][(size_t)maxEnd]].tok;
+            if (t->start > failOffset)
+            {
+                why.at = t;
+                why.complete = true;
+            }
+            else if (t->start == failOffset)
+                why.at = t;
+        }
+        if (!why.at && failOffset < 0 && size > 0)
+            why.at = cvs[(size_t)lists[(size_t)root][0]].tok;
+        return false;
+    }
+
+private:
+    std::vector<CV> cvs;
+    std::vector<std::vector<int>> lists;
+    int root = 0;
+    int endOffset = 0;
+    std::map<long long, std::vector<int>> memo;
+    std::set<long long> active;
+    const Tok *failTok = nullptr;
+    int failOffset = -1;
+
+    int build(const std::vector<Tok> &toks, size_t from, size_t to)
+    {
+        int id = (int)lists.size();
+        lists.push_back(std::vector<int>());
+        bool ws = false;
+        for (size_t k = from; k < to;)
+        {
+            const Tok &t = toks[k];
+            if (t.type == T_WS)
+            {
+                ws = true;
+                ++k;
+                continue;
+            }
+            CV cv;
+            cv.tok = &t;
+            cv.ws = ws;
+            ws = false;
+            size_t next = k + 1;
+            if (t.type == T_FUNC || t.type == T_LPAREN || t.type == T_LBRACK || t.type == T_LBRACE)
+            {
+                size_t end = blockEnd(toks, k);
+                if (end > to)
+                    end = to;
+                size_t inner = end;
+                int closeType = t.type == T_LBRACK ? T_RBRACK : t.type == T_LBRACE ? T_RBRACE : T_RPAREN;
+                if (inner > k + 1 && toks[inner - 1].type == closeType)
+                {
+                    cv.close = &toks[inner - 1];
+                    --inner;
+                }
+                cv.kids = build(toks, k + 1, inner);
+                next = end > k ? end : k + 1;
+            }
+            cvs.push_back(cv);
+            lists[(size_t)id].push_back((int)cvs.size() - 1);
+            k = next;
+        }
+        return id;
+    }
+
+    const CV &at(int list, int pos) const { return cvs[(size_t)lists[(size_t)list][(size_t)pos]]; }
+    int size(int list) const { return (int)lists[(size_t)list].size(); }
+
+    // the list `list` cannot go on at `pos`
+    void fail(int list, int pos)
+    {
+        const Tok *t = nullptr;
+        int offset;
+        if (pos < size(list))
+        {
+            t = at(list, pos).tok;
+            offset = t->start;
+        }
+        else
+        {
+            // the end of the list: its block's closing token, or the end of the value
+            offset = endOffset;
+            for (const CV &cv : cvs)
+                if (cv.kids == list)
+                {
+                    t = cv.close;
+                    offset = cv.close ? cv.close->start : endOffset;
+                }
+        }
+        if (offset > failOffset)
+        {
+            failOffset = offset;
+            failTok = t;
+        }
+    }
+
+    static void addUnique(std::vector<int> &out, int v)
+    {
+        if (std::find(out.begin(), out.end(), v) == out.end())
+            out.push_back(v);
+    }
+
+    void match(GNode *g, int list, int pos, std::vector<int> &ends)
+    {
+        long long key = ((long long)g->id << 32) | ((long long)list << 16) | (long long)pos;
+        auto found = memo.find(key);
+        if (found != memo.end())
+        {
+            ends = found->second;
+            return;
+        }
+        ends.clear();
+        if (active.count(key))
+            return; // a grammar that reaches itself without reading anything
+        active.insert(key);
+        std::vector<int> out;
+        if (g->min == 1 && g->max == 1 && !g->comma)
+            matchOnce(g, list, pos, out);
+        else
+            repeat(g, list, pos, out);
+        if (g->notEmpty)
+            out.erase(std::remove(out.begin(), out.end(), pos), out.end());
+        std::sort(out.begin(), out.end());
+        active.erase(key);
+        memo[key] = out;
+        ends = out;
+    }
+
+    void repeat(GNode *g, int list, int pos, std::vector<int> &out)
+    {
+        std::vector<int> frontier;
+        frontier.push_back(pos);
+        if (g->min == 0)
+            addUnique(out, pos);
+        int limit = g->max < 0 ? size(list) - pos + g->min + 1 : g->max;
+        for (int count = 1; count <= limit && !frontier.empty(); ++count)
+        {
+            std::vector<int> next;
+            for (int p : frontier)
+            {
+                int start = p;
+                if (count > 1 && g->comma)
+                {
+                    if (p < size(list) && at(list, p).tok->type == T_COMMA)
+                        start = p + 1;
+                    else
+                    {
+                        fail(list, p);
+                        continue;
+                    }
+                }
+                std::vector<int> e;
+                matchOnce(g, list, start, e);
+                for (int q : e)
+                    addUnique(next, q);
+            }
+            std::sort(next.begin(), next.end());
+            if (count >= g->min)
+                for (int q : next)
+                    addUnique(out, q);
+            if (next == frontier && count >= g->min)
+                break; // only empty matches: no more progress
+            frontier = next;
+        }
+    }
+
+    void matchWhole(GNode *g, int list, bool &ok)
+    {
+        std::vector<int> e;
+        match(g, list, 0, e);
+        ok = false;
+        for (int q : e)
+            if (q == size(list))
+                ok = true;
+        if (!ok)
+        {
+            int maxEnd = -1;
+            for (int q : e)
+                maxEnd = std::max(maxEnd, q);
+            if (maxEnd >= 0)
+                fail(list, maxEnd);
+        }
+    }
+
+    void subsets(GNode *g, int list, int pos, unsigned mask, bool all, std::set<long long> &seen, std::vector<int> &out)
+    {
+        long long key = ((long long)mask << 20) | (long long)pos;
+        if (seen.count(key))
+            return;
+        seen.insert(key);
+        size_t n = g->kids.size();
+        unsigned full = n >= 32 ? 0xFFFFFFFFu : ((1u << n) - 1);
+        if (all ? mask == full : mask != 0)
+            addUnique(out, pos);
+        for (size_t k = 0; k < n && k < 32; ++k)
+        {
+            if (mask & (1u << k))
+                continue;
+            std::vector<int> e;
+            match(g->kids[k], list, pos, e);
+            for (int q : e)
+                subsets(g, list, q, mask | (1u << k), all, seen, out);
+        }
+    }
+
+    void token(GNode *g, int list, int pos, std::vector<int> &out)
+    {
+        int n = size(list);
+        const std::string &want = g->name;
+        if (want == ",")
+        {
+            // CSS Values 4, 2.6: a comma between omitted items is left out
+            bool startCtx = pos == 0;
+            if (pos > 0)
+            {
+                const Tok *prev = at(list, pos - 1).tok;
+                startCtx = prev->type == T_COMMA || (prev->type == T_DELIM && prev->value != "?");
+            }
+            bool here = pos < n && at(list, pos).tok->type == T_COMMA;
+            if (here)
+            {
+                if (startCtx)
+                {
+                    fail(list, pos);
+                    return;
+                }
+                bool endNext = pos + 1 >= n ||
+                               (at(list, pos + 1).tok->type == T_DELIM && at(list, pos + 1).tok->value == "/");
+                if (endNext)
+                {
+                    fail(list, pos + 1);
+                    return;
+                }
+                out.push_back(pos + 1);
+                return;
+            }
+            bool endCtx = pos >= n || (at(list, pos).tok->type == T_DELIM && at(list, pos).tok->value == "/");
+            if (startCtx || endCtx)
+                out.push_back(pos);
+            else
+                fail(list, pos);
+            return;
+        }
+        if (pos >= n)
+        {
+            fail(list, pos);
+            return;
+        }
+        const Tok *t = at(list, pos).tok;
+        bool ok = false;
+        if (want == ":")
+            ok = t->type == T_COLON;
+        else if (want == ";")
+            ok = t->type == T_SEMI;
+        else if (want == "{")
+            ok = t->type == T_LBRACE;
+        else if (want.size() == 1)
+            ok = t->type == T_DELIM && t->value == want;
+        else
+            ok = t->type == T_IDENT && ieq(t->value, want);
+        if (ok)
+            out.push_back(pos + 1);
+        else
+            fail(list, pos);
+    }
+
+    bool inRange(GNode *g, const Tok *t)
+    {
+        if (g->loSet && t->number < g->lo)
+            return false;
+        if (g->hiSet && t->number > g->hi)
+            return false;
+        return true;
+    }
+
+    std::string unitType(const Tok *t)
+    {
+        std::map<std::string, std::string> &units = unitTable();
+        auto found = units.find(lower(t->value));
+        return found == units.end() ? std::string() : found->second;
+    }
+
+    // An+B (Selectors 4, 6.6.1; CSS Syntax 3, 6): odd, even, 3, 2n, -n+1, 2n - 3
+    void anPlusB(int list, int pos, std::vector<int> &out)
+    {
+        int n = size(list);
+        std::string text;
+        int k = pos;
+        for (; k < n && k < pos + 4; ++k)
+        {
+            const Tok *t = at(list, k).tok;
+            std::string piece;
+            if (t->type == T_IDENT)
+                piece = lower(t->value);
+            else if (t->type == T_DIM)
+            {
+                long long v = (long long)t->number;
+                piece = std::to_string(v) + lower(t->value);
+                if (t->number >= 0 && k > pos)
+                    piece = "+" + piece;
+            }
+            else if (t->type == T_NUM && t->integer)
+            {
+                long long v = (long long)t->number;
+                bool afterSign = !text.empty() && (text.back() == '+' || text.back() == '-');
+                piece = (t->number >= 0 && k > pos && !afterSign ? "+" : "") + std::to_string(v);
+            }
+            else if (t->type == T_DELIM && (t->value == "+" || t->value == "-"))
+                piece = t->value;
+            else
+                break;
+            text += piece;
+            if (valid(text))
+                out.push_back(k + 1);
+        }
+        if (out.empty())
+            fail(list, pos);
+    }
+
+    static bool valid(const std::string &t)
+    {
+        if (t == "odd" || t == "even")
+            return true;
+        size_t k = 0;
+        if (k < t.size() && (t[k] == '+' || t[k] == '-'))
+            ++k;
+        size_t digits = k;
+        while (k < t.size() && std::isdigit((unsigned char)t[k]))
+            ++k;
+        bool hasDigits = k > digits;
+        if (k == t.size())
+            return hasDigits;
+        if (t[k] != 'n')
+            return false;
+        ++k;
+        if (k == t.size())
+            return true;
+        if (t[k] != '+' && t[k] != '-')
+            return false;
+        ++k;
+        size_t b = k;
+        while (k < t.size() && std::isdigit((unsigned char)t[k]))
+            ++k;
+        return k == t.size() && k > b;
+    }
+
+    void type(GNode *g, int list, int pos, std::vector<int> &out)
+    {
+        const std::string &name = g->name;
+        int n = size(list);
+        // productions that take any number of component values
+        if (name == "any-value" || name == "declaration-value")
+        {
+            for (int k = pos + 1; k <= n; ++k)
+                out.push_back(k);
+            if (pos >= n)
+                fail(list, pos);
+            return;
+        }
+        if (name == "selector" || name == "forgiving-selector-list" || name == "forgiving-relative-selector-list")
+        {
+            for (int k = pos; k <= n; ++k)
+                out.push_back(k);
+            return;
+        }
+        if (name == "an+b" || name == "an-plus-b")
+        {
+            anPlusB(list, pos, out);
+            return;
+        }
+        if (name == "urange")
+        {
+            if (pos < n && at(list, pos).tok->type == T_IDENT && lower(at(list, pos).tok->value).compare(0, 1, "u") == 0)
+            {
+                int k = pos + 1;
+                while (k < n && !at(list, k).ws &&
+                       (at(list, k).tok->type == T_NUM || at(list, k).tok->type == T_DIM ||
+                        at(list, k).tok->type == T_IDENT ||
+                        (at(list, k).tok->type == T_DELIM && (at(list, k).tok->value == "?" || at(list, k).tok->value == "-"))))
+                    ++k;
+                if (k > pos + 1)
+                {
+                    out.push_back(k);
+                    return;
+                }
+            }
+            fail(list, pos);
+            return;
+        }
+        if (pos >= n)
+        {
+            if (!typeNode(name) || numericType(name))
+            {
+                fail(list, pos);
+                return;
+            }
+        }
+        if (pos < n)
+        {
+            const CV &cv = at(list, pos);
+            const Tok *t = cv.tok;
+            int verdict = -1; // -1: not a production handled here
+            if (numericType(name) && t->type == T_FUNC && mathFunction(t->value))
+                verdict = 1;
+            else if (name == "ident" || name == "ident-token")
+                verdict = t->type == T_IDENT;
+            else if (name == "custom-ident")
+                verdict = t->type == T_IDENT && !cssWide(t->value) && lower(t->value) != "default";
+            else if (name == "dashed-ident" || name == "custom-property-name")
+                verdict = t->type == T_IDENT && t->value.size() > 2 && t->value.compare(0, 2, "--") == 0;
+            else if (name == "string" || name == "string-token")
+                verdict = t->type == T_STR;
+            else if (name == "number")
+                verdict = t->type == T_NUM && inRange(g, t);
+            else if (name == "integer")
+                verdict = t->type == T_NUM && t->integer && inRange(g, t);
+            else if (name == "percentage")
+                verdict = t->type == T_PCT && inRange(g, t);
+            else if (name == "number-token")
+                verdict = t->type == T_NUM;
+            else if (name == "percentage-token")
+                verdict = t->type == T_PCT;
+            else if (name == "dimension" || name == "dimension-token")
+                verdict = t->type == T_DIM && inRange(g, t);
+            else if (name == "length")
+                verdict = ((t->type == T_DIM && unitType(t) == "length") || (t->type == T_NUM && t->number == 0)) &&
+                          inRange(g, t);
+            else if (name == "angle" || name == "time" || name == "frequency" || name == "resolution" ||
+                     name == "flex" || name == "decibel" || name == "semitones")
+                verdict = t->type == T_DIM && unitType(t) == name && inRange(g, t);
+            else if (name == "zero")
+                verdict = t->type == T_NUM && t->number == 0;
+            else if (name == "hex-color")
+                verdict = t->type == T_HASH && hexDigits(t->value);
+            else if (name == "hash-token" || name == "id-selector")
+                verdict = t->type == T_HASH;
+            else if (name == "function-token")
+                verdict = t->type == T_FUNC;
+            else if (name == "url-token")
+                verdict = t->type == T_URL;
+            else if (name == "delim-token")
+                verdict = t->type == T_DELIM;
+            if (verdict >= 0)
+            {
+                if (verdict)
+                    out.push_back(pos + 1);
+                else
+                    fail(list, pos);
+                return;
+            }
+        }
+        GNode *grammar = typeNode(name);
+        if (grammar && (g->loSet || g->hiSet))
+            grammar = rangedType(g);
+        if (!grammar)
+        {
+            // a production the data does not define: anything
+            for (int k = pos + 1; k <= n; ++k)
+                out.push_back(k);
+            return;
+        }
+        match(grammar, list, pos, out);
+    }
+
+    void matchOnce(GNode *g, int list, int pos, std::vector<int> &out)
+    {
+        int n = size(list);
+        switch (g->kind)
+        {
+        case G_SEQ:
+        {
+            std::vector<int> cur;
+            cur.push_back(pos);
+            for (GNode *k : g->kids)
+            {
+                std::vector<int> next;
+                for (int p : cur)
+                {
+                    std::vector<int> e;
+                    match(k, list, p, e);
+                    for (int q : e)
+                        addUnique(next, q);
+                }
+                cur = next;
+                if (cur.empty())
+                    break;
+            }
+            for (int q : cur)
+                addUnique(out, q);
+            return;
+        }
+        case G_ONE:
+            for (GNode *k : g->kids)
+            {
+                std::vector<int> e;
+                match(k, list, pos, e);
+                for (int q : e)
+                    addUnique(out, q);
+            }
+            return;
+        case G_ALL:
+        case G_ANY:
+        {
+            std::set<long long> seen;
+            subsets(g, list, pos, 0, g->kind == G_ALL, seen, out);
+            return;
+        }
+        case G_KEYWORD:
+            if (pos < n && at(list, pos).tok->type == T_IDENT && ieq(at(list, pos).tok->value, g->name))
+                out.push_back(pos + 1);
+            else
+                fail(list, pos);
+            return;
+        case G_TOKEN:
+            token(g, list, pos, out);
+            return;
+        case G_TYPE:
+            type(g, list, pos, out);
+            return;
+        case G_PROP:
+        {
+            GNode *p = propertyNode(g->name);
+            if (p)
+                match(p, list, pos, out);
+            else
+                fail(list, pos);
+            return;
+        }
+        case G_FUNC:
+        case G_PARENS:
+        case G_BRACKETS:
+        {
+            if (pos >= n)
+            {
+                fail(list, pos);
+                return;
+            }
+            const CV &cv = at(list, pos);
+            bool head = false;
+            if (g->kind == G_FUNC)
+                head = cv.tok->type == T_FUNC && ieq(cv.tok->value, g->name);
+            else if (g->kind == G_PARENS)
+                head = cv.tok->type == T_LPAREN;
+            else
+                head = cv.tok->type == T_LBRACK;
+            if (!head)
+            {
+                fail(list, pos);
+                return;
+            }
+            bool ok = false;
+            matchWhole(g->kids[0], cv.kids, ok);
+            if (ok)
+                out.push_back(pos + 1);
+            return;
+        }
+        case G_ANYFUNC:
+            if (pos < n && at(list, pos).tok->type == T_FUNC)
+                out.push_back(pos + 1);
+            else
+                fail(list, pos);
+            return;
+        }
+    }
+};
+
+void keywordsOf(GNode *g, std::set<int> &seen, std::set<std::string> &out)
+{
+    if (!g || seen.count(g->id))
+        return;
+    seen.insert(g->id);
+    if (g->kind == G_KEYWORD)
+        out.insert(g->name);
+    else if (g->kind == G_TYPE)
+        keywordsOf(typeNode(g->name), seen, out);
+    else if (g->kind == G_PROP)
+        keywordsOf(propertyNode(g->name), seen, out);
+    for (GNode *k : g->kids)
+        keywordsOf(k, seen, out);
+}
+
+} // namespace
+
+// ── public ───────────────────────────────────────────────────────────────
+
+bool matchGrammar(const std::string &grammar, const std::vector<Tok> &toks, size_t from, size_t to, Mismatch &why)
+{
+    Matcher m(toks, from, to);
+    return m.matches(parseGrammar(grammar), why);
+}
+
+const std::string *propertyGrammar(const std::string &name)
+{
+    std::map<std::string, PropertyEntry> &props = propertyTable();
+    auto found = props.find(name);
+    return found == props.end() ? nullptr : &found->second.grammar;
+}
+
+std::string propertyStatus(const std::string &name)
+{
+    std::map<std::string, PropertyEntry> &props = propertyTable();
+    auto found = props.find(name);
+    return found == props.end() ? std::string() : found->second.status;
+}
+
+const std::set<std::string> &propertyNames()
+{
+    static std::set<std::string> s;
+    if (s.empty())
+        for (int k = 0; data::kProperties[k]; k += 3)
+            s.insert(data::kProperties[k]);
+    return s;
+}
+
+std::set<std::string> grammarKeywords(const std::string &grammar)
+{
+    std::set<int> seen;
+    std::set<std::string> out;
+    keywordsOf(parseGrammar(grammar), seen, out);
+    return out;
+}
+
+const AtRuleInfo *atRuleInfo(const std::string &name)
+{
+    static std::map<std::string, AtRuleInfo> m;
+    if (m.empty())
+        for (int k = 0; data::kAtRules[k]; k += 4)
+        {
+            AtRuleInfo a;
+            a.prelude = data::kAtRules[k + 1];
+            a.blockPrelude = data::kAtRules[k + 2];
+            a.block = data::kAtRules[k + 3];
+            m[data::kAtRules[k]] = a;
+        }
+    auto found = m.find(name);
+    return found == m.end() ? nullptr : &found->second;
+}
+
+std::set<std::string> atRuleNames()
+{
+    std::set<std::string> out;
+    for (int k = 0; data::kAtRules[k]; k += 4)
+        out.insert(data::kAtRules[k]);
+    return out;
+}
+
+const std::string *descriptorGrammar(const std::string &atRule, const std::string &name)
+{
+    static std::map<std::string, std::string> m;
+    if (m.empty())
+        for (int k = 0; data::kDescriptors[k]; k += 3)
+            m[std::string(data::kDescriptors[k]) + " " + data::kDescriptors[k + 1]] = data::kDescriptors[k + 2];
+    auto found = m.find(atRule + " " + name);
+    return found == m.end() ? nullptr : &found->second;
+}
+
+std::set<std::string> descriptorNames(const std::string &atRule)
+{
+    std::set<std::string> out;
+    for (int k = 0; data::kDescriptors[k]; k += 3)
+        if (atRule == data::kDescriptors[k])
+            out.insert(data::kDescriptors[k + 1]);
+    return out;
+}
+
+bool knownPseudo(bool element, const std::string &name, bool function, std::string &args)
+{
+    const char *const *table = element ? data::kPseudoElements : data::kPseudoClasses;
+    std::string want = function ? name + "()" : name;
+    for (int k = 0; table[k]; k += 2)
+        if (want == table[k])
+        {
+            args = table[k + 1];
+            return true;
+        }
+    return false;
+}
+
+std::set<std::string> pseudoNames(bool element)
+{
+    const char *const *table = element ? data::kPseudoElements : data::kPseudoClasses;
+    std::set<std::string> out;
+    for (int k = 0; table[k]; k += 2)
+    {
+        std::string n = table[k];
+        if (n.size() > 2 && n.compare(n.size() - 2, 2, "()") == 0)
+            n = n.substr(0, n.size() - 2);
+        out.insert(n);
+    }
+    return out;
+}
+
+std::string unitOf(const std::string &unit)
+{
+    std::map<std::string, std::string> &units = unitTable();
+    auto found = units.find(lower(unit));
+    return found == units.end() ? std::string() : found->second;
+}
+
+std::set<std::string> unitNames(const std::string &type)
+{
+    std::set<std::string> out;
+    for (int k = 0; data::kUnits[k]; k += 2)
+        if (type.empty() || type == data::kUnits[k + 1])
+            out.insert(data::kUnits[k]);
+    return out;
+}
+
+} // namespace css

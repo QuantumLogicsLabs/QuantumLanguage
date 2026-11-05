@@ -8219,6 +8219,14 @@ void Gen::stmt(const cpp::StmtP &s)
         }
         break;
     case cpp::SK::Block:
+        if (s->isStatic)
+        {
+            // declarations that open no scope of their own (struct X {...} x;):
+            // x lives as long as the enclosing block
+            for (const cpp::StmtP &x : s->body)
+                stmt(x);
+            break;
+        }
         scopes_.emplace_back();
         for (const cpp::StmtP &x : s->body)
             stmt(x);

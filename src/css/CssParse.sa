@@ -447,13 +447,42 @@ namespace
 {
 
 // What a block holds: rules (a stylesheet, @media), declarations and nested
-// rules (a style rule), or descriptors (@font-face: names not checked)
+// rules (a style rule), descriptors (@font-face), @page's descriptors and
+// declarations, @font-feature-values' blocks (@swash ...) and their
+// declarations ("name: 1 2")
 enum BlockKind
 {
     B_RULES,
     B_STYLE,
-    B_DESCRIPTORS
+    B_DESCRIPTORS,
+    B_PAGE,
+    B_FEATURE,
+    B_FEATURE_BLOCK
 };
+
+bool vendorPrefixed(const std::string &name)
+{
+    return name.compare(0, 8, "-webkit-") == 0 || name.compare(0, 5, "-moz-") == 0 ||
+           name.compare(0, 4, "-ms-") == 0 || name.compare(0, 3, "-o-") == 0;
+}
+
+bool marginBox(const std::string &name)
+{
+    static const char *const names[] = {"top-left-corner", "top-left", "top-center", "top-right", "top-right-corner",
+                                        "bottom-left-corner", "bottom-left", "bottom-center", "bottom-right",
+                                        "bottom-right-corner", "left-top", "left-middle", "left-bottom", "right-top",
+                                        "right-middle", "right-bottom", nullptr};
+    for (int k = 0; names[k]; ++k)
+        if (name == names[k])
+            return true;
+    return false;
+}
+
+bool featureBlock(const std::string &name)
+{
+    return name == "swash" || name == "annotation" || name == "ornaments" || name == "stylistic" ||
+           name == "styleset" || name == "character-variant" || name == "historical-forms";
+}
 
 class Parser
 {
@@ -489,10 +518,10 @@ public:
                 if ((name == "import" || name == "charset") && otherRules)
                 {
                     problemAt(problems, t, "\"@" + name + "\" must come before all other rules; a browser ignores it here.");
-                    atRule(0, false);
+                    atRule(0, B_RULES);
                     continue;
                 }
-                item = atRule(0, false);
+                item = atRule(0, B_RULES);
                 if (!early)
                     otherRules = true;
             }
@@ -522,6 +551,7 @@ private:
     std::vector<Problem> &problems;
     std::vector<Tok> toks;
     size_t i = 0;
+    std::string atName; // the at-rule whose descriptors are being read
 
     static std::string indent(int depth) { return std::string((size_t)depth * 2, ' '); }
 
@@ -689,7 +719,7 @@ private:
             }
             std::string item;
             if (t.type == T_AT)
-                item = atRule(depth, kind != B_RULES);
+                item = atRule(depth, kind);
             else if (kind == B_RULES)
                 item = qualifiedRule(depth, false);
             else if (t.type == T_IDENT && t.value.compare(0, 2, "--") == 0)
@@ -762,14 +792,30 @@ private:
             problemAt(problems, nameTok, "Missing value for \"" + name + "\".");
             return "";
         }
-        if (kind == B_STYLE && !checkDeclaration(toks, nameTok, name, from, end, problems))
+        bool ok = true;
+        if (kind == B_STYLE)
+            ok = checkDeclaration(toks, nameTok, name, from, end, problems);
+        else if ((kind == B_DESCRIPTORS || kind == B_FEATURE) && !custom)
+            ok = checkDescriptor(toks, nameTok, atName, name, from, end, problems);
+        else if (kind == B_PAGE && !custom)
+            ok = descriptorGrammar("page", name) ? checkDescriptor(toks, nameTok, "page", name, from, end, problems)
+                                                 : checkDeclaration(toks, nameTok, name, from, end, problems);
+        else if (kind == B_FEATURE_BLOCK)
+        {
+            Mismatch why;
+            ok = matchGrammar("<integer [0,inf]>+", toks, from, end, why);
+            if (!ok)
+                problemAt(problems, why.at ? *why.at : nameTok,
+                          "A feature value is one or more whole numbers, like \"" + name + ": 1\".");
+        }
+        if (!ok)
             return "";
         return indent(depth) + name + ": " + value + (important ? " !important" : "") + ";";
     }
 
-    // An at-rule, from its "@name"; `inStyle`: inside a style rule, where
-    // @media and friends hold declarations
-    std::string atRule(int depth, bool inStyle)
+    // An at-rule, from its "@name"; `parent`: the kind of block it is in
+    // (inside a style rule, @media and friends hold declarations)
+    std::string atRule(int depth, int parent)
     {
         const Tok &at = toks[i++];
         std::string name = lower(at.value);
@@ -781,25 +827,22 @@ private:
                 break;
             i = opens(t) ? blockEnd(toks, i) : i + 1;
         }
+        size_t preludeEnd = i;
         std::string prelude = render(from, i, false);
         std::string head = "@" + name + (prelude.empty() ? "" : " " + prelude);
         ++rules;
 
-        static const std::set<std::string> statements = {"import", "charset", "namespace"};
-        static const std::set<std::string> groups = {"media", "supports", "layer", "container", "scope",
-                                                     "starting-style", "document", "-moz-document"};
-        static const std::set<std::string> descriptors = {
-            "font-face", "page", "property", "counter-style", "font-palette-values", "font-feature-values",
-            "view-transition", "position-try", "top-left-corner", "top-left", "top-center", "top-right",
-            "top-right-corner", "bottom-left-corner", "bottom-left", "bottom-center", "bottom-right",
-            "bottom-right-corner", "left-top", "left-middle", "left-bottom", "right-top", "right-middle",
-            "right-bottom", "swash", "annotation", "ornaments", "stylistic", "styleset", "character-variant"};
-        bool keyframes = name == "keyframes" || name == "-webkit-keyframes" || name == "-moz-keyframes" ||
-                         name == "-o-keyframes";
-        bool prefixed = name[0] == '-';
-        bool known = statements.count(name) || groups.count(name) || descriptors.count(name) || keyframes;
-        if (!known && !prefixed)
-            syntaxAt(problems, at, "Unknown at-rule \"@" + at.value + "\".");
+        // a browser's own at-rules: @-webkit-keyframes is @keyframes
+        bool vendor = vendorPrefixed(name);
+        std::string base = name;
+        if (vendor)
+            base = name.substr(name.find('-', 1) + 1);
+        const AtRuleInfo *info = atRuleInfo(base);
+        bool margin = parent == B_PAGE && marginBox(base);
+        bool feature = parent == B_FEATURE && featureBlock(base);
+        bool known = info || margin || feature;
+        if (!known && !vendor)
+            syntaxAt(problems, at, "Unknown at-rule \"@" + at.value + "\"." + suggest(name, atRuleNames()));
 
         if (toks[i].type != T_LBRACE)
         {
@@ -808,29 +851,18 @@ private:
                 ++i;
             if (!known)
                 return "";
-            if (!statements.count(name) && name != "layer")
+            if (!info || (info->block != "none" && info->block != "group-or-none"))
             {
                 syntaxAt(problems, at, "Expected \"{\" after \"" + head + "\".");
                 return "";
             }
-            if (name == "import")
-            {
-                size_t k = from;
-                while (toks[k].type == T_WS)
-                    ++k;
-                int t = toks[k].type;
-                bool url = t == T_STR || t == T_URL || (t == T_FUNC && lower(toks[k].value) == "url");
-                if (!url)
-                {
-                    problemAt(problems, at, "Expected a URL after \"@import\", like @import url(\"other.css\");.");
-                    return "";
-                }
-            }
+            if (!checkPrelude(toks, at, base, info->prelude, from, preludeEnd, problems))
+                return "";
             return indent(depth) + head + ";";
         }
         const Tok &brace = toks[i++];
         std::vector<std::string> items;
-        if (statements.count(name))
+        if (info && info->block == "none")
         {
             syntaxAt(problems, at, "\"@" + name + "\" cannot have a block.");
             i = blockEnd(toks, i - 1);
@@ -841,12 +873,36 @@ private:
             i = blockEnd(toks, i - 1);
             return "";
         }
-        if (keyframes)
+        bool ok = true;
+        if (info)
+            ok = checkPrelude(toks, at, base, info->blockPrelude, from, preludeEnd, problems);
+        std::string kind = info ? info->block : (margin ? "declarations" : "feature-block");
+        std::string saved = atName;
+        if (kind == "keyframes")
             keyframeBlock(depth + 1, brace, items);
-        else if (groups.count(name))
-            block(depth + 1, inStyle ? B_STYLE : B_RULES, brace, false, items);
+        else if (kind == "group" || kind == "group-or-none")
+            block(depth + 1, parent == B_STYLE ? B_STYLE : B_RULES, brace, false, items);
+        else if (kind == "descriptors")
+        {
+            atName = base;
+            block(depth + 1, B_DESCRIPTORS, brace, false, items);
+        }
+        else if (kind == "page")
+            block(depth + 1, B_PAGE, brace, false, items);
+        else if (kind == "feature-values")
+        {
+            atName = base;
+            block(depth + 1, B_FEATURE, brace, false, items);
+        }
+        else if (kind == "feature-block")
+            block(depth + 1, B_FEATURE_BLOCK, brace, false, items);
         else
-            block(depth + 1, name == "page" ? B_STYLE : B_DESCRIPTORS, brace, false, items);
+            block(depth + 1, B_STYLE, brace, false, items);
+        atName = saved;
+        // a browser drops an at-rule whose prelude is invalid (an invalid
+        // media query only matches nothing)
+        if (!ok && base != "media")
+            return "";
         return wrap(depth, head, items);
     }
 

@@ -1,0 +1,23 @@
+// quantum: cpp
+#pragma once
+// MDN's CSS data (generated/CssData.sa, written by src/tools/gen_css_data.py
+// from mdn-data and src/tools/css_data_patch.json). Each table is flat and
+// ends with nullptr; a row is the given number of strings. Grammars are in
+// the CSS value definition syntax ("<length> | auto").
+
+namespace css
+{
+namespace data
+{
+
+extern const char *const kVersion;
+extern const char *const kProperties[];     // 3: property, grammar, status
+extern const char *const kTypes[];          // 2: production ("color", "rgb()"), grammar
+extern const char *const kAtRules[];        // 4: at-rule, prelude, prelude before a block, block
+extern const char *const kDescriptors[];    // 3: at-rule, descriptor, grammar
+extern const char *const kPseudoClasses[];  // 2: name ("hover", "nth-child()"), arguments' grammar
+extern const char *const kPseudoElements[]; // 2: name, arguments' grammar
+extern const char *const kUnits[];          // 2: unit (lowercase), its type ("length")
+
+} // namespace data
+} // namespace css

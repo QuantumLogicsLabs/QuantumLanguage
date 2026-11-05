@@ -477,7 +477,7 @@ static int unboxOp(TK k)
 {
     if (k == TK::Char)
         return UNBOXC;
-    if (k == TK::Long || k == TK::Short || k == TK::Byte)
+    if (k == TK::Long || k == TK::Short || k == TK::Byte || k == TK::Float)
         return UNBOXN;
     return NONNULL;
 }
@@ -537,6 +537,11 @@ ASTNodePtr Sema::coerce(Val v, const TypeP &to, Pos pos, bool isCast, bool repor
         {
             need(cls("java.lang.Character"));
             return q::un(BOXC, std::move(n), l);
+        }
+        if (boxK == TK::Float)
+        {
+            need(cls("java.lang.Float"));
+            return q::un(BOXF, std::move(n), l);
         }
         if (boxK == TK::Long || boxK == TK::Short || boxK == TK::Byte)
         {

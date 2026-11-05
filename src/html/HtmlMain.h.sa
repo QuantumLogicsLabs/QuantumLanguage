@@ -26,4 +26,18 @@ Result compile(const std::string &source, const std::string &path, const std::ve
 // or an HTML element's tag
 bool looksLikePage(const std::string &source);
 
+// Conformance testing (hidden qrun flags). The tree construction tests of
+// the web-platform-tests / html5lib .dat format: each test's input is parsed
+// (as a document, or as a fragment in a context element; with scripting on,
+// off, or both) and its tree compared with the expected one. Prints the
+// failures and a summary; 0 when all pass.
+int runTreeTests(const std::vector<std::string> &files, bool verbose);
+
+// The tree of a page in that format (qrun --html-dump page.html)
+int dumpTreeFile(const std::string &path, bool scripting);
+
+// html5lib tokenizer tests, given as a batch file that tools write from the
+// JSON tests: prints each test's tokens, one JSON array per line
+int runTokenizerBatch(const std::string &path);
+
 } // namespace html
