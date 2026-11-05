@@ -235,7 +235,7 @@ private:
     // jop::BOXJ / BOXS / BOXB: the java.lang.Long / Short / Byte box of an
     // integer, from the valueOf cache for -128..127.
     QuantumValue javaBox(int op, const QuantumValue &v);
-    std::shared_ptr<QuantumClass> javaBoxClass_[4];
+    std::shared_ptr<QuantumClass> javaBoxClass_[5]; // Long, Short, Byte, Character, Float
     std::vector<QuantumValue> javaBoxCache_[4];
     // Globals that yield to a same-named member inside a method: common
     // identifiers like `next`/`count`/`find` registered as STL algorithms

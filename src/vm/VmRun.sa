@@ -1517,7 +1517,7 @@ void VM::runFrame(size_t stopDepth)
             break;
         }
         case Op::J_UN:
-            if (instr.operand >= jop::BOXJ && instr.operand <= jop::BOXC)
+            if ((instr.operand >= jop::BOXJ && instr.operand <= jop::BOXC) || instr.operand == jop::BOXF)
                 stack_.back() = javaBox(instr.operand, stack_.back());
             else
                 stack_.back() = javaUn(instr.operand, stack_.back());

@@ -1,0 +1,1994 @@
+// quantum: cpp
+// HTML front-end: the tokenizer, the state machine of the WHATWG HTML
+// standard (13.2.5 Tokenization) state by state, including character
+// references, script data escaping, CDATA sections and processing
+// instructions. Its parse errors carry the standard's error codes.
+#include "HtmlDom.h.sa"
+#include "HtmlEntities.h.sa"
+
+#include <algorithm>
+#include <map>
+
+namespace html
+{
+
+namespace
+{
+
+const unsigned kEof = 0xFFFFFFFFu;
+
+enum State
+{
+    TS_DATA = Parser::S_DATA,
+    TS_RCDATA = Parser::S_RCDATA,
+    TS_RAWTEXT = Parser::S_RAWTEXT,
+    TS_SCRIPT = Parser::S_SCRIPT,
+    TS_PLAINTEXT = Parser::S_PLAINTEXT,
+    TS_TAG_OPEN = 10,
+    TS_END_TAG_OPEN,
+    TS_TAG_NAME,
+    TS_RCDATA_LT,
+    TS_RCDATA_END_OPEN,
+    TS_RCDATA_END_NAME,
+    TS_RAWTEXT_LT,
+    TS_RAWTEXT_END_OPEN,
+    TS_RAWTEXT_END_NAME,
+    TS_SCRIPT_LT,
+    TS_SCRIPT_END_OPEN,
+    TS_SCRIPT_END_NAME,
+    TS_SCRIPT_ESC_START,
+    TS_SCRIPT_ESC_START_DASH,
+    TS_SCRIPT_ESC,
+    TS_SCRIPT_ESC_DASH,
+    TS_SCRIPT_ESC_DASH_DASH,
+    TS_SCRIPT_ESC_LT,
+    TS_SCRIPT_ESC_END_OPEN,
+    TS_SCRIPT_ESC_END_NAME,
+    TS_SCRIPT_DESC_START,
+    TS_SCRIPT_DESC,
+    TS_SCRIPT_DESC_DASH,
+    TS_SCRIPT_DESC_DASH_DASH,
+    TS_SCRIPT_DESC_LT,
+    TS_SCRIPT_DESC_END,
+    TS_BEFORE_ATTR_NAME,
+    TS_ATTR_NAME,
+    TS_AFTER_ATTR_NAME,
+    TS_BEFORE_ATTR_VALUE,
+    TS_ATTR_VALUE_DQ,
+    TS_ATTR_VALUE_SQ,
+    TS_ATTR_VALUE_UQ,
+    TS_AFTER_ATTR_VALUE_Q,
+    TS_SELF_CLOSING,
+    TS_BOGUS_COMMENT,
+    TS_MARKUP_DECL,
+    TS_COMMENT_START,
+    TS_COMMENT_START_DASH,
+    TS_COMMENT,
+    TS_COMMENT_LT,
+    TS_COMMENT_LT_BANG,
+    TS_COMMENT_LT_BANG_DASH,
+    TS_COMMENT_LT_BANG_DASH_DASH,
+    TS_COMMENT_END_DASH,
+    TS_COMMENT_END,
+    TS_COMMENT_END_BANG,
+    TS_DOCTYPE,
+    TS_BEFORE_DOCTYPE_NAME,
+    TS_DOCTYPE_NAME,
+    TS_AFTER_DOCTYPE_NAME,
+    TS_AFTER_DOCTYPE_PUBLIC_KW,
+    TS_BEFORE_DOCTYPE_PUBLIC_ID,
+    TS_DOCTYPE_PUBLIC_ID_DQ,
+    TS_DOCTYPE_PUBLIC_ID_SQ,
+    TS_AFTER_DOCTYPE_PUBLIC_ID,
+    TS_BETWEEN_DOCTYPE_IDS,
+    TS_AFTER_DOCTYPE_SYSTEM_KW,
+    TS_BEFORE_DOCTYPE_SYSTEM_ID,
+    TS_DOCTYPE_SYSTEM_ID_DQ,
+    TS_DOCTYPE_SYSTEM_ID_SQ,
+    TS_AFTER_DOCTYPE_SYSTEM_ID,
+    TS_BOGUS_DOCTYPE,
+    TS_CDATA,
+    TS_CDATA_BRACKET,
+    TS_CDATA_END,
+    TS_PI_OPEN,
+    TS_PI_TARGET,
+    TS_AFTER_PI_TARGET,
+    TS_PI_DATA,
+    TS_PI_QUESTIONABLE,
+    TS_CHAR_REF,
+    TS_NAMED_CHAR_REF,
+    TS_AMBIGUOUS_AMP,
+    TS_NUMERIC_CHAR_REF,
+    TS_HEX_CHAR_REF_START,
+    TS_HEX_CHAR_REF,
+    TS_DEC_CHAR_REF,
+    TS_NUMERIC_CHAR_REF_END
+};
+
+bool isWs(unsigned c) { return c == 0x09 || c == 0x0A || c == 0x0C || c == 0x20; }
+bool isUpper(unsigned c) { return c >= 'A' && c <= 'Z'; }
+bool isLower(unsigned c) { return c >= 'a' && c <= 'z'; }
+bool isAlpha(unsigned c) { return isUpper(c) || isLower(c); }
+bool isDigit(unsigned c) { return c >= '0' && c <= '9'; }
+bool isAlnum(unsigned c) { return isAlpha(c) || isDigit(c); }
+bool isHex(unsigned c) { return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+unsigned toLower(unsigned c) { return isUpper(c) ? c + 0x20 : c; }
+
+void appendUtf8(std::string &out, unsigned c)
+{
+    if (c < 0x80)
+        out += (char)c;
+    else if (c < 0x800)
+    {
+        out += (char)(0xC0 | (c >> 6));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+    else if (c < 0x10000)
+    {
+        out += (char)(0xE0 | (c >> 12));
+        out += (char)(0x80 | ((c >> 6) & 0x3F));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+    else
+    {
+        out += (char)(0xF0 | (c >> 18));
+        out += (char)(0x80 | ((c >> 12) & 0x3F));
+        out += (char)(0x80 | ((c >> 6) & 0x3F));
+        out += (char)(0x80 | (c & 0x3F));
+    }
+}
+
+const std::map<std::string, std::string> &entityMap()
+{
+    static std::map<std::string, std::string> m;
+    if (m.empty())
+        for (int k = 0; k < kEntityCount; ++k)
+            m[kEntities[2 * k]] = kEntities[2 * k + 1];
+    return m;
+}
+
+// What a browser makes of &#128; .. &#159; (Windows-1252)
+unsigned c1Replacement(unsigned c)
+{
+    static const unsigned table[32] = {0x20AC, 0x81,   0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+                                       0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D,   0x017D, 0x8F,
+                                       0x90,   0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                                       0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D,   0x017E, 0x0178};
+    return table[c - 0x80];
+}
+
+bool noncharacter(unsigned c) { return (c >= 0xFDD0 && c <= 0xFDEF) || (c & 0xFFFE) == 0xFFFE; }
+bool control(unsigned c) { return c <= 0x1F || (c >= 0x7F && c <= 0x9F); }
+
+// The message for a parse error code of the standard
+std::string messageFor(const std::string &code)
+{
+    static std::map<std::string, std::string> m;
+    if (m.empty())
+    {
+        m["abrupt-closing-of-empty-comment"] = "Premature end of comment. Use \"-->\" to end a comment properly.";
+        m["abrupt-doctype-public-identifier"] = "Premature \">\" inside the doctype's public identifier.";
+        m["abrupt-doctype-system-identifier"] = "Premature \">\" inside the doctype's system identifier.";
+        m["absence-of-digits-in-numeric-character-reference"] =
+            "No digits in a numeric character reference. (\"&\" probably should have been escaped as \"&amp;\".)";
+        m["cdata-in-html-content"] = "Saw \"<![CDATA[\" in HTML: CDATA sections are only allowed in SVG and MathML.";
+        m["character-reference-outside-unicode-range"] = "Character reference outside the permissible Unicode range.";
+        m["control-character-in-input-stream"] = "Forbidden control character in the text.";
+        m["control-character-reference"] = "Character reference expands to a control character.";
+        m["disallowed-processing-instruction-target"] =
+            "Processing instructions named \"xml\" or \"xml-stylesheet\" are not allowed in HTML.";
+        m["end-tag-with-attributes"] = "End tag had attributes.";
+        m["duplicate-attribute"] = "Duplicate attribute.";
+        m["end-tag-with-trailing-solidus"] = "Stray \"/\" at the end of an end tag.";
+        m["eof-before-tag-name"] = "End of file seen when looking for a tag name.";
+        m["eof-in-cdata"] = "End of file inside a CDATA section.";
+        m["eof-in-comment"] = "End of file inside comment.";
+        m["eof-in-doctype"] = "End of file inside doctype.";
+        m["eof-in-processing-instruction"] = "End of file inside a processing instruction.";
+        m["eof-in-script-html-comment-like-text"] = "End of file inside script text that looks like an HTML comment.";
+        m["eof-in-tag"] = "End of file inside a tag. Ignoring tag.";
+        m["incorrectly-closed-comment"] = "The comment ended with \"--!>\": use \"-->\".";
+        m["incorrectly-opened-comment"] = "Bogus comment.";
+        m["invalid-character-sequence-after-doctype-name"] = "Garbage after the doctype name.";
+        m["invalid-first-character-of-tag-name"] =
+            "Bad character after \"<\". Probable cause: Unescaped \"<\". Try escaping it as \"&lt;\".";
+        m["invalid-first-character-of-processing-instruction-target"] =
+            "Saw \"<?\" not followed by a name. Probable cause: Unescaped \"<\". Try escaping it as \"&lt;\".";
+        m["invalid-processing-instruction-target"] = "Bad character in a processing instruction's name.";
+        m["missing-attribute-value"] = "Attribute value missing.";
+        m["missing-doctype-name"] = "Missing doctype name. Expected \"<!DOCTYPE html>\".";
+        m["missing-doctype-public-identifier"] = "Expected a public identifier but the doctype ended.";
+        m["missing-doctype-system-identifier"] = "Expected a system identifier but the doctype ended.";
+        m["missing-end-tag-name"] = "Saw \"</>\". Probable causes: Unescaped \"<\" (escape as \"&lt;\") or mistyped end tag.";
+        m["missing-quote-before-doctype-public-identifier"] = "Expected a quote before the doctype's public identifier.";
+        m["missing-quote-before-doctype-system-identifier"] = "Expected a quote before the doctype's system identifier.";
+        m["missing-semicolon-after-character-reference"] =
+            "Character reference was not terminated by a semicolon. (Or \"&\" should have been escaped as \"&amp;\".)";
+        m["missing-whitespace-after-doctype-public-keyword"] = "No space after the doctype's \"PUBLIC\" keyword.";
+        m["missing-whitespace-after-doctype-system-keyword"] = "No space after the doctype's \"SYSTEM\" keyword.";
+        m["missing-whitespace-before-doctype-name"] = "Missing space before the doctype name.";
+        m["missing-whitespace-between-attributes"] = "No space between attributes.";
+        m["missing-whitespace-between-doctype-public-and-system-identifiers"] =
+            "No space between the doctype's public and system identifiers.";
+        m["nested-comment"] = "Saw \"<!--\" within a comment. Probable cause: Nested comment (not allowed).";
+        m["noncharacter-character-reference"] = "Character reference expands to a permanently unassigned code point.";
+        m["noncharacter-in-input-stream"] = "Forbidden code point (a Unicode noncharacter) in the text.";
+        m["null-character-reference"] = "Character reference expands to zero.";
+        m["surrogate-character-reference"] = "Character reference expands to a surrogate.";
+        m["unexpected-character-after-doctype-system-identifier"] = "Garbage after the doctype's system identifier.";
+        m["unexpected-character-in-attribute-name"] =
+            "Quote or \"<\" in attribute name. Probable cause: Matching quote missing somewhere earlier, or \">\" missing.";
+        m["unexpected-character-in-unquoted-attribute-value"] =
+            "Quote, \"<\", \"=\" or \"`\" in an unquoted attribute value. Probable causes: Attributes running "
+            "together or a URL query string in an unquoted attribute value.";
+        m["unexpected-equals-sign-before-attribute-name"] = "\"=\" at the start of an attribute name. Probable cause: Stray \"=\".";
+        m["unexpected-null-character"] = "Saw U+0000 in the text.";
+        m["unexpected-solidus-in-tag"] = "A slash was not immediately followed by \">\".";
+        m["unknown-named-character-reference"] =
+            "\"&\" did not start a character reference. (\"&\" probably should have been escaped as \"&amp;\".)";
+    }
+    auto found = m.find(code);
+    return found == m.end() ? "Parse error: " + code + "." : found->second;
+}
+
+} // namespace
+
+bool isHtml(const Node *n, const char *name) { return n && n->type == N_ELEMENT && n->ns == NS_HTML && n->name == name; }
+
+const Attr *findAttr(const Node *e, const std::string &name)
+{
+    for (const Attr &a : e->attrs)
+        if (a.name == name && a.ns == AN_NONE)
+            return &a;
+    return nullptr;
+}
+
+Parser::Parser(const std::string &source, bool scriptingOn) : src(source), scripting(scriptingOn)
+{
+    // decode UTF-8 (invalid bytes become U+FFFD), then CR LF and lone CR become LF
+    size_t n = source.size();
+    lineStarts.push_back(0);
+    for (size_t k = 0; k < n; ++k)
+        if (source[k] == '\n')
+            lineStarts.push_back((int)k + 1);
+    size_t k = 0;
+    while (k < n)
+    {
+        unsigned char b = (unsigned char)source[k];
+        unsigned c = 0xFFFD;
+        size_t len = 1;
+        if (b < 0x80)
+            c = b;
+        else if ((b & 0xE0) == 0xC0 && k + 1 < n && ((unsigned char)source[k + 1] & 0xC0) == 0x80)
+        {
+            c = ((b & 0x1F) << 6) | ((unsigned char)source[k + 1] & 0x3F);
+            len = 2;
+            if (c < 0x80)
+                c = 0xFFFD;
+        }
+        else if ((b & 0xF0) == 0xE0 && k + 2 < n && ((unsigned char)source[k + 1] & 0xC0) == 0x80 &&
+                 ((unsigned char)source[k + 2] & 0xC0) == 0x80)
+        {
+            c = ((b & 0x0F) << 12) | (((unsigned char)source[k + 1] & 0x3F) << 6) | ((unsigned char)source[k + 2] & 0x3F);
+            len = 3;
+            if (c < 0x800 || (c >= 0xD800 && c <= 0xDFFF))
+                c = 0xFFFD;
+        }
+        else if ((b & 0xF8) == 0xF0 && k + 3 < n && ((unsigned char)source[k + 1] & 0xC0) == 0x80 &&
+                 ((unsigned char)source[k + 2] & 0xC0) == 0x80 && ((unsigned char)source[k + 3] & 0xC0) == 0x80)
+        {
+            c = ((b & 0x07) << 18) | (((unsigned char)source[k + 1] & 0x3F) << 12) |
+                (((unsigned char)source[k + 2] & 0x3F) << 6) | ((unsigned char)source[k + 3] & 0x3F);
+            len = 4;
+            if (c < 0x10000 || c > 0x10FFFF)
+                c = 0xFFFD;
+        }
+        if (c == '\r')
+        {
+            c = '\n';
+            if (k + 1 < n && source[k + 1] == '\n')
+                len = 2;
+        }
+        // characters the standard forbids in the input stream
+        if (noncharacter(c))
+        {
+            tokError("noncharacter-in-input-stream", (int)k);
+            problems.back().at = (int)cp.size();
+        }
+        else if (control(c) && c != 0 && !isWs(c))
+        {
+            tokError("control-character-in-input-stream", (int)k);
+            problems.back().at = (int)cp.size();
+        }
+        cp.push_back(c);
+        offsetOf.push_back((int)k);
+        k += len;
+    }
+    offsetOf.push_back((int)n);
+    document = new Node();
+    document->type = N_DOCUMENT;
+    bookmarkNode.type = N_COMMENT;
+}
+
+void Parser::lineCol(int off, int &line, int &col) const
+{
+    size_t idx = (size_t)(std::upper_bound(lineStarts.begin(), lineStarts.end(), off) - lineStarts.begin()) - 1;
+    line = (int)idx + 1;
+    col = off - lineStarts[idx] + 1;
+}
+
+void Parser::report(int pos, int width, bool error, const std::string &message)
+{
+    ParseProblem p;
+    p.pos = pos;
+    p.width = std::max(1, width);
+    p.error = error;
+    p.message = message;
+    problems.push_back(p);
+}
+
+void Parser::tokError(const char *code, int at)
+{
+    report(at, 1, true, messageFor(code));
+    problems.back().code = code;
+    problems.back().at = (int)stepStart;
+}
+
+// (columns count UTF-16 code units, as the html5lib tests do: a character
+// outside the BMP is two)
+void Parser::cpLineCol(int at, int &line, int &col) const
+{
+    line = 1;
+    col = 1;
+    for (int k = 0; k < at; ++k)
+    {
+        if (k < (int)cp.size() && cp[k] == '\n')
+        {
+            ++line;
+            col = 1;
+        }
+        else
+            col += k < (int)cp.size() && cp[k] > 0xFFFF ? 2 : 1;
+    }
+}
+
+unsigned Parser::next()
+{
+    if (i >= cp.size())
+    {
+        ++i; // so that reconsume() returns to EOF
+        return kEof;
+    }
+    return cp[i++];
+}
+
+void Parser::reconsume() { --i; }
+
+// offset of the character just consumed
+int Parser::here() const { return offsetOf[std::min(i == 0 ? 0 : i - 1, cp.size())]; }
+
+bool Parser::lookahead(const char *s, bool caseless) const
+{
+    size_t k = i;
+    for (; *s; ++s, ++k)
+    {
+        if (k >= cp.size())
+            return false;
+        unsigned c = cp[k];
+        unsigned want = (unsigned char)*s;
+        if (caseless ? toLower(c) != toLower(want) : c != want)
+            return false;
+    }
+    return true;
+}
+
+void Parser::emit(Token t) { queue.push_back(t); }
+
+void Parser::emitChar(unsigned c, int at)
+{
+    if (queue.empty() || queue.back().type != Token::CHARS)
+    {
+        Token t;
+        t.type = Token::CHARS;
+        t.pos = at;
+        queue.push_back(t);
+    }
+    appendUtf8(queue.back().data, c);
+}
+
+void Parser::emitString(const std::string &s, int at)
+{
+    for (char c : s)
+        emitChar((unsigned char)c, at);
+}
+
+void Parser::emitCurrent()
+{
+    finishAttr();
+    if (cur.type == Token::START)
+        lastStartTag = cur.name;
+    else if (cur.type == Token::END)
+    {
+        if (!cur.attrs.empty())
+            tokError("end-tag-with-attributes", cur.pos);
+        if (cur.selfClosing)
+            tokError("end-tag-with-trailing-solidus", cur.pos);
+    }
+    emit(cur);
+}
+
+void Parser::startAttr()
+{
+    finishAttr();
+    cur.attrs.push_back(Attr());
+    attr = &cur.attrs.back();
+    attr->pos = here();
+    attr->at = (int)stepStart;
+}
+
+// an attribute whose name is a duplicate is dropped (with a parse error)
+void Parser::finishAttr()
+{
+    if (!attr)
+        return;
+    for (size_t k = 0; k + 1 < cur.attrs.size(); ++k)
+        if (cur.attrs[k].name == attr->name)
+        {
+            report(attr->pos, (int)attr->name.size(), true, "Duplicate attribute \"" + attr->name + "\".");
+            problems.back().code = "duplicate-attribute";
+            // detected as the name ends
+            int chars = 0;
+            for (char ch : attr->name)
+                if (((unsigned char)ch & 0xC0) != 0x80)
+                    ++chars;
+            problems.back().at = attr->at + chars;
+            cur.attrs.pop_back();
+            break;
+        }
+    attr = nullptr;
+}
+
+bool Parser::charRefInAttr() const
+{
+    return returnState == TS_ATTR_VALUE_DQ || returnState == TS_ATTR_VALUE_SQ || returnState == TS_ATTR_VALUE_UQ;
+}
+
+void Parser::flushCharRef()
+{
+    for (unsigned c : tempCps)
+    {
+        if (charRefInAttr())
+            appendUtf8(attr->value, c);
+        else
+            emitChar(c, tokStart);
+    }
+}
+
+bool Parser::appropriateEnd() const { return cur.type == Token::END && !lastStartTag.empty() && cur.name == lastStartTag; }
+
+void Parser::namedCharRef()
+{
+    const std::map<std::string, std::string> &table = entityMap();
+    std::string word;
+    size_t k = i;
+    while (k < cp.size() && word.size() < 32 && isAlnum(cp[k]))
+        word += (char)cp[k++];
+    if (k < cp.size() && cp[k] == ';' && word.size() < 32)
+        word += ';';
+    size_t best = 0;
+    for (size_t len = word.size(); len > 0; --len)
+        if (table.count(word.substr(0, len)))
+        {
+            best = len;
+            break;
+        }
+    if (best == 0)
+    {
+        flushCharRef();
+        state = TS_AMBIGUOUS_AMP;
+        return;
+    }
+    std::string name = word.substr(0, best);
+    for (size_t m = 0; m < best; ++m)
+        tempCps.push_back((unsigned char)name[m]);
+    i += best;
+    bool semi = name.back() == ';';
+    unsigned nextC = i < cp.size() ? cp[i] : kEof;
+    if (charRefInAttr() && !semi && (nextC == '=' || isAlnum(nextC)))
+    {
+        flushCharRef();
+        state = returnState;
+        return;
+    }
+    if (!semi)
+    {
+        tokError("missing-semicolon-after-character-reference", tokStart);
+        problems.back().at = (int)i;
+    }
+    tempCps.clear();
+    const std::string &text = table.at(name);
+    // the replacement is UTF-8: decode it back into code points
+    for (size_t m = 0; m < text.size();)
+    {
+        unsigned char b = (unsigned char)text[m];
+        unsigned c;
+        size_t len = 1;
+        if (b < 0x80)
+            c = b;
+        else if ((b & 0xE0) == 0xC0)
+        {
+            c = ((b & 0x1F) << 6) | ((unsigned char)text[m + 1] & 0x3F);
+            len = 2;
+        }
+        else if ((b & 0xF0) == 0xE0)
+        {
+            c = ((b & 0x0F) << 12) | (((unsigned char)text[m + 1] & 0x3F) << 6) | ((unsigned char)text[m + 2] & 0x3F);
+            len = 3;
+        }
+        else
+        {
+            c = ((b & 0x07) << 18) | (((unsigned char)text[m + 1] & 0x3F) << 12) |
+                (((unsigned char)text[m + 2] & 0x3F) << 6) | ((unsigned char)text[m + 3] & 0x3F);
+            len = 4;
+        }
+        tempCps.push_back(c);
+        m += len;
+    }
+    flushCharRef();
+    state = returnState;
+}
+
+// Runs the state machine until a token other than characters is queued;
+// the tree builder then handles each token before the next is made, since
+// a start tag can switch the tokenizer's state.
+bool Parser::nextToken(Token &t)
+{
+    while (true)
+    {
+        bool ready = false;
+        for (const Token &q : queue)
+            if (q.type != Token::CHARS)
+                ready = true;
+        if (ready)
+            break;
+        step();
+    }
+    t = queue.front();
+    queue.pop_front();
+    return t.type != Token::END_OF_FILE;
+}
+
+std::vector<Token> Parser::tokenizeAll(int initialState, const std::string &lastTag)
+{
+    tokenizerOnly = true;
+    state = initialState == S_CDATA ? TS_CDATA : initialState;
+    lastStartTag = lastTag;
+    std::vector<Token> out;
+    Token t;
+    while (true)
+    {
+        bool more = nextToken(t);
+        out.push_back(t);
+        if (!more)
+            break;
+    }
+    return out;
+}
+
+void Parser::step()
+{
+    stepStart = i;
+    unsigned c = next();
+    int at = here();
+    Token eof;
+    eof.type = Token::END_OF_FILE;
+    eof.pos = (int)src.size();
+    switch (state)
+    {
+    case TS_DATA:
+        if (c == '&')
+        {
+            returnState = TS_DATA;
+            tokStart = at;
+            state = TS_CHAR_REF;
+        }
+        else if (c == '<')
+        {
+            tokStart = at;
+            state = TS_TAG_OPEN;
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            emitChar(0, at);
+        }
+        else if (c == kEof)
+            emit(eof);
+        else
+            emitChar(c, at);
+        break;
+    case TS_RCDATA:
+        if (c == '&')
+        {
+            returnState = TS_RCDATA;
+            tokStart = at;
+            state = TS_CHAR_REF;
+        }
+        else if (c == '<')
+        {
+            tokStart = at;
+            state = TS_RCDATA_LT;
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            emitChar(0xFFFD, at);
+        }
+        else if (c == kEof)
+            emit(eof);
+        else
+            emitChar(c, at);
+        break;
+    case TS_RAWTEXT:
+    case TS_SCRIPT:
+        if (c == '<')
+        {
+            tokStart = at;
+            state = state == TS_RAWTEXT ? TS_RAWTEXT_LT : TS_SCRIPT_LT;
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            emitChar(0xFFFD, at);
+        }
+        else if (c == kEof)
+            emit(eof);
+        else
+            emitChar(c, at);
+        break;
+    case TS_PLAINTEXT:
+        if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            emitChar(0xFFFD, at);
+        }
+        else if (c == kEof)
+            emit(eof);
+        else
+            emitChar(c, at);
+        break;
+    case TS_TAG_OPEN:
+        if (c == '!')
+            state = TS_MARKUP_DECL;
+        else if (c == '/')
+            state = TS_END_TAG_OPEN;
+        else if (isAlpha(c))
+        {
+            cur = Token();
+            cur.type = Token::START;
+            cur.pos = tokStart;
+            reconsume();
+            state = TS_TAG_NAME;
+        }
+        else if (c == '?')
+        {
+            tempCps.clear();
+            state = TS_PI_OPEN;
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-before-tag-name", at);
+            emitChar('<', tokStart);
+            emit(eof);
+        }
+        else
+        {
+            tokError("invalid-first-character-of-tag-name", tokStart);
+            emitChar('<', tokStart);
+            reconsume();
+            state = TS_DATA;
+        }
+        break;
+    case TS_END_TAG_OPEN:
+        if (isAlpha(c))
+        {
+            cur = Token();
+            cur.type = Token::END;
+            cur.pos = tokStart;
+            reconsume();
+            state = TS_TAG_NAME;
+        }
+        else if (c == '>')
+        {
+            tokError("missing-end-tag-name", tokStart);
+            state = TS_DATA;
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-before-tag-name", at);
+            emitChar('<', tokStart);
+            emitChar('/', tokStart);
+            emit(eof);
+        }
+        else
+        {
+            tokError("invalid-first-character-of-tag-name", tokStart);
+            cur = Token();
+            cur.type = Token::COMMENT;
+            cur.pos = tokStart;
+            reconsume();
+            state = TS_BOGUS_COMMENT;
+        }
+        break;
+    case TS_TAG_NAME:
+        if (isWs(c))
+            state = TS_BEFORE_ATTR_NAME;
+        else if (c == '/')
+            state = TS_SELF_CLOSING;
+        else if (c == '>')
+        {
+            state = TS_DATA;
+            emitCurrent();
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            appendUtf8(cur.name, 0xFFFD);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-tag", cur.pos);
+            emit(eof);
+        }
+        else
+            appendUtf8(cur.name, toLower(c));
+        break;
+
+    // ── RCDATA, RAWTEXT and script data end tags ──
+    case TS_RCDATA_LT:
+    case TS_RAWTEXT_LT:
+        if (c == '/')
+        {
+            tempCps.clear();
+            state = state == TS_RCDATA_LT ? TS_RCDATA_END_OPEN : TS_RAWTEXT_END_OPEN;
+        }
+        else
+        {
+            emitChar('<', tokStart);
+            reconsume();
+            state = state == TS_RCDATA_LT ? TS_RCDATA : TS_RAWTEXT;
+        }
+        break;
+    case TS_RCDATA_END_OPEN:
+    case TS_RAWTEXT_END_OPEN:
+    case TS_SCRIPT_END_OPEN:
+    case TS_SCRIPT_ESC_END_OPEN:
+    {
+        int back = state == TS_RCDATA_END_OPEN ? TS_RCDATA
+                   : state == TS_RAWTEXT_END_OPEN ? TS_RAWTEXT
+                   : state == TS_SCRIPT_END_OPEN ? TS_SCRIPT
+                                                  : TS_SCRIPT_ESC;
+        int nameState = state == TS_RCDATA_END_OPEN ? TS_RCDATA_END_NAME
+                        : state == TS_RAWTEXT_END_OPEN ? TS_RAWTEXT_END_NAME
+                        : state == TS_SCRIPT_END_OPEN ? TS_SCRIPT_END_NAME
+                                                       : TS_SCRIPT_ESC_END_NAME;
+        if (isAlpha(c))
+        {
+            cur = Token();
+            cur.type = Token::END;
+            cur.pos = tokStart;
+            reconsume();
+            state = nameState;
+        }
+        else
+        {
+            emitChar('<', tokStart);
+            emitChar('/', tokStart);
+            reconsume();
+            state = back;
+        }
+        break;
+    }
+    case TS_RCDATA_END_NAME:
+    case TS_RAWTEXT_END_NAME:
+    case TS_SCRIPT_END_NAME:
+    case TS_SCRIPT_ESC_END_NAME:
+    {
+        int back = state == TS_RCDATA_END_NAME ? TS_RCDATA
+                   : state == TS_RAWTEXT_END_NAME ? TS_RAWTEXT
+                   : state == TS_SCRIPT_END_NAME ? TS_SCRIPT
+                                                  : TS_SCRIPT_ESC;
+        if (isWs(c) && appropriateEnd())
+            state = TS_BEFORE_ATTR_NAME;
+        else if (c == '/' && appropriateEnd())
+            state = TS_SELF_CLOSING;
+        else if (c == '>' && appropriateEnd())
+        {
+            state = TS_DATA;
+            emitCurrent();
+        }
+        else if (isAlpha(c))
+        {
+            appendUtf8(cur.name, toLower(c));
+            tempCps.push_back(c);
+        }
+        else
+        {
+            emitChar('<', tokStart);
+            emitChar('/', tokStart);
+            for (unsigned t : tempCps)
+                emitChar(t, tokStart);
+            reconsume();
+            state = back;
+        }
+        break;
+    }
+    case TS_SCRIPT_LT:
+        if (c == '/')
+        {
+            tempCps.clear();
+            state = TS_SCRIPT_END_OPEN;
+        }
+        else if (c == '!')
+        {
+            state = TS_SCRIPT_ESC_START;
+            emitChar('<', tokStart);
+            emitChar('!', at);
+        }
+        else
+        {
+            emitChar('<', tokStart);
+            reconsume();
+            state = TS_SCRIPT;
+        }
+        break;
+    case TS_SCRIPT_ESC_START:
+    case TS_SCRIPT_ESC_START_DASH:
+        if (c == '-')
+        {
+            state = state == TS_SCRIPT_ESC_START ? TS_SCRIPT_ESC_START_DASH : TS_SCRIPT_ESC_DASH_DASH;
+            emitChar('-', at);
+        }
+        else
+        {
+            reconsume();
+            state = TS_SCRIPT;
+        }
+        break;
+    case TS_SCRIPT_ESC:
+    case TS_SCRIPT_ESC_DASH:
+    case TS_SCRIPT_ESC_DASH_DASH:
+        if (c == '-')
+        {
+            state = state == TS_SCRIPT_ESC ? TS_SCRIPT_ESC_DASH : TS_SCRIPT_ESC_DASH_DASH;
+            emitChar('-', at);
+        }
+        else if (c == '<')
+        {
+            tokStart = at;
+            state = TS_SCRIPT_ESC_LT;
+        }
+        else if (c == '>' && state == TS_SCRIPT_ESC_DASH_DASH)
+        {
+            state = TS_SCRIPT;
+            emitChar('>', at);
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            state = TS_SCRIPT_ESC;
+            emitChar(0xFFFD, at);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-script-html-comment-like-text", at);
+            emit(eof);
+        }
+        else
+        {
+            state = TS_SCRIPT_ESC;
+            emitChar(c, at);
+        }
+        break;
+    case TS_SCRIPT_ESC_LT:
+        if (c == '/')
+        {
+            tempCps.clear();
+            state = TS_SCRIPT_ESC_END_OPEN;
+        }
+        else if (isAlpha(c))
+        {
+            tempCps.clear();
+            emitChar('<', tokStart);
+            reconsume();
+            state = TS_SCRIPT_DESC_START;
+        }
+        else
+        {
+            emitChar('<', tokStart);
+            reconsume();
+            state = TS_SCRIPT_ESC;
+        }
+        break;
+    case TS_SCRIPT_DESC_START:
+    case TS_SCRIPT_DESC_END:
+        if (isWs(c) || c == '/' || c == '>')
+        {
+            std::string word;
+            for (unsigned t : tempCps)
+                word += (char)t;
+            bool isScript = word == "script";
+            if (state == TS_SCRIPT_DESC_START)
+                state = isScript ? TS_SCRIPT_DESC : TS_SCRIPT_ESC;
+            else
+                state = isScript ? TS_SCRIPT_ESC : TS_SCRIPT_DESC;
+            emitChar(c, at);
+        }
+        else if (isAlpha(c))
+        {
+            tempCps.push_back(toLower(c));
+            emitChar(c, at);
+        }
+        else
+        {
+            reconsume();
+            state = state == TS_SCRIPT_DESC_START ? TS_SCRIPT_ESC : TS_SCRIPT_DESC;
+        }
+        break;
+    case TS_SCRIPT_DESC:
+    case TS_SCRIPT_DESC_DASH:
+    case TS_SCRIPT_DESC_DASH_DASH:
+        if (c == '-')
+        {
+            state = state == TS_SCRIPT_DESC ? TS_SCRIPT_DESC_DASH : TS_SCRIPT_DESC_DASH_DASH;
+            emitChar('-', at);
+        }
+        else if (c == '<')
+        {
+            state = TS_SCRIPT_DESC_LT;
+            emitChar('<', at);
+        }
+        else if (c == '>' && state == TS_SCRIPT_DESC_DASH_DASH)
+        {
+            state = TS_SCRIPT;
+            emitChar('>', at);
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            state = TS_SCRIPT_DESC;
+            emitChar(0xFFFD, at);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-script-html-comment-like-text", at);
+            emit(eof);
+        }
+        else
+        {
+            state = TS_SCRIPT_DESC;
+            emitChar(c, at);
+        }
+        break;
+    case TS_SCRIPT_DESC_LT:
+        if (c == '/')
+        {
+            tempCps.clear();
+            state = TS_SCRIPT_DESC_END;
+            emitChar('/', at);
+        }
+        else
+        {
+            reconsume();
+            state = TS_SCRIPT_DESC;
+        }
+        break;
+
+    // ── attributes ──
+    case TS_BEFORE_ATTR_NAME:
+        if (isWs(c))
+            break;
+        if (c == '/' || c == '>' || c == kEof)
+        {
+            reconsume();
+            state = TS_AFTER_ATTR_NAME;
+        }
+        else if (c == '=')
+        {
+            tokError("unexpected-equals-sign-before-attribute-name", at);
+            startAttr();
+            appendUtf8(attr->name, c);
+            state = TS_ATTR_NAME;
+        }
+        else
+        {
+            startAttr();
+            reconsume();
+            state = TS_ATTR_NAME;
+        }
+        break;
+    case TS_ATTR_NAME:
+        if (isWs(c) || c == '/' || c == '>' || c == kEof)
+        {
+            reconsume();
+            state = TS_AFTER_ATTR_NAME;
+        }
+        else if (c == '=')
+            state = TS_BEFORE_ATTR_VALUE;
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            appendUtf8(attr->name, 0xFFFD);
+        }
+        else
+        {
+            if (c == '"' || c == '\'' || c == '<')
+                tokError("unexpected-character-in-attribute-name", at);
+            appendUtf8(attr->name, toLower(c));
+        }
+        break;
+    case TS_AFTER_ATTR_NAME:
+        if (isWs(c))
+            break;
+        if (c == '/')
+            state = TS_SELF_CLOSING;
+        else if (c == '=')
+            state = TS_BEFORE_ATTR_VALUE;
+        else if (c == '>')
+        {
+            state = TS_DATA;
+            emitCurrent();
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-tag", cur.pos);
+            emit(eof);
+        }
+        else
+        {
+            startAttr();
+            reconsume();
+            state = TS_ATTR_NAME;
+        }
+        break;
+    case TS_BEFORE_ATTR_VALUE:
+        if (isWs(c))
+            break;
+        if (attr)
+            attr->valuePos = offsetOf[std::min(i, cp.size())];
+        if (c == '"')
+            state = TS_ATTR_VALUE_DQ;
+        else if (c == '\'')
+            state = TS_ATTR_VALUE_SQ;
+        else if (c == '>')
+        {
+            tokError("missing-attribute-value", at);
+            if (attr)
+                attr->valuePos = at;
+            state = TS_DATA;
+            emitCurrent();
+        }
+        else
+        {
+            if (attr)
+                attr->valuePos = at;
+            reconsume();
+            state = TS_ATTR_VALUE_UQ;
+        }
+        break;
+    case TS_ATTR_VALUE_DQ:
+    case TS_ATTR_VALUE_SQ:
+        if (c == (state == TS_ATTR_VALUE_DQ ? (unsigned)'"' : (unsigned)'\''))
+            state = TS_AFTER_ATTR_VALUE_Q;
+        else if (c == '&')
+        {
+            returnState = state;
+            tokStart = at;
+            state = TS_CHAR_REF;
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            appendUtf8(attr->value, 0xFFFD);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-tag", cur.pos);
+            emit(eof);
+        }
+        else
+            appendUtf8(attr->value, c);
+        break;
+    case TS_ATTR_VALUE_UQ:
+        if (isWs(c))
+            state = TS_BEFORE_ATTR_NAME;
+        else if (c == '&')
+        {
+            returnState = TS_ATTR_VALUE_UQ;
+            tokStart = at;
+            state = TS_CHAR_REF;
+        }
+        else if (c == '>')
+        {
+            state = TS_DATA;
+            emitCurrent();
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            appendUtf8(attr->value, 0xFFFD);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-tag", cur.pos);
+            emit(eof);
+        }
+        else
+        {
+            if (c == '"' || c == '\'' || c == '<' || c == '=' || c == '`')
+                tokError("unexpected-character-in-unquoted-attribute-value", at);
+            appendUtf8(attr->value, c);
+        }
+        break;
+    case TS_AFTER_ATTR_VALUE_Q:
+        if (isWs(c))
+            state = TS_BEFORE_ATTR_NAME;
+        else if (c == '/')
+            state = TS_SELF_CLOSING;
+        else if (c == '>')
+        {
+            state = TS_DATA;
+            emitCurrent();
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-tag", cur.pos);
+            emit(eof);
+        }
+        else
+        {
+            tokError("missing-whitespace-between-attributes", at);
+            reconsume();
+            state = TS_BEFORE_ATTR_NAME;
+        }
+        break;
+    case TS_SELF_CLOSING:
+        if (c == '>')
+        {
+            cur.selfClosing = true;
+            state = TS_DATA;
+            emitCurrent();
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-tag", cur.pos);
+            emit(eof);
+        }
+        else
+        {
+            tokError("unexpected-solidus-in-tag", at);
+            reconsume();
+            state = TS_BEFORE_ATTR_NAME;
+        }
+        break;
+
+    // ── comments ──
+    case TS_BOGUS_COMMENT:
+        if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            emit(cur);
+            emit(eof);
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            appendUtf8(cur.data, 0xFFFD);
+        }
+        else
+            appendUtf8(cur.data, c);
+        break;
+    case TS_MARKUP_DECL:
+        reconsume();
+        if (lookahead("--", false))
+        {
+            i += 2;
+            cur = Token();
+            cur.type = Token::COMMENT;
+            cur.pos = tokStart;
+            state = TS_COMMENT_START;
+        }
+        else if (lookahead("DOCTYPE", true))
+        {
+            i += 7;
+            state = TS_DOCTYPE;
+        }
+        else if (lookahead("[CDATA[", false))
+        {
+            i += 7;
+            Node *adjusted = tokenizerOnly ? nullptr : adjustedCurrent();
+            if (adjusted && adjusted->ns != NS_HTML)
+                state = TS_CDATA;
+            else
+            {
+                tokError("cdata-in-html-content", tokStart);
+                problems.back().at = (int)i - 1; // detected on the second "["
+                cur = Token();
+                cur.type = Token::COMMENT;
+                cur.pos = tokStart;
+                cur.data = "[CDATA[";
+                state = TS_BOGUS_COMMENT;
+            }
+        }
+        else
+        {
+            tokError("incorrectly-opened-comment", tokStart);
+            cur = Token();
+            cur.type = Token::COMMENT;
+            cur.pos = tokStart;
+            state = TS_BOGUS_COMMENT;
+        }
+        break;
+    case TS_COMMENT_START:
+        if (c == '-')
+            state = TS_COMMENT_START_DASH;
+        else if (c == '>')
+        {
+            tokError("abrupt-closing-of-empty-comment", cur.pos);
+            state = TS_DATA;
+            emit(cur);
+        }
+        else
+        {
+            reconsume();
+            state = TS_COMMENT;
+        }
+        break;
+    case TS_COMMENT_START_DASH:
+        if (c == '-')
+            state = TS_COMMENT_END;
+        else if (c == '>')
+        {
+            tokError("abrupt-closing-of-empty-comment", cur.pos);
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-comment", cur.pos);
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            cur.data += '-';
+            reconsume();
+            state = TS_COMMENT;
+        }
+        break;
+    case TS_COMMENT:
+        if (c == '<')
+        {
+            cur.data += '<';
+            state = TS_COMMENT_LT;
+        }
+        else if (c == '-')
+            state = TS_COMMENT_END_DASH;
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            appendUtf8(cur.data, 0xFFFD);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-comment", cur.pos);
+            emit(cur);
+            emit(eof);
+        }
+        else
+            appendUtf8(cur.data, c);
+        break;
+    case TS_COMMENT_LT:
+        if (c == '!')
+        {
+            cur.data += '!';
+            state = TS_COMMENT_LT_BANG;
+        }
+        else if (c == '<')
+            cur.data += '<';
+        else
+        {
+            reconsume();
+            state = TS_COMMENT;
+        }
+        break;
+    case TS_COMMENT_LT_BANG:
+        if (c == '-')
+            state = TS_COMMENT_LT_BANG_DASH;
+        else
+        {
+            reconsume();
+            state = TS_COMMENT;
+        }
+        break;
+    case TS_COMMENT_LT_BANG_DASH:
+        if (c == '-')
+            state = TS_COMMENT_LT_BANG_DASH_DASH;
+        else
+        {
+            reconsume();
+            state = TS_COMMENT_END_DASH;
+        }
+        break;
+    case TS_COMMENT_LT_BANG_DASH_DASH:
+        if (c != '>' && c != kEof)
+            tokError("nested-comment", at);
+        reconsume();
+        state = TS_COMMENT_END;
+        break;
+    case TS_COMMENT_END_DASH:
+        if (c == '-')
+            state = TS_COMMENT_END;
+        else if (c == kEof)
+        {
+            tokError("eof-in-comment", cur.pos);
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            cur.data += '-';
+            reconsume();
+            state = TS_COMMENT;
+        }
+        break;
+    case TS_COMMENT_END:
+        if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == '!')
+            state = TS_COMMENT_END_BANG;
+        else if (c == '-')
+            cur.data += '-';
+        else if (c == kEof)
+        {
+            tokError("eof-in-comment", cur.pos);
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            cur.data += "--";
+            reconsume();
+            state = TS_COMMENT;
+        }
+        break;
+    case TS_COMMENT_END_BANG:
+        if (c == '-')
+        {
+            cur.data += "--!";
+            state = TS_COMMENT_END_DASH;
+        }
+        else if (c == '>')
+        {
+            tokError("incorrectly-closed-comment", at);
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-comment", cur.pos);
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            cur.data += "--!";
+            reconsume();
+            state = TS_COMMENT;
+        }
+        break;
+
+    // ── DOCTYPE ──
+    case TS_DOCTYPE:
+        if (isWs(c))
+            state = TS_BEFORE_DOCTYPE_NAME;
+        else if (c == '>')
+        {
+            reconsume();
+            state = TS_BEFORE_DOCTYPE_NAME;
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur = Token();
+            cur.type = Token::DOCTYPE;
+            cur.pos = tokStart;
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            tokError("missing-whitespace-before-doctype-name", at);
+            reconsume();
+            state = TS_BEFORE_DOCTYPE_NAME;
+        }
+        break;
+    case TS_BEFORE_DOCTYPE_NAME:
+        if (isWs(c))
+            break;
+        cur = Token();
+        cur.type = Token::DOCTYPE;
+        cur.pos = tokStart;
+        if (c == '>')
+        {
+            tokError("missing-doctype-name", tokStart);
+            cur.forceQuirks = true;
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            cur.hasName = true;
+            if (c == 0)
+            {
+                tokError("unexpected-null-character", at);
+                appendUtf8(cur.name, 0xFFFD);
+            }
+            else
+                appendUtf8(cur.name, toLower(c));
+            state = TS_DOCTYPE_NAME;
+        }
+        break;
+    case TS_DOCTYPE_NAME:
+        if (isWs(c))
+            state = TS_AFTER_DOCTYPE_NAME;
+        else if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            appendUtf8(cur.name, 0xFFFD);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+            appendUtf8(cur.name, toLower(c));
+        break;
+    case TS_AFTER_DOCTYPE_NAME:
+        if (isWs(c))
+            break;
+        if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            reconsume();
+            if (lookahead("PUBLIC", true))
+            {
+                i += 6;
+                state = TS_AFTER_DOCTYPE_PUBLIC_KW;
+            }
+            else if (lookahead("SYSTEM", true))
+            {
+                i += 6;
+                state = TS_AFTER_DOCTYPE_SYSTEM_KW;
+            }
+            else
+            {
+                // the character is reconsumed in the bogus DOCTYPE state
+                tokError("invalid-character-sequence-after-doctype-name", at);
+                cur.forceQuirks = true;
+                state = TS_BOGUS_DOCTYPE;
+            }
+        }
+        break;
+    case TS_AFTER_DOCTYPE_PUBLIC_KW:
+    case TS_AFTER_DOCTYPE_SYSTEM_KW:
+    {
+        bool pub = state == TS_AFTER_DOCTYPE_PUBLIC_KW;
+        if (isWs(c))
+            state = pub ? TS_BEFORE_DOCTYPE_PUBLIC_ID : TS_BEFORE_DOCTYPE_SYSTEM_ID;
+        else if (c == '"' || c == '\'')
+        {
+            tokError(pub ? "missing-whitespace-after-doctype-public-keyword" : "missing-whitespace-after-doctype-system-keyword", at);
+            if (pub)
+            {
+                cur.hasPublic = true;
+                cur.publicId.clear();
+                state = c == '"' ? TS_DOCTYPE_PUBLIC_ID_DQ : TS_DOCTYPE_PUBLIC_ID_SQ;
+            }
+            else
+            {
+                cur.hasSystem = true;
+                cur.systemId.clear();
+                state = c == '"' ? TS_DOCTYPE_SYSTEM_ID_DQ : TS_DOCTYPE_SYSTEM_ID_SQ;
+            }
+        }
+        else if (c == '>')
+        {
+            tokError(pub ? "missing-doctype-public-identifier" : "missing-doctype-system-identifier", at);
+            cur.forceQuirks = true;
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            tokError(pub ? "missing-quote-before-doctype-public-identifier" : "missing-quote-before-doctype-system-identifier", at);
+            cur.forceQuirks = true;
+            reconsume();
+            state = TS_BOGUS_DOCTYPE;
+        }
+        break;
+    }
+    case TS_BEFORE_DOCTYPE_PUBLIC_ID:
+    case TS_BEFORE_DOCTYPE_SYSTEM_ID:
+    {
+        bool pub = state == TS_BEFORE_DOCTYPE_PUBLIC_ID;
+        if (isWs(c))
+            break;
+        if (c == '"' || c == '\'')
+        {
+            if (pub)
+            {
+                cur.hasPublic = true;
+                cur.publicId.clear();
+                state = c == '"' ? TS_DOCTYPE_PUBLIC_ID_DQ : TS_DOCTYPE_PUBLIC_ID_SQ;
+            }
+            else
+            {
+                cur.hasSystem = true;
+                cur.systemId.clear();
+                state = c == '"' ? TS_DOCTYPE_SYSTEM_ID_DQ : TS_DOCTYPE_SYSTEM_ID_SQ;
+            }
+        }
+        else if (c == '>')
+        {
+            tokError(pub ? "missing-doctype-public-identifier" : "missing-doctype-system-identifier", at);
+            cur.forceQuirks = true;
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            tokError(pub ? "missing-quote-before-doctype-public-identifier" : "missing-quote-before-doctype-system-identifier", at);
+            cur.forceQuirks = true;
+            reconsume();
+            state = TS_BOGUS_DOCTYPE;
+        }
+        break;
+    }
+    case TS_DOCTYPE_PUBLIC_ID_DQ:
+    case TS_DOCTYPE_PUBLIC_ID_SQ:
+    case TS_DOCTYPE_SYSTEM_ID_DQ:
+    case TS_DOCTYPE_SYSTEM_ID_SQ:
+    {
+        bool pub = state == TS_DOCTYPE_PUBLIC_ID_DQ || state == TS_DOCTYPE_PUBLIC_ID_SQ;
+        unsigned quote = (state == TS_DOCTYPE_PUBLIC_ID_DQ || state == TS_DOCTYPE_SYSTEM_ID_DQ) ? '"' : '\'';
+        std::string &id = pub ? cur.publicId : cur.systemId;
+        if (c == quote)
+            state = pub ? TS_AFTER_DOCTYPE_PUBLIC_ID : TS_AFTER_DOCTYPE_SYSTEM_ID;
+        else if (c == 0)
+        {
+            tokError("unexpected-null-character", at);
+            appendUtf8(id, 0xFFFD);
+        }
+        else if (c == '>')
+        {
+            tokError(pub ? "abrupt-doctype-public-identifier" : "abrupt-doctype-system-identifier", at);
+            cur.forceQuirks = true;
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+            appendUtf8(id, c);
+        break;
+    }
+    case TS_AFTER_DOCTYPE_PUBLIC_ID:
+    case TS_BETWEEN_DOCTYPE_IDS:
+        if (isWs(c))
+        {
+            if (state == TS_AFTER_DOCTYPE_PUBLIC_ID)
+                state = TS_BETWEEN_DOCTYPE_IDS;
+        }
+        else if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == '"' || c == '\'')
+        {
+            if (state == TS_AFTER_DOCTYPE_PUBLIC_ID)
+                tokError("missing-whitespace-between-doctype-public-and-system-identifiers", at);
+            cur.hasSystem = true;
+            cur.systemId.clear();
+            state = c == '"' ? TS_DOCTYPE_SYSTEM_ID_DQ : TS_DOCTYPE_SYSTEM_ID_SQ;
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            tokError("missing-quote-before-doctype-system-identifier", at);
+            cur.forceQuirks = true;
+            reconsume();
+            state = TS_BOGUS_DOCTYPE;
+        }
+        break;
+    case TS_AFTER_DOCTYPE_SYSTEM_ID:
+        if (isWs(c))
+            break;
+        if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-doctype", tokStart);
+            cur.forceQuirks = true;
+            emit(cur);
+            emit(eof);
+        }
+        else
+        {
+            tokError("unexpected-character-after-doctype-system-identifier", at);
+            reconsume();
+            state = TS_BOGUS_DOCTYPE;
+        }
+        break;
+    case TS_BOGUS_DOCTYPE:
+        if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == 0)
+            tokError("unexpected-null-character", at);
+        else if (c == kEof)
+        {
+            emit(cur);
+            emit(eof);
+        }
+        break;
+
+    // ── CDATA sections ──
+    case TS_CDATA:
+        if (c == ']')
+            state = TS_CDATA_BRACKET;
+        else if (c == kEof)
+        {
+            tokError("eof-in-cdata", at);
+            emit(eof);
+        }
+        else
+            emitChar(c, at);
+        break;
+    case TS_CDATA_BRACKET:
+        if (c == ']')
+            state = TS_CDATA_END;
+        else
+        {
+            emitChar(']', at);
+            reconsume();
+            state = TS_CDATA;
+        }
+        break;
+    case TS_CDATA_END:
+        if (c == ']')
+            emitChar(']', at);
+        else if (c == '>')
+            state = TS_DATA;
+        else
+        {
+            emitChar(']', at);
+            emitChar(']', at);
+            reconsume();
+            state = TS_CDATA;
+        }
+        break;
+
+    // ── processing instructions ──
+    case TS_PI_OPEN:
+        if (isAlpha(c) || c == '_')
+        {
+            reconsume();
+            state = TS_PI_TARGET;
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-processing-instruction", tokStart);
+            emit(eof);
+        }
+        else
+        {
+            tokError("invalid-first-character-of-processing-instruction-target", tokStart);
+            cur = Token();
+            cur.type = Token::COMMENT;
+            cur.pos = tokStart;
+            cur.data = "?";
+            reconsume();
+            state = TS_BOGUS_COMMENT;
+        }
+        break;
+    case TS_PI_TARGET:
+        if (isWs(c) || c == '?' || c == '>')
+        {
+            std::string target;
+            for (unsigned t : tempCps)
+                appendUtf8(target, t);
+            std::string lowerTarget;
+            for (char t : target)
+                lowerTarget += (char)toLower((unsigned char)t);
+            if (lowerTarget == "xml" || lowerTarget == "xml-stylesheet")
+            {
+                tokError("disallowed-processing-instruction-target", tokStart);
+                cur = Token();
+                cur.type = Token::COMMENT;
+                cur.pos = tokStart;
+                cur.data = "?" + target;
+                reconsume();
+                state = TS_BOGUS_COMMENT;
+            }
+            else
+            {
+                cur = Token();
+                cur.type = Token::PI;
+                cur.pos = tokStart;
+                cur.name = target;
+                reconsume();
+                state = TS_AFTER_PI_TARGET;
+            }
+        }
+        else if (isAlnum(c) || c == '-' || c == '_')
+            tempCps.push_back(c);
+        else if (c == kEof)
+        {
+            tokError("eof-in-processing-instruction", tokStart);
+            emit(eof);
+        }
+        else
+        {
+            tokError("invalid-processing-instruction-target", at);
+            cur = Token();
+            cur.type = Token::COMMENT;
+            cur.pos = tokStart;
+            cur.data = "?";
+            for (unsigned t : tempCps)
+                appendUtf8(cur.data, t);
+            reconsume();
+            state = TS_BOGUS_COMMENT;
+        }
+        break;
+    case TS_AFTER_PI_TARGET:
+        if (!isWs(c))
+        {
+            reconsume();
+            state = TS_PI_DATA;
+        }
+        break;
+    case TS_PI_DATA:
+        if (c == '?')
+            state = TS_PI_QUESTIONABLE;
+        else if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-processing-instruction", tokStart);
+            emit(eof);
+        }
+        else
+            appendUtf8(cur.data, c);
+        break;
+    case TS_PI_QUESTIONABLE:
+        if (c == '>')
+        {
+            state = TS_DATA;
+            emit(cur);
+        }
+        else if (c == kEof)
+        {
+            tokError("eof-in-processing-instruction", tokStart);
+            emit(eof);
+        }
+        else
+        {
+            cur.data += '?';
+            reconsume();
+            state = TS_PI_DATA;
+        }
+        break;
+
+    // ── character references ──
+    case TS_CHAR_REF:
+        tempCps.clear();
+        tempCps.push_back('&');
+        if (isAlnum(c))
+        {
+            reconsume();
+            state = TS_NAMED_CHAR_REF;
+        }
+        else if (c == '#')
+        {
+            tempCps.push_back('#');
+            state = TS_NUMERIC_CHAR_REF;
+        }
+        else
+        {
+            flushCharRef();
+            reconsume();
+            state = returnState;
+        }
+        break;
+    case TS_NAMED_CHAR_REF:
+        reconsume();
+        namedCharRef();
+        break;
+    case TS_AMBIGUOUS_AMP:
+        if (isAlnum(c))
+        {
+            if (charRefInAttr())
+                appendUtf8(attr->value, c);
+            else
+                emitChar(c, at);
+        }
+        else
+        {
+            if (c == ';')
+                tokError("unknown-named-character-reference", tokStart);
+            reconsume();
+            state = returnState;
+        }
+        break;
+    case TS_NUMERIC_CHAR_REF:
+        charRefCode = 0;
+        if (c == 'x' || c == 'X')
+        {
+            tempCps.push_back(c);
+            state = TS_HEX_CHAR_REF_START;
+        }
+        else if (isDigit(c))
+        {
+            reconsume();
+            state = TS_DEC_CHAR_REF;
+        }
+        else
+        {
+            tokError("absence-of-digits-in-numeric-character-reference", tokStart);
+            flushCharRef();
+            reconsume();
+            state = returnState;
+        }
+        break;
+    case TS_HEX_CHAR_REF_START:
+        if (isHex(c))
+        {
+            reconsume();
+            state = TS_HEX_CHAR_REF;
+        }
+        else
+        {
+            tokError("absence-of-digits-in-numeric-character-reference", tokStart);
+            flushCharRef();
+            reconsume();
+            state = returnState;
+        }
+        break;
+    case TS_HEX_CHAR_REF:
+    case TS_DEC_CHAR_REF:
+    {
+        bool hex = state == TS_HEX_CHAR_REF;
+        if (isDigit(c) || (hex && isHex(c)))
+        {
+            unsigned digit = isDigit(c) ? c - '0' : toLower(c) - 'a' + 10;
+            if (charRefCode <= 0x10FFFF)
+                charRefCode = charRefCode * (hex ? 16 : 10) + digit;
+        }
+        else if (c == ';')
+            state = TS_NUMERIC_CHAR_REF_END;
+        else
+        {
+            tokError("missing-semicolon-after-character-reference", tokStart);
+            reconsume();
+            state = TS_NUMERIC_CHAR_REF_END;
+        }
+        break;
+    }
+    case TS_NUMERIC_CHAR_REF_END:
+    {
+        reconsume();
+        unsigned n = charRefCode;
+        if (n == 0)
+        {
+            tokError("null-character-reference", tokStart);
+            n = 0xFFFD;
+        }
+        else if (n > 0x10FFFF)
+        {
+            tokError("character-reference-outside-unicode-range", tokStart);
+            n = 0xFFFD;
+        }
+        else if (n >= 0xD800 && n <= 0xDFFF)
+        {
+            tokError("surrogate-character-reference", tokStart);
+            n = 0xFFFD;
+        }
+        else if (noncharacter(n))
+            tokError("noncharacter-character-reference", tokStart);
+        else if (n == 0x0D || (control(n) && !isWs(n)))
+        {
+            tokError("control-character-reference", tokStart);
+            if (n >= 0x80 && n <= 0x9F)
+                n = c1Replacement(n);
+        }
+        tempCps.clear();
+        tempCps.push_back(n);
+        flushCharRef();
+        state = returnState;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+} // namespace html

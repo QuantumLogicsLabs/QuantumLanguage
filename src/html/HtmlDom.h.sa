@@ -1,0 +1,285 @@
+// quantum: cpp
+#pragma once
+// HTML front-end internals: the DOM the parser builds, the tokens, and the
+// parser, an implementation of the WHATWG HTML standard's "13.2 Parsing HTML
+// documents": the tokenizer state machine (HtmlTokenizer.sa) and tree
+// construction with every insertion mode (HtmlTree.sa), so that a page gets
+// the same tree a browser builds for it.
+#include <deque>
+#include <string>
+#include <vector>
+
+namespace html
+{
+
+enum Namespace
+{
+    NS_HTML,
+    NS_SVG,
+    NS_MATHML
+};
+
+// the namespace of a foreign attribute (xlink:href, xml:lang, xmlns)
+enum AttrNamespace
+{
+    AN_NONE,
+    AN_XLINK,
+    AN_XML,
+    AN_XMLNS
+};
+
+struct Attr
+{
+    std::string name, value;
+    int ns = AN_NONE;
+    int pos = 0;       // offset of the name in the source
+    int valuePos = -1; // offset of the value's first character
+    int at = -1;       // index of the name's first character (code points)
+};
+
+enum NodeType
+{
+    N_DOCUMENT,
+    N_DOCTYPE,
+    N_ELEMENT,
+    N_TEXT,
+    N_COMMENT,
+    N_PI,
+    N_FRAGMENT
+};
+
+struct Node
+{
+    int type = N_ELEMENT;
+    std::string name; // element local name, doctype name, PI target
+    int ns = NS_HTML;
+    std::vector<Attr> attrs;
+    std::string data;     // text, comment, PI data; a doctype's public identifier
+    std::string systemId; // a doctype's system identifier
+    std::vector<Node *> kids;
+    Node *parent = nullptr;
+    Node *content = nullptr;      // a template element's contents (a fragment)
+    bool htmlIntegration = false; // MathML annotation-xml with an HTML encoding
+    bool implied = false;         // made by the parser: no tag in the source
+    int pos = 0;                  // offset of its start tag
+    int contentPos = -1;          // a raw-text element: offset of its text
+    // the DOM state the parser's insertions and pops drive (option and
+    // selectedcontent elements, 4.10.10 and 4.10.17)
+    bool selectedness = false;
+    Node *cachedSelect = nullptr;
+    bool scDisabled = false;
+};
+
+bool isHtml(const Node *n, const char *name);
+const Attr *findAttr(const Node *e, const std::string &name);
+
+struct Token
+{
+    enum Type
+    {
+        DOCTYPE,
+        START,
+        END,
+        COMMENT,
+        CHARS,
+        PI,
+        END_OF_FILE
+    };
+    Type type = END_OF_FILE;
+    std::string name; // tag name, doctype name, PI target
+    std::vector<Attr> attrs;
+    bool selfClosing = false;
+    bool acknowledged = false;
+    std::string data; // characters, comment, PI data
+    std::string publicId, systemId;
+    bool hasName = false, hasPublic = false, hasSystem = false, forceQuirks = false;
+    int pos = 0; // offset where the token starts
+};
+
+// A parse error or warning at an offset of the source
+struct ParseProblem
+{
+    int pos = 0, width = 1;
+    bool error = true;
+    std::string message;
+    std::string code; // the standard's code for a tokenizer error
+    // where the error was detected, as a code point index (the position the
+    // html5lib tests give: the character being consumed, or the next one)
+    int at = -1;
+};
+
+// A token waiting in an active formatting elements entry; el == nullptr is a marker
+struct Formatting
+{
+    Node *el = nullptr;
+    Token tok;
+};
+
+class Parser
+{
+public:
+    Parser(const std::string &source, bool scripting);
+    // Parses as a fragment in the context of element `name` (namespace ns)
+    void setFragmentContext(const std::string &name, int ns);
+    // The document (or, for a fragment, the root html element whose children
+    // are the fragment)
+    Node *parse();
+
+    std::vector<ParseProblem> problems;
+    Node *document = nullptr;
+    Node *htmlEl = nullptr, *headEl = nullptr, *bodyEl = nullptr;
+    bool hasDoctype = false, explicitHtml = false, explicitHead = false;
+    int quirks = 0; // 0 no quirks, 1 limited quirks, 2 quirks
+
+    void report(int pos, int width, bool error, const std::string &message);
+    void lineCol(int off, int &line, int &col) const;
+    // line and column (in characters) of a code point index, after the
+    // input stream's newline normalization
+    void cpLineCol(int at, int &line, int &col) const;
+
+    // tokenizer states the tree builder switches to
+    enum TokState
+    {
+        S_DATA,
+        S_RCDATA,
+        S_RAWTEXT,
+        S_SCRIPT,
+        S_PLAINTEXT,
+        S_CDATA
+    };
+    // runs only the tokenizer, from `state` (the html5lib tokenizer tests)
+    std::vector<Token> tokenizeAll(int state, const std::string &lastStartTag);
+
+private:
+    // ── input ──
+    std::vector<unsigned> cp;  // the source as code points, CR LF and CR made LF
+    std::vector<int> offsetOf; // byte offset of each code point (one more at the end)
+    std::vector<int> lineStarts;
+    size_t i = 0;              // next code point
+    size_t stepStart = 0;      // the code point the current tokenizer step began at
+    const std::string &src;
+
+    // ── tokenizer (HtmlTokenizer.sa) ──
+    int state = 0, returnState = 0;
+    Token cur;            // the tag, comment or doctype being built
+    Attr *attr = nullptr; // the attribute being built
+    std::string tempBuf;  // the temporary buffer (UTF-8)
+    std::vector<unsigned> tempCps;
+    unsigned charRefCode = 0;
+    std::string lastStartTag;
+    std::deque<Token> queue;
+    int tokStart = 0; // offset where the current token began
+    bool tokenizerOnly = false;
+
+    bool nextToken(Token &t);
+    void step();
+    void emit(Token t);
+    void emitChar(unsigned c, int at);
+    void emitString(const std::string &s, int at);
+    void emitCurrent();
+    void tokError(const char *code, int at);
+    unsigned next();
+    void reconsume();
+    int here() const;
+    bool lookahead(const char *s, bool caseless) const;
+    void startAttr();
+    void finishAttr();
+    void flushCharRef();
+    bool charRefInAttr() const;
+    void namedCharRef();
+    bool appropriateEnd() const;
+
+    // ── tree construction (HtmlTree.sa) ──
+    bool scripting;
+    Node *context = nullptr; // the fragment context element
+    int mode = 0, originalMode = 0;
+    std::vector<int> templateModes;
+    std::vector<Node *> open;
+    std::vector<Formatting> afe;
+    Node *formEl = nullptr;
+    bool framesetOk = true, fosterParenting = false, skipNewline = false;
+    std::string pendingTableChars;
+    bool pendingTableNonSpace = false;
+    int pendingTablePos = 0;
+    std::vector<Node *> reportedUnclosed;
+    Node bookmarkNode;
+    std::vector<Node *> pendingSelects; // "queue a microtask to update" (run at the end)
+
+    void dispatch(Token &t);
+    bool rules(int m, Token &t);
+    bool foreign(Token &t);
+    bool initial(Token &t);
+    bool beforeHtml(Token &t);
+    bool beforeHead(Token &t);
+    bool inHead(Token &t);
+    bool inHeadNoscript(Token &t);
+    bool afterHead(Token &t);
+    bool inBody(Token &t);
+    bool bodyStart(Token &t);
+    bool bodyEnd(Token &t);
+    bool text(Token &t);
+    bool inTable(Token &t);
+    bool inTableText(Token &t);
+    bool inCaption(Token &t);
+    bool inColumnGroup(Token &t);
+    bool inTableBody(Token &t);
+    bool inRow(Token &t);
+    bool inCell(Token &t);
+    bool inTemplate(Token &t);
+    bool afterBody(Token &t);
+    bool inFrameset(Token &t);
+    bool afterFrameset(Token &t);
+    bool afterAfterBody(Token &t);
+    bool afterAfterFrameset(Token &t);
+
+    Node *current() const;
+    Node *adjustedCurrent() const;
+    Node *createElement(const Token &t, int ns);
+    void placeFor(Node *override, Node *&parent, Node *&before);
+    void insertAt(Node *parent, Node *before, Node *n);
+    Node *insertForeign(const Token &t, int ns);
+    Node *insertHtml(const Token &t);
+    Node *insertImplied(const char *name, int pos);
+    void insertChars(const std::string &s);
+    void insertComment(const Token &t, Node *parent);
+    void insertPI(const Token &t, Node *parent);
+    void detach(Node *n);
+    void pop();
+    void popTo(size_t size);
+    void removeAt(size_t index);
+    bool templateContents() const;
+    // DOM steps: insertion, post-connection, removing, popped off the stack
+    void inserted(Node *n);
+    void removed(Node *n);
+    void popped(Node *n);
+    void updateOptionSelect(Node *option, std::vector<Node *> *result);
+    void updateForOption(Node *option);
+    void updateSelectSelectedcontents(Node *select);
+    void updateSelectedcontent(Node *select, Node *sc);
+    void popUntil(const char *name);
+    void popUntilNode(Node *n);
+    bool special(const Node *n) const;
+    bool inScope(const char *name, int kind) const;
+    bool nodeInScope(const Node *n) const;
+    int stackIndex(const Node *n) const;
+    int afeIndex(const Node *n) const;
+    void generateImpliedEnd(const char *except);
+    void generateImpliedEndThoroughly();
+    void closeP(const Token &t);
+    void resetMode();
+    void pushFormatting(Node *el, const Token &t);
+    void reconstructFormatting();
+    void clearFormattingToMarker();
+    bool adoptionAgency(Token &t);
+    void anyOtherEnd(Token &t);
+    void genericRawText(Token &t, int tokState);
+    void clearStackBackTo(const char *names);
+    void closeCell();
+    void processSpaceThen(Token &t, bool insertSpace, bool &consumed);
+    void openElementsError(const Token &t, const char *what);
+    void unclosed(Node *n);
+    void parseError(const Token &t, const std::string &message);
+    void finish();
+};
+
+} // namespace html

@@ -156,6 +156,10 @@
 #pragma quantum_tu
 #include "../../html/Html.sa"
 #pragma quantum_tu
+#include "../../html/HtmlTokenizer.sa"
+#pragma quantum_tu
+#include "../../html/HtmlTree.sa"
+#pragma quantum_tu
 #include "../../generated/HtmlEntityData.sa"
 #pragma quantum_tu
 #include "../../dialect/RubyDialect.sa"

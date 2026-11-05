@@ -1,0 +1,3208 @@
+// quantum: cpp
+// HTML front-end: tree construction, as the WHATWG HTML standard defines it
+// (13.2.6): every insertion mode, foreign content (SVG and MathML), the list
+// of active formatting elements with the adoption agency algorithm, foster
+// parenting for content misplaced in tables, templates, and the fragment
+// case. Its parse errors are worded the way the W3C checker words them.
+#include "HtmlDom.h.sa"
+
+#include <algorithm>
+#include <cctype>
+
+namespace html
+{
+
+namespace
+{
+
+enum Mode
+{
+    M_INITIAL,
+    M_BEFORE_HTML,
+    M_BEFORE_HEAD,
+    M_IN_HEAD,
+    M_IN_HEAD_NOSCRIPT,
+    M_AFTER_HEAD,
+    M_IN_BODY,
+    M_TEXT,
+    M_IN_TABLE,
+    M_IN_TABLE_TEXT,
+    M_IN_CAPTION,
+    M_IN_COLUMN_GROUP,
+    M_IN_TABLE_BODY,
+    M_IN_ROW,
+    M_IN_CELL,
+    M_IN_TEMPLATE,
+    M_AFTER_BODY,
+    M_IN_FRAMESET,
+    M_AFTER_FRAMESET,
+    M_AFTER_AFTER_BODY,
+    M_AFTER_AFTER_FRAMESET
+};
+
+enum Scope
+{
+    SC_DEFAULT,
+    SC_LIST,
+    SC_BUTTON,
+    SC_TABLE
+};
+
+// whether `name` is one of the space-separated words of `list`
+bool among(const std::string &name, const char *list)
+{
+    const char *p = list;
+    while (*p)
+    {
+        const char *q = p;
+        while (*q && *q != ' ')
+            ++q;
+        size_t len = (size_t)(q - p);
+        if (name.size() == len)
+        {
+            // (a character loop: the native backend's four-argument
+            // std::string::compare ignores the length of the C string)
+            size_t k = 0;
+            while (k < len && name[k] == p[k])
+                ++k;
+            if (k == len)
+                return true;
+        }
+        p = *q ? q + 1 : q;
+    }
+    return false;
+}
+
+bool isSpace(char c) { return c == '\t' || c == '\n' || c == '\f' || c == '\r' || c == ' '; }
+
+bool start(const Token &t, const char *names) { return t.type == Token::START && among(t.name, names); }
+bool end(const Token &t, const char *names) { return t.type == Token::END && among(t.name, names); }
+
+bool htmlAmong(const Node *n, const char *names)
+{
+    return n && n->type == N_ELEMENT && n->ns == NS_HTML && among(n->name, names);
+}
+
+std::string lower(const std::string &s)
+{
+    std::string out = s;
+    for (char &c : out)
+        c = (char)std::tolower((unsigned char)c);
+    return out;
+}
+
+// whether `lowered` (lowercase) starts with `prefix`, ignoring ASCII case
+bool startsCi(const std::string &lowered, const char *prefix)
+{
+    std::string p = lower(prefix);
+    return lowered.compare(0, p.size(), p) == 0;
+}
+
+bool sameAttrs(const std::vector<Attr> &a, const std::vector<Attr> &b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (const Attr &x : a)
+    {
+        bool found = false;
+        for (const Attr &y : b)
+            if (x.name == y.name && x.ns == y.ns && x.value == y.value)
+                found = true;
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+// MathML attributes, SVG attributes and element names, and foreign
+// attributes, as the standard adjusts them
+void adjustMathMLAttrs(Token &t)
+{
+    for (Attr &a : t.attrs)
+        if (a.name == "definitionurl")
+            a.name = "definitionURL";
+}
+
+void adjustSvgAttrs(Token &t)
+{
+    static const char *const table[] = {
+        "attributename", "attributeName", "attributetype", "attributeType", "basefrequency", "baseFrequency",
+        "baseprofile", "baseProfile", "calcmode", "calcMode", "clippathunits", "clipPathUnits",
+        "diffuseconstant", "diffuseConstant", "edgemode", "edgeMode", "filterunits", "filterUnits", "glyphref",
+        "glyphRef", "gradienttransform", "gradientTransform", "gradientunits", "gradientUnits", "kernelmatrix",
+        "kernelMatrix", "kernelunitlength", "kernelUnitLength", "keypoints", "keyPoints", "keysplines",
+        "keySplines", "keytimes", "keyTimes", "lengthadjust", "lengthAdjust", "limitingconeangle",
+        "limitingConeAngle", "markerheight", "markerHeight", "markerunits", "markerUnits", "markerwidth",
+        "markerWidth", "maskcontentunits", "maskContentUnits", "maskunits", "maskUnits", "numoctaves",
+        "numOctaves", "pathlength", "pathLength", "patterncontentunits", "patternContentUnits",
+        "patterntransform", "patternTransform", "patternunits", "patternUnits", "pointsatx", "pointsAtX",
+        "pointsaty", "pointsAtY", "pointsatz", "pointsAtZ", "preservealpha", "preserveAlpha",
+        "preserveaspectratio", "preserveAspectRatio", "primitiveunits", "primitiveUnits", "refx", "refX",
+        "refy", "refY", "repeatcount", "repeatCount", "repeatdur", "repeatDur", "requiredextensions",
+        "requiredExtensions", "requiredfeatures", "requiredFeatures", "specularconstant", "specularConstant",
+        "specularexponent", "specularExponent", "spreadmethod", "spreadMethod", "startoffset", "startOffset",
+        "stddeviation", "stdDeviation", "stitchtiles", "stitchTiles", "surfacescale", "surfaceScale",
+        "systemlanguage", "systemLanguage", "tablevalues", "tableValues", "targetx", "targetX", "targety",
+        "targetY", "textlength", "textLength", "viewbox", "viewBox", "viewtarget", "viewTarget",
+        "xchannelselector", "xChannelSelector", "ychannelselector", "yChannelSelector", "zoomandpan",
+        "zoomAndPan", nullptr};
+    for (Attr &a : t.attrs)
+        for (int k = 0; table[k]; k += 2)
+            if (a.name == table[k])
+            {
+                a.name = table[k + 1];
+                break;
+            }
+}
+
+void adjustSvgName(Token &t)
+{
+    static const char *const table[] = {
+        "altglyph", "altGlyph", "altglyphdef", "altGlyphDef", "altglyphitem", "altGlyphItem", "animatecolor",
+        "animateColor", "animatemotion", "animateMotion", "animatetransform", "animateTransform", "clippath",
+        "clipPath", "feblend", "feBlend", "fecolormatrix", "feColorMatrix", "fecomponenttransfer",
+        "feComponentTransfer", "fecomposite", "feComposite", "feconvolvematrix", "feConvolveMatrix",
+        "fediffuselighting", "feDiffuseLighting", "fedisplacementmap", "feDisplacementMap", "fedistantlight",
+        "feDistantLight", "fedropshadow", "feDropShadow", "feflood", "feFlood", "fefunca", "feFuncA",
+        "fefuncb", "feFuncB", "fefuncg", "feFuncG", "fefuncr", "feFuncR", "fegaussianblur", "feGaussianBlur",
+        "feimage", "feImage", "femerge", "feMerge", "femergenode", "feMergeNode", "femorphology",
+        "feMorphology", "feoffset", "feOffset", "fepointlight", "fePointLight", "fespecularlighting",
+        "feSpecularLighting", "fespotlight", "feSpotLight", "fetile", "feTile", "feturbulence", "feTurbulence",
+        "foreignobject", "foreignObject", "glyphref", "glyphRef", "lineargradient", "linearGradient",
+        "radialgradient", "radialGradient", "textpath", "textPath", nullptr};
+    for (int k = 0; table[k]; k += 2)
+        if (t.name == table[k])
+        {
+            t.name = table[k + 1];
+            return;
+        }
+}
+
+void adjustForeignAttrs(Token &t)
+{
+    for (Attr &a : t.attrs)
+    {
+        const std::string &n = a.name;
+        if (n == "xlink:actuate" || n == "xlink:arcrole" || n == "xlink:href" || n == "xlink:role" ||
+            n == "xlink:show" || n == "xlink:title" || n == "xlink:type")
+        {
+            a.ns = AN_XLINK;
+            a.name = n.substr(6);
+        }
+        else if (n == "xml:lang" || n == "xml:space")
+        {
+            a.ns = AN_XML;
+            a.name = n.substr(4);
+        }
+        else if (n == "xmlns")
+            a.ns = AN_XMLNS;
+        else if (n == "xmlns:xlink")
+        {
+            a.ns = AN_XMLNS;
+            a.name = "xlink";
+        }
+    }
+}
+
+bool mathmlTextIntegration(const Node *n)
+{
+    return n && n->ns == NS_MATHML && (n->name == "mi" || n->name == "mo" || n->name == "mn" || n->name == "ms" ||
+                                       n->name == "mtext");
+}
+
+bool htmlIntegration(const Node *n)
+{
+    if (!n)
+        return false;
+    if (n->ns == NS_MATHML)
+        return n->name == "annotation-xml" && n->htmlIntegration;
+    return n->ns == NS_SVG && (n->name == "foreignObject" || n->name == "desc" || n->name == "title");
+}
+
+const char *const kImpliedEnd = "dd dt li optgroup option p rb rp rt rtc";
+const char *const kOpenAtEndOk =
+    "dd dt li optgroup option p rb rp rt rtc tbody td tfoot th thead tr body html";
+
+} // namespace
+
+// ── the dispatcher ───────────────────────────────────────────────────────
+
+void Parser::setFragmentContext(const std::string &name, int ns)
+{
+    context = new Node();
+    context->name = name;
+    context->ns = ns;
+}
+
+Node *Parser::parse()
+{
+    if (context)
+    {
+        // the HTML fragment parsing algorithm
+        if (context->ns == NS_HTML)
+        {
+            if (among(context->name, "title textarea"))
+                state = S_RCDATA;
+            else if (among(context->name, "style xmp iframe noembed noframes"))
+                state = S_RAWTEXT;
+            else if (context->name == "script")
+                state = S_SCRIPT;
+            else if (context->name == "noscript" && scripting)
+                state = S_RAWTEXT;
+            else if (context->name == "plaintext")
+                state = S_PLAINTEXT;
+        }
+        htmlEl = new Node();
+        htmlEl->name = "html";
+        htmlEl->implied = true;
+        htmlEl->parent = document;
+        document->kids.push_back(htmlEl);
+        open.push_back(htmlEl);
+        if (isHtml(context, "template"))
+            templateModes.push_back(M_IN_TEMPLATE);
+        resetMode();
+        if (isHtml(context, "form"))
+            formEl = context;
+    }
+    Token t;
+    while (true)
+    {
+        bool more = nextToken(t);
+        if (skipNewline)
+        {
+            skipNewline = false;
+            if (t.type == Token::CHARS && !t.data.empty() && t.data[0] == '\n')
+            {
+                t.data.erase(0, 1);
+                if (t.data.empty())
+                    continue;
+            }
+        }
+        dispatch(t);
+        if (!more)
+            break;
+    }
+    finish();
+    return context ? htmlEl : document;
+}
+
+void Parser::dispatch(Token &t)
+{
+    while (true)
+    {
+        Node *n = adjustedCurrent();
+        bool htmlRules = open.empty() || n->ns == NS_HTML || t.type == Token::END_OF_FILE ||
+                         (mathmlTextIntegration(n) && t.type == Token::START && t.name != "mglyph" &&
+                          t.name != "malignmark") ||
+                         (mathmlTextIntegration(n) && t.type == Token::CHARS) ||
+                         (n->ns == NS_MATHML && n->name == "annotation-xml" && t.type == Token::START &&
+                          t.name == "svg") ||
+                         (htmlIntegration(n) && (t.type == Token::START || t.type == Token::CHARS));
+        if (htmlRules ? rules(mode, t) : foreign(t))
+            break;
+    }
+    if (t.type == Token::START && t.selfClosing && !t.acknowledged)
+        report(t.pos, (int)t.name.size() + 1, true,
+               "Self-closing syntax (\"/>\") used on a non-void HTML element. Ignoring the slash and treating as a "
+               "start tag.");
+}
+
+bool Parser::rules(int m, Token &t)
+{
+    switch (m)
+    {
+    case M_INITIAL: return initial(t);
+    case M_BEFORE_HTML: return beforeHtml(t);
+    case M_BEFORE_HEAD: return beforeHead(t);
+    case M_IN_HEAD: return inHead(t);
+    case M_IN_HEAD_NOSCRIPT: return inHeadNoscript(t);
+    case M_AFTER_HEAD: return afterHead(t);
+    case M_IN_BODY: return inBody(t);
+    case M_TEXT: return text(t);
+    case M_IN_TABLE: return inTable(t);
+    case M_IN_TABLE_TEXT: return inTableText(t);
+    case M_IN_CAPTION: return inCaption(t);
+    case M_IN_COLUMN_GROUP: return inColumnGroup(t);
+    case M_IN_TABLE_BODY: return inTableBody(t);
+    case M_IN_ROW: return inRow(t);
+    case M_IN_CELL: return inCell(t);
+    case M_IN_TEMPLATE: return inTemplate(t);
+    case M_AFTER_BODY: return afterBody(t);
+    case M_IN_FRAMESET: return inFrameset(t);
+    case M_AFTER_FRAMESET: return afterFrameset(t);
+    case M_AFTER_AFTER_BODY: return afterAfterBody(t);
+    default: return afterAfterFrameset(t);
+    }
+}
+
+// ── nodes ────────────────────────────────────────────────────────────────
+
+Node *Parser::current() const { return open.empty() ? nullptr : open.back(); }
+
+Node *Parser::adjustedCurrent() const
+{
+    if (context && open.size() == 1)
+        return context;
+    return current();
+}
+
+Node *Parser::createElement(const Token &t, int ns)
+{
+    Node *e = new Node();
+    e->name = t.name;
+    e->ns = ns;
+    e->attrs = t.attrs;
+    e->pos = t.pos;
+    if (ns == NS_HTML && t.name == "template")
+    {
+        e->content = new Node();
+        e->content->type = N_FRAGMENT;
+    }
+    if (ns == NS_HTML && t.name == "option")
+        for (const Attr &a : t.attrs)
+            if (a.name == "selected")
+                e->selectedness = true;
+    if (ns == NS_MATHML && t.name == "annotation-xml")
+        for (const Attr &a : t.attrs)
+            if (a.name == "encoding" && (lower(a.value) == "text/html" || lower(a.value) == "application/xhtml+xml"))
+                e->htmlIntegration = true;
+    return e;
+}
+
+// the appropriate place for inserting a node, with foster parenting
+void Parser::placeFor(Node *override, Node *&parent, Node *&before)
+{
+    Node *target = override ? override : current();
+    before = nullptr;
+    if (fosterParenting && htmlAmong(target, "table tbody tfoot thead tr"))
+    {
+        int last = -1;
+        for (int k = (int)open.size() - 1; k >= 0; --k)
+            if (htmlAmong(open[k], "template table"))
+            {
+                last = k;
+                break;
+            }
+        if (last < 0)
+        {
+            parent = open[0];
+            return;
+        }
+        Node *found = open[last];
+        if (found->name == "template")
+            target = found;
+        else if (found->parent)
+        {
+            target = found->parent;
+            before = found;
+        }
+        else
+            target = open[last - 1];
+    }
+    if (isHtml(target, "template"))
+    {
+        parent = target->content;
+        before = nullptr;
+        return;
+    }
+    parent = target;
+}
+
+void Parser::insertAt(Node *parent, Node *before, Node *n)
+{
+    if (parent->type == N_DOCUMENT && n->type == N_ELEMENT)
+        for (Node *k : parent->kids)
+            if (k->type == N_ELEMENT)
+                return;
+    n->parent = parent;
+    auto it = before ? std::find(parent->kids.begin(), parent->kids.end(), before) : parent->kids.end();
+    parent->kids.insert(it, n);
+    inserted(n);
+}
+
+Node *Parser::insertForeign(const Token &t, int ns)
+{
+    Node *e = createElement(t, ns);
+    e->contentPos = offsetOf[std::min(i, cp.size())]; // where its text starts (style)
+    Node *parent, *before;
+    placeFor(nullptr, parent, before);
+    insertAt(parent, before, e);
+    open.push_back(e);
+    return e;
+}
+
+Node *Parser::insertHtml(const Token &t) { return insertForeign(t, NS_HTML); }
+
+Node *Parser::insertImplied(const char *name, int pos)
+{
+    Token t;
+    t.type = Token::START;
+    t.name = name;
+    t.pos = pos;
+    Node *e = insertHtml(t);
+    e->implied = true;
+    return e;
+}
+
+void Parser::insertChars(const std::string &s)
+{
+    if (s.empty())
+        return;
+    Node *parent, *before;
+    placeFor(nullptr, parent, before);
+    if (parent->type == N_DOCUMENT)
+        return;
+    Node *prev = nullptr;
+    if (before)
+    {
+        auto it = std::find(parent->kids.begin(), parent->kids.end(), before);
+        if (it != parent->kids.begin())
+            prev = *(it - 1);
+    }
+    else if (!parent->kids.empty())
+        prev = parent->kids.back();
+    if (prev && prev->type == N_TEXT)
+    {
+        prev->data += s;
+        return;
+    }
+    Node *text = new Node();
+    text->type = N_TEXT;
+    text->data = s;
+    insertAt(parent, before, text);
+}
+
+void Parser::insertComment(const Token &t, Node *parent)
+{
+    Node *c = new Node();
+    c->type = N_COMMENT;
+    c->data = t.data;
+    c->pos = t.pos;
+    if (parent)
+    {
+        insertAt(parent, nullptr, c);
+        return;
+    }
+    Node *before;
+    placeFor(nullptr, parent, before);
+    insertAt(parent, before, c);
+}
+
+void Parser::insertPI(const Token &t, Node *parent)
+{
+    Node *p = new Node();
+    p->type = N_PI;
+    p->name = t.name;
+    p->data = t.data;
+    p->pos = t.pos;
+    if (parent)
+    {
+        insertAt(parent, nullptr, p);
+        return;
+    }
+    Node *before;
+    placeFor(nullptr, parent, before);
+    insertAt(parent, before, p);
+}
+
+void Parser::detach(Node *n)
+{
+    if (!n->parent)
+        return;
+    std::vector<Node *> &kids = n->parent->kids;
+    kids.erase(std::remove(kids.begin(), kids.end(), n), kids.end());
+    n->parent = nullptr;
+    removed(n);
+}
+
+void Parser::pop()
+{
+    Node *n = open.back();
+    open.pop_back();
+    popped(n);
+}
+
+void Parser::popTo(size_t size)
+{
+    while (open.size() > size)
+        pop();
+}
+
+void Parser::removeAt(size_t index)
+{
+    Node *n = open[index];
+    open.erase(open.begin() + (long)index);
+    popped(n);
+}
+
+// "parsing template contents": a template is open, or is the fragment's context
+bool Parser::templateContents() const
+{
+    if (isHtml(context, "template"))
+        return true;
+    for (Node *n : open)
+        if (isHtml(n, "template"))
+            return true;
+    return false;
+}
+
+// ── DOM steps for option and selectedcontent elements ────────────────────
+// The parser inserts and pops these elements, and the DOM reacts: an option
+// joins its select's list of options (which can change which option is
+// selected), and a select's selectedcontent element holds a copy of the
+// selected option's contents.
+
+namespace
+{
+
+bool connected(const Node *n)
+{
+    while (n->parent)
+        n = n->parent;
+    return n->type == N_DOCUMENT;
+}
+
+void inclusiveElements(Node *n, std::vector<Node *> &out)
+{
+    if (n->type != N_ELEMENT)
+        return;
+    out.push_back(n);
+    for (Node *k : n->kids)
+        inclusiveElements(k, out);
+}
+
+Node *nearestSelect(const Node *e)
+{
+    bool optgroup = false;
+    for (Node *a = e->parent; a && a->type == N_ELEMENT; a = a->parent)
+    {
+        if (htmlAmong(a, "datalist hr option"))
+            return nullptr;
+        if (isHtml(a, "optgroup"))
+        {
+            if (optgroup)
+                return nullptr;
+            optgroup = true;
+        }
+        if (isHtml(a, "select"))
+            return a;
+    }
+    return nullptr;
+}
+
+// a select's list of options
+void optionsUnder(Node *n, std::vector<Node *> &out, int optgroups)
+{
+    for (Node *k : n->kids)
+    {
+        if (k->type != N_ELEMENT)
+            continue;
+        bool optgroup = isHtml(k, "optgroup");
+        if (isHtml(k, "option"))
+            out.push_back(k);
+        if (htmlAmong(k, "select hr option datalist") || (optgroup && optgroups > 0))
+            continue;
+        optionsUnder(k, out, optgroups + (optgroup ? 1 : 0));
+    }
+}
+
+bool optionDisabled(const Node *o)
+{
+    if (findAttr(o, "disabled"))
+        return true;
+    for (const Node *a = o->parent; a && a->type == N_ELEMENT; a = a->parent)
+    {
+        if (htmlAmong(a, "select hr datalist option"))
+            return false;
+        if (isHtml(a, "optgroup"))
+            return findAttr(a, "disabled") != nullptr;
+    }
+    return false;
+}
+
+long displaySize(const Node *select)
+{
+    const Attr *size = findAttr(select, "size");
+    if (size)
+    {
+        const std::string &v = size->value;
+        size_t k = 0;
+        while (k < v.size() && isSpace(v[k]))
+            ++k;
+        if (k < v.size() && v[k] == '+')
+            ++k;
+        if (k < v.size() && v[k] >= '0' && v[k] <= '9')
+        {
+            long n = 0;
+            while (k < v.size() && v[k] >= '0' && v[k] <= '9' && n < 100000000)
+                n = n * 10 + (v[k++] - '0');
+            return n;
+        }
+    }
+    return findAttr(select, "multiple") ? 4 : 1;
+}
+
+// the selectedness setting algorithm; whether anything changed
+bool selectednessSetting(Node *select)
+{
+    if (findAttr(select, "multiple"))
+        return false;
+    bool changed = false;
+    Node *firstEnabled = nullptr;
+    Node *lastSelected = nullptr;
+    std::vector<Node *> options;
+    optionsUnder(select, options, 0);
+    for (Node *o : options)
+    {
+        if (o->selectedness)
+        {
+            if (lastSelected)
+            {
+                lastSelected->selectedness = false;
+                changed = true;
+            }
+            lastSelected = o;
+        }
+        if (!firstEnabled && !optionDisabled(o))
+            firstEnabled = o;
+    }
+    if (!lastSelected && firstEnabled && displaySize(select) == 1)
+    {
+        firstEnabled->selectedness = true;
+        changed = true;
+    }
+    return changed;
+}
+
+Node *cloneTree(const Node *n)
+{
+    Node *c = new Node();
+    c->type = n->type;
+    c->name = n->name;
+    c->ns = n->ns;
+    c->attrs = n->attrs;
+    c->data = n->data;
+    c->systemId = n->systemId;
+    c->htmlIntegration = n->htmlIntegration;
+    c->implied = true;
+    c->pos = n->pos;
+    if (isHtml(n, "option") && findAttr(n, "selected"))
+        c->selectedness = true;
+    if (n->content)
+        c->content = cloneTree(n->content);
+    for (Node *k : n->kids)
+    {
+        Node *kc = cloneTree(k);
+        kc->parent = c;
+        c->kids.push_back(kc);
+    }
+    return c;
+}
+
+// recalculates a selectedcontent element's disabledness; its select
+Node *recalcDisabled(Node *sc)
+{
+    Node *select = nullptr;
+    sc->scDisabled = false;
+    for (Node *a = sc->parent; a && a->type == N_ELEMENT; a = a->parent)
+    {
+        if (isHtml(a, "select"))
+        {
+            if (!select)
+            {
+                select = a;
+                continue;
+            }
+            sc->scDisabled = true;
+            break;
+        }
+        if (htmlAmong(a, "option selectedcontent"))
+        {
+            sc->scDisabled = true;
+            break;
+        }
+    }
+    return select;
+}
+
+void selectedcontentsUnder(Node *n, std::vector<Node *> &out)
+{
+    for (Node *k : n->kids)
+    {
+        if (k->type != N_ELEMENT)
+            continue;
+        if (isHtml(k, "selectedcontent") && !k->scDisabled)
+            out.push_back(k);
+        selectedcontentsUnder(k, out);
+    }
+}
+
+} // namespace
+
+void Parser::inserted(Node *n)
+{
+    std::vector<Node *> els;
+    inclusiveElements(n, els);
+    bool any = false;
+    for (Node *e : els)
+        if (htmlAmong(e, "option selectedcontent"))
+            any = true;
+    if (!any)
+        return;
+    for (Node *e : els) // insertion steps
+    {
+        if (isHtml(e, "option"))
+            updateOptionSelect(e, nullptr);
+        else if (isHtml(e, "selectedcontent"))
+            recalcDisabled(e);
+    }
+    if (!connected(n))
+        return;
+    for (Node *e : els) // post-connection steps
+    {
+        if (isHtml(e, "option"))
+            updateForOption(e);
+        else if (isHtml(e, "selectedcontent"))
+        {
+            Node *select = recalcDisabled(e);
+            if (!e->scDisabled && select && !findAttr(select, "multiple"))
+                updateSelectedcontent(select, e);
+        }
+    }
+}
+
+void Parser::removed(Node *n)
+{
+    std::vector<Node *> els;
+    inclusiveElements(n, els);
+    for (Node *e : els)
+        if (isHtml(e, "option"))
+            updateOptionSelect(e, &pendingSelects);
+}
+
+void Parser::popped(Node *n)
+{
+    if (isHtml(n, "option"))
+        updateForOption(n);
+}
+
+void Parser::updateOptionSelect(Node *option, std::vector<Node *> *result)
+{
+    Node *oldSelect = option->cachedSelect;
+    Node *newSelect = nearestSelect(option);
+    option->cachedSelect = newSelect;
+    if (oldSelect == newSelect)
+        return;
+    for (int k = 0; k < 2; ++k)
+    {
+        Node *select = k == 0 ? oldSelect : newSelect;
+        if (!select)
+            continue;
+        bool changed = selectednessSetting(select);
+        if ((option->selectedness || changed) && result)
+            result->push_back(select);
+    }
+}
+
+void Parser::updateForOption(Node *option)
+{
+    Node *select = option->cachedSelect;
+    if (!select || !option->selectedness)
+        return;
+    updateSelectSelectedcontents(select);
+}
+
+void Parser::updateSelectSelectedcontents(Node *select)
+{
+    if (findAttr(select, "multiple"))
+        return;
+    std::vector<Node *> scs;
+    selectedcontentsUnder(select, scs);
+    for (Node *sc : scs)
+        updateSelectedcontent(select, sc);
+}
+
+void Parser::updateSelectedcontent(Node *select, Node *sc)
+{
+    if (sc->scDisabled)
+        return;
+    std::vector<Node *> options;
+    optionsUnder(select, options, 0);
+    Node *option = nullptr;
+    for (Node *o : options)
+        if (o->selectedness)
+        {
+            option = o;
+            break;
+        }
+    std::vector<Node *> fresh;
+    if (option)
+        for (Node *k : option->kids)
+            fresh.push_back(cloneTree(k));
+    // replace all
+    std::vector<Node *> old = sc->kids;
+    for (Node *k : old)
+        detach(k);
+    for (Node *k : fresh)
+        insertAt(sc, nullptr, k);
+}
+
+// ── the stack of open elements ───────────────────────────────────────────
+
+void Parser::popUntil(const char *name)
+{
+    while (!open.empty())
+    {
+        Node *n = open.back();
+        pop();
+        if (isHtml(n, name))
+            return;
+    }
+}
+
+void Parser::popUntilNode(Node *n)
+{
+    while (!open.empty())
+    {
+        Node *k = open.back();
+        pop();
+        if (k == n)
+            return;
+    }
+}
+
+bool Parser::special(const Node *n) const
+{
+    if (n->ns == NS_MATHML)
+        return among(n->name, "mi mo mn ms mtext annotation-xml");
+    if (n->ns == NS_SVG)
+        return n->name == "foreignObject" || n->name == "desc" || n->name == "title";
+    return among(n->name,
+                 "address applet area article aside base basefont bgsound blockquote body br button caption center "
+                 "col colgroup dd details dir div dl dt embed fieldset figcaption figure footer form frame frameset "
+                 "h1 h2 h3 h4 h5 h6 head header hgroup hr html iframe img input keygen li link listing main marquee "
+                 "menu meta nav noembed noframes noscript object ol p param plaintext pre script search section "
+                 "select source style summary table tbody td template textarea tfoot th thead title tr track ul "
+                 "wbr xmp");
+}
+
+namespace
+{
+
+bool scopeBoundary(const Node *n, int kind)
+{
+    if (kind == SC_TABLE)
+        return htmlAmong(n, "html table template");
+    if (n->ns == NS_MATHML)
+        return among(n->name, "mi mo mn ms mtext annotation-xml");
+    if (n->ns == NS_SVG)
+        return n->name == "foreignObject" || n->name == "desc" || n->name == "title";
+    if (among(n->name, "applet caption html table td th marquee object select template"))
+        return true;
+    if (kind == SC_LIST)
+        return n->name == "ol" || n->name == "ul";
+    if (kind == SC_BUTTON)
+        return n->name == "button";
+    return false;
+}
+
+} // namespace
+
+bool Parser::inScope(const char *name, int kind) const
+{
+    for (size_t k = open.size(); k-- > 0;)
+    {
+        const Node *n = open[k];
+        if (n->ns == NS_HTML && among(n->name, name))
+            return true;
+        if (scopeBoundary(n, kind))
+            return false;
+    }
+    return false;
+}
+
+bool Parser::nodeInScope(const Node *target) const
+{
+    for (size_t k = open.size(); k-- > 0;)
+    {
+        if (open[k] == target)
+            return true;
+        if (scopeBoundary(open[k], SC_DEFAULT))
+            return false;
+    }
+    return false;
+}
+
+int Parser::stackIndex(const Node *n) const
+{
+    for (size_t k = open.size(); k-- > 0;)
+        if (open[k] == n)
+            return (int)k;
+    return -1;
+}
+
+int Parser::afeIndex(const Node *n) const
+{
+    for (size_t k = afe.size(); k-- > 0;)
+        if (afe[k].el == n)
+            return (int)k;
+    return -1;
+}
+
+void Parser::generateImpliedEnd(const char *except)
+{
+    while (!open.empty() && htmlAmong(current(), kImpliedEnd) && !(except && current()->name == except))
+        pop();
+}
+
+void Parser::generateImpliedEndThoroughly()
+{
+    while (!open.empty() && htmlAmong(current(), "caption colgroup dd dt li optgroup option p rb rp rt rtc tbody td "
+                                                 "tfoot th thead tr"))
+        pop();
+}
+
+void Parser::unclosed(Node *n)
+{
+    if (n->implied || n->type != N_ELEMENT)
+        return;
+    if (std::find(reportedUnclosed.begin(), reportedUnclosed.end(), n) != reportedUnclosed.end())
+        return;
+    reportedUnclosed.push_back(n);
+    report(n->pos, (int)n->name.size() + 1, true, "Unclosed element \"" + n->name + "\".");
+}
+
+void Parser::parseError(const Token &t, const std::string &message)
+{
+    int width = t.type == Token::START ? (int)t.name.size() + 1 : t.type == Token::END ? (int)t.name.size() + 2 : 1;
+    report(t.pos, width, true, message);
+}
+
+// "End tag X seen, but there were open elements", and each element left
+// open above the one the end tag closes (the one named `what`)
+void Parser::openElementsError(const Token &t, const char *what)
+{
+    parseError(t, "End tag \"" + t.name + "\" seen, but there were open elements.");
+    for (size_t k = open.size(); k-- > 0;)
+    {
+        Node *n = open[k];
+        if (n->ns == NS_HTML && among(n->name, what))
+            break;
+        if (!htmlAmong(n, kImpliedEnd))
+            unclosed(n);
+    }
+}
+
+void Parser::closeP(const Token &t)
+{
+    generateImpliedEnd("p");
+    if (!isHtml(current(), "p"))
+    {
+        std::string message = "End tag \"p\" seen, but there were open elements.";
+        if (t.type != Token::END)
+            message = "Start tag \"" + t.name + "\" implied the end of \"p\", but there were open elements.";
+        report(t.pos, (int)t.name.size() + 1, true, message);
+        for (size_t k = open.size(); k-- > 0 && !isHtml(open[k], "p");)
+            unclosed(open[k]);
+    }
+    popUntil("p");
+}
+
+void Parser::resetMode()
+{
+    for (size_t k = open.size(); k-- > 0;)
+    {
+        Node *n = open[k];
+        bool last = k == 0;
+        if (last && context)
+            n = context;
+        if (n->ns == NS_HTML)
+        {
+            const std::string &nm = n->name;
+            if ((nm == "td" || nm == "th") && !last)
+            {
+                mode = M_IN_CELL;
+                return;
+            }
+            if (nm == "tr")
+            {
+                mode = M_IN_ROW;
+                return;
+            }
+            if (nm == "tbody" || nm == "thead" || nm == "tfoot")
+            {
+                mode = M_IN_TABLE_BODY;
+                return;
+            }
+            if (nm == "caption")
+            {
+                mode = M_IN_CAPTION;
+                return;
+            }
+            if (nm == "colgroup")
+            {
+                mode = M_IN_COLUMN_GROUP;
+                return;
+            }
+            if (nm == "table")
+            {
+                mode = M_IN_TABLE;
+                return;
+            }
+            if (nm == "template")
+            {
+                mode = templateModes.empty() ? M_IN_BODY : templateModes.back();
+                return;
+            }
+            if (nm == "head" && !last)
+            {
+                mode = M_IN_HEAD;
+                return;
+            }
+            if (nm == "body")
+            {
+                mode = M_IN_BODY;
+                return;
+            }
+            if (nm == "frameset")
+            {
+                mode = M_IN_FRAMESET;
+                return;
+            }
+            if (nm == "html")
+            {
+                mode = headEl ? M_AFTER_HEAD : M_BEFORE_HEAD;
+                return;
+            }
+        }
+        if (last)
+        {
+            mode = M_IN_BODY;
+            return;
+        }
+    }
+    mode = M_IN_BODY;
+}
+
+// ── active formatting elements ───────────────────────────────────────────
+
+void Parser::pushFormatting(Node *el, const Token &t)
+{
+    int same = 0, earliest = -1;
+    for (int k = (int)afe.size() - 1; k >= 0 && afe[k].el; --k)
+    {
+        Node *e = afe[k].el;
+        if (e->name == el->name && e->ns == el->ns && sameAttrs(afe[k].tok.attrs, t.attrs))
+        {
+            ++same;
+            earliest = k;
+        }
+    }
+    if (same >= 3)
+        afe.erase(afe.begin() + earliest);
+    Formatting f;
+    f.el = el;
+    f.tok = t;
+    afe.push_back(f);
+}
+
+void Parser::reconstructFormatting()
+{
+    if (afe.empty())
+        return;
+    if (!afe.back().el || stackIndex(afe.back().el) >= 0)
+        return;
+    size_t k = afe.size() - 1;
+    while (k > 0 && afe[k - 1].el && stackIndex(afe[k - 1].el) < 0)
+        --k;
+    for (; k < afe.size(); ++k)
+    {
+        afe[k].el = insertHtml(afe[k].tok);
+        afe[k].el->implied = true;
+    }
+}
+
+void Parser::clearFormattingToMarker()
+{
+    while (!afe.empty())
+    {
+        bool marker = afe.back().el == nullptr;
+        afe.pop_back();
+        if (marker)
+            return;
+    }
+}
+
+// The adoption agency algorithm; false when there is no formatting element,
+// so the end tag is handled as "any other end tag"
+bool Parser::adoptionAgency(Token &t)
+{
+    const std::string &subject = t.name;
+    Node *cur = current();
+    if (cur && isHtml(cur, subject.c_str()) && afeIndex(cur) < 0)
+    {
+        pop();
+        return true;
+    }
+    for (int outer = 0; outer < 8; ++outer)
+    {
+        int fi = -1;
+        for (int k = (int)afe.size() - 1; k >= 0 && afe[k].el; --k)
+            if (isHtml(afe[k].el, subject.c_str()))
+            {
+                fi = k;
+                break;
+            }
+        if (fi < 0)
+            return false;
+        Node *fe = afe[fi].el;
+        int si = stackIndex(fe);
+        if (si < 0)
+        {
+            parseError(t, "End tag \"" + subject + "\" violates nesting rules.");
+            afe.erase(afe.begin() + fi);
+            return true;
+        }
+        if (!nodeInScope(fe))
+        {
+            parseError(t, "No \"" + subject + "\" element in scope but a \"" + subject + "\" end tag seen.");
+            return true;
+        }
+        if (fe != current())
+            parseError(t, "End tag \"" + subject + "\" violates nesting rules.");
+        int fbi = -1;
+        for (size_t k = (size_t)si + 1; k < open.size(); ++k)
+            if (special(open[k]))
+            {
+                fbi = (int)k;
+                break;
+            }
+        if (fbi < 0)
+        {
+            popTo((size_t)si);
+            afe.erase(afe.begin() + fi);
+            return true;
+        }
+        Node *furthest = open[(size_t)fbi];
+        Node *common = open[(size_t)si - 1];
+        // the bookmark is an entry of its own in the list
+        Formatting mark;
+        mark.el = &bookmarkNode;
+        afe.insert(afe.begin() + fi + 1, mark);
+        Node *lastNode = furthest;
+        int idx = fbi;
+        for (int inner = 1;; ++inner)
+        {
+            --idx;
+            Node *node = open[(size_t)idx];
+            if (node == fe)
+                break;
+            int ai = afeIndex(node);
+            if (inner > 3 && ai >= 0)
+            {
+                afe.erase(afe.begin() + ai);
+                ai = -1;
+            }
+            if (ai < 0)
+            {
+                removeAt(idx);
+                continue;
+            }
+            Node *fresh = createElement(afe[(size_t)ai].tok, NS_HTML);
+            fresh->implied = true;
+            afe[(size_t)ai].el = fresh;
+            open[(size_t)idx] = fresh;
+            node = fresh;
+            if (lastNode == furthest)
+            {
+                int bi = afeIndex(&bookmarkNode);
+                Formatting moved = afe[(size_t)bi];
+                afe.erase(afe.begin() + bi);
+                afe.insert(afe.begin() + afeIndex(fresh) + 1, moved);
+            }
+            detach(lastNode);
+            insertAt(fresh, nullptr, lastNode);
+            lastNode = node;
+        }
+        detach(lastNode);
+        Node *parent, *before;
+        placeFor(common, parent, before);
+        insertAt(parent, before, lastNode);
+        int feAfe = afeIndex(fe);
+        Node *fresh = createElement(afe[(size_t)feAfe].tok, NS_HTML);
+        fresh->implied = true;
+        std::vector<Node *> moved = furthest->kids;
+        for (Node *k : moved)
+        {
+            detach(k);
+            insertAt(fresh, nullptr, k);
+        }
+        insertAt(furthest, nullptr, fresh);
+        Formatting entry = afe[(size_t)feAfe];
+        entry.el = fresh;
+        afe.erase(afe.begin() + feAfe);
+        int bi = afeIndex(&bookmarkNode);
+        afe[(size_t)bi] = entry;
+        removeAt(stackIndex(fe));
+        open.insert(open.begin() + stackIndex(furthest) + 1, fresh);
+    }
+    return true;
+}
+
+void Parser::anyOtherEnd(Token &t)
+{
+    for (size_t k = open.size(); k-- > 0;)
+    {
+        Node *n = open[k];
+        if (n->ns == NS_HTML && n->name == t.name)
+        {
+            generateImpliedEnd(t.name.c_str());
+            if (n != current())
+                openElementsError(t, t.name.c_str());
+            popTo(k);
+            return;
+        }
+        if (special(n))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return;
+        }
+    }
+}
+
+void Parser::genericRawText(Token &t, int tokState)
+{
+    Node *e = insertHtml(t);
+    e->contentPos = offsetOf[std::min(i, cp.size())];
+    state = tokState;
+    originalMode = mode;
+    mode = M_TEXT;
+}
+
+void Parser::clearStackBackTo(const char *names)
+{
+    while (!open.empty() && !htmlAmong(current(), names))
+        pop();
+}
+
+void Parser::closeCell()
+{
+    generateImpliedEnd(nullptr);
+    if (!htmlAmong(current(), "td th"))
+    {
+        report(current()->pos, 1, true, "A table cell was implicitly closed, but there were open elements.");
+        for (size_t k = open.size(); k-- > 0 && !htmlAmong(open[k], "td th");)
+            unclosed(open[k]);
+    }
+    while (!open.empty())
+    {
+        Node *n = open.back();
+        pop();
+        if (htmlAmong(n, "td th"))
+            break;
+    }
+    clearFormattingToMarker();
+    mode = M_IN_ROW;
+}
+
+// Leading whitespace of a character token: inserted (or dropped); the rest
+// of the token is left for the caller. `consumed`: nothing is left.
+void Parser::processSpaceThen(Token &t, bool insertSpace, bool &consumed)
+{
+    size_t k = 0;
+    while (k < t.data.size() && isSpace(t.data[k]))
+        ++k;
+    if (insertSpace && k)
+        insertChars(t.data.substr(0, k));
+    t.data.erase(0, k);
+    consumed = t.data.empty();
+}
+
+// ── insertion modes ──────────────────────────────────────────────────────
+
+bool Parser::initial(Token &t)
+{
+    bool consumed = false;
+    switch (t.type)
+    {
+    case Token::CHARS:
+        processSpaceThen(t, false, consumed);
+        if (consumed)
+            return true;
+        break;
+    case Token::COMMENT:
+        insertComment(t, document);
+        return true;
+    case Token::PI:
+        insertPI(t, document);
+        return true;
+    case Token::DOCTYPE:
+    {
+        if (!t.hasName || t.name != "html" || t.hasPublic || (t.hasSystem && t.systemId != "about:legacy-compat"))
+            report(t.pos, 9, true, "Obsolete doctype. Expected \"<!DOCTYPE html>\".");
+        Node *d = new Node();
+        d->type = N_DOCTYPE;
+        d->name = t.name;
+        d->data = t.publicId;
+        d->systemId = t.systemId;
+        d->pos = t.pos;
+        insertAt(document, nullptr, d);
+        hasDoctype = true;
+        std::string pub = lower(t.publicId), sys = lower(t.systemId);
+        static const char *const quirkyPrefixes[] = {
+            "+//Silmaril//dtd html Pro v0r11 19970101//", "-//AS//DTD HTML 3.0 asWedit + extensions//",
+            "-//AdvaSoft Ltd//DTD HTML 3.0 asWedit + extensions//", "-//IETF//DTD HTML 2.0 Level 1//",
+            "-//IETF//DTD HTML 2.0 Level 2//", "-//IETF//DTD HTML 2.0 Strict Level 1//",
+            "-//IETF//DTD HTML 2.0 Strict Level 2//", "-//IETF//DTD HTML 2.0 Strict//", "-//IETF//DTD HTML 2.0//",
+            "-//IETF//DTD HTML 2.1E//", "-//IETF//DTD HTML 3.0//", "-//IETF//DTD HTML 3.2 Final//",
+            "-//IETF//DTD HTML 3.2//", "-//IETF//DTD HTML 3//", "-//IETF//DTD HTML Level 0//",
+            "-//IETF//DTD HTML Level 1//", "-//IETF//DTD HTML Level 2//", "-//IETF//DTD HTML Level 3//",
+            "-//IETF//DTD HTML Strict Level 0//", "-//IETF//DTD HTML Strict Level 1//",
+            "-//IETF//DTD HTML Strict Level 2//", "-//IETF//DTD HTML Strict Level 3//", "-//IETF//DTD HTML Strict//",
+            "-//IETF//DTD HTML//", "-//Metrius//DTD Metrius Presentational//",
+            "-//Microsoft//DTD Internet Explorer 2.0 HTML Strict//", "-//Microsoft//DTD Internet Explorer 2.0 HTML//",
+            "-//Microsoft//DTD Internet Explorer 2.0 Tables//", "-//Microsoft//DTD Internet Explorer 3.0 HTML Strict//",
+            "-//Microsoft//DTD Internet Explorer 3.0 HTML//", "-//Microsoft//DTD Internet Explorer 3.0 Tables//",
+            "-//Netscape Comm. Corp.//DTD HTML//", "-//Netscape Comm. Corp.//DTD Strict HTML//",
+            "-//O'Reilly and Associates//DTD HTML 2.0//", "-//O'Reilly and Associates//DTD HTML Extended 1.0//",
+            "-//O'Reilly and Associates//DTD HTML Extended Relaxed 1.0//",
+            "-//SQ//DTD HTML 2.0 HoTMetaL + extensions//",
+            "-//SoftQuad Software//DTD HoTMetaL PRO 6.0::19990601::extensions to HTML 4.0//",
+            "-//SoftQuad//DTD HoTMetaL PRO 4.0::19971010::extensions to HTML 4.0//",
+            "-//Spyglass//DTD HTML 2.0 Extended//", "-//Sun Microsystems Corp.//DTD HotJava HTML//",
+            "-//Sun Microsystems Corp.//DTD HotJava Strict HTML//", "-//W3C//DTD HTML 3 1995-03-24//",
+            "-//W3C//DTD HTML 3.2 Draft//", "-//W3C//DTD HTML 3.2 Final//", "-//W3C//DTD HTML 3.2//",
+            "-//W3C//DTD HTML 3.2S Draft//", "-//W3C//DTD HTML 4.0 Frameset//", "-//W3C//DTD HTML 4.0 Transitional//",
+            "-//W3C//DTD HTML Experimental 19960712//", "-//W3C//DTD HTML Experimental 970421//",
+            "-//W3C//DTD W3 HTML//", "-//W3O//DTD W3 HTML 3.0//", "-//WebTechs//DTD Mozilla HTML 2.0//",
+            "-//WebTechs//DTD Mozilla HTML//", nullptr};
+        bool quirky = t.forceQuirks || t.name != "html" || pub == lower("-//W3O//DTD W3 HTML Strict 3.0//EN//") ||
+                      pub == lower("-/W3C/DTD HTML 4.0 Transitional/EN") || pub == "html" ||
+                      sys == "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd";
+        for (int k = 0; !quirky && quirkyPrefixes[k]; ++k)
+            if (t.hasPublic && startsCi(pub, quirkyPrefixes[k]))
+                quirky = true;
+        bool noSystem = !t.hasSystem;
+        if (!quirky && t.hasPublic && noSystem &&
+            (startsCi(pub, "-//W3C//DTD HTML 4.01 Frameset//") || startsCi(pub, "-//W3C//DTD HTML 4.01 Transitional//")))
+            quirky = true;
+        if (quirky)
+            quirks = 2;
+        else if (t.hasPublic && (startsCi(pub, "-//W3C//DTD XHTML 1.0 Frameset//") || startsCi(pub, "-//W3C//DTD XHTML 1.0 Transitional//") ||
+                                 (!noSystem && (startsCi(pub, "-//W3C//DTD HTML 4.01 Frameset//") ||
+                                                startsCi(pub, "-//W3C//DTD HTML 4.01 Transitional//")))))
+            quirks = 1;
+        mode = M_BEFORE_HTML;
+        return true;
+    }
+    default:
+        break;
+    }
+    // no doctype: quirks mode. Reported as a warning, so that a fragment
+    // like "<h1>Hi</h1>" still compiles.
+    if (t.type == Token::CHARS)
+        report(t.pos, 1, false, "Non-space characters found without seeing a doctype first. Expected \"<!DOCTYPE html>\".");
+    else if (t.type == Token::START)
+        report(t.pos, (int)t.name.size() + 1, false, "Start tag seen without seeing a doctype first. Expected \"<!DOCTYPE html>\".");
+    else if (t.type == Token::END)
+        report(t.pos, (int)t.name.size() + 2, false, "End tag seen without seeing a doctype first. Expected \"<!DOCTYPE html>\".");
+    quirks = 2;
+    mode = M_BEFORE_HTML;
+    return false;
+}
+
+bool Parser::beforeHtml(Token &t)
+{
+    bool consumed = false;
+    switch (t.type)
+    {
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::COMMENT:
+        insertComment(t, document);
+        return true;
+    case Token::PI:
+        insertPI(t, document);
+        return true;
+    case Token::CHARS:
+        processSpaceThen(t, false, consumed);
+        if (consumed)
+            return true;
+        break;
+    case Token::START:
+        if (t.name == "html")
+        {
+            htmlEl = createElement(t, NS_HTML);
+            insertAt(document, nullptr, htmlEl);
+            open.push_back(htmlEl);
+            explicitHtml = true;
+            mode = M_BEFORE_HEAD;
+            return true;
+        }
+        break;
+    case Token::END:
+        if (!among(t.name, "head body html br"))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+    Token h;
+    h.type = Token::START;
+    h.name = "html";
+    h.pos = t.pos;
+    htmlEl = createElement(h, NS_HTML);
+    htmlEl->implied = true;
+    insertAt(document, nullptr, htmlEl);
+    open.push_back(htmlEl);
+    mode = M_BEFORE_HEAD;
+    return false;
+}
+
+bool Parser::beforeHead(Token &t)
+{
+    bool consumed = false;
+    switch (t.type)
+    {
+    case Token::CHARS:
+        processSpaceThen(t, false, consumed);
+        if (consumed)
+            return true;
+        break;
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        if (t.name == "head")
+        {
+            headEl = insertHtml(t);
+            explicitHead = true;
+            mode = M_IN_HEAD;
+            return true;
+        }
+        break;
+    case Token::END:
+        if (!among(t.name, "head body html br"))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+    headEl = insertImplied("head", t.pos);
+    mode = M_IN_HEAD;
+    return false;
+}
+
+bool Parser::inHead(Token &t)
+{
+    bool consumed = false;
+    switch (t.type)
+    {
+    case Token::CHARS:
+        processSpaceThen(t, true, consumed);
+        if (consumed)
+            return true;
+        break;
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        if (among(t.name, "base basefont bgsound link meta"))
+        {
+            insertHtml(t);
+            pop();
+            t.acknowledged = true;
+            return true;
+        }
+        if (t.name == "title")
+        {
+            genericRawText(t, S_RCDATA);
+            return true;
+        }
+        if ((t.name == "noscript" && scripting) || t.name == "noframes" || t.name == "style")
+        {
+            genericRawText(t, S_RAWTEXT);
+            return true;
+        }
+        if (t.name == "noscript")
+        {
+            insertHtml(t);
+            mode = M_IN_HEAD_NOSCRIPT;
+            return true;
+        }
+        if (t.name == "script")
+        {
+            genericRawText(t, S_SCRIPT);
+            return true;
+        }
+        if (t.name == "template")
+        {
+            insertHtml(t);
+            Formatting marker;
+            afe.push_back(marker);
+            framesetOk = false;
+            mode = M_IN_TEMPLATE;
+            templateModes.push_back(M_IN_TEMPLATE);
+            return true;
+        }
+        if (t.name == "head")
+        {
+            parseError(t, "Start tag \"head\" seen but an element of the same type was already open.");
+            return true;
+        }
+        break;
+    case Token::END:
+        if (t.name == "head")
+        {
+            pop();
+            mode = M_AFTER_HEAD;
+            return true;
+        }
+        if (t.name == "template")
+        {
+            bool any = false;
+            for (Node *n : open)
+                if (isHtml(n, "template"))
+                    any = true;
+            if (!any)
+            {
+                parseError(t, "Stray end tag \"template\".");
+                return true;
+            }
+            generateImpliedEndThoroughly();
+            if (!isHtml(current(), "template"))
+                openElementsError(t, "template");
+            popUntil("template");
+            clearFormattingToMarker();
+            templateModes.pop_back();
+            resetMode();
+            return true;
+        }
+        if (!among(t.name, "body html br"))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+    pop();
+    mode = M_AFTER_HEAD;
+    return false;
+}
+
+bool Parser::inHeadNoscript(Token &t)
+{
+    bool consumed = false;
+    switch (t.type)
+    {
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        if (among(t.name, "basefont bgsound link meta noframes style"))
+            return rules(M_IN_HEAD, t);
+        if (t.name == "head" || t.name == "noscript")
+        {
+            parseError(t, "Stray start tag \"" + t.name + "\".");
+            return true;
+        }
+        break;
+    case Token::END:
+        if (t.name == "noscript")
+        {
+            pop();
+            mode = M_IN_HEAD;
+            return true;
+        }
+        if (t.name != "br")
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        break;
+    case Token::CHARS:
+        processSpaceThen(t, true, consumed);
+        if (consumed)
+            return true;
+        break;
+    case Token::COMMENT:
+    case Token::PI:
+        return rules(M_IN_HEAD, t);
+    default:
+        break;
+    }
+    parseError(t, t.type == Token::START ? "Bad start tag in \"" + t.name + "\" in \"noscript\" in \"head\"."
+                                         : std::string("Bad content in \"noscript\" in \"head\"."));
+    pop();
+    mode = M_IN_HEAD;
+    return false;
+}
+
+bool Parser::afterHead(Token &t)
+{
+    bool consumed = false;
+    switch (t.type)
+    {
+    case Token::CHARS:
+        processSpaceThen(t, true, consumed);
+        if (consumed)
+            return true;
+        break;
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        if (t.name == "body")
+        {
+            bodyEl = insertHtml(t);
+            framesetOk = false;
+            mode = M_IN_BODY;
+            return true;
+        }
+        if (t.name == "frameset")
+        {
+            insertHtml(t);
+            mode = M_IN_FRAMESET;
+            return true;
+        }
+        if (among(t.name, "base basefont bgsound link meta noframes script style template title"))
+        {
+            parseError(t, "\"" + t.name + "\" element between \"head\" and \"body\".");
+            open.push_back(headEl);
+            bool done = rules(M_IN_HEAD, t);
+            int k = stackIndex(headEl);
+            if (k >= 0)
+                removeAt(k);
+            return done;
+        }
+        if (t.name == "head")
+        {
+            parseError(t, "Stray start tag \"head\".");
+            return true;
+        }
+        break;
+    case Token::END:
+        if (t.name == "template")
+            return rules(M_IN_HEAD, t);
+        if (!among(t.name, "body html br"))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+    bodyEl = insertImplied("body", t.pos);
+    framesetOk = true;
+    mode = M_IN_BODY;
+    return false;
+}
+
+bool Parser::inBody(Token &t)
+{
+    switch (t.type)
+    {
+    case Token::CHARS:
+    {
+        std::string s;
+        bool nonSpace = false;
+        for (char c : t.data)
+        {
+            if (c == '\0')
+                continue;
+            if (!isSpace(c))
+                nonSpace = true;
+            s += c;
+        }
+        if (s.empty())
+            return true;
+        reconstructFormatting();
+        insertChars(s);
+        if (nonSpace)
+            framesetOk = false;
+        return true;
+    }
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        return bodyStart(t);
+    case Token::END:
+        return bodyEnd(t);
+    case Token::END_OF_FILE:
+    {
+        if (!templateModes.empty())
+            return rules(M_IN_TEMPLATE, t);
+        bool any = false;
+        for (size_t k = open.size(); k-- > 0;)
+            if (!htmlAmong(open[k], kOpenAtEndOk) && !open[k]->implied)
+            {
+                if (!any)
+                    report(t.pos, 1, true, "End of file seen and there were open elements.");
+                any = true;
+                unclosed(open[k]);
+            }
+        return true;
+    }
+    }
+    return true;
+}
+
+bool Parser::bodyStart(Token &t)
+{
+    const std::string nm = t.name;
+    bool templateOpen = false;
+    for (Node *n : open)
+        if (isHtml(n, "template"))
+            templateOpen = true;
+
+    if (nm == "html")
+    {
+        parseError(t, "Stray start tag \"html\".");
+        if (!templateOpen)
+            for (const Attr &a : t.attrs)
+                if (!findAttr(open[0], a.name))
+                    open[0]->attrs.push_back(a);
+        return true;
+    }
+    if (among(nm, "base basefont bgsound link meta noframes script style template title"))
+        return rules(M_IN_HEAD, t);
+    if (nm == "body")
+    {
+        parseError(t, "Start tag \"body\" seen but an element of the same type was already open.");
+        if (open.size() == 1 || !isHtml(open[1], "body") || templateOpen)
+            return true;
+        framesetOk = false;
+        for (const Attr &a : t.attrs)
+            if (!findAttr(open[1], a.name))
+                open[1]->attrs.push_back(a);
+        return true;
+    }
+    if (nm == "frameset")
+    {
+        parseError(t, "Stray start tag \"frameset\".");
+        if (open.size() == 1 || !isHtml(open[1], "body") || !framesetOk)
+            return true;
+        detach(open[1]);
+        popTo(1);
+        insertHtml(t);
+        mode = M_IN_FRAMESET;
+        return true;
+    }
+    if (among(nm, "address article aside blockquote center details dialog dir div dl fieldset figcaption figure "
+                  "footer header hgroup main menu nav ol p search section summary ul"))
+    {
+        if (inScope("p", SC_BUTTON))
+            closeP(t);
+        insertHtml(t);
+        return true;
+    }
+    if (among(nm, "h1 h2 h3 h4 h5 h6"))
+    {
+        if (inScope("p", SC_BUTTON))
+            closeP(t);
+        if (htmlAmong(current(), "h1 h2 h3 h4 h5 h6"))
+        {
+            parseError(t, "Heading cannot be a child of another heading.");
+            pop();
+        }
+        insertHtml(t);
+        return true;
+    }
+    if (nm == "pre" || nm == "listing")
+    {
+        if (inScope("p", SC_BUTTON))
+            closeP(t);
+        insertHtml(t);
+        skipNewline = true;
+        framesetOk = false;
+        return true;
+    }
+    if (nm == "form")
+    {
+        if (formEl && !templateContents())
+        {
+            parseError(t, "Saw a \"form\" start tag, but there was already an active \"form\" element. Nested forms "
+                          "are not allowed. Ignoring the tag.");
+            return true;
+        }
+        if (inScope("p", SC_BUTTON))
+            closeP(t);
+        Node *f = insertHtml(t);
+        if (!templateContents())
+            formEl = f;
+        return true;
+    }
+    if (nm == "li" || nm == "dd" || nm == "dt")
+    {
+        framesetOk = false;
+        for (size_t k = open.size(); k-- > 0;)
+        {
+            Node *n = open[k];
+            bool match = nm == "li" ? isHtml(n, "li") : htmlAmong(n, "dd dt");
+            if (match)
+            {
+                const std::string other = n->name;
+                generateImpliedEnd(other.c_str());
+                if (!isHtml(current(), other.c_str()))
+                {
+                    parseError(t, "Start tag \"" + nm + "\" implied the end of \"" + other + "\", but there were open elements.");
+                    for (size_t m = open.size(); m-- > 0 && open[m] != n;)
+                        unclosed(open[m]);
+                }
+                popUntil(other.c_str());
+                break;
+            }
+            if (special(n) && !htmlAmong(n, "address div p"))
+                break;
+        }
+        if (inScope("p", SC_BUTTON))
+            closeP(t);
+        insertHtml(t);
+        return true;
+    }
+    if (nm == "plaintext")
+    {
+        if (inScope("p", SC_BUTTON))
+            closeP(t);
+        insertHtml(t);
+        state = S_PLAINTEXT;
+        return true;
+    }
+    if (nm == "button")
+    {
+        if (inScope("button", SC_DEFAULT))
+        {
+            parseError(t, "Start tag \"button\" seen but an element of the same type was already open.");
+            generateImpliedEnd(nullptr);
+            popUntil("button");
+        }
+        reconstructFormatting();
+        insertHtml(t);
+        framesetOk = false;
+        return true;
+    }
+    if (nm == "a")
+    {
+        for (int k = (int)afe.size() - 1; k >= 0 && afe[k].el; --k)
+            if (isHtml(afe[k].el, "a"))
+            {
+                Node *old = afe[k].el;
+                parseError(t, "An \"a\" start tag seen but an element of the same type was already open.");
+                adoptionAgency(t);
+                int ai = afeIndex(old);
+                if (ai >= 0)
+                    afe.erase(afe.begin() + ai);
+                int si = stackIndex(old);
+                if (si >= 0)
+                    removeAt(si);
+                break;
+            }
+        reconstructFormatting();
+        pushFormatting(insertHtml(t), t);
+        return true;
+    }
+    if (among(nm, "b big code em font i s small strike strong tt u"))
+    {
+        reconstructFormatting();
+        pushFormatting(insertHtml(t), t);
+        return true;
+    }
+    if (nm == "nobr")
+    {
+        reconstructFormatting();
+        if (inScope("nobr", SC_DEFAULT))
+        {
+            parseError(t, "An \"nobr\" start tag seen but an element of the same type was already open.");
+            if (!adoptionAgency(t))
+                anyOtherEnd(t);
+            reconstructFormatting();
+        }
+        pushFormatting(insertHtml(t), t);
+        return true;
+    }
+    if (among(nm, "applet marquee object"))
+    {
+        reconstructFormatting();
+        insertHtml(t);
+        Formatting marker;
+        afe.push_back(marker);
+        framesetOk = false;
+        return true;
+    }
+    if (nm == "table")
+    {
+        if (quirks != 2 && inScope("p", SC_BUTTON))
+            closeP(t);
+        insertHtml(t);
+        framesetOk = false;
+        mode = M_IN_TABLE;
+        return true;
+    }
+    if (among(nm, "area br embed img keygen wbr"))
+    {
+        reconstructFormatting();
+        insertHtml(t);
+        pop();
+        t.acknowledged = true;
+        framesetOk = false;
+        return true;
+    }
+    if (nm == "input")
+    {
+        if (isHtml(context, "select"))
+        {
+            parseError(t, "Start tag \"input\" seen in \"select\".");
+            return true;
+        }
+        if (inScope("select", SC_DEFAULT))
+        {
+            parseError(t, "Start tag \"input\" seen in \"select\".");
+            popUntil("select");
+        }
+        reconstructFormatting();
+        insertHtml(t);
+        pop();
+        t.acknowledged = true;
+        const Attr *type = nullptr;
+        for (const Attr &a : t.attrs)
+            if (a.name == "type")
+                type = &a;
+        if (!type || lower(type->value) != "hidden")
+            framesetOk = false;
+        return true;
+    }
+    if (among(nm, "param source track"))
+    {
+        insertHtml(t);
+        pop();
+        t.acknowledged = true;
+        return true;
+    }
+    if (nm == "hr")
+    {
+        if (inScope("p", SC_BUTTON))
+            closeP(t);
+        if (inScope("select", SC_DEFAULT))
+        {
+            generateImpliedEnd(nullptr);
+            if (inScope("option", SC_DEFAULT) || inScope("optgroup", SC_DEFAULT))
+                parseError(t, "Start tag \"hr\" seen in an open \"option\".");
+        }
+        insertHtml(t);
+        pop();
+        t.acknowledged = true;
+        framesetOk = false;
+        return true;
+    }
+    if (nm == "image")
+    {
+        parseError(t, "Saw a start tag \"image\".");
+        t.name = "img";
+        return false;
+    }
+    if (nm == "textarea")
+    {
+        Node *e = insertHtml(t);
+        e->contentPos = offsetOf[std::min(i, cp.size())];
+        skipNewline = true;
+        state = S_RCDATA;
+        originalMode = mode;
+        framesetOk = false;
+        mode = M_TEXT;
+        return true;
+    }
+    if (nm == "xmp")
+    {
+        if (inScope("p", SC_BUTTON))
+            closeP(t);
+        reconstructFormatting();
+        framesetOk = false;
+        genericRawText(t, S_RAWTEXT);
+        return true;
+    }
+    if (nm == "iframe")
+    {
+        framesetOk = false;
+        genericRawText(t, S_RAWTEXT);
+        return true;
+    }
+    if (nm == "noembed" || (nm == "noscript" && scripting))
+    {
+        genericRawText(t, S_RAWTEXT);
+        return true;
+    }
+    if (nm == "select")
+    {
+        if (isHtml(context, "select"))
+        {
+            parseError(t, "Start tag \"select\" seen in \"select\".");
+            return true;
+        }
+        if (inScope("select", SC_DEFAULT))
+        {
+            parseError(t, "Start tag \"select\" seen in \"select\".");
+            popUntil("select");
+            return true;
+        }
+        reconstructFormatting();
+        insertHtml(t);
+        framesetOk = false;
+        return true;
+    }
+    if (nm == "option")
+    {
+        if (inScope("select", SC_DEFAULT))
+        {
+            generateImpliedEnd("optgroup");
+            if (inScope("option", SC_DEFAULT))
+                parseError(t, "Start tag \"option\" seen in an open \"option\".");
+        }
+        else if (isHtml(current(), "option"))
+            pop();
+        reconstructFormatting();
+        insertHtml(t);
+        return true;
+    }
+    if (nm == "optgroup")
+    {
+        if (inScope("select", SC_DEFAULT))
+        {
+            generateImpliedEnd(nullptr);
+            if (inScope("option", SC_DEFAULT) || inScope("optgroup", SC_DEFAULT))
+                parseError(t, "Start tag \"optgroup\" seen in an open \"option\" or \"optgroup\".");
+        }
+        else if (isHtml(current(), "option"))
+            pop();
+        reconstructFormatting();
+        insertHtml(t);
+        return true;
+    }
+    if (nm == "rb" || nm == "rtc")
+    {
+        if (inScope("ruby", SC_DEFAULT))
+        {
+            generateImpliedEnd(nullptr);
+            if (!isHtml(current(), "ruby"))
+                parseError(t, "Start tag \"" + nm + "\" seen without an open \"ruby\" element.");
+        }
+        insertHtml(t);
+        return true;
+    }
+    if (nm == "rp" || nm == "rt")
+    {
+        if (inScope("ruby", SC_DEFAULT))
+        {
+            generateImpliedEnd("rtc");
+            if (!htmlAmong(current(), "rtc ruby"))
+                parseError(t, "Start tag \"" + nm + "\" seen without an open \"ruby\" element.");
+        }
+        insertHtml(t);
+        return true;
+    }
+    if (nm == "math" || nm == "svg")
+    {
+        reconstructFormatting();
+        if (nm == "math")
+            adjustMathMLAttrs(t);
+        else
+            adjustSvgAttrs(t);
+        adjustForeignAttrs(t);
+        insertForeign(t, nm == "math" ? NS_MATHML : NS_SVG);
+        if (t.selfClosing)
+        {
+            pop();
+            t.acknowledged = true;
+        }
+        return true;
+    }
+    if (among(nm, "caption col colgroup frame head tbody td tfoot th thead tr"))
+    {
+        parseError(t, "Stray start tag \"" + nm + "\".");
+        return true;
+    }
+    reconstructFormatting();
+    insertHtml(t);
+    return true;
+}
+
+bool Parser::bodyEnd(Token &t)
+{
+    const std::string nm = t.name;
+    if (nm == "template")
+        return rules(M_IN_HEAD, t);
+    if (nm == "body" || nm == "html")
+    {
+        if (!inScope("body", SC_DEFAULT))
+        {
+            parseError(t, "Stray end tag \"" + nm + "\".");
+            return true;
+        }
+        bool any = false;
+        for (size_t k = open.size(); k-- > 0;)
+            if (!htmlAmong(open[k], kOpenAtEndOk) && !open[k]->implied)
+            {
+                if (!any)
+                    parseError(t, "End tag for \"body\" seen, but there were unclosed elements.");
+                any = true;
+                unclosed(open[k]);
+            }
+        mode = M_AFTER_BODY;
+        return nm == "body";
+    }
+    if (among(nm, "address article aside blockquote button center details dialog dir div dl fieldset figcaption "
+                  "figure footer header hgroup listing main menu nav ol pre search section select summary ul"))
+    {
+        if (!inScope(nm.c_str(), SC_DEFAULT))
+        {
+            parseError(t, "Stray end tag \"" + nm + "\".");
+            return true;
+        }
+        generateImpliedEnd(nullptr);
+        if (!isHtml(current(), nm.c_str()))
+            openElementsError(t, nm.c_str());
+        popUntil(nm.c_str());
+        return true;
+    }
+    if (nm == "form")
+    {
+        if (!templateContents())
+        {
+            Node *node = formEl;
+            formEl = nullptr;
+            if (!node || !nodeInScope(node))
+            {
+                parseError(t, "Stray end tag \"form\".");
+                return true;
+            }
+            generateImpliedEnd(nullptr);
+            if (current() != node)
+                openElementsError(t, "form");
+            int k = stackIndex(node);
+            if (k >= 0)
+                removeAt(k);
+            return true;
+        }
+        if (!inScope("form", SC_DEFAULT))
+        {
+            parseError(t, "Stray end tag \"form\".");
+            return true;
+        }
+        generateImpliedEnd(nullptr);
+        if (!isHtml(current(), "form"))
+            openElementsError(t, "form");
+        popUntil("form");
+        return true;
+    }
+    if (nm == "p")
+    {
+        if (!inScope("p", SC_BUTTON))
+        {
+            parseError(t, "No \"p\" element in scope but a \"p\" end tag seen.");
+            insertImplied("p", t.pos);
+        }
+        closeP(t);
+        return true;
+    }
+    if (nm == "li")
+    {
+        if (!inScope("li", SC_LIST))
+        {
+            parseError(t, "No \"li\" element in list scope but a \"li\" end tag seen.");
+            return true;
+        }
+        generateImpliedEnd("li");
+        if (!isHtml(current(), "li"))
+            openElementsError(t, "li");
+        popUntil("li");
+        return true;
+    }
+    if (nm == "dd" || nm == "dt")
+    {
+        if (!inScope(nm.c_str(), SC_DEFAULT))
+        {
+            parseError(t, "No \"" + nm + "\" element in scope but a \"" + nm + "\" end tag seen.");
+            return true;
+        }
+        generateImpliedEnd(nm.c_str());
+        if (!isHtml(current(), nm.c_str()))
+            openElementsError(t, nm.c_str());
+        popUntil(nm.c_str());
+        return true;
+    }
+    if (among(nm, "h1 h2 h3 h4 h5 h6"))
+    {
+        if (!inScope("h1 h2 h3 h4 h5 h6", SC_DEFAULT))
+        {
+            parseError(t, "Stray end tag \"" + nm + "\".");
+            return true;
+        }
+        generateImpliedEnd(nullptr);
+        if (!isHtml(current(), nm.c_str()))
+            openElementsError(t, "h1 h2 h3 h4 h5 h6");
+        while (!open.empty())
+        {
+            Node *n = open.back();
+            pop();
+            if (htmlAmong(n, "h1 h2 h3 h4 h5 h6"))
+                break;
+        }
+        return true;
+    }
+    if (among(nm, "a b big code em font i nobr s small strike strong tt u"))
+    {
+        if (!adoptionAgency(t))
+            anyOtherEnd(t);
+        return true;
+    }
+    if (among(nm, "applet marquee object"))
+    {
+        if (!inScope(nm.c_str(), SC_DEFAULT))
+        {
+            parseError(t, "Stray end tag \"" + nm + "\".");
+            return true;
+        }
+        generateImpliedEnd(nullptr);
+        if (!isHtml(current(), nm.c_str()))
+            openElementsError(t, nm.c_str());
+        popUntil(nm.c_str());
+        clearFormattingToMarker();
+        return true;
+    }
+    if (nm == "br")
+    {
+        parseError(t, "End tag \"br\".");
+        Token br;
+        br.type = Token::START;
+        br.name = "br";
+        br.pos = t.pos;
+        return bodyStart(br);
+    }
+    anyOtherEnd(t);
+    return true;
+}
+
+bool Parser::text(Token &t)
+{
+    if (t.type == Token::CHARS)
+    {
+        insertChars(t.data);
+        return true;
+    }
+    if (t.type == Token::END_OF_FILE)
+    {
+        report(t.pos, 1, true, "End of file seen when expecting text or an end tag.");
+        unclosed(current());
+        pop();
+        mode = originalMode;
+        return false;
+    }
+    if (t.type == Token::END)
+    {
+        pop();
+        mode = originalMode;
+    }
+    return true;
+}
+
+bool Parser::inTable(Token &t)
+{
+    switch (t.type)
+    {
+    case Token::CHARS:
+        if (htmlAmong(current(), "table tbody template tfoot thead tr"))
+        {
+            pendingTableChars.clear();
+            pendingTableNonSpace = false;
+            pendingTablePos = t.pos;
+            originalMode = mode;
+            mode = M_IN_TABLE_TEXT;
+            return false;
+        }
+        break;
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "caption")
+        {
+            clearStackBackTo("table template html");
+            Formatting marker;
+            afe.push_back(marker);
+            insertHtml(t);
+            mode = M_IN_CAPTION;
+            return true;
+        }
+        if (t.name == "colgroup")
+        {
+            clearStackBackTo("table template html");
+            insertHtml(t);
+            mode = M_IN_COLUMN_GROUP;
+            return true;
+        }
+        if (t.name == "col")
+        {
+            clearStackBackTo("table template html");
+            insertImplied("colgroup", t.pos);
+            mode = M_IN_COLUMN_GROUP;
+            return false;
+        }
+        if (among(t.name, "tbody tfoot thead"))
+        {
+            clearStackBackTo("table template html");
+            insertHtml(t);
+            mode = M_IN_TABLE_BODY;
+            return true;
+        }
+        if (among(t.name, "td th tr"))
+        {
+            clearStackBackTo("table template html");
+            insertImplied("tbody", t.pos);
+            mode = M_IN_TABLE_BODY;
+            return false;
+        }
+        if (t.name == "table")
+        {
+            parseError(t, "Start tag \"table\" seen but the previous \"table\" is still open.");
+            if (!inScope("table", SC_TABLE))
+                return true;
+            popUntil("table");
+            resetMode();
+            return false;
+        }
+        if (among(t.name, "style script template"))
+            return rules(M_IN_HEAD, t);
+        if (t.name == "input")
+        {
+            bool hidden = false;
+            for (const Attr &a : t.attrs)
+                if (a.name == "type" && lower(a.value) == "hidden")
+                    hidden = true;
+            if (hidden)
+            {
+                parseError(t, "Start tag \"input\" seen in \"table\".");
+                insertHtml(t);
+                pop();
+                t.acknowledged = true;
+                return true;
+            }
+        }
+        if (t.name == "form")
+        {
+            parseError(t, "Start tag \"form\" seen in \"table\".");
+            bool inTemplate = templateContents();
+            if (formEl && !inTemplate)
+                return true;
+            Node *f = insertHtml(t);
+            if (!inTemplate)
+                formEl = f;
+            pop();
+            return true;
+        }
+        break;
+    case Token::END:
+        if (t.name == "table")
+        {
+            if (!inScope("table", SC_TABLE))
+            {
+                parseError(t, "Stray end tag \"table\".");
+                return true;
+            }
+            popUntil("table");
+            resetMode();
+            return true;
+        }
+        if (among(t.name, "body caption col colgroup html tbody td tfoot th thead tr"))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        if (t.name == "template")
+            return rules(M_IN_HEAD, t);
+        break;
+    case Token::END_OF_FILE:
+        return rules(M_IN_BODY, t);
+    }
+    // anything else: foster parenting
+    if (t.type == Token::START)
+        parseError(t, "Start tag \"" + t.name + "\" seen in \"table\".");
+    else if (t.type == Token::END)
+        parseError(t, "Stray end tag \"" + t.name + "\".");
+    fosterParenting = true;
+    bool done = rules(M_IN_BODY, t);
+    fosterParenting = false;
+    return done;
+}
+
+bool Parser::inTableText(Token &t)
+{
+    if (t.type == Token::CHARS)
+    {
+        for (char c : t.data)
+        {
+            if (c == '\0')
+                continue;
+            if (!isSpace(c))
+                pendingTableNonSpace = true;
+            pendingTableChars += c;
+        }
+        return true;
+    }
+    if (pendingTableNonSpace)
+    {
+        report(pendingTablePos, 1, true, "Misplaced non-space characters inside a table.");
+        Token chars;
+        chars.type = Token::CHARS;
+        chars.data = pendingTableChars;
+        chars.pos = pendingTablePos;
+        fosterParenting = true;
+        rules(M_IN_BODY, chars);
+        fosterParenting = false;
+    }
+    else
+        insertChars(pendingTableChars);
+    pendingTableChars.clear();
+    mode = originalMode;
+    return false;
+}
+
+bool Parser::inCaption(Token &t)
+{
+    bool closes = end(t, "caption") || end(t, "table") ||
+                  start(t, "caption col colgroup tbody td tfoot th thead tr");
+    if (closes)
+    {
+        if (!inScope("caption", SC_TABLE))
+        {
+            parseError(t, "Stray " + std::string(t.type == Token::START ? "start" : "end") + " tag \"" + t.name + "\".");
+            return true;
+        }
+        generateImpliedEnd(nullptr);
+        if (!isHtml(current(), "caption"))
+            openElementsError(t, "caption");
+        popUntil("caption");
+        clearFormattingToMarker();
+        mode = M_IN_TABLE;
+        return t.type == Token::END && t.name == "caption";
+    }
+    if (end(t, "body col colgroup html tbody td tfoot th thead tr"))
+    {
+        parseError(t, "Stray end tag \"" + t.name + "\".");
+        return true;
+    }
+    return rules(M_IN_BODY, t);
+}
+
+bool Parser::inColumnGroup(Token &t)
+{
+    bool consumed = false;
+    switch (t.type)
+    {
+    case Token::CHARS:
+        processSpaceThen(t, true, consumed);
+        if (consumed)
+            return true;
+        break;
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        if (t.name == "col")
+        {
+            insertHtml(t);
+            pop();
+            t.acknowledged = true;
+            return true;
+        }
+        if (t.name == "template")
+            return rules(M_IN_HEAD, t);
+        break;
+    case Token::END:
+        if (t.name == "colgroup")
+        {
+            if (!isHtml(current(), "colgroup"))
+            {
+                parseError(t, "Stray end tag \"colgroup\".");
+                return true;
+            }
+            pop();
+            mode = M_IN_TABLE;
+            return true;
+        }
+        if (t.name == "col")
+        {
+            parseError(t, "Stray end tag \"col\".");
+            return true;
+        }
+        if (t.name == "template")
+            return rules(M_IN_HEAD, t);
+        break;
+    case Token::END_OF_FILE:
+        return rules(M_IN_BODY, t);
+    }
+    if (!isHtml(current(), "colgroup"))
+    {
+        parseError(t, "Content not allowed in \"colgroup\".");
+        return true;
+    }
+    pop();
+    mode = M_IN_TABLE;
+    return false;
+}
+
+bool Parser::inTableBody(Token &t)
+{
+    if (start(t, "tr"))
+    {
+        clearStackBackTo("tbody tfoot thead template html");
+        insertHtml(t);
+        mode = M_IN_ROW;
+        return true;
+    }
+    if (start(t, "th td"))
+    {
+        parseError(t, "Start tag \"" + t.name + "\" seen in a table body without an open \"tr\".");
+        clearStackBackTo("tbody tfoot thead template html");
+        insertImplied("tr", t.pos);
+        mode = M_IN_ROW;
+        return false;
+    }
+    if (end(t, "tbody tfoot thead"))
+    {
+        if (!inScope(t.name.c_str(), SC_TABLE))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        clearStackBackTo("tbody tfoot thead template html");
+        pop();
+        mode = M_IN_TABLE;
+        return true;
+    }
+    if (start(t, "caption col colgroup tbody tfoot thead") || end(t, "table"))
+    {
+        if (!inScope("tbody thead tfoot", SC_TABLE))
+        {
+            parseError(t, std::string("Stray ") + (t.type == Token::START ? "start" : "end") + " tag \"" + t.name + "\".");
+            return true;
+        }
+        clearStackBackTo("tbody tfoot thead template html");
+        pop();
+        mode = M_IN_TABLE;
+        return false;
+    }
+    if (end(t, "body caption col colgroup html td th tr"))
+    {
+        parseError(t, "Stray end tag \"" + t.name + "\".");
+        return true;
+    }
+    return rules(M_IN_TABLE, t);
+}
+
+bool Parser::inRow(Token &t)
+{
+    if (start(t, "th td"))
+    {
+        clearStackBackTo("tr template html");
+        insertHtml(t);
+        mode = M_IN_CELL;
+        Formatting marker;
+        afe.push_back(marker);
+        return true;
+    }
+    if (end(t, "tr"))
+    {
+        if (!inScope("tr", SC_TABLE))
+        {
+            parseError(t, "Stray end tag \"tr\".");
+            return true;
+        }
+        clearStackBackTo("tr template html");
+        pop();
+        mode = M_IN_TABLE_BODY;
+        return true;
+    }
+    if (start(t, "caption col colgroup tbody tfoot thead tr") || end(t, "table"))
+    {
+        if (!inScope("tr", SC_TABLE))
+        {
+            parseError(t, std::string("Stray ") + (t.type == Token::START ? "start" : "end") + " tag \"" + t.name + "\".");
+            return true;
+        }
+        clearStackBackTo("tr template html");
+        pop();
+        mode = M_IN_TABLE_BODY;
+        return false;
+    }
+    if (end(t, "tbody tfoot thead"))
+    {
+        if (!inScope(t.name.c_str(), SC_TABLE))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        if (!inScope("tr", SC_TABLE))
+            return true;
+        clearStackBackTo("tr template html");
+        pop();
+        mode = M_IN_TABLE_BODY;
+        return false;
+    }
+    if (end(t, "body caption col colgroup html td th"))
+    {
+        parseError(t, "Stray end tag \"" + t.name + "\".");
+        return true;
+    }
+    return rules(M_IN_TABLE, t);
+}
+
+bool Parser::inCell(Token &t)
+{
+    if (end(t, "td th"))
+    {
+        if (!inScope(t.name.c_str(), SC_TABLE))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        generateImpliedEnd(nullptr);
+        if (!isHtml(current(), t.name.c_str()))
+            openElementsError(t, t.name.c_str());
+        popUntil(t.name.c_str());
+        clearFormattingToMarker();
+        mode = M_IN_ROW;
+        return true;
+    }
+    if (start(t, "caption col colgroup tbody td tfoot th thead tr"))
+    {
+        if (!inScope("td th", SC_TABLE))
+        {
+            parseError(t, "Stray start tag \"" + t.name + "\".");
+            return true;
+        }
+        closeCell();
+        return false;
+    }
+    if (end(t, "body caption col colgroup html"))
+    {
+        parseError(t, "Stray end tag \"" + t.name + "\".");
+        return true;
+    }
+    if (end(t, "table tbody tfoot thead tr"))
+    {
+        if (!inScope(t.name.c_str(), SC_TABLE))
+        {
+            parseError(t, "Stray end tag \"" + t.name + "\".");
+            return true;
+        }
+        closeCell();
+        return false;
+    }
+    return rules(M_IN_BODY, t);
+}
+
+bool Parser::inTemplate(Token &t)
+{
+    switch (t.type)
+    {
+    case Token::CHARS:
+    case Token::COMMENT:
+    case Token::PI:
+    case Token::DOCTYPE:
+        return rules(M_IN_BODY, t);
+    case Token::START:
+    {
+        if (among(t.name, "base basefont bgsound link meta noframes script style template title"))
+            return rules(M_IN_HEAD, t);
+        int next = M_IN_BODY;
+        if (among(t.name, "caption colgroup tbody tfoot thead"))
+            next = M_IN_TABLE;
+        else if (t.name == "col")
+            next = M_IN_COLUMN_GROUP;
+        else if (t.name == "tr")
+            next = M_IN_TABLE_BODY;
+        else if (t.name == "td" || t.name == "th")
+            next = M_IN_ROW;
+        templateModes.pop_back();
+        templateModes.push_back(next);
+        mode = next;
+        return false;
+    }
+    case Token::END:
+        if (t.name == "template")
+            return rules(M_IN_HEAD, t);
+        parseError(t, "Stray end tag \"" + t.name + "\".");
+        return true;
+    case Token::END_OF_FILE:
+    {
+        bool any = false;
+        for (Node *n : open)
+            if (isHtml(n, "template"))
+                any = true;
+        if (!any)
+            return true;
+        report(t.pos, 1, true, "End of file seen and there were open elements.");
+        for (size_t k = open.size(); k-- > 0 && !isHtml(open[k], "template");)
+            unclosed(open[k]);
+        for (size_t k = open.size(); k-- > 0;)
+            if (isHtml(open[k], "template"))
+            {
+                unclosed(open[k]);
+                break;
+            }
+        popUntil("template");
+        clearFormattingToMarker();
+        templateModes.pop_back();
+        resetMode();
+        return false;
+    }
+    }
+    return true;
+}
+
+bool Parser::afterBody(Token &t)
+{
+    bool consumed = false;
+    switch (t.type)
+    {
+    case Token::CHARS:
+    {
+        size_t k = 0;
+        while (k < t.data.size() && isSpace(t.data[k]))
+            ++k;
+        if (k)
+        {
+            Token space = t;
+            space.data = t.data.substr(0, k);
+            rules(M_IN_BODY, space);
+            t.data.erase(0, k);
+        }
+        consumed = t.data.empty();
+        if (consumed)
+            return true;
+        break;
+    }
+    case Token::COMMENT:
+        insertComment(t, open[0]);
+        return true;
+    case Token::PI:
+        insertPI(t, open[0]);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        break;
+    case Token::END:
+        if (t.name == "html")
+        {
+            if (context)
+            {
+                parseError(t, "Stray end tag \"html\".");
+                return true;
+            }
+            mode = M_AFTER_AFTER_BODY;
+            return true;
+        }
+        break;
+    case Token::END_OF_FILE:
+        return true;
+    }
+    if (t.type == Token::CHARS)
+        report(t.pos, 1, true, "Non-space character after body.");
+    else
+        parseError(t, std::string("Stray ") + (t.type == Token::START ? "start" : "end") + " tag \"" + t.name + "\".");
+    mode = M_IN_BODY;
+    return false;
+}
+
+bool Parser::inFrameset(Token &t)
+{
+    switch (t.type)
+    {
+    case Token::CHARS:
+    {
+        std::string space;
+        bool other = false;
+        for (char c : t.data)
+            if (isSpace(c))
+                space += c;
+            else
+                other = true;
+        insertChars(space);
+        if (other)
+            report(t.pos, 1, true, "Non-space character in \"frameset\".");
+        return true;
+    }
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        if (t.name == "frameset")
+        {
+            insertHtml(t);
+            return true;
+        }
+        if (t.name == "frame")
+        {
+            insertHtml(t);
+            pop();
+            t.acknowledged = true;
+            return true;
+        }
+        if (t.name == "noframes")
+            return rules(M_IN_HEAD, t);
+        break;
+    case Token::END:
+        if (t.name == "frameset")
+        {
+            if (current() == open[0])
+            {
+                parseError(t, "Stray end tag \"frameset\".");
+                return true;
+            }
+            pop();
+            if (!context && !isHtml(current(), "frameset"))
+                mode = M_AFTER_FRAMESET;
+            return true;
+        }
+        break;
+    case Token::END_OF_FILE:
+        if (current() != open[0])
+            report(t.pos, 1, true, "End of file seen and there were open elements.");
+        return true;
+    }
+    parseError(t, std::string("Stray ") + (t.type == Token::START ? "start" : "end") + " tag \"" + t.name + "\".");
+    return true;
+}
+
+bool Parser::afterFrameset(Token &t)
+{
+    switch (t.type)
+    {
+    case Token::CHARS:
+    {
+        std::string space;
+        bool other = false;
+        for (char c : t.data)
+            if (isSpace(c))
+                space += c;
+            else
+                other = true;
+        insertChars(space);
+        if (other)
+            report(t.pos, 1, true, "Non-space character after \"frameset\".");
+        return true;
+    }
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        if (t.name == "noframes")
+            return rules(M_IN_HEAD, t);
+        break;
+    case Token::END:
+        if (t.name == "html")
+        {
+            mode = M_AFTER_AFTER_FRAMESET;
+            return true;
+        }
+        break;
+    case Token::END_OF_FILE:
+        return true;
+    }
+    parseError(t, std::string("Stray ") + (t.type == Token::START ? "start" : "end") + " tag \"" + t.name + "\".");
+    return true;
+}
+
+bool Parser::afterAfterBody(Token &t)
+{
+    switch (t.type)
+    {
+    case Token::COMMENT:
+        insertComment(t, document);
+        return true;
+    case Token::PI:
+        insertPI(t, document);
+        return true;
+    case Token::DOCTYPE:
+        return rules(M_IN_BODY, t);
+    case Token::CHARS:
+    {
+        size_t k = 0;
+        while (k < t.data.size() && isSpace(t.data[k]))
+            ++k;
+        if (k)
+        {
+            Token space = t;
+            space.data = t.data.substr(0, k);
+            rules(M_IN_BODY, space);
+            t.data.erase(0, k);
+        }
+        if (t.data.empty())
+            return true;
+        break;
+    }
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        break;
+    case Token::END_OF_FILE:
+        return true;
+    default:
+        break;
+    }
+    if (t.type == Token::CHARS)
+        report(t.pos, 1, true, "Non-space character after body.");
+    else
+        parseError(t, std::string("Stray ") + (t.type == Token::START ? "start" : "end") + " tag \"" + t.name + "\".");
+    mode = M_IN_BODY;
+    return false;
+}
+
+bool Parser::afterAfterFrameset(Token &t)
+{
+    switch (t.type)
+    {
+    case Token::COMMENT:
+        insertComment(t, document);
+        return true;
+    case Token::PI:
+        insertPI(t, document);
+        return true;
+    case Token::DOCTYPE:
+        return rules(M_IN_BODY, t);
+    case Token::CHARS:
+    {
+        size_t k = 0;
+        while (k < t.data.size() && isSpace(t.data[k]))
+            ++k;
+        if (k)
+        {
+            Token space = t;
+            space.data = t.data.substr(0, k);
+            rules(M_IN_BODY, space);
+        }
+        if (k < t.data.size())
+            report(t.pos, 1, true, "Non-space character after \"frameset\".");
+        return true;
+    }
+    case Token::START:
+        if (t.name == "html")
+            return rules(M_IN_BODY, t);
+        if (t.name == "noframes")
+            return rules(M_IN_HEAD, t);
+        break;
+    case Token::END_OF_FILE:
+        return true;
+    default:
+        break;
+    }
+    parseError(t, std::string("Stray ") + (t.type == Token::START ? "start" : "end") + " tag \"" + t.name + "\".");
+    return true;
+}
+
+// ── foreign content ──────────────────────────────────────────────────────
+
+bool Parser::foreign(Token &t)
+{
+    switch (t.type)
+    {
+    case Token::CHARS:
+    {
+        std::string s;
+        for (char c : t.data)
+        {
+            if (c == '\0')
+            {
+                s += "\xEF\xBF\xBD";
+                continue;
+            }
+            if (!isSpace(c))
+                framesetOk = false;
+            s += c;
+        }
+        insertChars(s);
+        return true;
+    }
+    case Token::COMMENT:
+        insertComment(t, nullptr);
+        return true;
+    case Token::PI:
+        insertPI(t, nullptr);
+        return true;
+    case Token::DOCTYPE:
+        report(t.pos, 9, true, "Stray doctype.");
+        return true;
+    case Token::START:
+    {
+        bool breakout =
+            among(t.name, "b big blockquote body br center code dd div dl dt em embed h1 h2 h3 h4 h5 h6 head hr i "
+                          "img li listing menu meta nobr ol p pre ruby s small span strong strike sub sup table tt "
+                          "u ul var");
+        if (t.name == "font")
+            for (const Attr &a : t.attrs)
+                if (a.name == "color" || a.name == "face" || a.name == "size")
+                    breakout = true;
+        if (breakout)
+        {
+            parseError(t, "HTML start tag \"" + t.name + "\" in a foreign namespace context.");
+            while (!open.empty() && !mathmlTextIntegration(current()) && !htmlIntegration(current()) &&
+                   current()->ns != NS_HTML)
+                pop();
+            return rules(mode, t);
+        }
+        Node *acn = adjustedCurrent();
+        int ns = acn->ns;
+        if (ns == NS_MATHML)
+            adjustMathMLAttrs(t);
+        if (ns == NS_SVG)
+        {
+            adjustSvgName(t);
+            adjustSvgAttrs(t);
+        }
+        adjustForeignAttrs(t);
+        insertForeign(t, ns);
+        if (t.selfClosing)
+        {
+            pop();
+            t.acknowledged = true;
+        }
+        return true;
+    }
+    case Token::END:
+    {
+        if (t.name == "br" || t.name == "p")
+        {
+            parseError(t, "HTML end tag \"" + t.name + "\" in a foreign namespace context.");
+            while (!open.empty() && !mathmlTextIntegration(current()) && !htmlIntegration(current()) &&
+                   current()->ns != NS_HTML)
+                pop();
+            return rules(mode, t);
+        }
+        if (t.name == "script" && current() && current()->ns == NS_SVG && current()->name == "script")
+        {
+            pop();
+            return true;
+        }
+        size_t k = open.size() - 1;
+        if (lower(open[k]->name) != t.name)
+            parseError(t, "End tag \"" + t.name + "\" did not match the name of the current open element (\"" +
+                              open[k]->name + "\").");
+        while (true)
+        {
+            if (k == 0)
+                return true;
+            if (lower(open[k]->name) == t.name)
+            {
+                popTo(k);
+                return true;
+            }
+            --k;
+            if (open[k]->ns == NS_HTML)
+                return rules(mode, t);
+        }
+    }
+    default:
+        return true;
+    }
+}
+
+void Parser::finish()
+{
+    while (!open.empty())
+        pop();
+    for (size_t k = 0; k < pendingSelects.size(); ++k)
+        updateSelectSelectedcontents(pendingSelects[k]);
+    pendingSelects.clear();
+    if (context)
+        return;
+    for (Node *k : document->kids)
+        if (k->type == N_ELEMENT)
+            htmlEl = k;
+    if (!htmlEl)
+        return;
+    for (Node *k : htmlEl->kids)
+    {
+        if (isHtml(k, "head") && !headEl)
+            headEl = k;
+        if (isHtml(k, "body"))
+            bodyEl = k;
+    }
+}
+
+} // namespace html

@@ -1,9 +1,11 @@
 // quantum: cpp
 #pragma once
-// CSS front-end internals: the tokens of CSS Syntax Level 3 (CssParse.sa)
-// and the checks the parser runs on selectors and declarations (CssCheck.sa).
+// CSS front-end internals: the tokens of CSS Syntax Level 3 (CssParse.sa),
+// the checks the parser runs on selectors, declarations and at-rules
+// (CssCheck.sa), and the value grammars they use (CssGrammar.sa).
 #include "CssMain.h.sa"
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -77,5 +79,59 @@ bool checkSelector(const std::vector<Tok> &toks, size_t from, size_t to, const T
 // Checks the selectors of a keyframe ("from", "to", "50%", "entry 10%")
 bool checkKeyframeSelector(const std::vector<Tok> &toks, size_t from, size_t to, const Tok &brace,
                            std::vector<Problem> &problems);
+
+// Checks a descriptor of an at-rule (@font-face's src, @property's syntax);
+// false when a browser would drop it
+bool checkDescriptor(const std::vector<Tok> &toks, const Tok &nameTok, const std::string &atRule,
+                     const std::string &name, size_t from, size_t to, std::vector<Problem> &problems);
+
+// Checks the prelude of an at-rule, tokens [from, to), against `grammar`
+bool checkPrelude(const std::vector<Tok> &toks, const Tok &at, const std::string &name, const std::string &grammar,
+                  size_t from, size_t to, std::vector<Problem> &problems);
+
+// " Did you mean "x"?" for the closest of `names`, or ""
+std::string suggest(const std::string &word, const std::set<std::string> &names);
+
+// ── value grammars (CssGrammar.sa), from MDN's CSS data (generated/CssData.sa) ──
+
+// Where a value stops matching its grammar
+struct Mismatch
+{
+    const Tok *at = nullptr; // the first token that does not fit; nullptr: the value ends too soon
+    bool complete = false;   // the tokens before `at` already make a whole value
+};
+
+// Whether tokens [from, to) match `grammar` (CSS value definition syntax)
+bool matchGrammar(const std::string &grammar, const std::vector<Tok> &toks, size_t from, size_t to, Mismatch &why);
+
+// A property's grammar (nullptr: no such property) and status (standard,
+// experimental, nonstandard, obsolete); every property's name
+const std::string *propertyGrammar(const std::string &name);
+std::string propertyStatus(const std::string &name);
+const std::set<std::string> &propertyNames();
+
+// The keywords a grammar accepts, for "Did you mean"
+std::set<std::string> grammarKeywords(const std::string &grammar);
+
+// An at-rule: the grammar of its prelude (when it is a statement, and when a
+// block follows), and what its block holds: none, group, group-or-none,
+// descriptors, page, keyframes, feature-values, declarations
+struct AtRuleInfo
+{
+    std::string prelude, blockPrelude, block;
+};
+const AtRuleInfo *atRuleInfo(const std::string &name);
+std::set<std::string> atRuleNames();
+const std::string *descriptorGrammar(const std::string &atRule, const std::string &name);
+std::set<std::string> descriptorNames(const std::string &atRule);
+
+// Whether `name` is a pseudo-class (or with `element`, a pseudo-element),
+// written as a function (`function`) or not; `args`: its arguments' grammar
+bool knownPseudo(bool element, const std::string &name, bool function, std::string &args);
+std::set<std::string> pseudoNames(bool element);
+
+// A unit's type ("length", "angle" ...; "" for no unit), and the units of a type ("": all)
+std::string unitOf(const std::string &unit);
+std::set<std::string> unitNames(const std::string &type);
 
 } // namespace css

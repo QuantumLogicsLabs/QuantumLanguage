@@ -2685,8 +2685,10 @@ public:
         // (qualified) name, maybe with template args
         auto e = mk(EK::Name, line);
         std::vector<std::vector<TArg>> allTargs;
+        size_t nameTok = p_; // the last component's token, for "is it a type?"
         while (true)
         {
+            nameTok = p_;
             std::string n = ident();
             e->name.push_back(n);
             allTargs.emplace_back();
@@ -2734,7 +2736,7 @@ public:
         e->targs = allTargs.back();
         e->scopeTargs = allTargs; // per component: X<T>::f keeps X's
         // A type used as a value: T(args) / T{args}
-        bool isType = e->name.size() > 1 ? qualifiedType(e->name.back()) : unqualType(t_[p_ - 1]);
+        bool isType = e->name.size() > 1 ? qualifiedType(e->name.back()) : unqualType(t_[nameTok]);
         if (isType && (is("(") || is("{")))
         {
             auto ty = std::make_shared<TypeName>();

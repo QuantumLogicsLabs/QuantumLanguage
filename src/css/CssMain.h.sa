@@ -42,4 +42,8 @@ struct Result
 };
 Result compile(const std::string &source, const std::string &path);
 
+// Conformance testing (qrun --css-values BATCH): each line of the batch is
+// "property<TAB>value"; prints "ok", or "error<TAB>message", per line
+int runValueBatch(const std::string &path);
+
 } // namespace css
