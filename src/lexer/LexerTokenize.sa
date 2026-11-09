@@ -531,9 +531,61 @@ std::vector<Token> Lexer::tokenize()
     int bracketDepth = 0;      // track ( { [ depth — never emit INDENT/DEDENT inside these
     int parenBracketDepth = 0; // track ( [ depth only — entirely drop NEWLINE inside these
 
+    // Python blocks nested in a { } block (mixed syntax: `fn f() { while x: ... }`,
+    // and Ruby `do |x| ... end` blocks, which the dialect pass turns into
+    // `each(fn(x) { ... })`). Each open brace keeps its own stack of the indented
+    // blocks opened inside it. Line starts come from the raw tokens, because
+    // NEWLINE is dropped inside the ( ) of a call that a brace may sit in. A
+    // colon opens a block only when its statement starts with a block keyword,
+    // so dict literals, `case 1:`, `public:` and ternaries are untouched.
+    std::vector<char> openKinds;              // open brackets, innermost last: ( [ {
+    std::vector<std::vector<int>> openIndents; // per open bracket; used for { only
+    bool atStmtStart = true;
+    TokenType stmtType = TokenType::NEWLINE;
+    int stmtLine = 1;
+    bool stmtHasQuestion = false;
+    auto opensBlockInBraces = [](TokenType t) -> bool
+    {
+        switch (t)
+        {
+        case TokenType::IF:
+        case TokenType::ELIF:
+        case TokenType::ELSE:
+        case TokenType::WHILE:
+        case TokenType::FOR:
+        case TokenType::TRY:
+        case TokenType::EXCEPT:
+        case TokenType::FINALLY:
+        case TokenType::WITH:
+        case TokenType::FN:
+        case TokenType::DEF:
+        case TokenType::CLASS:
+            return true;
+        default:
+            return false;
+        }
+    };
+
     for (size_t i = 0; i < rawTokens.size(); ++i)
     {
         Token &tok = rawTokens[i];
+
+        // First token of a line directly inside a { } block: close the Python
+        // blocks of that brace which this line's indentation leaves.
+        bool inBrace = !openKinds.empty() && openKinds.back() == '{';
+        bool lineStart = tok.type != TokenType::NEWLINE && tok.type != TokenType::EOF_TOKEN &&
+                         (i == 0 || rawTokens[i - 1].type == TokenType::NEWLINE);
+        if (inBrace && lineStart)
+        {
+            std::vector<int> &stack = openIndents.back();
+            int ind = indentOf[tok.line];
+            while (!stack.empty() && ind < stack.back())
+            {
+                stack.pop_back();
+                tokens.emplace_back(TokenType::DEDENT, "DEDENT", tok.line, tok.col);
+            }
+            atStmtStart = true;
+        }
 
         // Track bracket/brace/paren depth
         if (tok.type == TokenType::LBRACE ||
@@ -543,6 +595,10 @@ std::vector<Token> Lexer::tokenize()
             bracketDepth++;
             if (tok.type != TokenType::LBRACE)
                 parenBracketDepth++;
+            openKinds.push_back(tok.type == TokenType::LBRACE     ? '{'
+                                : tok.type == TokenType::LBRACKET ? '['
+                                                                  : '(');
+            openIndents.emplace_back();
         }
         else if (tok.type == TokenType::RBRACE ||
                  tok.type == TokenType::RBRACKET ||
@@ -551,10 +607,58 @@ std::vector<Token> Lexer::tokenize()
             bracketDepth = std::max(0, bracketDepth - 1);
             if (tok.type != TokenType::RBRACE)
                 parenBracketDepth = std::max(0, parenBracketDepth - 1);
+            if (!openKinds.empty())
+            {
+                // close the Python blocks still open inside this brace
+                for (size_t k = openIndents.back().size(); k > 0; --k)
+                    tokens.emplace_back(TokenType::DEDENT, "DEDENT", tok.line, tok.col);
+                openKinds.pop_back();
+                openIndents.pop_back();
+            }
         }
 
         if (tok.type == TokenType::NEWLINE && parenBracketDepth > 0)
             continue; // Drop NEWLINE entirely inside ( ) and [ ]
+
+        // Remember how the current statement starts (for colons inside braces)
+        if (tok.type == TokenType::NEWLINE || tok.type == TokenType::SEMICOLON ||
+            tok.type == TokenType::LBRACE || tok.type == TokenType::RBRACE)
+            atStmtStart = true;
+        else if (atStmtStart)
+        {
+            atStmtStart = false;
+            stmtType = tok.type;
+            stmtLine = tok.line;
+            stmtHasQuestion = false;
+        }
+        if (tok.type == TokenType::QUESTION)
+            stmtHasQuestion = true;
+
+        // COLON + NEWLINE + deeper indent directly inside a { } block → open Python block
+        if (tok.type == TokenType::COLON && inBrace && opensBlockInBraces(stmtType) && !stmtHasQuestion)
+        {
+            size_t j = i + 1;
+            while (j < rawTokens.size() && rawTokens[j].type == TokenType::NEWLINE)
+                ++j;
+            if (j > i + 1 && j < rawTokens.size() && rawTokens[j].type != TokenType::EOF_TOKEN)
+            {
+                std::vector<int> &stack = openIndents.back();
+                int nextIndent = indentOf[rawTokens[j].line];
+                int curIndent = stack.empty() ? indentOf[stmtLine] : stack.back();
+                if (nextIndent > curIndent && nextIndent > indentOf[stmtLine])
+                {
+                    tokens.push_back(tok);
+                    if (parenBracketDepth == 0) // NEWLINE is dropped inside ( ) and [ ]
+                        for (size_t k = i + 1; k < j; ++k)
+                            tokens.push_back(rawTokens[k]);
+                    i = j - 1;
+                    atStmtStart = true;
+                    stack.push_back(nextIndent);
+                    tokens.emplace_back(TokenType::INDENT, "INDENT", tok.line, tok.col);
+                    continue;
+                }
+            }
+        }
 
         // COLON followed by NEWLINE + deeper indent → open Python block
         // But NOT inside brackets/braces/parens (dict literal, array, call args)

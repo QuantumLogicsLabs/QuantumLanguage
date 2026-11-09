@@ -460,6 +460,19 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
             R = QuantumValue((double)R.asLong());
     }
 
+    // Python / Ruby string formatting: "year %d: %.2f" % (y, balance).
+    // A tuple / array gives one value per specifier; anything else is the one
+    // value. A string without '%' stays numeric ("10" % 3 is 1, as in JS).
+    if (op == Op::MOD && L.isString() && L.asString().find('%') != std::string::npos)
+    {
+        std::vector<QuantumValue> args;
+        if (R.isArray())
+            args.assign(R.asArray()->begin(), R.asArray()->end());
+        else
+            args.push_back(R);
+        return QuantumValue(quantumPrintf(L.asString(), args, 0));
+    }
+
     // Numeric arithmetic
     double l = 0, r = 0;
     bool hasNum = L.isNumber() || R.isNumber();

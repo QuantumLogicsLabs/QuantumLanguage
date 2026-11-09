@@ -2348,19 +2348,30 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
 
     code = rbConvertRaiseComma(code);
 
+    // `puts x` -> `print(x)`. A C-style `;` ending the statement
+    // (`puts "hi";` in mixed code) stays outside the parens.
+    auto wrapCall = [](const std::string &callee, const std::string &argIn) {
+      std::string arg = trimCopy(argIn);
+      bool semi = false;
+      while (!arg.empty() && arg.back() == ';') {
+        arg.pop_back();
+        semi = true;
+      }
+      return callee + "(" + trimCopy(arg) + ")" + (semi ? ";" : "");
+    };
     if (startsWith(code, "puts("))
       code = "print" + code.substr(4);
     else if (startsWith(code, "puts "))
-      code = "print(" + trimCopy(code.substr(5)) + ")";
+      code = wrapCall("print", code.substr(5));
     else if (startsWith(code, "print "))
-      code = "print(" + trimCopy(code.substr(6)) + ")";
+      code = wrapCall("print", code.substr(6));
     else {
       // Ruby also allows paren-less calls on a receiver, e.g.
       // `file.puts "text"` — wrap the argument in parens.
       static const std::regex dotPutsRe("^(.+\\.puts)\\s+([^(].*)$");
       std::smatch m;
       if (std::regex_match(code, m, dotPutsRe))
-        code = m[1].str() + "(" + m[2].str() + ")";
+        code = wrapCall(m[1].str(), m[2].str());
     }
 
     // Ruby's `next` skips to the next iteration. How that is spelled

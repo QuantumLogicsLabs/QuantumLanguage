@@ -37,6 +37,100 @@ extern std::vector<std::string> g_scriptArgv;
 #define M_E 2.71828182845904523536
 #endif
 
+// ── printf / sprintf / "fmt" % args (C-style format strings) ─────────────────
+// Supported specifiers: %d %i %u %f %F %e %E %g %G %s %c %x %X %o %% and
+// flags/width/precision, e.g.  printf("%d + %d = %d\n", a, b, a+b),
+// sprintf("%05.2f", 3.14), "year %d: %.2f" % (y, balance)
+std::string quantumPrintf(const std::string &fmt, const std::vector<QuantumValue> &args, size_t argStart)
+{
+    std::string out;
+    size_t argIdx = argStart;
+    for (size_t i = 0; i < fmt.size(); ++i)
+    {
+        if (fmt[i] != '%')
+        {
+            out += fmt[i];
+            continue;
+        }
+        ++i;
+        if (i >= fmt.size())
+            break;
+        if (fmt[i] == '%')
+        {
+            out += '%';
+            continue;
+        }
+
+        // Collect optional flags, width, precision
+        std::string spec = "%";
+        while (i < fmt.size() && (fmt[i] == '-' || fmt[i] == '+' ||
+                                  fmt[i] == ' ' || fmt[i] == '0' || fmt[i] == '#'))
+            spec += fmt[i++];
+        while (i < fmt.size() && std::isdigit((unsigned char)fmt[i]))
+            spec += fmt[i++];
+        if (i < fmt.size() && fmt[i] == '.')
+        {
+            spec += fmt[i++];
+            while (i < fmt.size() && std::isdigit((unsigned char)fmt[i]))
+                spec += fmt[i++];
+        }
+        if (i >= fmt.size())
+            break;
+
+        char conv = fmt[i];
+        spec += conv;
+
+        QuantumValue arg;
+        if (argIdx < args.size())
+            arg = args[argIdx++];
+
+        char buf[128] = {};
+        switch (conv)
+        {
+        case 'd':
+        case 'i':
+            std::snprintf(buf, sizeof(buf), spec.c_str(), (long long)(arg.isNumber() ? arg.asNumber() : 0.0));
+            break;
+        case 'u':
+            std::snprintf(buf, sizeof(buf), spec.c_str(), (unsigned long long)(arg.isNumber() ? arg.asNumber() : 0.0));
+            break;
+        case 'f':
+        case 'F':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G':
+            std::snprintf(buf, sizeof(buf), spec.c_str(), arg.isNumber() ? arg.asNumber() : 0.0);
+            break;
+        case 'x':
+        case 'X':
+        case 'o':
+            std::snprintf(buf, sizeof(buf), spec.c_str(), (unsigned long long)(arg.isNumber() ? arg.asNumber() : 0.0));
+            break;
+        case 'c':
+        {
+            char ch = arg.isNumber() ? (char)(int)arg.asNumber()
+                                     : (arg.isString() && !arg.asString().empty() ? arg.asString()[0] : '?');
+            std::snprintf(buf, sizeof(buf), spec.c_str(), ch);
+            break;
+        }
+        case 's':
+        {
+            std::string sv = arg.isNil() ? "(nil)" : arg.toString();
+            std::vector<char> tmp(sv.size() + 256);
+            std::snprintf(tmp.data(), tmp.size(), spec.c_str(), sv.c_str()); // e.g. "%-10s"
+            out += tmp.data();
+            continue;
+        }
+        default:
+            out += spec;
+            continue;
+        }
+        out += buf;
+    }
+    return out;
+}
+
 // One engine behind random.*, randint(), rand() and Math.random(), so that
 // random.seed(n) makes the whole family reproducible.
 static std::mt19937_64 &sharedRng()
@@ -797,97 +891,7 @@ void VM::registerNatives()
     auto quantumFormat = [](const std::string &fmt,
                             const std::vector<QuantumValue> &args,
                             size_t argStart) -> std::string
-    {
-        std::string out;
-        size_t argIdx = argStart;
-        for (size_t i = 0; i < fmt.size(); ++i)
-        {
-            if (fmt[i] != '%')
-            {
-                out += fmt[i];
-                continue;
-            }
-            ++i;
-            if (i >= fmt.size())
-                break;
-            if (fmt[i] == '%')
-            {
-                out += '%';
-                continue;
-            }
-
-            // Collect optional flags, width, precision
-            std::string spec = "%";
-            while (i < fmt.size() && (fmt[i] == '-' || fmt[i] == '+' ||
-                                      fmt[i] == ' ' || fmt[i] == '0' || fmt[i] == '#'))
-                spec += fmt[i++];
-            while (i < fmt.size() && std::isdigit((unsigned char)fmt[i]))
-                spec += fmt[i++];
-            if (i < fmt.size() && fmt[i] == '.')
-            {
-                spec += fmt[i++];
-                while (i < fmt.size() && std::isdigit((unsigned char)fmt[i]))
-                    spec += fmt[i++];
-            }
-            if (i >= fmt.size())
-                break;
-
-            char conv = fmt[i];
-            spec += conv;
-
-            QuantumValue arg;
-            if (argIdx < args.size())
-                arg = args[argIdx++];
-
-            char buf[128] = {};
-            switch (conv)
-            {
-            case 'd':
-            case 'i':
-                std::snprintf(buf, sizeof(buf), spec.c_str(), (long long)(arg.isNumber() ? arg.asNumber() : 0.0));
-                break;
-            case 'u':
-                std::snprintf(buf, sizeof(buf), spec.c_str(), (unsigned long long)(arg.isNumber() ? arg.asNumber() : 0.0));
-                break;
-            case 'f':
-            case 'F':
-            case 'e':
-            case 'E':
-            case 'g':
-            case 'G':
-                std::snprintf(buf, sizeof(buf), spec.c_str(), arg.isNumber() ? arg.asNumber() : 0.0);
-                break;
-            case 'x':
-            case 'X':
-            case 'o':
-                std::snprintf(buf, sizeof(buf), spec.c_str(), (unsigned long long)(arg.isNumber() ? arg.asNumber() : 0.0));
-                break;
-            case 'c':
-            {
-                char ch = arg.isNumber() ? (char)(int)arg.asNumber()
-                                         : (arg.isString() && !arg.asString().empty() ? arg.asString()[0] : '?');
-                std::snprintf(buf, sizeof(buf), spec.c_str(), ch);
-                break;
-            }
-            case 's':
-            {
-                std::string sv = arg.isNil() ? "(nil)" : arg.toString();
-                // Replace %s spec with correct snprintf call
-                std::string fmtS = spec; // e.g. "%-10s"
-                // snprintf with string
-                std::vector<char> tmp(sv.size() + 256);
-                std::snprintf(tmp.data(), tmp.size(), fmtS.c_str(), sv.c_str());
-                out += tmp.data();
-                continue;
-            }
-            default:
-                out += spec;
-                continue;
-            }
-            out += buf;
-        }
-        return out;
-    };
+    { return quantumPrintf(fmt, args, argStart); };
 
     reg("printf", [quantumFormat](std::vector<QuantumValue> args) -> QuantumValue
         {

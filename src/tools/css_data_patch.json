@@ -19,7 +19,9 @@
     "syntax": { "syntax": "<string>", "comment": "@property's syntax descriptor (CSS Properties and Values API)" },
     "unicode-range": { "syntax": "<urange>#", "comment": "@font-face's unicode-range (CSS Fonts 4): the old production name" },
     "unicode-range-token": { "syntax": "<urange>", "comment": "CSS Syntax 3 <urange>" },
-    "language-code": { "syntax": "[ <ident> | <string> ]#", "comment": ":lang() takes a list of language ranges (Selectors 4, 7.2)" }
+    "language-code": { "syntax": "[ <ident> | <string> ]#", "comment": ":lang() takes a list of language ranges (Selectors 4, 7.2)" },
+    "size-feature": { "syntax": "<mf-plain> | <mf-boolean> | <mf-range>", "comment": "CSS Conditional 5: a container size feature has a media feature's syntax inside the parens of <query-in-parens>, as in @container (min-width: 30rem); mdn-data gives <media-query-list>" },
+    "scroll-state-feature": { "syntax": "<mf-plain> | <mf-boolean> | <mf-range>", "comment": "CSS Conditional 5: scroll-state(stuck: top) has a media feature's syntax; mdn-data gives <media-query-list>" }
   },
 
   "properties": {},
