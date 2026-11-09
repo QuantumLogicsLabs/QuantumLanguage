@@ -154,6 +154,10 @@
 #pragma quantum_tu
 #include "../../css/CssCheck.sa"
 #pragma quantum_tu
+#include "../../css/CssGrammar.sa"
+#pragma quantum_tu
+#include "../../generated/CssData.sa"
+#pragma quantum_tu
 #include "../../html/Html.sa"
 #pragma quantum_tu
 #include "../../html/HtmlTokenizer.sa"

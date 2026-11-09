@@ -1023,7 +1023,7 @@ const char *const kTypes[] = {
     "single-transition", "[ none | <single-transition-property> ] || <time> || <easing-function> || <time> || <transition-behavior-value>",
     "single-transition-property", "all | <custom-ident>",
     "size", "closest-side | farthest-side | closest-corner | farthest-corner | <length> | <length-percentage>{2}",
-    "size-feature", "<media-query-list>",
+    "size-feature", "<mf-plain> | <mf-boolean> | <mf-range>",
     "skew()", "skew( [ <angle> | <zero> ] , [ <angle> | <zero> ]\? )",
     "skewX()", "skewX( [ <angle> | <zero> ] )",
     "skewY()", "skewY( [ <angle> | <zero> ] )",

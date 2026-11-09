@@ -1031,10 +1031,39 @@ fn lexTokenize(src) {
     return lexIndentPass(src, raw, lx["line"])
 }
 
+# The index of the first token of the statement now being read (len(tokens)
+# when there is none). A line break outside ( [ also ends a statement: inside
+# parentheses the NEWLINE tokens themselves are dropped.
+fn lexStatementStart(tokens) {
+    let k = len(tokens)
+    let depth = 0
+    while k > 0 {
+        let t = tokens[k - 1][0]
+        if t == T_NEWLINE or t == T_LBRACE or t == T_RBRACE or t == T_SEMICOLON or t == T_INDENT or t == T_DEDENT {
+            break
+        }
+        if depth == 0 and k < len(tokens) and tokens[k - 1][2] != tokens[k][2] {
+            break
+        }
+        if t == T_RPAREN or t == T_RBRACKET {
+            depth = depth + 1
+        } else if (t == T_LPAREN or t == T_LBRACKET) and depth > 0 {
+            depth = depth - 1
+        }
+        k = k - 1
+    }
+    return k
+}
+
+fn lexIsBlockHeader(t) {
+    return t == T_IF or t == T_ELIF or t == T_ELSE or t == T_WHILE or t == T_FOR or t == T_DEF or t == T_FN or t == T_FUNCTION or t == T_CLASS or t == T_TRY or t == T_EXCEPT or t == T_FINALLY or t == T_WITH
+}
+
 # ── Python-style INDENT / DEDENT ─────────────────────────────────────────────
 # A COLON followed by a NEWLINE and a more-indented line opens a block; a
-# less-indented line closes blocks. Never inside ( [ {; NEWLINEs inside ( [
-# are dropped entirely.
+# less-indented line closes blocks. Not inside ( [ { — except that a Python
+# block header in a brace block opens one there; NEWLINEs inside ( [ are
+# dropped entirely.
 fn lexIndentPass(src, raw, lastLine) {
     let indentOf = []
     let k = 0
@@ -1071,6 +1100,8 @@ fn lexIndentPass(src, raw, lastLine) {
     let stack = [0]
     let bracketDepth = 0
     let parenBracketDepth = 0
+    # the open brackets, innermost last: [type, len(stack) when it opened]
+    let open = []
     let count = len(raw)
     i = 0
     while i < count {
@@ -1081,6 +1112,7 @@ fn lexIndentPass(src, raw, lastLine) {
             if t != T_LBRACE {
                 parenBracketDepth = parenBracketDepth + 1
             }
+            open.push([t, len(stack)])
         } else if t == T_RBRACE or t == T_RBRACKET or t == T_RPAREN {
             if bracketDepth > 0 {
                 bracketDepth = bracketDepth - 1
@@ -1088,8 +1120,69 @@ fn lexIndentPass(src, raw, lastLine) {
             if t != T_RBRACE and parenBracketDepth > 0 {
                 parenBracketDepth = parenBracketDepth - 1
             }
+            if len(open) > 0 {
+                # blocks opened inside this bracket end with it
+                let mark = open[len(open) - 1][1]
+                while len(stack) > mark {
+                    stack.pop()
+                    tokens.push(lexTok(T_DEDENT, "DEDENT", tok[2], tok[3]))
+                }
+                open.pop()
+            }
         }
-        if t == T_NEWLINE and parenBracketDepth > 0 {
+        let inBrace = len(open) > 0 and open[len(open) - 1][0] == T_LBRACE
+        # NEWLINEs inside ( [ are dropped — but not in an indented block opened
+        # in a brace block within them (`xs.each(fn(w) {` ...)
+        let indentedInBrace = inBrace and len(stack) > open[len(open) - 1][1]
+        if t == T_NEWLINE and parenBracketDepth > 0 and not indentedInBrace {
+            i = i + 1
+            continue
+        }
+        # A Python block header (`if c:`, `for x in xs:`, `else:` ...) inside a
+        # brace block opens an indented block too; other colons there
+        # (`case 1:`, `public:`, dict entries) never do.
+        if t == T_COLON and bracketDepth > 0 and inBrace {
+            let h = lexStatementStart(tokens)
+            if h < len(tokens) and lexIsBlockHeader(tokens[h][0]) {
+                let j = i + 1
+                while j < count and raw[j][0] == T_NEWLINE {
+                    j = j + 1
+                }
+                if j > i + 1 and j < count and raw[j][0] != T_EOF {
+                    let nextIndent = indentOf[raw[j][2]]
+                    if nextIndent > indentOf[tokens[h][2]] and nextIndent > stack[len(stack) - 1] {
+                        tokens.push(tok)
+                        let m = i + 1
+                        while m < j {
+                            tokens.push(raw[m])
+                            m = m + 1
+                        }
+                        i = j
+                        stack.push(nextIndent)
+                        tokens.push(lexTok(T_INDENT, "INDENT", tok[2], tok[3]))
+                        continue
+                    }
+                }
+            }
+            tokens.push(tok)
+            i = i + 1
+            continue
+        }
+        # ... and its end: a less indented line inside the same brace
+        if t == T_NEWLINE and bracketDepth > 0 and inBrace and len(stack) > open[len(open) - 1][1] {
+            tokens.push(tok)
+            let j = i + 1
+            while j < count and raw[j][0] == T_NEWLINE {
+                j = j + 1
+            }
+            if j < count and raw[j][0] != T_EOF {
+                let nextIndent = indentOf[raw[j][2]]
+                let mark = open[len(open) - 1][1]
+                while len(stack) > mark and nextIndent < stack[len(stack) - 1] {
+                    stack.pop()
+                    tokens.push(lexTok(T_DEDENT, "DEDENT", tok[2], tok[3]))
+                }
+            }
             i = i + 1
             continue
         }

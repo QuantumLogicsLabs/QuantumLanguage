@@ -576,6 +576,12 @@ static bool rbLooksLikeReturnable(const std::string &line) {
   for (auto &p : skip)
     if (startsWith(t, p))
       return false;
+  // a C++ stream statement (`cout << x << endl`) is not a value
+  for (const char *stream : {"cout", "cerr", "cin", "std::cout", "std::cerr", "std::cin"}) {
+    std::string s = stream;
+    if (startsWith(t, s) && (t.size() == s.size() || !rbIsIdentChar(t[s.size()])))
+      return false;
+  }
   if (t.back() == '{')
     return false;
   if (rbFindTopLevelAssign(t) != std::string::npos)
@@ -2348,12 +2354,19 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
 
     code = rbConvertRaiseComma(code);
 
+    // `puts x` → `print(x)`; a `;` ends the argument (`puts x; y = 1`)
+    auto parenless = [](const std::string &arg) {
+      size_t semi = rbFindTopLevel(arg, ";");
+      if (semi == std::string::npos)
+        return "print(" + trimCopy(arg) + ")";
+      return "print(" + trimCopy(arg.substr(0, semi)) + ")" + arg.substr(semi);
+    };
     if (startsWith(code, "puts("))
       code = "print" + code.substr(4);
     else if (startsWith(code, "puts "))
-      code = "print(" + trimCopy(code.substr(5)) + ")";
+      code = parenless(code.substr(5));
     else if (startsWith(code, "print "))
-      code = "print(" + trimCopy(code.substr(6)) + ")";
+      code = parenless(code.substr(6));
     else {
       // Ruby also allows paren-less calls on a receiver, e.g.
       // `file.puts "text"` — wrap the argument in parens.

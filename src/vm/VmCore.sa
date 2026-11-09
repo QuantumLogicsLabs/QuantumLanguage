@@ -246,6 +246,23 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
             R = QuantumValue(jsDateMs(R));
     }
 
+    // Python / Ruby string formatting: "%5.2f %s" % (x, name), "%d" % n.
+    // A tuple or array on the right supplies one argument per conversion.
+    if (op == Op::MOD && L.isString())
+    {
+        QuantumValue fmt = globals->get("sprintf");
+        if (fmt.isNative())
+        {
+            std::vector<QuantumValue> fargs{L};
+            if (R.isArray())
+                for (auto &v : *R.asArray())
+                    fargs.push_back(v);
+            else
+                fargs.push_back(R);
+            return fmt.asNative()->fn(fargs);
+        }
+    }
+
     // STL iterator arithmetic and comparison: v.begin() + n, it - first,
     // it != v.end(), ++it.
     {
