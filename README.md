@@ -477,7 +477,7 @@ Runs every `.sa` file in the directory, prints `PASS` / `FAIL` per file with err
 
 ### The compiler is written in Quantum
 
-Everything under `src/` is Quantum. A file whose first line is `// quantum: cpp` is written in Quantum's C-style syntax; `X.h.sa` declares and `X.sa` defines. Quantum compiles these itself: `qrun src/tools/selfhost/quantumc.sa <file> <out.qbc>` is the whole compiler, compiled by Quantum and running on the Quantum VM. Fed its own source, it reproduces itself byte for byte (`src/tools/bootstrap.sh`).
+Everything under `src/` is Quantum. A file whose first line is `// quantum: cpp` is written in Quantum's C-style syntax; `X.h.sa` declares and `X.sa` defines. Quantum compiles these itself: `qrun src/selfhost/quantumc.sa <file> <out.qbc>` is the whole compiler, compiled by Quantum and running on the Quantum VM. Fed its own source, it reproduces itself byte for byte.
 
 ### Building
 
@@ -487,9 +487,9 @@ build-quantum.bat --verify   :: and check the new qrun rebuilds itself byte for 
 build-quantum.bat --seed     :: and make the new qrun the seed
 ```
 
-No external compiler or toolchain is involved, only Windows' `cmd`. `seed\qrun.exe` is qrun compiled to x86-64 machine code by Quantum's own native backend (`src/native/`). It compiles `src\` (`--native src\tools\selfhost\qrun_all.sa`) into a new qrun, which compiles itself again; that one builds `quantum.exe`, `quantum_stub.exe` and `qpm.exe`. Every tool, the VM included, is native code Quantum generated: there is no outside compiler, assembler or linker anywhere in the chain, and the C runtime functions used are Windows' own (`ucrtbase.dll`). A qrun build takes about 30 seconds.
+No external compiler or toolchain is involved, only Windows' `cmd`. `seed\qrun.exe` is qrun compiled to x86-64 machine code by Quantum's own native backend (`src/native/`). It compiles `src\` (`--native src\selfhost\qrun_all.sa`) into a new qrun, which compiles itself again; that one builds `quantum.exe`, `quantum_stub.exe` and `qpm.exe`. Every tool, the VM included, is native code Quantum generated: there is no outside compiler, assembler or linker anywhere in the chain, and the C runtime functions used are Windows' own (`ucrtbase.dll`). A qrun build takes about 30 seconds.
 
-The build is a fixed point: the qrun built by the seed and the qrun built by itself are byte-identical (`bash src/tools/native_bootstrap.sh` checks this). Any edit under `src\`, the VM runtime included, takes effect through this build; `--seed` then makes it the new seed.
+The build is a fixed point: the qrun built by the seed and the qrun built by itself are byte-identical (`build-quantum.bat --verify` checks this). Any edit under `src\`, the VM runtime included, takes effect through this build; `--seed` then makes it the new seed.
 
 ---
 

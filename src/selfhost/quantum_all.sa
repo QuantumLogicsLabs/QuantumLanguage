@@ -1,6 +1,6 @@
 // quantum: cpp
 // The whole of quantum.exe (compiler, VM, CLI) as one program, for the
-// native backend:  qrun --native src/tools/selfhost/quantum_all.sa quantum.exe
+// native backend:  qrun --native src/selfhost/quantum_all.sa quantum.exe
 // (the same sources CMake builds into quantum; QUANTUM_MODE_COMPILER as there).
 #define QUANTUM_MODE_COMPILER 1
 #include "quantum_sources.sa"

@@ -1,7 +1,7 @@
 // quantum: cpp
 #pragma once
-// MDN's CSS data (generated/CssData.sa, written by src/tools/gen_css_data.py
-// from mdn-data and src/tools/css_data_patch.json). Each table is flat and
+// MDN's CSS data (generated/CssData.sa: mdn-data with corrections, maintained
+// by hand). Each table is flat and
 // ends with nullptr; a row is the given number of strings. Grammars are in
 // the CSS value definition syntax ("<length> | auto").
 

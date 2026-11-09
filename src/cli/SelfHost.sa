@@ -1,7 +1,8 @@
 // quantum: cpp
 // Support for the Quantum-written compiler in src/: the C++ front-end's
-// tokens and bytecode to check it against, and a runner for the bytecode
-// files it writes (qrun --dump-tokens / --emit-qbc / --exec).
+// tokens and bytecode to check it against, a runner for the bytecode
+// files it writes (qrun --dump-tokens / --emit-qbc / --exec), and the
+// writer of src/generated/'s embedded libraries (qrun --embed).
 #include "AstDump.h.sa"
 #include "Cli.h.sa"
 #include "Dialect.h.sa"
@@ -15,10 +16,15 @@
 #include "Vm.h.sa"
 #include "../cpp/Cpp.h.sa"
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -221,4 +227,141 @@ int execBytecodeFile(const std::string &path)
         std::cerr << "[Fatal] " << e.what() << "\n";
         return 1;
     }
+}
+
+// ─── qrun --embed: the libraries the compiler carries inside itself ───────────
+// Writes src/generated/: the text files below as source files defining
+// functions that return them.
+//   lib/cpp/*                  -> CppLibData.sa       cpp::libraryHeaders()
+//   lib/native/*               -> NativeLibData.sa    native::libraryHeaders()
+//   src/java/<package>/**.sa   -> JavaPreludeData.sa  java::preludeSources()
+//     (the Java library: the .sa files in src/java's folders, not the
+//     front-end's own files directly in src/java)
+//   src/dialect/javastyle/*.sa -> JavaStyleData.sa    javastyle::librarySources()
+//   src/js/lib/*.sa            -> JsLibData.sa        js::jsLibrarySources()
+//   src/ruby/lib/*.sa          -> RubyLibData.sa      ruby::librarySources()
+//   src/python/lib/*.sa        -> PyLibData.sa        py::librarySources()
+// (the js/ruby/python lib .sa files hold that language's source). Run from
+// compiler/, then rebuild. A file is rewritten only when its text changes.
+namespace
+{
+std::string embedReadText(const std::string &path)
+{
+    std::ifstream in(path);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+// The files under dir (recursively) whose name ends with `ext` ("" = any),
+// as paths relative to dir with / separators, sorted
+std::vector<std::string> embedListFiles(const std::string &dir, const std::string &ext)
+{
+    std::vector<std::string> out;
+    for (const auto &entry : std::filesystem::recursive_directory_iterator(dir))
+    {
+        if (!entry.is_regular_file())
+            continue;
+        std::string rel = std::filesystem::path(entry.path()).lexically_relative(dir).generic_string();
+        if (!ext.empty() && (rel.size() < ext.size() || rel.compare(rel.size() - ext.size(), ext.size(), ext) != 0))
+            continue;
+        out.push_back(rel);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// key -> text pairs as the body of a function returning them
+std::string embedGenerate(const std::string &from, const std::string &ns, const std::string &fn,
+                          const std::vector<std::pair<std::string, std::string>> &items, const std::string &delim)
+{
+    std::string out = "// quantum: cpp\n";
+    out += "// Generated from " + from + " by qrun --embed. Do not edit.\n";
+    out += "#include <string>\n#include <utility>\n#include <vector>\n\nnamespace " + ns + "\n{\n";
+    out += "const std::vector<std::pair<std::string, std::string>> &" + fn + "()\n{\n";
+    out += "    static const std::vector<std::pair<std::string, std::string>> items = {\n";
+    for (const auto &it : items)
+        out += "        {\"" + it.first + "\", R\"" + delim + "(" + it.second + ")" + delim + "\"},\n";
+    out += "    };\n    return items;\n}\n} // namespace " + ns + "\n";
+    return out;
+}
+
+bool embedWriteIfChanged(const std::string &path, const std::string &text)
+{
+    if (std::filesystem::exists(path) && embedReadText(path) == text)
+        return false;
+    std::ofstream out(path);
+    out << text;
+    return true;
+}
+} // namespace
+
+int embedLibraries()
+{
+    if (!std::filesystem::exists("src/java/lang") || !std::filesystem::exists("src/dialect/javastyle"))
+    {
+        std::cerr << "embed: run from the compiler/ directory\n";
+        return 1;
+    }
+    std::filesystem::create_directories("src/generated");
+    int changed = 0;
+
+    std::vector<std::pair<std::string, std::string>> items;
+    // The C++ and native library headers (lib/) are regenerated only where the
+    // folder exists: without it the checked-in CppLibData.sa / NativeLibData.sa
+    // stay as they are.
+    if (std::filesystem::exists("lib/cpp"))
+    {
+        for (const std::string &f : embedListFiles("lib/cpp", ""))
+            items.push_back({f, embedReadText("lib/cpp/" + f)});
+        changed += embedWriteIfChanged("src/generated/CppLibData.sa",
+                                       embedGenerate("lib/cpp", "cpp", "libraryHeaders", items, "QCPPLIB"));
+        items.clear();
+    }
+    if (std::filesystem::exists("lib/native"))
+    {
+        for (const std::string &f : embedListFiles("lib/native", ""))
+            items.push_back({f, embedReadText("lib/native/" + f)});
+        changed += embedWriteIfChanged("src/generated/NativeLibData.sa",
+                                       embedGenerate("lib/native", "native", "libraryHeaders", items, "QNATIVELIB"));
+        items.clear();
+    }
+
+    for (const std::string &f : embedListFiles("src/java", ".sa"))
+    {
+        if (f.find('/') == std::string::npos)
+            continue; // a file of the front-end itself
+        std::string name = std::filesystem::path(f).stem().string() + ".java";
+        items.push_back({name, embedReadText("src/java/" + f)});
+    }
+    changed += embedWriteIfChanged("src/generated/JavaPreludeData.sa",
+                                   embedGenerate("src/java", "java", "preludeSources", items, "JAVA"));
+
+    items.clear();
+    for (const std::string &f : embedListFiles("src/dialect/javastyle", ".sa"))
+        items.push_back({f, embedReadText("src/dialect/javastyle/" + f)});
+    changed += embedWriteIfChanged("src/generated/JavaStyleData.sa",
+                                   embedGenerate("src/dialect/javastyle", "javastyle", "librarySources", items,
+                                                 "QJAVASTYLE"));
+
+    items.clear();
+    for (const std::string &f : embedListFiles("src/ruby/lib", ".sa"))
+        items.push_back({f, embedReadText("src/ruby/lib/" + f)});
+    changed += embedWriteIfChanged("src/generated/RubyLibData.sa",
+                                   embedGenerate("src/ruby/lib", "ruby", "librarySources", items, "QRUBYLIB"));
+
+    items.clear();
+    for (const std::string &f : embedListFiles("src/python/lib", ".sa"))
+        items.push_back({f, embedReadText("src/python/lib/" + f)});
+    changed += embedWriteIfChanged("src/generated/PyLibData.sa",
+                                   embedGenerate("src/python/lib", "py", "librarySources", items, "QPYLIB"));
+
+    items.clear();
+    for (const std::string &f : embedListFiles("src/js/lib", ".sa"))
+        items.push_back({f, embedReadText("src/js/lib/" + f)});
+    changed += embedWriteIfChanged("src/generated/JsLibData.sa",
+                                   embedGenerate("src/js/lib", "js", "jsLibrarySources", items, "QJSLIB"));
+
+    std::cout << "embed: " << changed << " file(s) updated in src/generated\n";
+    return 0;
 }

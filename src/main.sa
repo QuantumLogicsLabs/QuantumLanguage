@@ -194,6 +194,9 @@ int main(int argc, char *argv[])
         g_scriptArgv.assign(argv + 2, argv + argc);
         return execBytecodeFile(argv[2]);
     }
+    // Rewrites src/generated/ from lib/ and the language libraries in src/
+    if (a1 == "--embed")
+        return embedLibraries();
     // Any supported source file runs natively on the Quantum VM —
     // .js/.py/.rb/.c/.cpp/.java/.html/.css go through Quantum's own front-ends,
     // so no node/python/gcc/g++/javac or browser is required.

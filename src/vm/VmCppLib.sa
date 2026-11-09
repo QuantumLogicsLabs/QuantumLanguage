@@ -45,7 +45,7 @@ void VM::registerCppLibNatives()
         globals->define(name, QuantumValue(n));
     };
 
-    // ── Quantum itself, compiled by Quantum (src/tools/selfhost/quantum.sa) ──
+    // ── Quantum itself, compiled by Quantum (src/selfhost/quantum.sa) ──
     // the running executable's path
     reg("__q_self_exe", [](std::vector<QV>) -> QV { return QV(getExecutablePath()); });
     // runs serialized bytecode (a string of its bytes) in a fresh VM with

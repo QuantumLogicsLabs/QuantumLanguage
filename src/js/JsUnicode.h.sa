@@ -1,7 +1,7 @@
 // quantum: cpp
 #pragma once
 // JavaScript front-end: Unicode properties, case mapping and normalization.
-// The tables are generated (src/tools/gen_js_unicode.py).
+// The tables are in src/generated/JsUnicodeData.sa (Unicode 17.0).
 #include <string>
 #include <vector>
 
