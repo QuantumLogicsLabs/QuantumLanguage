@@ -576,6 +576,12 @@ static bool rbLooksLikeReturnable(const std::string &line) {
   for (auto &p : skip)
     if (startsWith(t, p))
       return false;
+  // a C++ stream statement (`cout << x << endl`) is not a value
+  for (const char *stream : {"cout", "cerr", "cin", "std::cout", "std::cerr", "std::cin"}) {
+    std::string s = stream;
+    if (startsWith(t, s) && (t.size() == s.size() || !rbIsIdentChar(t[s.size()])))
+      return false;
+  }
   if (t.back() == '{')
     return false;
   if (rbFindTopLevelAssign(t) != std::string::npos)
@@ -2348,16 +2354,14 @@ std::string applyRubyDialect(const std::string &source, bool strict) {
 
     code = rbConvertRaiseComma(code);
 
-    // `puts x` -> `print(x)`. A C-style `;` ending the statement
-    // (`puts "hi";` in mixed code) stays outside the parens.
-    auto wrapCall = [](const std::string &callee, const std::string &argIn) {
-      std::string arg = trimCopy(argIn);
-      bool semi = false;
-      while (!arg.empty() && arg.back() == ';') {
-        arg.pop_back();
-        semi = true;
-      }
-      return callee + "(" + trimCopy(arg) + ")" + (semi ? ";" : "");
+    // `puts x` -> `print(x)`. A `;` ends the argument and stays outside the
+    // parens with whatever follows it: `puts "hi";` in mixed code,
+    // `puts x; y = 1`.
+    auto wrapCall = [](const std::string &callee, const std::string &arg) {
+      size_t semi = rbFindTopLevel(arg, ";");
+      if (semi == std::string::npos)
+        return callee + "(" + trimCopy(arg) + ")";
+      return callee + "(" + trimCopy(arg.substr(0, semi)) + ")" + arg.substr(semi);
     };
     if (startsWith(code, "puts("))
       code = "print" + code.substr(4);

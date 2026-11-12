@@ -912,6 +912,38 @@ void VM::registerNatives()
         if (args.empty() || !args[0].isString()) return QuantumValue(std::string(""));
         return QuantumValue(quantumFormat(args[0].asString(), args, 1)); });
 
+    // format(fmt, ...) is sprintf (SYNTAX.md); format(value, spec) with a
+    // non-% first argument is Python's: "[<|>][+][0][width][,][.prec][type]".
+    reg("format", [quantumFormat](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.empty()) return QuantumValue(std::string(""));
+        if (args[0].isString() && (args.size() == 1 || args[0].asString().find('%') != std::string::npos))
+            return QuantumValue(quantumFormat(args[0].asString(), args, 1));
+        std::string spec = args.size() > 1 ? args[1].toString() : "";
+        if (spec.empty()) return QuantumValue(args[0].toString());
+        std::string flags, width, prec;
+        size_t i = 0;
+        if (spec[i] == '<') { flags += '-'; ++i; }
+        else if (spec[i] == '>') ++i;
+        if (i < spec.size() && spec[i] == '+') { flags += '+'; ++i; }
+        if (i < spec.size() && spec[i] == '0') { flags += '0'; ++i; }
+        while (i < spec.size() && std::isdigit((unsigned char)spec[i])) width += spec[i++];
+        if (i < spec.size() && spec[i] == '.')
+        {
+            prec = ".";
+            ++i;
+            while (i < spec.size() && std::isdigit((unsigned char)spec[i])) prec += spec[i++];
+        }
+        char type = i < spec.size() ? spec[i++] : 0;
+        if (i != spec.size() || (type && std::string("dfFeEgGxXobs").find(type) == std::string::npos))
+            return QuantumValue(args[0].toString()); // a spec beyond this subset
+        if (!type)
+            type = args[0].isNumber() ? (prec.empty() ? 's' : 'g') : 's';
+        std::vector<QuantumValue> one{QuantumValue(std::string("%") + flags + width + prec + type), args[0]};
+        if (type == 's') one[1] = QuantumValue(args[0].toString());
+        return QuantumValue(quantumFormat(one[0].asString(), one, 1)); });
+    weakGlobals_.insert("format");
+
     reg("fprintf", [quantumFormat](std::vector<QuantumValue> args) -> QuantumValue
         {
         // fprintf(stderr, fmt, ...) or fprintf(stdout, fmt, ...)
@@ -950,29 +982,49 @@ void VM::registerNatives()
             arr->push_back(QuantumValue(tuple));
         }
         return QuantumValue(arr); });
-    reg("map", [this](std::vector<QuantumValue> args) -> QuantumValue
+    // Python's map(f, it, ...) / filter(f, it) on a .sa file's values. The
+    // function may be a native, a closure (lambda, fn, arrow) or a bound
+    // method; an iterable is an array, a string (its characters) or a dict
+    // (its keys). filter(None, it) keeps the truthy items.
+    auto iterItems = [](const QuantumValue &v, const char *who) -> std::shared_ptr<Array>
+    {
+        if (v.isArray())
+            return v.asArray();
+        auto arr = std::make_shared<Array>();
+        if (v.isString())
+            for (char c : v.asString())
+                arr->push_back(QuantumValue(std::string(1, c)));
+        else if (v.isDict())
+            for (auto &kv : *v.asDict())
+                arr->push_back(QuantumValue(kv.first));
+        else
+            throw TypeError(std::string(who) + "() requires an iterable, got " + v.typeName());
+        return arr;
+    };
+    reg("map", [this, iterItems](std::vector<QuantumValue> args) -> QuantumValue
         {
         if(args.size()<2) throw RuntimeError("map() requires 2 args");
-        auto fn=args[0]; auto &iterable=args[1];
-        if(!iterable.isArray()) throw TypeError("map() requires iterable");
+        std::vector<std::shared_ptr<Array>> its;
+        size_t n=SIZE_MAX;
+        for(size_t i=1;i<args.size();++i) {
+            its.push_back(iterItems(args[i], "map"));
+            n=std::min(n, its.back()->size());
+        }
         auto arr=std::make_shared<Array>();
-        auto *nat=std::get_if<std::shared_ptr<QuantumNative>>(&fn.data);
-        if(!nat) return QuantumValue(arr);
-        for(auto &v:*iterable.asArray()) {
-            QuantumValue result = (*nat)->fn({v});
-            arr->push_back(result);
+        for(size_t k=0;k<n;++k) {
+            std::vector<QuantumValue> callArgs;
+            for(auto &it:its) callArgs.push_back((*it)[k]);
+            arr->push_back(invokeCallable(args[0], callArgs));
         }
         return QuantumValue(arr); });
-    reg("filter", [this](std::vector<QuantumValue> args) -> QuantumValue
+    reg("filter", [this, iterItems](std::vector<QuantumValue> args) -> QuantumValue
         {
         if(args.size()<2) throw RuntimeError("filter() requires 2 args");
-        auto fn=args[0]; auto &iterable=args[1];
-        if(!iterable.isArray()) throw TypeError("filter() requires iterable");
+        auto items=iterItems(args[1], "filter");
         auto arr=std::make_shared<Array>();
-        auto *nat=std::get_if<std::shared_ptr<QuantumNative>>(&fn.data);
-        if(!nat) return QuantumValue(arr);
-        for(auto &v:*iterable.asArray()) {
-            if((*nat)->fn({v}).isTruthy()) arr->push_back(v);
+        for(auto &v:*items) {
+            bool keep = args[0].isNil() ? v.isTruthy() : invokeCallable(args[0], {v}).isTruthy();
+            if(keep) arr->push_back(v);
         }
         return QuantumValue(arr); });
     // Emitted first in a compiled .py program (see compileSource).
@@ -3780,9 +3832,19 @@ void VM::registerNatives()
 
     // STL container constructors — maps become dicts, sequences become arrays.
     // "map<string,int> m;" parses to "m = map()" via the default-ctor path.
+    // `map` is also Python's map(f, iterable), registered above: a call whose
+    // first argument is callable goes there instead of building a dict.
+    QuantumValue pyMap = globals->get("map");
     for (const char *dictLike : {"map", "unordered_map", "multimap"})
-        reg(dictLike, [](std::vector<QuantumValue>) -> QuantumValue
-            { return QuantumValue(std::make_shared<Dict>()); });
+    {
+        bool isMap = std::string(dictLike) == "map";
+        reg(dictLike, [pyMap, isMap](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            if (isMap && a.size() >= 2 && pyMap.isNative() &&
+                (a[0].isNative() || a[0].isClosure() || a[0].isBoundMethod()))
+                return pyMap.asNative()->fn(a);
+            return QuantumValue(std::make_shared<Dict>()); });
+    }
     for (const char *arrLike : {"vector", "stack", "queue", "deque", "priority_queue"})
         reg(arrLike, [](std::vector<QuantumValue> a) -> QuantumValue
             {
