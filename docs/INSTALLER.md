@@ -76,20 +76,26 @@ python conformance/run.py
 The quickest way is the script in the installer folder:
 
 ```bat
-installer\build-installer.bat          :: next patch version: 3.0.0 -> 3.0.1
-installer\build-installer.bat 3.1.0    :: that version instead
+installer\build-installer.bat          :: next patch versions: installer 3.0.0 -> 3.0.1, npm 1.0.3 -> 1.0.4
+installer\build-installer.bat 3.1.0    :: that installer version instead
 ```
 
 The script works in this order:
 
-1. It takes the version from `installer\version.txt` and adds 1 to the last number, unless you give a version.
-2. It checks that the four `build\*.exe` files exist and runs ISCC.
-3. It copies the result to the website at `..\frontend\public\downloads\QuantumSetup.exe`.
-4. It compares the copy byte for byte with the original.
-5. Only then does it write the new version to `version.txt`. A failed run therefore doesn't use up a version
-   number.
+1. It takes the installer version from `installer\version.txt` and adds 1 to the last number, unless you give a
+   version.
+2. It checks that the four `build\*.exe` files and `build\package.json` exist, and that npm is installed and you
+   are logged in (`npm login`). It does this before building anything.
+3. It runs ISCC, copies the result to the website at `..\frontend\public\downloads\QuantumSetup.exe`, and compares
+   the copy byte for byte with the original.
+4. It adds 1 to the last number of the npm package version in `build\package.json` and runs `npm publish` in
+   `build\`. If publishing fails, it puts the old version back in `package.json`.
+5. Only when all of that succeeds does it write the new version to `version.txt`. A failed run therefore uses up
+   neither version number.
 
-All its paths are relative to `installer\`.
+The installer and the npm package have separate version numbers. Run the script in a terminal: if your npm
+account uses two-factor authentication, `npm publish` asks for the code. All its paths are relative to
+`installer\`.
 
 To run ISCC yourself instead, use this in cmd. Without `/DMyAppVersion=`, `Quantum.iss` uses the version in
 `version.txt`.
@@ -148,8 +154,9 @@ git commit -m "Update installer"
 
 Commit the `src\` change in this repo too, together with `seed\qrun.exe` if you updated the seed.
 
-`build\` is a separate git checkout of `QuantumLanguageCompiler`. `build-quantum.bat` overwrites the exes in it.
-Publishing those binaries is a separate commit in that repo and isn't needed for the installer.
+`build\` is also the npm package `quantum-compiler`, which `build-installer.bat` publishes, and a separate git
+checkout of `QuantumLanguageCompiler`. The script doesn't commit there: committing the new exes and the bumped
+`package.json` is a separate step in that repo.
 
 ## When `src\` needs a newer compiler (the seed)
 
@@ -199,12 +206,13 @@ Commit the regenerated files with the library change, and don't edit them by han
 
 ## Version numbers
 
-Only the installer's version is bumped automatically, by `build-installer.bat`. The others are typed in by hand,
-and they currently disagree:
+`build-installer.bat` bumps the first two automatically. The others are typed in by hand, and they currently
+disagree:
 
 | Location | Currently | Shown as |
 | --- | --- | --- |
 | [installer/version.txt](../installer/version.txt) (read by `Quantum.iss`; `ISCC /DMyAppVersion=` overrides it) | `3.0.0` | setup wizard, *Installed apps* |
+| `build\package.json` | `1.0.3` | npm package `quantum-compiler` |
 | [src/main.sa](../src/main.sa) (both `--version` handlers and the header comment) | `v2.0.0` | `quantum --version`, `qrun --version` |
 | [src/cli/Cli.sa](../src/cli/Cli.sa) (banner) | `v2.0.0` | `--help` / REPL banner |
 | [src/qpm/QpmMain.sa](../src/qpm/QpmMain.sa) | `qpm 1.0.0` | `qpm --version` (versioned separately) |
