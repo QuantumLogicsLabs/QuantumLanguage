@@ -2,7 +2,7 @@
 #pragma once
 // The bytecode of one source text through lexer, parser and compiler only
 // (no dialect pass, no module resolution): `qrun --emit-qbc-core`, and the
-// self-hosting driver src/tools/selfhost/qbc.cpp that runs this same code
+// self-hosting driver src/selfhost/qbc.cpp that runs this same code
 // under Quantum's own C/C++ front-end.
 #include <cstdint>
 #include <string>

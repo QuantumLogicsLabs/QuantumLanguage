@@ -1,6 +1,6 @@
 // quantum: cpp
 // Ruby front-end: what the libraries written in Ruby (src/ruby/lib, embedded
-// by src/tools/embed.sa) need from the runtime, their loader, Marshal's deep
+// by qrun --embed) need from the runtime, their loader, Marshal's deep
 // copies and the entry point the VM calls.
 #include "RubyRt.h.sa"
 #include "RubyMain.h.sa"

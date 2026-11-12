@@ -16,12 +16,11 @@ The library is written in Java, one file per top-level type, named after it
 (`util/ArrayList.sa` holds `java.util.ArrayList`). The files use the `.sa`
 extension like the rest of the compiler source, but their content is Java.
 
-The compiler carries the library inside itself: `src/tools/embed.sa` collects
+The compiler carries the library inside itself: `qrun --embed` collects
 every `.sa` file in this folder's subfolders (not the front-end's own files)
 into `src/generated/JavaPreludeData.sa` (`java::preludeSources()`), naming each
 one `<Type>.java`, the file name a library frame shows in a stack trace. After
-changing a library file, run the embed tool from `compiler/`
-(`qrun src/tools/embed.sa`) and rebuild.
+changing a library file, run `qrun --embed` from `compiler/` and rebuild.
 
 ## Conventions
 

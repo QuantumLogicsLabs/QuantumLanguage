@@ -1,5 +1,5 @@
 // quantum: cpp
 // quantum_stub.exe (the runtime a bundled program is appended to) as one
 // program, for the native backend:
-//   qrun --native src/tools/selfhost/stub_all.sa quantum_stub.exe
+//   qrun --native src/selfhost/stub_all.sa quantum_stub.exe
 #include "quantum_sources.sa"

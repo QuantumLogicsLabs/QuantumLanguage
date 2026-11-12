@@ -104,6 +104,11 @@ QuantumValue stlIteratorDeref(const QuantumValue &v);
 // and returns it, or nullptr when the call had none.
 std::shared_ptr<Dict> takeKwargs(std::vector<QuantumValue> &args);
 
+// C-style formatting behind printf / sprintf and `"fmt" % args` (VmNatives.cpp):
+// %d %i %u %f %e %g %s %c %x %X %o %% with flags, width and precision, taking
+// the values from args[argStart] on.
+std::string quantumPrintf(const std::string &fmt, const std::vector<QuantumValue> &args, size_t argStart);
+
 // ─── JavaScript runtime objects (VmJsRuntime.cpp) ─────────────────────────────
 // Date / URL / URLSearchParams are dicts tagged by a hidden key; their methods
 // dispatch through callJsObjectMethod (from VM::callDictMethod).

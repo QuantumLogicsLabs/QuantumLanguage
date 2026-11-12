@@ -1,5 +1,5 @@
 // quantum: cpp
 // qrun.exe (the interpreter: always runs, never bundles) as one program, for
-// the native backend:  qrun --native src/tools/selfhost/qrun_all.sa qrun.exe
+// the native backend:  qrun --native src/selfhost/qrun_all.sa qrun.exe
 #define QRUN_MODE 1
 #include "quantum_sources.sa"

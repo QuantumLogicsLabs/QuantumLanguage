@@ -1,25 +1,25 @@
 // quantum: cpp
 // The bootstrap C++ lexer, parser, bytecode compiler and serializer,
 // compiled by Quantum's own C/C++ front-end:
-//   qrun src/tools/selfhost/qbc.cpp <file> <out.qbc>
+//   qrun src/selfhost/qbc.cpp <file> <out.qbc>
 // writes the same bytes as `qrun --emit-qbc-core <file> <out.qbc>`.
-#include "../../include/Error.h.sa"
-#include "../../include/QbcCore.h.sa"
-#include "../../Token.sa"
-#include "../../lexer/LexerCore.sa"
-#include "../../lexer/LexerReaders.sa"
-#include "../../lexer/LexerTokenize.sa"
-#include "../../parser/ParserCore.sa"
-#include "../../parser/ParserExpressions.sa"
-#include "../../parser/ParserLiterals.sa"
-#include "../../parser/ParserStatements.sa"
-#include "../../compiler/CompilerCore.sa"
-#include "../../compiler/CompilerExpressions.sa"
-#include "../../compiler/CompilerFunctions.sa"
-#include "../../compiler/CompilerStatements.sa"
-#include "../../Serializer.sa"
-#include "../../Value.sa"
-#include "../../cli/QbcCore.sa"
+#include "../include/Error.h.sa"
+#include "../include/QbcCore.h.sa"
+#include "../Token.sa"
+#include "../lexer/LexerCore.sa"
+#include "../lexer/LexerReaders.sa"
+#include "../lexer/LexerTokenize.sa"
+#include "../parser/ParserCore.sa"
+#include "../parser/ParserExpressions.sa"
+#include "../parser/ParserLiterals.sa"
+#include "../parser/ParserStatements.sa"
+#include "../compiler/CompilerCore.sa"
+#include "../compiler/CompilerExpressions.sa"
+#include "../compiler/CompilerFunctions.sa"
+#include "../compiler/CompilerStatements.sa"
+#include "../Serializer.sa"
+#include "../Value.sa"
+#include "../cli/QbcCore.sa"
 
 #include <fstream>
 #include <iostream>

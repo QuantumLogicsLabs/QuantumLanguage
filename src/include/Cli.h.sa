@@ -60,12 +60,12 @@ int runSingleFileForTest(const std::string &path);
 // ─── Self-hosting support (src/, the Quantum-written compiler) ─────────────────────────────────────
 // --dump-tokens: the C++ lexer's tokens, one per line (type, line, col, value).
 int dumpTokens(const std::string &path);
-// --dump-ast: the C++ parser's tree, one node per line (src/tools/astdump.sa).
+// --dump-ast: the C++ parser's tree, one node per line.
 int dumpAst(const std::string &path);
 // --emit-qbc: compiles a program and writes its serialized bytecode.
 int emitBytecodeFile(const std::string &path, const std::string &outPath);
 // --emit-qbc-core: the same through lexer, parser and compiler only (no
-// dialect pass or module resolution), as src/tools/selfhost/qbc.cpp does.
+// dialect pass or module resolution), as src/selfhost/qbc.cpp does.
 int emitCoreBytecodeFile(const std::string &path, const std::string &outPath);
 // --dis-qbc: disassembles a serialized bytecode file (to diff two compilers' output).
 int disassembleBytecodeFile(const std::string &path);
@@ -73,6 +73,10 @@ int disassembleBytecodeFile(const std::string &path);
 int dumpCppAst(const std::string &path);
 // --exec: runs a serialized bytecode file (args after it go to sys.argv).
 int execBytecodeFile(const std::string &path);
+// --embed: rewrites src/generated/'s embedded libraries (lib/cpp, lib/native,
+// the Java, Java-style, JavaScript, Ruby and Python libraries) from their
+// sources. Run from compiler/, then rebuild.
+int embedLibraries();
 
 // ─── Standalone .exe bundling ─────────────────────────────────────────────
 // Path of the currently running executable.

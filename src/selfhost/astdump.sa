@@ -1,21 +1,21 @@
 // quantum: cpp
 // The bootstrap C++ lexer and parser, compiled by Quantum's own C/C++
 // front-end:
-//   qrun src/tools/selfhost/astdump.cpp <file>
+//   qrun src/selfhost/astdump.cpp <file>
 // prints the same tree as `qrun --dump-ast <file>` (cli/SelfHost.cpp).
-#include "../../include/AstDump.h.sa"
-#include "../../include/Error.h.sa"
-#include "../../include/Lexer.h.sa"
-#include "../../include/Parser.h.sa"
-#include "../../Token.sa"
-#include "../../lexer/LexerCore.sa"
-#include "../../lexer/LexerReaders.sa"
-#include "../../lexer/LexerTokenize.sa"
-#include "../../parser/ParserCore.sa"
-#include "../../parser/ParserExpressions.sa"
-#include "../../parser/ParserLiterals.sa"
-#include "../../parser/ParserStatements.sa"
-#include "../../cli/AstDump.sa"
+#include "../include/AstDump.h.sa"
+#include "../include/Error.h.sa"
+#include "../include/Lexer.h.sa"
+#include "../include/Parser.h.sa"
+#include "../Token.sa"
+#include "../lexer/LexerCore.sa"
+#include "../lexer/LexerReaders.sa"
+#include "../lexer/LexerTokenize.sa"
+#include "../parser/ParserCore.sa"
+#include "../parser/ParserExpressions.sa"
+#include "../parser/ParserLiterals.sa"
+#include "../parser/ParserStatements.sa"
+#include "../cli/AstDump.sa"
 
 #include <fstream>
 #include <iostream>

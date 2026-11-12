@@ -6,7 +6,7 @@
 //   quantum --emit-qbc <file> <out>    write its bytecode
 //   quantum --bundle <file> <out.exe>  a standalone executable of it
 //   quantum --native <file> <out.exe>  native x86-64 code (src/native/)
-//   quantum --build-self <out.exe> [src/tools/selfhost/quantum.sa]
+//   quantum --build-self <out.exe> [src/selfhost/quantum.sa]
 //                                      rebuild this compiler from src/
 //
 // The VM underneath is the one this executable carries (the seed, seed/);
@@ -128,7 +128,7 @@ int usage()
                  "       quantum --emit-qbc <file> <out.qbc>\n"
                  "       quantum --bundle <file> <out.exe>\n"
                  "       quantum --native <file> <out.exe>\n"
-                 "       quantum --build-self <out.exe> [src/tools/selfhost/quantum.sa]\n";
+                 "       quantum --build-self <out.exe> [src/selfhost/quantum.sa]\n";
     return 1;
 }
 
@@ -162,7 +162,7 @@ int main(int argc, char **argv)
         return nativeCompileFile(argv[2], argv[3]);
     if (cmd == "--build-self" && argc >= 3)
     {
-        std::string driver = argc >= 4 ? argv[3] : "src/tools/selfhost/quantum.sa";
+        std::string driver = argc >= 4 ? argv[3] : "src/selfhost/quantum.sa";
         std::string bytes;
         if (!compileFile(driver, bytes))
             return 1;

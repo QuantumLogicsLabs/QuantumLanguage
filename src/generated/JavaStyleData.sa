@@ -1,5 +1,5 @@
 // quantum: cpp
-// Generated from src/dialect/javastyle by src/tools/embed.sa. Do not edit.
+// Generated from src/dialect/javastyle by qrun --embed. Do not edit.
 #include <string>
 #include <utility>
 #include <vector>

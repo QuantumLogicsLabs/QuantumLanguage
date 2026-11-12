@@ -2,7 +2,7 @@
 
 What Java-style code in a `.sa` file calls (`System.out.println`, `new ArrayList<>()`, `Collectors`, ...).
 `src/dialect/JavaDialect.sa` rewrites the Java syntax; this library supplies the classes. It is Quantum
-source, embedded into the compiler (`src/tools/embed.sa` → `src/generated/JavaStyleData.sa`), and
+source, embedded into the compiler (`qrun --embed` → `src/generated/JavaStyleData.sa`), and
 `compileSource()` (`src/Pipeline.sa`) puts it in front of a program that carries the
 `// quantum: java-style` marker, files in name order.
 

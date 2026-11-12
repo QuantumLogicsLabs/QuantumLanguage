@@ -11,7 +11,7 @@ rem   build-quantum.bat --seed     then make the new qrun the seed
 setlocal
 cd /d "%~dp0"
 set OUT=build
-set SH=src\tools\selfhost
+set SH=src\selfhost
 rem the library headers come from inside the compiler, never from disk
 set QUANTUM_NATIVE_LIB=
 

@@ -1,5 +1,5 @@
 // quantum: cpp
-// Generated from src/python/lib by src/tools/embed.sa. Do not edit.
+// Generated from src/python/lib by qrun --embed. Do not edit.
 #include <string>
 #include <utility>
 #include <vector>
