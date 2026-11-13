@@ -111,8 +111,6 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
                                      const std::string &sourcePath,
                                      bool debug)
 {
-    // C/C++: the typed front-end (src/cpp/) when the program is within its
-    // subset; otherwise the dialect pipeline below.
     const std::string ext = fileExtLower(sourcePath);
     // Java: its own front-end (src/java/), always strict — a program javac
     // rejects is a compile error, reported the way javac reports it.
@@ -150,39 +148,35 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
             throw CompileError(strictCppReport(u, sourcePath, source));
         }
     }
+    // C/C++: the typed front-end (src/cpp/), and nothing else. A .c / .cpp
+    // file is C or C++ (strictSource): a program the front-end rejects is a
+    // compile error, reported the way gcc reports it, and does not fall back
+    // to the mixed-syntax pipeline below (mixed syntax belongs in a .sa
+    // file). QUANTUM_OLD_CPP, a debugging aid, sends the file there instead.
     if ((ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".cxx") && !std::getenv("QUANTUM_OLD_CPP"))
     {
         std::ifstream in(sourcePath, std::ios::binary);
-        if (in)
-        {
-            std::ostringstream ss;
-            ss << in.rdbuf();
-            try
-            {
-                ASTNodePtr program = cpp::compileProgram(sourcePath, ss.str());
-                Compiler compiler;
-                auto chunk = compiler.compile(*program);
-                if (debug)
-                    disassembleChunk(*chunk, std::cerr);
-                return chunk;
-            }
-            catch (const cpp::LinkError &l)
-            {
-                if (g_strictMode)
-                    throw CompileError(sourcePath + ": error: " + l.what() + "\n");
-                throw QuantumError("LinkError", l.what());
-            }
-            catch (const cpp::Unsupported &u)
-            {
-                if (g_strictMode)
-                    throw CompileError(strictCppReport(u, sourcePath, ss.str()));
-                if (std::getenv("QUANTUM_DEBUG_CPPFE"))
-                    std::cerr << "[cppfe] falling back: " << u.what() << " (" << (u.file.empty() ? sourcePath : u.file)
-                              << ":" << u.line << ")\n";
-            }
-        }
-        else if (g_strictMode)
+        if (!in)
             throw CompileError(sourcePath + ": error: cannot open source file\n");
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        try
+        {
+            ASTNodePtr program = cpp::compileProgram(sourcePath, ss.str());
+            Compiler compiler;
+            auto chunk = compiler.compile(*program);
+            if (debug)
+                disassembleChunk(*chunk, std::cerr);
+            return chunk;
+        }
+        catch (const cpp::LinkError &l)
+        {
+            throw CompileError(sourcePath + ": error: " + l.what() + "\n");
+        }
+        catch (const cpp::Unsupported &u)
+        {
+            throw CompileError(strictCppReport(u, sourcePath, ss.str()));
+        }
     }
 
     Lexer lexer(source);

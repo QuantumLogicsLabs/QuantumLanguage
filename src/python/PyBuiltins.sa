@@ -2533,21 +2533,6 @@ int runProgram(const std::string &source, const std::string &path, RunFailure &f
     return status;
 }
 
-bool canRun(const std::string &source, const std::string &path, std::string &why)
-{
-    (void)path;
-    try
-    {
-        parseModule(source);
-        return true;
-    }
-    catch (SyntaxErr &e)
-    {
-        why = e.message;
-        return false;
-    }
-}
-
 std::string syntaxReport(const std::string &source, const std::string &path)
 {
     try

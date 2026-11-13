@@ -33,7 +33,10 @@ The build produces **three binaries** with distinct roles:
 | `qrun.exe`         | Interprets source directly — no `.exe` is generated                            |
 | `quantum_stub.exe` | The bare VM runtime that gets bundled into produced executables                |
 
-Both `quantum` and `qrun` accept `.sa`, `.js`, `.py`, `.c`, and `.cpp` files. Every extension runs **natively on the Quantum VM** through the same multi-syntax front-end — no Node.js, Python, or GCC installation is required. (Non-`.sa` files are supported at the level of Quantum's multi-syntax subset, not the full host language.)
+Both `quantum` and `qrun` also accept `.js`, `.py`, `.rb`, `.c`, `.cpp` and `.java` files, and run them **natively on the Quantum VM** — no Node.js, Python, Ruby, GCC or JDK installation is required. The extension decides the language:
+
+- **`.sa` is Quantum.** Python, JavaScript, C, C++, Java and Ruby syntax may be mixed freely in one file.
+- **Every other extension is strictly its own language.** A `.cpp` file must be valid C++, a `.js` file valid JavaScript, and so on. Each has its own front-end, and code the language's real compiler or interpreter would reject (`let x = 5;` in a `.cpp` file, `def f():` in a `.js` file) is an error, reported the way gcc / node / python / ruby / javac report it. Mixed-syntax code belongs in a `.sa` file.
 
 ```bash
 quantum hello.sa     # → hello.exe created, then launched
@@ -512,10 +515,10 @@ Quantum-Language/
 │   ├── qpm/                      # qpm package manager
 │   ├── Serializer.sa  Disassembler.sa  TypeChecker.sa  Pipeline.sa  ...
 │   ├── lexer.sa  parser*.sa  ast.sa   # an independent port in Quantum's own syntax
-│   └── tools/
-│       ├── selfhost/quantumc.sa  # the whole compiler as one program (self-compile driver)
-│       ├── bootstrap.sh          # fixed point: q1 == q2 == q3
-│       └── compare_selfhost.sh   # self-hosted output check on every example
+│   └── selfhost/
+│       ├── quantum_sources.sa    # every translation unit of the build
+│       ├── qrun_all.sa  quantum_all.sa  stub_all.sa  qpm_all.sa   # one program per binary
+│       └── quantumc.sa           # the whole compiler as one program (self-compile driver)
 ├── examples/                     # Runnable .sa programs
 │   ├── hello.sa
 │   ├── features.sa               # Full feature showcase

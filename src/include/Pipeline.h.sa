@@ -17,12 +17,15 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
 // values instead of blocking on stdin. Read by src/vm/VmNatives.cpp.
 extern bool g_testMode;
 
-// --strict: a .c/.cpp/.py/.js/.rb file must be valid in its language. That
-// language's front-end has the final word — a program it rejects is a compile
-// error (reported the way gcc / python / node / ruby report it) instead of
-// falling back to the multi-syntax pipeline that accepts mixed-style code.
-// Python and Ruby runtime errors are then reported the real interpreter's way
-// too. (.java is always strict; .sa is never strict.)
+// --strict. A .c/.cpp/.py/.js/.rb/.java file needs no flag: it is always
+// strict (strictSource, Dialect.h.sa) — it must be valid in its language, a
+// program that language's front-end rejects is a compile error (reported the
+// way gcc / python / node / ruby / javac report it), and Python and Ruby
+// runtime errors are reported the real interpreter's way. A .sa file, where
+// the syntaxes mix, is never strict. What the flag still adds: a web page's
+// or stylesheet's errors become compile errors (otherwise they are reported
+// and the page is shown anyway), and a .sa file written in C++ syntax
+// (`// quantum: cpp`) may not name a type C++ does not know.
 extern bool g_strictMode;
 
 // --print: a web page (.html, or a .sa file holding one) is printed, as the

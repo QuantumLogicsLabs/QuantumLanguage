@@ -327,6 +327,10 @@ public:
     std::vector<ASTNodePtr> *pre_ = nullptr; // hoisted temps of the current statement
     bool canHoist_ = false;
     Scope *global_ = nullptr, *std_ = nullptr;
+    // A type C/C++ has never heard of is a compile error: a .c / .cpp file
+    // (or --strict). Off for Quantum written in C++ syntax (a marked .sa
+    // file), where such a name has dynamic semantics. Set by compileProgram().
+    bool strictTypes_ = false;
 
 private:
     Program &prog_;
