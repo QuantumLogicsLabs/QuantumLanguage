@@ -21,6 +21,7 @@
 bool g_testMode = false;
 std::vector<std::string> g_scriptArgv;
 bool g_strictMode = false;
+bool g_printPages = false;
 
 // ─── Strict C/C++ diagnostics ─────────────────────────────────────────────────
 

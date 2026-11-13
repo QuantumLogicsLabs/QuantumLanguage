@@ -1,0 +1,343 @@
+// quantum: cpp
+// HTML front-end: showing a compiled page in the web browser. The page is
+// written to <temp>/quantum-pages/<name>.html and that file is opened in the
+// default browser: the program registered for http(s) links, since .html
+// files are often associated with an editor on a developer's machine. When
+// no browser is registered, the file is opened with whatever .html opens with.
+// The program itself, started again with no console, deletes the file once
+// the browser has had time to read it. Kept apart from the rest of the
+// front-end so that only this file sees the Windows API.
+#include "HtmlMain.h.sa"
+
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+
+// the registry function used (advapi32.dll; RegGetValueW is in Windows Vista
+// and later), declared here as the native backend's <windows.h> has no
+// registry functions
+#ifdef __QUANTUM__
+namespace __dll_advapi32
+{
+LONG RegGetValueW(HANDLE key, LPCWSTR subKey, LPCWSTR value, DWORD flags, LPDWORD type, LPVOID data, LPDWORD size);
+}
+using __dll_advapi32::RegGetValueW;
+#endif
+#endif
+
+namespace fs = std::filesystem;
+
+namespace html
+{
+
+namespace
+{
+
+// a file name made of the characters every file system takes
+std::string safeName(const std::string &name)
+{
+    std::string out;
+    for (char c : name)
+    {
+        bool keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' ||
+                    c == '_' || c == '.';
+        out += keep ? c : '_';
+    }
+    if (out.empty() || out[0] == '.')
+        out = "page" + out;
+    return out;
+}
+
+// The file: URL of a file. Characters a URL or a command line would read as
+// syntax are percent-encoded; the rest (non-ASCII too) are kept as they are.
+std::string fileUrl(const std::string &path)
+{
+    static const char *const hex = "0123456789ABCDEF";
+    std::string out = "file://";
+    if (path.empty() || (path[0] != '/' && path[0] != '\\'))
+        out += "/";
+    for (char ch : path)
+    {
+        unsigned char c = (unsigned char)ch;
+        if (c == '\\')
+            out += '/';
+        else if (c <= 0x20 || c == 0x7F || c == '%' || c == '#' || c == '?' || c == '"' || c == '\'' || c == '<' ||
+                 c == '>' || c == '`' || c == '^' || c == '{' || c == '}' || c == '|')
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+        else
+            out += (char)c;
+    }
+    return out;
+}
+
+#ifdef _WIN32
+
+std::wstring wide(const std::string &s)
+{
+    if (s.empty())
+        return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    if (n <= 0)
+        return std::wstring();
+    std::vector<wchar_t> buf((size_t)n);
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), buf.data(), n);
+    return std::wstring(buf.data(), (size_t)n);
+}
+
+std::string narrow(const std::wstring &w)
+{
+    if (w.empty())
+        return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0)
+        return std::string();
+    std::vector<char> buf((size_t)n);
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), buf.data(), n, nullptr, nullptr);
+    return std::string(buf.data(), (size_t)n);
+}
+
+std::string envVar(const wchar_t *name)
+{
+    wchar_t buf[1024];
+    DWORD n = GetEnvironmentVariableW(name, buf, 1024);
+    if (n == 0 || n >= 1024)
+        return std::string();
+    return narrow(std::wstring(buf, (size_t)n));
+}
+
+// HKEY_CLASSES_ROOT and HKEY_CURRENT_USER
+HANDLE classesRoot() { return (HANDLE)0xFFFFFFFF80000000ULL; }
+HANDLE currentUser() { return (HANDLE)0xFFFFFFFF80000001ULL; }
+
+// A string value of the registry ("" when it is not there). REG_EXPAND_SZ
+// values come back with their environment variables expanded.
+std::wstring regString(HANDLE root, const std::wstring &key, const wchar_t *value)
+{
+    const DWORD RT_SZ = 0x00000002; // RRF_RT_REG_SZ
+    DWORD size = 0;
+    if (RegGetValueW(root, key.c_str(), value, RT_SZ, nullptr, nullptr, &size) != 0 || size < sizeof(wchar_t))
+        return std::wstring();
+    std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, L'\0');
+    if (RegGetValueW(root, key.c_str(), value, RT_SZ, nullptr, buf.data(), &size) != 0)
+        return std::wstring();
+    size_t len = 0;
+    while (len < buf.size() && buf[len] != L'\0')
+        ++len;
+    return std::wstring(buf.data(), len);
+}
+
+// The command line the default browser opens a link with, such as
+// "C:\...\chrome.exe" --single-argument %1
+std::wstring browserCommand()
+{
+    const std::wstring choice = L"Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\";
+    const wchar_t *schemes[2] = {L"https", L"http"};
+    for (int k = 0; k < 2; ++k)
+    {
+        std::wstring progId = regString(currentUser(), choice + schemes[k] + L"\\UserChoice", L"ProgId");
+        if (progId.empty())
+            continue;
+        std::wstring command = regString(classesRoot(), progId + L"\\shell\\open\\command", nullptr);
+        if (!command.empty())
+            return command;
+    }
+    return regString(classesRoot(), L"http\\shell\\open\\command", nullptr);
+}
+
+// `command` with the URL in place of %1 (%L, %l), and %* dropped; the URL
+// is added at the end when the command has no place for it
+std::wstring withUrl(const std::wstring &command, const std::wstring &url)
+{
+    std::wstring out;
+    bool placed = false;
+    for (size_t k = 0; k < command.size(); ++k)
+    {
+        if (command[k] == L'%' && k + 1 < command.size())
+        {
+            wchar_t c = command[k + 1];
+            if (c == L'1' || c == L'L' || c == L'l')
+            {
+                out += url;
+                placed = true;
+                ++k;
+                continue;
+            }
+            if (c == L'*')
+            {
+                ++k;
+                continue;
+            }
+        }
+        out += command[k];
+    }
+    if (!placed)
+        out += L" \"" + url + L"\"";
+    return out;
+}
+
+bool startBrowser(const std::string &file)
+{
+    std::wstring command = browserCommand();
+    if (!command.empty())
+    {
+        std::wstring line = withUrl(command, wide(fileUrl(file)));
+        std::vector<wchar_t> buf(line.begin(), line.end());
+        buf.push_back(L'\0');
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+        {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return true;
+        }
+    }
+    // no browser registered for links (or it would not start): what .html opens with
+    HINSTANCE h = ShellExecuteW(nullptr, L"open", wide(file).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    return (unsigned long long)h > 32;
+}
+
+std::string tempFolder()
+{
+    std::string dir = envVar(L"TEMP");
+    if (dir.empty())
+        dir = envVar(L"TMP");
+    return dir.empty() ? std::string(".") : dir;
+}
+
+#ifndef DETACHED_PROCESS
+#define DETACHED_PROCESS 0x00000008
+#endif
+
+// Starts this program again as `<it> --__delete-page <file>`: no console,
+// no handles inherited (a caller reading the output through a pipe is not
+// kept waiting), and outside the console's Ctrl+C group
+bool startDeleter(const std::string &file)
+{
+    wchar_t self[2048];
+    DWORD n = GetModuleFileNameW(nullptr, self, 2048);
+    if (n == 0 || n >= 2048)
+        return false;
+    std::wstring line = L"\"" + std::wstring(self, (size_t)n) + L"\" --__delete-page \"" + wide(file) + L"\"";
+    std::vector<wchar_t> buf(line.begin(), line.end());
+    buf.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                        nullptr, nullptr, &si, &pi))
+        return false;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
+}
+
+#else
+
+bool startBrowser(const std::string &file)
+{
+#ifdef __APPLE__
+    std::string command = "open '" + file + "' >/dev/null 2>&1";
+#else
+    std::string command = "xdg-open '" + file + "' >/dev/null 2>&1";
+#endif
+    return std::system(command.c_str()) == 0;
+}
+
+std::string tempFolder()
+{
+    const char *dir = std::getenv("TMPDIR");
+    return dir && *dir ? std::string(dir) : std::string("/tmp");
+}
+
+bool startDeleter(const std::string &file)
+{
+    std::string command =
+        "(sleep " + std::to_string(pageSeconds) + "; rm -f '" + file + "') </dev/null >/dev/null 2>&1 &";
+    return std::system(command.c_str()) == 0;
+}
+
+#endif
+
+fs::path pagesFolder() { return fs::path(tempFolder()) / "quantum-pages"; }
+
+// a path to compare: normalized, '/' separators, lower case
+std::string pathKey(const fs::path &p)
+{
+    std::string s = p.lexically_normal().generic_string();
+    for (char &c : s)
+        c = (char)std::tolower((unsigned char)c);
+    while (s.size() > 1 && s.back() == '/')
+        s.pop_back();
+    return s;
+}
+
+} // namespace
+
+bool openInBrowser(const std::string &page, const std::string &name, std::string &file)
+{
+    fs::path dir = pagesFolder();
+    fs::path out = dir / (safeName(name) + ".html");
+    file = out.string();
+    // twice: the helper deleting an earlier page may remove the folder, once
+    // empty, just as this one is written
+    bool written = false;
+    for (int attempt = 0; attempt < 2 && !written; ++attempt)
+    {
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        std::ofstream f(out, std::ios::binary | std::ios::trunc);
+        if (!f)
+            continue;
+        f << page;
+        f.flush();
+        if (!f)
+            continue;
+        written = true;
+    }
+    if (!written)
+        return false;
+    if (!startBrowser(file))
+    {
+        std::error_code ec;
+        fs::remove(out, ec);
+        return false;
+    }
+    startDeleter(file);
+    return true;
+}
+
+int deletePageLater(const std::string &file)
+{
+    fs::path page(file);
+    std::string ext = pathKey(page.extension());
+    if (pathKey(page.parent_path()) != pathKey(pagesFolder()) || ext != ".html")
+        return 1;
+    std::this_thread::sleep_for(std::chrono::seconds(pageSeconds));
+    std::error_code ec;
+    fs::remove(page, ec);
+    fs::remove(pagesFolder(), ec); // a folder is removed only when empty
+    return 0;
+}
+
+} // namespace html

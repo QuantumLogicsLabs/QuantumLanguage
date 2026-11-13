@@ -48,6 +48,12 @@ int main(int argc, char *argv[])
     SetConsoleCP(CP_UTF8);
 #endif
 
+    // Hidden: the helper a page shown in the browser starts to delete its
+    // file afterwards (src/html/HtmlBrowser.sa). First, so that a standalone
+    // program (page.exe) is its own helper rather than running again.
+    if (argc == 3 && std::string(argv[1]) == "--__delete-page")
+        return html::deletePageLater(argv[2]);
+
     std::string exePath = getExecutablePath();
 
     // ══════════════════════════════════════════════════════════════

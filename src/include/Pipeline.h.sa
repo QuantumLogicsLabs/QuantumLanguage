@@ -25,6 +25,10 @@ extern bool g_testMode;
 // too. (.java is always strict; .sa is never strict.)
 extern bool g_strictMode;
 
+// --print: a web page (.html, or a .sa file holding one) is printed, as the
+// compiled document, instead of being opened in the default browser.
+extern bool g_printPages;
+
 // The running script's path followed by its command-line arguments
 // (`qrun tool.sa --json` -> {"tool.sa", "--json"}). Set by main() before the
 // VM is constructed; exposed to scripts as sys.argv by src/vm/VmNatives.cpp.

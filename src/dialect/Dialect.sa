@@ -19,6 +19,8 @@ namespace fs = std::filesystem;
 
 extern bool g_strictMode; // Pipeline.sa: qrun --strict
 extern bool g_testMode;   // Pipeline.sa: the test runner is running
+extern bool g_printPages; // Pipeline.sa: qrun --print
+extern bool g_stageMarker; // Cli.sa: a caller captures the output (the execution API)
 extern std::vector<std::string> g_scriptArgv; // Pipeline.sa: the script, then its arguments
 
 // multi-syntax front-end — no node/python/gcc/g++ required.
@@ -79,17 +81,47 @@ static std::string quantumStringLiteral(const std::string &text)
     return out + "\"";
 }
 
-// A page or stylesheet the web front-ends compiled: the program writes it
-// out. Its errors are compile errors under --strict and in the test runner;
-// otherwise they are reported and the page is written anyway, the way a
-// browser shows a page with mistakes in it.
-static std::string webProgram(const std::string &output, const std::string &report, bool failed)
+// A page or stylesheet the web front-ends compiled. Its errors are compile
+// errors under --strict and in the test runner; otherwise they are reported
+// and the page is shown anyway, the way a browser shows a page with mistakes
+// in it.
+static void reportWebProblems(const std::string &report, bool failed)
 {
     if (failed && (g_strictMode || g_testMode))
         throw CompileError(report);
     std::cerr << report;
     std::cerr.flush();
-    return "print(" + quantumStringLiteral(output) + ")\n";
+}
+
+// The name of a page's file in the browser's folder: the source file's name
+// and a hash of its full path, so that two folders' index.html stay apart
+static std::string pageName(const std::string &path)
+{
+    std::error_code ec;
+    fs::path full = fs::absolute(fs::path(path), ec);
+    if (ec || full.empty())
+        full = fs::path(path);
+    std::string key = full.lexically_normal().generic_string();
+    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+    unsigned long long h = 2166136261ULL; // FNV-1a
+    for (char c : key)
+        h = ((h ^ (unsigned long long)(unsigned char)c) * 16777619ULL) & 0xFFFFFFFFULL;
+    static const char *const hex = "0123456789abcdef";
+    std::string tag;
+    for (int shift = 28; shift >= 0; shift -= 4)
+        tag += hex[(h >> shift) & 15];
+    return fs::path(path).stem().string() + "-" + tag;
+}
+
+// A page: the program opens it in the default browser (__html_open__,
+// src/html/HtmlBrowser.sa). It prints the page instead under --print, in the
+// test runner, and for a caller that captures the output (--stage-marker).
+static std::string pageProgram(const html::Result &r, const std::string &path)
+{
+    reportWebProblems(r.report, r.failed);
+    if (g_printPages || g_testMode || g_stageMarker)
+        return "print(" + quantumStringLiteral(r.output) + ")\n";
+    return "__html_open__(" + quantumStringLiteral(r.browser) + ", " + quantumStringLiteral(pageName(path)) + ")\n";
 }
 
 std::string applyDialect(std::string source, const std::string &path)
@@ -112,12 +144,13 @@ std::string applyDialect(std::string source, const std::string &path)
         if (!g_scriptArgv.empty() && g_scriptArgv[0] == path)
             sheets.assign(g_scriptArgv.begin() + 1, g_scriptArgv.end());
         html::Result r = html::compile(source, path, sheets);
-        return webProgram(r.output, r.report, r.failed);
+        return pageProgram(r, path);
     }
     if (ext == ".css" || (ext == ".sa" && css::looksLikeStylesheet(source)))
     {
         css::Result r = css::compile(source, path);
-        return webProgram(r.output, r.report, r.failed);
+        reportWebProblems(r.report, r.failed);
+        return "print(" + quantumStringLiteral(r.output) + ")\n";
     }
 
     // C++ project structure first (local #includes, namespaces, out-of-class
