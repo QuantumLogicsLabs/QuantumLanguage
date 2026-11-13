@@ -39,6 +39,13 @@ bool hasSupportedExt(const std::string &path)
            ext == ".java" || ext == ".html" || ext == ".htm" || ext == ".css";
 }
 
+bool strictSource(const std::string &path)
+{
+    std::string ext = fileExtLower(path);
+    return ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".py" || ext == ".js" ||
+           ext == ".rb" || ext == ".java";
+}
+
 bool isMarkedCppSource(const std::string &source)
 {
     size_t i = 0;
@@ -172,50 +179,34 @@ std::string applyDialect(std::string source, const std::string &path)
             std::cerr << "----- Java-style pass -----\n" << source << "----- end -----\n";
     }
 
-    // Under --strict a .py/.js/.rb file is that language and nothing else: a
-    // program its front-end cannot parse is a compile error, reported the way
-    // python / node / ruby report it, instead of going to the mixed-syntax
-    // pipeline below.
-    if (g_strictMode && (ext == ".py" || ext == ".js" || ext == ".rb"))
+    // A .py / .js / .rb file is that language and nothing else (strictSource):
+    // a program its front-end cannot parse is a compile error, reported the
+    // way python / node / ruby report it, and never goes to the mixed-syntax
+    // pipeline below (mixed syntax belongs in a .sa file). Otherwise that
+    // front-end runs it (src/python, src/js, src/ruby); the program travels
+    // inside the chunk as a string.
+    if (ext == ".py" || ext == ".js" || ext == ".rb")
     {
         std::string report = ext == ".py"   ? py::syntaxReport(source, path)
                              : ext == ".js" ? js::syntaxReport(source, path)
                                             : ruby::syntaxReport(source, path);
         if (!report.empty())
             throw CompileError(report);
+        std::string run = "__ruby_run__(";
+        if (ext == ".py")
+            run = "__py_run__(";
+        else if (ext == ".js")
+            run = "__js_run__(";
+        return run + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
     }
 
-    if (ext == ".py")
+    // Ruby syntax in a .sa file, on the lines that cannot be another style's
+    if (ext == ".sa")
     {
-        // A .py file runs on the Python front-end (src/python) when it can
-        // parse it; the program travels inside the chunk as a string
-        std::string why;
-        if (g_strictMode || py::canRun(source, path, why))
-            return "__py_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
-    }
-
-    if (ext == ".js")
-    {
-        // A .js file runs on the JavaScript front-end (src/js) when it can
-        // parse it; the program travels inside the chunk as a string
-        std::string why;
-        if (g_strictMode || js::canRun(source, path, why))
-            return "__js_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
-    }
-
-    if (ext == ".rb")
-    {
-        // A .rb file runs on the Ruby front-end (src/ruby) when it can parse
-        // it; the program travels inside the chunk as a string
-        std::string why;
-        if (g_strictMode || ruby::canRun(source, path, why))
-            return "__ruby_run__(" + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
-        source = applyRubyDialect(source, /*strict=*/true);
-    }
-    else if (ext == ".sa")
         source = applyRubyDialect(source, /*strict=*/false);
-    if ((ext == ".rb" || ext == ".sa") && std::getenv("QUANTUM_DEBUG_RUBY"))
-        std::cerr << "----- translated -----\n" << source << "----- end -----\n";
+        if (std::getenv("QUANTUM_DEBUG_RUBY"))
+            std::cerr << "----- translated -----\n" << source << "----- end -----\n";
+    }
 
     // __cpp_runtime__() switches the VM to C/C++ arithmetic rules first.
     if ((ext == ".c" || ext == ".cpp") && definesMainFunction(source))

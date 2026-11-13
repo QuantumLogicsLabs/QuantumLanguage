@@ -282,8 +282,8 @@ int checkFile(const std::string &path)
     }
     std::ostringstream ss;
     ss << file.rdbuf();
-    // C/C++: whatever compileSource would use — the typed front-end when the
-    // program is within its subset
+    // C/C++, Java and Quantum in C++ syntax: their own front-end's verdict,
+    // as compileSource gives it
     const std::string ext = fileExtLower(path);
     if ((ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".cxx" || ext == ".java" ||
          (ext == ".sa" && isMarkedCppSource(ss.str()))) &&
@@ -337,6 +337,13 @@ int checkFile(const std::string &path)
                   << (at.fromInclude ? " (in code it #includes)" : "") << "\n";
         return 1;
     }
+    catch (const CompileError &e)
+    {
+        // a .py / .js / .rb file its language's front-end rejects: the report
+        // is complete, in python's / node's / ruby's own format
+        std::cerr << e.what();
+        return 1;
+    }
     catch (const std::exception &e)
     {
         std::cerr << path << ":1:1: error: " << e.what() << "\n";
@@ -358,12 +365,17 @@ void printHelp(const char *prog)
               << "  " << prog << " build [name] [--run]  Build a C/C++ project natively (= qpm build)\n"
               << "  qrun <file>                 Interpret directly (no .exe)\n\n"
               << "  Supported files: .sa .js .py .rb .c .cpp .java .html .css — all run natively\n"
-              << "  on the Quantum VM (multi-syntax subset; node/python/gcc NOT required)\n\n"
+              << "  on the Quantum VM (node/python/gcc NOT required)\n\n"
+              << "  A .sa file is Quantum: Python, JavaScript, C, C++, Java and Ruby syntax may\n"
+              << "  be mixed in it. Every other extension is strictly its own language: a .cpp\n"
+              << "  file must be valid C++, a .js file valid JavaScript, and so on; what the\n"
+              << "  language's own compiler would reject is a compile error.\n\n"
               << "  A web page (.html, or a .sa file that is one) opens in your default browser;\n"
               << "  --print before the file prints the compiled page instead:\n"
               << "  qrun --print page.html > out.html\n\n"
               << "  quantum hello.sa            → hello.exe created and run\n"
               << "  quantum prog.c              → prog.exe created and run (no gcc)\n"
-              << "  qrun    hello.py            → interpreted directly\n"
-              << "  qrun    hello.rb            → Ruby-style subset interpreted directly\n";
+              << "  qrun    hello.py            → interpreted directly, as Python\n"
+              << "  qrun    hello.rb            → interpreted directly, as Ruby\n"
+              << "  qrun    hello.sa            → interpreted directly, any syntax\n";
 }

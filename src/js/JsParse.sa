@@ -3909,10 +3909,4 @@ bool findSyntaxError(const std::string &source, const std::string &path, std::st
     }
 }
 
-bool canRun(const std::string &source, const std::string &path, std::string &why)
-{
-    int line = 0, col = 0;
-    return !findSyntaxError(source, path, why, line, col);
-}
-
 } // namespace js

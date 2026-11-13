@@ -3194,20 +3194,6 @@ ProgramNode *parseEval(const std::string &source, const std::string &file, Scope
     return p.parseEval(outer, scope);
 }
 
-bool canRun(const std::string &source, const std::string &path, std::string &why)
-{
-    try
-    {
-        parseProgram(source, path);
-    }
-    catch (const SyntaxError &e)
-    {
-        why = e.message;
-        return false;
-    }
-    return true;
-}
-
 std::string syntaxReport(const std::string &source, const std::string &path)
 {
     try

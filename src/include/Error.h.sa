@@ -41,10 +41,11 @@ public:
         : QuantumError("IndexError", msg, line) {}
 };
 
-// A program rejected at compile time by a strict front-end (Java, or C/C++
-// under --strict). `what()` is the complete diagnostic, already in the real
-// compiler's format (gcc's `file:line:col: error: ...`, javac's
-// `File.java:line: error: ...`), so the CLI prints it verbatim.
+// A program rejected at compile time by its language's front-end (a .c /
+// .cpp / .java / .py / .js / .rb file: always strict). `what()` is the
+// complete diagnostic, already in the real tool's format (gcc's
+// `file:line:col: error: ...`, javac's `File.java:line: error: ...`,
+// python's `File "x.py", line N` ...), so the CLI prints it verbatim.
 class CompileError : public QuantumError
 {
 public:

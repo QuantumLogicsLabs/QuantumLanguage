@@ -18,11 +18,9 @@ struct RunFailure
 // Runs a Ruby program to its end; the result is the exit status
 int runProgram(const std::string &source, const std::string &path, RunFailure &failure);
 
-// Whether this front-end can parse the source (`why`: the syntax error if not)
-bool canRun(const std::string &source, const std::string &path, std::string &why);
-
-// What ruby prints when it cannot parse the source (qrun --strict reports it
-// as a compile error), or "" when the source parses
+// What ruby prints when it cannot parse the source (qrun reports it as a
+// compile error: a .rb file is Ruby and nothing else), or "" when the source
+// parses
 std::string syntaxReport(const std::string &source, const std::string &path);
 
 } // namespace ruby

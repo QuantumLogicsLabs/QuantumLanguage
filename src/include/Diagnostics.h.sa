@@ -1,9 +1,9 @@
 // quantum: cpp
 #pragma once
-// Compiler-style error reports for the strict front-ends (C/C++, Python,
-// JavaScript and Ruby under --strict; Java), laid out the way the real tools
-// print them so that output from `qrun --strict` reads like gcc / javac /
-// python / node / ruby output.
+// Compiler-style error reports for the strict front-ends (C/C++, Java,
+// Python, JavaScript and Ruby: a file with one of their extensions), laid out
+// the way the real tools print them so that qrun's output for such a file
+// reads like gcc / javac / python / node / ruby output.
 
 #include <string>
 #include <vector>

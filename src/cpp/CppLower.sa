@@ -12,6 +12,7 @@
 //   T* / unique_ptr<T> to an object → the object;  nullptr → nil
 //   T* / T& to a scalar → Ref [container, key] (a boxed local is [value])
 #include "CppLower.h.sa"
+#include "Dialect.h.sa"
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +21,7 @@
 #include <iostream>
 #include <sstream>
 
-extern bool g_strictMode; // src/Pipeline.cpp
+extern bool g_strictMode; // src/Pipeline.sa: qrun --strict
 
 namespace cpp
 {
@@ -998,7 +999,7 @@ TP Lowerer::resolveType(const TypeNameP &tn, Scope *sc)
         {
             if (s && s->kind == Symbol::Type && !s->type)
                 base = tDyn();
-            else if (g_strictMode && !s)
+            else if (strictTypes_ && !s)
             {
                 // A type C/C++ has never heard of (`let x = 1;`) is a compile
                 // error; a real library type outside the subset is reported
@@ -3881,6 +3882,7 @@ ASTNodePtr compileProgram(const std::string &path, const std::string &source)
     }
     Program prog = parse(pp);
     Lowerer lw(prog);
+    lw.strictTypes_ = g_strictMode || strictSource(path);
     try
     {
         return lw.run();

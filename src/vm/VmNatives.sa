@@ -28,7 +28,6 @@
 namespace fs = std::filesystem;
 
 extern bool g_testMode;
-extern bool g_strictMode; // Pipeline.sa: qrun --strict
 extern std::vector<std::string> g_scriptArgv;
 
 #ifndef M_PI
@@ -251,31 +250,33 @@ void VM::registerNatives()
         return QuantumValue(); });
 
     // A Python program (applyDialect): the Python front-end runs it to its end.
-    // It has printed the traceback; under --strict that is the whole report,
-    // as from python.
+    // For an uncaught exception it has printed the traceback, and that is the
+    // whole report, as from python. The test runner is handed the exception
+    // as well: it tells a program that only wanted input from one that failed.
     reg("__py_run__", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         py::RunFailure failure;
         int status = py::runProgram(args[0].asString(), args[1].asString(), failure);
-        if (failure.failed && !g_strictMode)
+        if (failure.failed && g_testMode)
             throw QuantumError(failure.kind, failure.message, failure.line);
         if (status != 0)
             std::exit(status);
         return QuantumValue(); });
 
     // A Ruby program (applyDialect): the Ruby front-end runs it to its end.
-    // Under --strict an uncaught exception is reported the way ruby reports it.
+    // An uncaught exception is reported the way ruby reports it; the test
+    // runner is handed it instead, for its own report.
     reg("__ruby_run__", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         ruby::RunFailure failure;
         int status = ruby::runProgram(args[0].asString(), args[1].asString(), failure);
-        if (failure.failed && g_strictMode)
+        if (failure.failed && g_testMode)
+            throw QuantumError(failure.kind, failure.message, failure.line);
+        if (failure.failed)
         {
             std::cerr << failure.report;
             std::cerr.flush();
         }
-        else if (failure.failed)
-            throw QuantumError(failure.kind, failure.message, failure.line);
         if (status != 0)
             std::exit(status);
         return QuantumValue(); });

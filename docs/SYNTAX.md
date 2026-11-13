@@ -50,6 +50,31 @@ xor_tool.sa
 scanner.sa
 ```
 
+The extension decides what a file may contain:
+
+| Extension | Language | Syntax accepted |
+| --- | --- | --- |
+| `.sa` | Quantum | every style on this page, mixed freely in one file |
+| `.py` | Python | Python only |
+| `.js` | JavaScript | JavaScript only |
+| `.rb` | Ruby | Ruby only |
+| `.c` | C | C only (C++ is an error) |
+| `.cpp` | C++ | C++ only |
+| `.java` | Java | Java only |
+
+Every extension other than `.sa` is strictly its own language. The file is compiled by that
+language's own front-end, and code the real compiler or interpreter would reject is an error,
+reported the way that tool reports it. Nothing falls back to the mixed syntax:
+
+```
+$ qrun demo.cpp
+demo.cpp:3:9: error: expected ';' before 'x'
+    3 |     let x = 5;
+      |         ^
+```
+
+The same line is fine in a `.sa` file. To mix syntaxes, use `.sa`.
+
 ---
 
 ## Comments
@@ -385,8 +410,9 @@ Programs behave as they do under Node.js 20 (the reference it is tested against)
 and built-ins, promises and the event loop, `process`, `console`, `Buffer`, `URL`, `Intl`, typed
 arrays and the modules `assert`, `buffer`, `crypto` (hashes), `events`, `fs` (whole files), `os`,
 `path`, `perf_hooks`, `querystring`, `readline`, `stream`, `string_decoder`, `timers`, `tty`, `url`,
-`util`, `vm` and `worker_threads` (main thread only). A file the front-end cannot parse falls back
-to the older JavaScript dialect of the common syntax.
+`util`, `vm` and `worker_threads` (main thread only). A file the front-end cannot parse is a
+`SyntaxError`, reported the way node reports it: a `.js` file is JavaScript and nothing else.
+JavaScript-style code mixed with the other styles belongs in a `.sa` file.
 
 Timers run on virtual time: waiting costs nothing, and their order does not depend on how fast the
 program runs. A program that reads the clock still sees real time pass.
