@@ -2,6 +2,7 @@
 #include "../js/JsMain.h.sa"
 #include "../ruby/RubyMain.h.sa"
 #include "../python/PyMain.h.sa"
+#include "../html/HtmlMain.h.sa"
 #include "Vm.h.sa"
 #include "Error.h.sa"
 #include <iostream>
@@ -277,6 +278,29 @@ void VM::registerNatives()
             throw QuantumError(failure.kind, failure.message, failure.line);
         if (status != 0)
             std::exit(status);
+        return QuantumValue(); });
+
+    // A web page (applyDialect): shown in the default browser. When it cannot
+    // be (no browser, the temp folder not writable), the page is printed.
+    reg("__html_open__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        std::string page = args.size() > 0 ? args[0].toString() : std::string();
+        std::string name = args.size() > 1 ? args[1].toString() : std::string("page");
+        std::string file;
+        std::cout.flush();
+        if (html::openInBrowser(page, name, file))
+            std::cout << "Opened in the browser: " << file << " (deleted again in " << html::pageSeconds
+                      << " seconds)\n";
+        else
+        {
+            std::cerr << "[Warning] could not open the page in a browser";
+            if (!file.empty())
+                std::cerr << " (" << file << ")";
+            std::cerr << "; printing it instead\n";
+            std::cerr.flush();
+            std::cout << page << "\n";
+        }
+        std::cout.flush();
         return QuantumValue(); });
 
     // ── I/O ───────────────────────────────────────────────────────────────

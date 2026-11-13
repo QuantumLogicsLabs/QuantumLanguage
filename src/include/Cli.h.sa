@@ -24,9 +24,10 @@ void printHelp(const char *prog);
 extern bool g_stageMarker;
 inline const char *kStageMarker = "\x1e[quantum:compiled]\x1e\n";
 
-// Removes the global flags (--strict, --stage-marker) that precede the
-// command or file in argv, setting g_strictMode / g_stageMarker. Arguments
-// after the source file belong to the program and are left alone.
+// Removes the global flags (--strict, --print, --stage-marker) that precede
+// the command or file in argv, setting g_strictMode / g_printPages /
+// g_stageMarker. Arguments after the source file belong to the program and
+// are left alone.
 std::vector<char *> takeGlobalFlags(int argc, char *argv[]);
 
 // ─── Running a single file ────────────────────────────────────────────────

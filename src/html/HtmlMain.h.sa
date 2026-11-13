@@ -11,16 +11,35 @@ namespace html
 {
 
 // A page as qrun compiles it: the document, gcc-style diagnostics, and
-// whether any of them is an error
+// whether any of them is an error. `browser` is the same document for the
+// browser to open from a file of its own: its relative URLs (src, href,
+// srcset, CSS url() ...) are made file: URLs, so the images, scripts and
+// links next to the source page still load.
 struct Result
 {
-    std::string output, report;
+    std::string output, report, browser;
     bool failed = false;
 };
 
 // Compiles the page at `path`; `extraSheets` are stylesheet files applied as
 // well (qrun page.html extra.css), unless the page links them already
 Result compile(const std::string &source, const std::string &path, const std::vector<std::string> &extraSheets);
+
+// Shows a compiled page (Result::browser) in the default web browser: writes
+// it to <temp>/quantum-pages/<name>.html and opens that file. `file` is set
+// to where it went. The file is deleted again pageSeconds later, by a helper
+// process (deletePageLater) so that the program need not wait for the
+// browser. False when the page could not be written or no browser could be
+// started; the file is not left behind then either.
+bool openInBrowser(const std::string &page, const std::string &name, std::string &file);
+
+// how long a page's file is kept for the browser to read it
+const int pageSeconds = 10;
+
+// The helper's work (the hidden `--__delete-page <file>` of every Quantum
+// program): waits pageSeconds, then deletes `file` and, when nothing else is
+// in it, the pages folder. Only a file in that folder is ever deleted.
+int deletePageLater(const std::string &file);
 
 // Whether a .sa file holds a page: it starts with a doctype, an HTML comment
 // or an HTML element's tag

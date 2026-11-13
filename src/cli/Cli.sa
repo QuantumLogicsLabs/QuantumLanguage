@@ -203,6 +203,8 @@ std::vector<char *> takeGlobalFlags(int argc, char *argv[])
         std::string a = argv[i];
         if (i > 0 && !flagsDone && a == "--strict")
             g_strictMode = true;
+        else if (i > 0 && !flagsDone && a == "--print")
+            g_printPages = true;
         else if (i > 0 && !flagsDone && a == "--stage-marker")
             g_stageMarker = true;
         else
@@ -355,8 +357,11 @@ void printHelp(const char *prog)
               << "  " << prog << " --test  [dir]      Batch-test all supported source files\n"
               << "  " << prog << " build [name] [--run]  Build a C/C++ project natively (= qpm build)\n"
               << "  qrun <file>                 Interpret directly (no .exe)\n\n"
-              << "  Supported files: .sa .js .py .rb .c .cpp .java — all run natively on the\n"
-              << "  Quantum VM (multi-syntax subset; node/python/gcc NOT required)\n\n"
+              << "  Supported files: .sa .js .py .rb .c .cpp .java .html .css — all run natively\n"
+              << "  on the Quantum VM (multi-syntax subset; node/python/gcc NOT required)\n\n"
+              << "  A web page (.html, or a .sa file that is one) opens in your default browser;\n"
+              << "  --print before the file prints the compiled page instead:\n"
+              << "  qrun --print page.html > out.html\n\n"
               << "  quantum hello.sa            → hello.exe created and run\n"
               << "  quantum prog.c              → prog.exe created and run (no gcc)\n"
               << "  qrun    hello.py            → interpreted directly\n"

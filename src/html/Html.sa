@@ -297,6 +297,197 @@ std::string newlines(const std::string &text)
 
 std::string pathKey(const fs::path &p) { return lower(p.lexically_normal().generic_string()); }
 
+// ── the browser's copy: relative URLs made absolute ──────────────────────
+
+// The file: URL of a folder, ending in "/". Characters a URL or CSS would
+// read as syntax are percent-encoded; the rest (non-ASCII too) are kept.
+std::string folderUrl(const fs::path &dir)
+{
+    std::error_code ec;
+    fs::path full = dir.empty() ? fs::current_path(ec) : fs::absolute(dir, ec);
+    if (ec)
+        full = dir;
+    std::string p = full.lexically_normal().generic_string();
+    static const char *const hex = "0123456789ABCDEF";
+    std::string out = "file://";
+    if (p.empty() || p[0] != '/')
+        out += "/";
+    for (char ch : p)
+    {
+        unsigned char c = (unsigned char)ch;
+        if (c <= 0x20 || c == 0x7F || c == '%' || c == '#' || c == '?' || c == '"' || c == '\'' || c == '(' ||
+            c == ')' || c == '<' || c == '>' || c == '\\' || c == '`' || c == '^' || c == '{' || c == '}' || c == '|')
+        {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+        else
+            out += (char)c;
+    }
+    if (out.back() != '/')
+        out += '/';
+    return out;
+}
+
+std::string trimWs(const std::string &s)
+{
+    size_t a = 0, b = s.size();
+    while (a < b && isWs(s[a]))
+        ++a;
+    while (b > a && isWs(s[b - 1]))
+        --b;
+    return s.substr(a, b - a);
+}
+
+// Whether a URL is relative to the page's folder: not empty, no scheme
+// (http:, data:, mailto: ...), and not "#fragment", "?query", "/path" or "//host"
+bool folderRelative(const std::string &url)
+{
+    if (url.empty())
+        return false;
+    char c = url[0];
+    if (c == '#' || c == '?' || c == '/' || c == '\\')
+        return false;
+    if (std::isalpha((unsigned char)c))
+    {
+        size_t k = 1;
+        while (k < url.size() &&
+               (std::isalnum((unsigned char)url[k]) || url[k] == '+' || url[k] == '-' || url[k] == '.'))
+            ++k;
+        if (k < url.size() && url[k] == ':')
+            return false;
+    }
+    return true;
+}
+
+// `value` resolved against the folder URL `base` when it is relative
+std::string absoluteUrl(const std::string &value, const std::string &base)
+{
+    std::string url = trimWs(value);
+    return folderRelative(url) ? base + url : value;
+}
+
+// srcset="a.png 1x, b.png 2x": each candidate's URL resolved
+std::string absoluteSrcset(const std::string &value, const std::string &base)
+{
+    std::string out;
+    size_t k = 0, n = value.size();
+    while (k < n)
+    {
+        while (k < n && (isWs(value[k]) || value[k] == ','))
+            out += value[k++];
+        if (k >= n)
+            break;
+        size_t start = k;
+        while (k < n && !isWs(value[k]))
+            ++k;
+        std::string url = value.substr(start, k - start);
+        // commas at the end of the URL separate it from the next candidate
+        std::string commas;
+        while (!url.empty() && url.back() == ',')
+        {
+            commas += ',';
+            url.pop_back();
+        }
+        out += absoluteUrl(url, base) + commas;
+        if (!commas.empty())
+            continue;
+        // the descriptors, up to the comma that ends the candidate
+        int depth = 0;
+        while (k < n && !(value[k] == ',' && depth <= 0))
+        {
+            if (value[k] == '(')
+                ++depth;
+            else if (value[k] == ')')
+                --depth;
+            out += value[k++];
+        }
+    }
+    return out;
+}
+
+bool cssIdentChar(char c)
+{
+    return std::isalnum((unsigned char)c) || c == '-' || c == '_' || (unsigned char)c >= 0x80;
+}
+
+// A CSS string whose opening quote is css[k]: its text as written (escapes
+// kept), with k moved past the closing quote
+std::string cssString(const std::string &css, size_t &k)
+{
+    char quote = css[k++];
+    size_t start = k;
+    while (k < css.size() && css[k] != quote && css[k] != '\n')
+    {
+        if (css[k] == '\\' && k + 1 < css.size())
+            ++k;
+        ++k;
+    }
+    std::string text = css.substr(start, k - start);
+    if (k < css.size() && css[k] == quote)
+        ++k;
+    return text;
+}
+
+// CSS with the relative URLs of url(...) and @import "..." resolved
+std::string absoluteCssUrls(const std::string &css, const std::string &base)
+{
+    std::string out;
+    size_t k = 0, n = css.size();
+    while (k < n)
+    {
+        char c = css[k];
+        if (c == '/' && k + 1 < n && css[k + 1] == '*')
+        {
+            size_t end = css.find("*/", k + 2);
+            end = end == std::string::npos ? n : end + 2;
+            out += css.substr(k, end - k);
+            k = end;
+            continue;
+        }
+        if (c == '"' || c == '\'')
+        {
+            size_t start = k;
+            cssString(css, k);
+            out += css.substr(start, k - start);
+            continue;
+        }
+        bool isUrl = (c == 'u' || c == 'U') && lower(css.substr(k, 4)) == "url(" && (k == 0 || !cssIdentChar(css[k - 1]));
+        bool isImport = c == '@' && lower(css.substr(k, 7)) == "@import" && (k + 7 >= n || !cssIdentChar(css[k + 7]));
+        if (!isUrl && !isImport)
+        {
+            out += c;
+            ++k;
+            continue;
+        }
+        size_t head = isUrl ? 4 : 7;
+        out += css.substr(k, head);
+        k += head;
+        while (k < n && isWs(css[k]))
+            out += css[k++];
+        if (k < n && (css[k] == '"' || css[k] == '\''))
+        {
+            char quote = css[k];
+            size_t start = k;
+            std::string text = cssString(css, k);
+            bool closed = k > start + 1 && css[k - 1] == quote;
+            out += quote;
+            out += absoluteUrl(text, base);
+            if (closed)
+                out += quote;
+        }
+        else if (isUrl)
+        {
+            size_t start = k;
+            while (k < n && css[k] != ')' && !isWs(css[k]))
+                ++k;
+            out += absoluteUrl(css.substr(start, k - start), base);
+        }
+    }
+    return out;
+}
+
 // ── the page: checks, stylesheets, output ────────────────────────────────
 
 struct Diag
@@ -353,6 +544,7 @@ public:
             t->parent = style;
             style->kids.push_back(t);
             headEl->kids.push_back(style);
+            sheetFolder[style] = folderUrl(file.parent_path());
         }
 
         for (const ParseProblem &p : parser.problems)
@@ -374,12 +566,16 @@ public:
         }
         r.report += sheetReports;
         r.failed = failed;
-        for (size_t k = 0; k < doc->kids.size(); ++k)
-        {
-            if (k)
-                r.output += "\n";
-            serializeNode(r.output, doc->kids[k], true);
-        }
+        r.output = serializeDocument(doc);
+        // the browser opens the page from a file of its own, so its relative
+        // URLs are resolved against the source's folder first. A page with a
+        // <base href> has said what they resolve against: only that is resolved.
+        std::string folder = folderUrl(fs::path(path).parent_path());
+        if (Attr *baseHref = findBaseHref(doc))
+            baseHref->value = absoluteUrl(baseHref->value, folder);
+        else
+            absolutize(doc, folder);
+        r.browser = serializeDocument(doc);
         return r;
     }
 
@@ -390,8 +586,71 @@ private:
     std::vector<Diag> diags;
     std::set<std::string> ids;
     std::set<std::string> linked; // stylesheets inlined so far
+    std::map<const Node *, std::string> sheetFolder; // an inlined stylesheet: its own folder's URL
     std::string sheetReports;
     bool failed = false;
+
+    static std::string serializeDocument(const Node *doc)
+    {
+        std::string out;
+        for (size_t k = 0; k < doc->kids.size(); ++k)
+        {
+            if (k)
+                out += "\n";
+            serializeNode(out, doc->kids[k], true);
+        }
+        return out;
+    }
+
+    // the href of the first <base href> (the one the document uses)
+    static Attr *findBaseHref(Node *x)
+    {
+        if (x->type == N_ELEMENT && x->ns == NS_HTML && x->name == "base")
+            for (Attr &a : x->attrs)
+                if (a.name == "href" && a.ns == AN_NONE)
+                    return &a;
+        for (Node *k : x->kids)
+            if (Attr *a = findBaseHref(k))
+                return a;
+        return nullptr;
+    }
+
+    // Resolves the relative URLs under `x` against the folder URL `base`:
+    // the attributes that load or link something, srcset, and url() in CSS.
+    // An inlined stylesheet's url()s are relative to the stylesheet's folder.
+    void absolutize(Node *x, const std::string &base)
+    {
+        if (x->type == N_ELEMENT)
+        {
+            for (Attr &a : x->attrs)
+            {
+                const std::string &nm = a.name;
+                if (a.ns == AN_XLINK && nm == "href")
+                    a.value = absoluteUrl(a.value, base);
+                else if (a.ns != AN_NONE)
+                    continue;
+                else if (nm == "src" || nm == "href" || nm == "poster" || nm == "action" || nm == "formaction" ||
+                         (nm == "data" && x->name == "object") || (nm == "background" && x->ns == NS_HTML))
+                    a.value = absoluteUrl(a.value, base);
+                else if (nm == "srcset")
+                    a.value = absoluteSrcset(a.value, base);
+                else if (nm == "style")
+                    a.value = absoluteCssUrls(a.value, base);
+            }
+            if (x->name == "style" && x->ns != NS_MATHML)
+            {
+                auto own = sheetFolder.find(x);
+                const std::string &from = own != sheetFolder.end() ? own->second : base;
+                for (Node *k : x->kids)
+                    if (k->type == N_TEXT)
+                        k->data = absoluteCssUrls(k->data, from);
+            }
+        }
+        if (x->content)
+            absolutize(x->content, base);
+        for (Node *k : x->kids)
+            absolutize(k, base);
+    }
 
     void add(int pos, int width, bool error, const std::string &message) { parser.report(pos, width, error, message); }
     void warn(int pos, int width, const std::string &message) { add(pos, width, false, message); }
@@ -538,6 +797,7 @@ private:
         t->parent = x;
         x->kids.clear();
         x->kids.push_back(t);
+        sheetFolder[x] = folderUrl(file.parent_path());
     }
 };
 
