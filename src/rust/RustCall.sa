@@ -1,0 +1,1985 @@
+// quantum: cpp
+// Rust front-end: calls. Functions and methods of the program (with their
+// generic parameters worked out from the arguments), closures, the dispatch
+// of a method call (the type's own impls first, then the library's methods
+// for that kind of value, then through Box / Rc / Deref), what a path names
+// as a value, constants, conversions (From / Into), Default, and the
+// library's macros.
+#include "RustRt.h.sa"
+
+namespace rust
+{
+
+namespace
+{
+
+const int kMaxDepth = 3000;
+
+bool modWithin(ModDef *from, ModDef *home)
+{
+    while (home && home->isBlock)
+        home = home->parent;
+    for (ModDef *m = from; m; m = m->parent)
+        if (m == home)
+            return true;
+    return false;
+}
+
+FnDef *traitDefault(TraitDef *t, const std::string &name, int depth)
+{
+    auto it = t->methods.find(name);
+    if (it != t->methods.end() && it->second->body)
+        return it->second;
+    if (depth > 8)
+        return nullptr;
+    for (Path *sup : t->supers)
+    {
+        Sym *s = lookupName(t->mod, sup->segs.back().name);
+        if (s && s->k == S_TRAIT && s->trait != t)
+            if (FnDef *f = traitDefault(s->trait, name, depth + 1))
+                return f;
+    }
+    return nullptr;
+}
+
+// how well a value fits a declared type: 0 no, 1 perhaps, 2 yes
+int tyMatches(Ty *t, V v)
+{
+    t = tyResolve(t);
+    if (!t)
+        return 1;
+    switch (t->k)
+    {
+    case TY_REF:
+        return tyMatches(t->elem, peel(v));
+    case TY_TUPLE:
+        if (t->items.empty())
+            return v.k == V_UNIT ? 2 : 0;
+        return v.k == V_TUPLE && v.p->items.size() == t->items.size() ? 2 : 0;
+    case TY_ARRAY:
+    case TY_SLICE:
+        return v.k == V_ARRAY || v.k == V_VEC || v.k == V_SLICE ? 2 : 0;
+    case TY_PATH:
+    {
+        uint8_t prim = t->prim;
+        if (isIntPrim(prim))
+            return v.k != V_INT ? 0 : v.t == prim ? 2 : v.t == 0 ? 1 : 0;
+        if (isFloatPrim(prim))
+            return v.k != V_FLOAT ? 0 : v.t == prim ? 2 : v.t == 0 ? 1 : 0;
+        if (prim == PR_BOOL)
+            return v.k == V_BOOL ? 2 : 0;
+        if (prim == PR_CHAR)
+            return v.k == V_CHAR ? 2 : 0;
+        if (prim == PR_STR)
+            return v.k == V_STR ? 2 : 0;
+        if (t->def)
+        {
+            TypeDef *got = v.k == V_STRUCT ? static_cast<StructObj *>(v.p)->def
+                           : v.k == V_ENUM ? static_cast<EnumObj *>(v.p)->def : nullptr;
+            return got == t->def ? 2 : 0;
+        }
+        if (!t->path)
+            return 1;
+        const std::string &name = t->path->segs.back().name;
+        if (name == "String")
+            return v.k == V_STR ? (v.x ? 2 : 1) : 0;
+        if (name == "Vec")
+            return v.k == V_VEC ? 2 : 0;
+        if (name == "Option")
+            return v.k == V_ENUM && static_cast<EnumObj *>(v.p)->def == G.optionDef ? 2 : 0;
+        if (name == "Result")
+            return v.k == V_ENUM && static_cast<EnumObj *>(v.p)->def == G.resultDef ? 2 : 0;
+        if (name == "Box")
+            return v.k == V_BOX ? 2 : 0;
+        if (name == "HashMap" || name == "BTreeMap")
+            return v.k == V_MAP ? 2 : 0;
+        return 1;
+    }
+    }
+    return 1;
+}
+
+// among the impls of a method (From<A>, From<B>): the one for these arguments
+FnDef *pickOverload(FnDef *f, const std::vector<V> &args)
+{
+    if (!f->overload)
+        return f;
+    FnDef *best = f;
+    int bestScore = -1;
+    for (FnDef *c = f; c; c = c->overload)
+    {
+        size_t self = c->selfKind != SK_NONE ? 1 : 0;
+        if (c->params.size() + self != args.size())
+            continue;
+        int score = 1;
+        bool ok = true;
+        for (size_t k = 0; k < c->params.size() && ok; ++k)
+        {
+            int m = tyMatches(c->params[k].ty, args[self + k]);
+            if (m == 0)
+                ok = false;
+            score += m;
+        }
+        if (ok && score > bestScore)
+        {
+            best = c;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+// what the generic parameter `name` is, going by a parameter's type and the argument given for it
+Ty *inferTy(Ty *pt, V v, const std::string &name)
+{
+    if (!pt)
+        return nullptr;
+    switch (pt->k)
+    {
+    case TY_REF:
+        return inferTy(pt->elem, v.k == V_REF ? slotAt(v.p, v.hi) : v, name);
+    case TY_TUPLE:
+        if (v.k == V_TUPLE)
+            for (size_t k = 0; k < pt->items.size() && k < v.p->items.size(); ++k)
+                if (Ty *t = inferTy(pt->items[k], v.p->items[k], name))
+                    return t;
+        return nullptr;
+    case TY_ARRAY:
+    case TY_SLICE:
+    {
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        if (seqOf(v, o, start, len) && len > 0)
+            return inferTy(pt->elem, o->items[(size_t)start], name);
+        return nullptr;
+    }
+    case TY_PATH:
+    {
+        if (!pt->path || pt->path->qself)
+            return nullptr;
+        const PathSeg &seg = pt->path->segs.back();
+        if (pt->path->segs.size() == 1 && seg.name == name && seg.args.empty())
+            return tyOfValue(v);
+        if (seg.args.empty())
+            return nullptr;
+        V x = peelAll(v);
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        if (seqOf(x, o, start, len))
+            return len > 0 ? inferTy(seg.args[0], o->items[(size_t)start], name) : nullptr;
+        if (x.k == V_ENUM)
+        {
+            EnumObj *e = static_cast<EnumObj *>(x.p);
+            if (e->def == G.optionDef && e->variant == 1)
+                return inferTy(seg.args[0], e->items[0], name);
+            if (e->def == G.resultDef && (size_t)e->variant < seg.args.size())
+                return inferTy(seg.args[(size_t)e->variant], e->items[0], name);
+            return nullptr;
+        }
+        if (x.k == V_MAP || x.k == V_SET)
+        {
+            MapObj *m = static_cast<MapObj *>(x.p);
+            for (size_t k = 0; k < m->keys.size(); ++k)
+            {
+                if (m->keys[k].k == V_MOVED)
+                    continue;
+                if (Ty *t = inferTy(seg.args[0], m->keys[k], name))
+                    return t;
+                if (seg.args.size() > 1 && !m->isSet)
+                    return inferTy(seg.args[1], m->items[k], name);
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
+    }
+    return nullptr;
+}
+
+void bindGenerics(Frame &fr, FnDef *f, std::vector<V> &args, const std::vector<Ty *> *targs, Ty *hint)
+{
+    size_t self = f->selfKind != SK_NONE ? 1 : 0;
+    size_t explicitIdx = 0;
+    for (const GenericParam &g : f->generics)
+    {
+        if (g.isLifetime)
+            continue;
+        GenBind b;
+        b.name = g.name;
+        b.isConst = g.isConst;
+        Ty *given = targs && explicitIdx < targs->size() ? (*targs)[explicitIdx] : nullptr;
+        ++explicitIdx;
+        if (g.isConst)
+        {
+            if (given && given->len)
+                b.val = eval(given->len, nullptr);
+            else
+                for (size_t k = 0; k < f->params.size() && self + k < args.size(); ++k)
+                {
+                    // [T; N]: N is how long the argument is
+                    Ty *pt = f->params[k].ty;
+                    while (pt && pt->k == TY_REF)
+                        pt = pt->elem;
+                    if (pt && pt->k == TY_ARRAY && pt->len && pt->len->k == N_PATH &&
+                        pt->len->path->segs.back().name == g.name)
+                    {
+                        Obj *o = nullptr;
+                        int64_t start = 0, len = 0;
+                        if (seqOf(args[self + k], o, start, len))
+                            b.val = mkUint((uint64_t)len, PR_USIZE);
+                    }
+                }
+            fr.gen.push_back(b);
+            continue;
+        }
+        if (given && given->k != TY_INFER)
+            b.ty = tyResolve(given);
+        for (size_t k = 0; !b.ty && k < f->params.size() && self + k < args.size(); ++k)
+            b.ty = inferTy(f->params[k].ty, args[self + k], g.name);
+        if (!b.ty && hint && f->ret && f->ret->k == TY_PATH && f->ret->path && f->ret->path->segs.size() == 1 &&
+            f->ret->path->segs[0].name == g.name)
+            b.ty = tyResolve(hint);
+        fr.gen.push_back(b);
+    }
+}
+
+// the value of the const parameter `name` in a type, going by a value of that type ([T; N]: its length)
+bool constFromTy(Ty *t, V v, const std::string &name, V &out)
+{
+    if (!t)
+        return false;
+    switch (t->k)
+    {
+    case TY_REF:
+        return constFromTy(t->elem, peel(v), name, out);
+    case TY_TUPLE:
+    {
+        V x = peel(v);
+        if (x.k != V_TUPLE)
+            return false;
+        for (size_t k = 0; k < t->items.size() && k < x.p->items.size(); ++k)
+            if (constFromTy(t->items[k], x.p->items[k], name, out))
+                return true;
+        return false;
+    }
+    case TY_ARRAY:
+    case TY_SLICE:
+    {
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        if (!seqOf(v, o, start, len))
+            return false;
+        if (t->k == TY_ARRAY && t->len && t->len->k == N_PATH && t->len->path && t->len->path->segs.size() == 1 &&
+            t->len->path->segs[0].name == name)
+        {
+            out = mkUint((uint64_t)len, PR_USIZE);
+            return true;
+        }
+        return len > 0 && constFromTy(t->elem, o->items[(size_t)start], name, out);
+    }
+    case TY_PATH:
+    {
+        if (!t->path || t->path->segs.back().args.empty())
+            return false;
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        if (seqOf(v, o, start, len))
+            return len > 0 && constFromTy(t->path->segs.back().args[0], o->items[(size_t)start], name, out);
+        return false;
+    }
+    }
+    return false;
+}
+
+// impl<T, const N: usize> Type<T, N>: what T and N are for this receiver
+void bindImplGenerics(Frame &fr, ImplDef *im, V self)
+{
+    Ty *st = im->selfTy;
+    while (st && (st->k == TY_REF || st->k == TY_PTR))
+        st = st->elem;
+    V x = peelAll(self);
+    TypeDef *td = x.k == V_STRUCT ? static_cast<StructObj *>(x.p)->def
+                  : x.k == V_ENUM ? static_cast<EnumObj *>(x.p)->def : nullptr;
+    if (!st || !st->path || !td)
+        return;
+    const PathSeg &seg = st->path->segs.back();
+    std::vector<std::string> typeParams;
+    for (const GenericParam &g : td->generics)
+        if (!g.isLifetime)
+            typeParams.push_back(g.name);
+    const std::vector<FieldDef> *fields = &td->fields;
+    if (x.k == V_ENUM)
+        fields = &td->variants[(size_t)static_cast<EnumObj *>(x.p)->variant].fields;
+    for (const GenericParam &g : im->generics)
+    {
+        if (g.isLifetime)
+            continue;
+        GenBind b;
+        b.name = g.name;
+        b.isConst = g.isConst;
+        for (size_t j = 0; j < seg.args.size() && j < typeParams.size(); ++j)
+        {
+            Ty *arg = seg.args[j];
+            if (!arg || arg->k != TY_PATH || !arg->path || arg->path->segs.size() != 1 ||
+                arg->path->segs[0].name != g.name)
+                continue;
+            const std::string &own = typeParams[j];
+            for (size_t k = 0; k < fields->size() && k < x.p->items.size(); ++k)
+            {
+                if (g.isConst)
+                {
+                    if (constFromTy((*fields)[k].ty, x.p->items[k], own, b.val))
+                        break;
+                }
+                else if (Ty *t = inferTy((*fields)[k].ty, x.p->items[k], own))
+                {
+                    b.ty = t;
+                    break;
+                }
+            }
+            break;
+        }
+        fr.gen.push_back(b);
+    }
+}
+
+void evalArgs(const std::vector<Node *> &kids, std::vector<V> &out, FnDef *f, size_t skip)
+{
+    out.reserve(out.size() + kids.size());
+    for (size_t k = 0; k < kids.size(); ++k)
+    {
+        Ty *want = nullptr;
+        if (f && k >= skip && k - skip < f->params.size())
+            want = f->params[k - skip].ty;
+        out.push_back(eval(kids[k], want));
+        if (G.flow)
+            return;
+    }
+}
+
+V callClosure(ClosureObj *c, std::vector<V> &args, const Node *at)
+{
+    Node *d = c->def;
+    bool enter = takeAsyncEntry();
+    if (d->op == 2 && !enter)
+    {
+        // async |x| ...: the call makes a future
+        V self;
+        self.k = V_CLOSURE;
+        self.p = c;
+        return asyncClosureFuture(self, args);
+    }
+    if (d->pats.size() != args.size())
+        errAt(at, "E0057", "this function takes " + std::to_string(d->pats.size()) + " argument" +
+                               (d->pats.size() == 1 ? "" : "s") + " but " + std::to_string(args.size()) + " argument" +
+                               (args.size() == 1 ? " was" : "s were") + " supplied");
+    if (++G.depth > kMaxDepth)
+        panicAt(at, "\x01stack overflow");
+    Frame fr;
+    fr.slots.resize((size_t)d->nslots, nullptr);
+    fr.self = c->self;
+    fr.mod = c->mod;
+    fr.gen = c->gen;
+    fr.ret = d->ty;
+    for (size_t k = 0; k < c->caps.size(); ++k)
+        fr.slots[(size_t)d->capInner[k]] = c->caps[k];
+    Frame *saved = G.fr;
+    G.fr = &fr;
+    for (size_t k = 0; k < d->pats.size(); ++k)
+    {
+        V v = d->tys[k] ? coerce(args[k], d->tys[k], at) : args[k];
+        Pat *pat = d->pats[k];
+        if (pat->k == P_BIND && !pat->sub && !pat->byRef)
+            fr.slots[(size_t)pat->slot] = newCell(v);
+        else if (pat->k != P_WILD)
+        {
+            Place pl;
+            pl.o = newCell(v);
+            pl.i = 0;
+            if (!matchPat(pat, pl, M_MOVE, at))
+                errAt(at, "E0005", "refutable pattern in closure argument");
+        }
+    }
+    V result = eval(d->a, d->ty);
+    if (G.flow == FL_RETURN)
+    {
+        result = G.flowVal;
+        G.flow = FL_NONE;
+        G.flowVal = V();
+    }
+    if (d->ty)
+        result = coerce(result, d->ty, at);
+    if (G.trackDrops)
+        for (size_t k = fr.slots.size(); k-- > 0;)
+        {
+            bool captured = false;
+            for (int inner : d->capInner)
+                if ((size_t)inner == k)
+                    captured = true;
+            if (!captured && fr.slots[k])
+                dropSlot(fr.slots[k]->items[0], at);
+        }
+    G.fr = saved;
+    --G.depth;
+    return result;
+}
+
+// the library's methods for a kind of value
+bool builtinMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    if ((sv.k == V_ENUM || sv.k == V_NATIVE) && jsonMethod(sv, n, args, hint, out))
+        return true;
+    switch (sv.k)
+    {
+    case V_INT:
+        if (numMethod(sp, sv, n, args, hint, out))
+            return true;
+        break;
+    case V_FLOAT:
+        if (floatMethod(sp, sv, n, args, hint, out))
+            return true;
+        break;
+    case V_CHAR:
+        if (charMethod(sv, n, args, hint, out))
+            return true;
+        break;
+    case V_STR:
+        if (strMethod(sp, sv, n, args, hint, out))
+            return true;
+        break;
+    case V_VEC:
+    case V_ARRAY:
+    case V_SLICE:
+    case V_DEQUE:
+    case V_HEAP:
+        if (seqMethod(sp, sv, n, args, hint, out))
+            return true;
+        break;
+    case V_MAP:
+    case V_SET:
+        if (mapMethod(sp, sv, n, args, hint, out))
+            return true;
+        break;
+    case V_ENUM:
+    {
+        TypeDef *def = static_cast<EnumObj *>(sv.p)->def;
+        if (def == G.optionDef && optionMethod(sp, sv, n, args, hint, out))
+            return true;
+        if (def == G.resultDef && resultMethod(sp, sv, n, args, hint, out))
+            return true;
+        break;
+    }
+    case V_ITER:
+    case V_RANGE:
+        if (iterMethod(sv, n, args, hint, out))
+            return true;
+        break;
+    }
+    if (miscMethod(sp, sv, n, args, hint, out))
+        return true;
+    return commonMethod(sp, sv, n, args, hint, out);
+}
+
+[[noreturn]] void noMethod(const Node *n, V sv)
+{
+    std::string kind = sv.k == V_STRUCT ? "struct " : sv.k == V_ENUM ? "enum " : "";
+    std::string name = typeName(sv);
+    errAt(n, "E0599", "no method named `" + n->s + "` found for " + kind + "`" + name + "` in the current scope",
+          "method not found in `" + name + "`");
+}
+
+// The call recv.name(args): `rp` is where the receiver is; `kids` are the
+// argument expressions, or `given` the arguments already evaluated.
+V dispatchMethod(Place rp, const Node *n, const std::vector<Node *> *kids, std::vector<V> *given, Ty *hint)
+{
+    const std::string &name = n->s;
+    Place sp = rp;
+    for (;;)
+    {
+        V &s = slotAt(sp.o, sp.i);
+        if (s.k == V_REF)
+        {
+            sp.o = s.p;
+            sp.i = s.hi;
+            sp.ref = true;
+        }
+        else if (s.k == V_MOVED)
+            errAt(n, s.n == 1 ? "E0381" : "E0382", s.n == 1 ? "used binding isn't initialized" : "borrow of moved value",
+                  s.n == 1 ? "used here but it isn't initialized" : "value borrowed here after move");
+        else
+            break;
+    }
+    std::vector<V> args;
+    bool argsReady = false;
+    for (int guard = 0; guard < 16; ++guard)
+    {
+        V sv = slotAt(sp.o, sp.i);
+        // the program's own method for this type
+        if (FnDef *f = findMethodFor(sv, name))
+        {
+            if (f->selfKind == SK_NONE)
+                errAt(n, "E0599", "no method named `" + name + "` found for `" + typeName(sv) + "` in the current scope",
+                      "this is an associated function, not a method: use `" + typeName(sv) + "::" + name + "(..)`");
+            if (!f->isPub && !f->ofTrait && f->impl && !modWithin(G.fr->mod, f->impl->mod))
+                errAt(n, "E0624", "method `" + name + "` is private", "private method");
+            std::vector<V> all;
+            all.push_back(V());
+            if (given)
+                for (const V &v : *given)
+                    all.push_back(v);
+            else if (argsReady)
+                for (const V &v : args)
+                    all.push_back(v);
+            else
+            {
+                evalArgs(*kids, all, f, 0);
+                if (G.flow)
+                    return V();
+            }
+            f = pickOverload(f, all);
+            size_t ownGenerics = 0;
+            for (const GenericParam &g : f->generics)
+                if (!g.isLifetime)
+                    ++ownGenerics;
+            if (n->tys.size() > ownGenerics)
+                errAt(n, "E0107", "method takes " + std::to_string(ownGenerics) + " generic argument" +
+                                      (ownGenerics == 1 ? "" : "s") + " but " + std::to_string(n->tys.size()) +
+                                      " generic argument" + (n->tys.size() == 1 ? " was" : "s were") + " supplied",
+                      "expected " + std::to_string(ownGenerics) + " generic argument" + (ownGenerics == 1 ? "" : "s"));
+            if (f->selfKind == SK_VALUE)
+            {
+                V &slot = slotAt(sp.o, sp.i);
+                if (sp.ref && !isCopy(slot))
+                    errAt(n, "E0507", "cannot move out of a value which is behind a shared reference",
+                          "`" + name + "` takes `self` by value: clone the value first with `.clone()`");
+                all[0] = takeFrom(slot, n, "self");
+            }
+            else
+                all[0] = mkRef(sp.o, sp.i, f->selfKind == SK_MUT);
+            TypeDef *self = typeDefOf(sv);
+            return callFn(f, all, self ? self : f->owner, n, hint, &n->tys);
+        }
+        if (!argsReady)
+        {
+            if (given)
+                args = *given;
+            else
+            {
+                evalArgs(*kids, args, nullptr, 0);
+                if (G.flow)
+                    return V();
+            }
+            argsReady = true;
+        }
+        if (sv.k == V_INT && sv.n == 2 && sv.t == 0)
+        {
+            static const char *const strOnly[] = {
+                "to_lowercase", "to_uppercase", "to_ascii_lowercase", "to_ascii_uppercase", "trim", "trim_start",
+                "trim_end", "trim_matches", "trim_start_matches", "trim_end_matches", "chars", "char_indices",
+                "bytes", "as_bytes", "lines", "split", "split_whitespace", "splitn", "split_once", "rsplit",
+                "rsplit_once", "starts_with", "ends_with", "find", "rfind", "replace", "replacen", "parse",
+                "push_str", "as_str", "eq_ignore_ascii_case", "strip_prefix", "strip_suffix", "to_string_lossy",
+                "repeat", "insert_str", "matches", "is_char_boundary"};
+            bool stringish = false;
+            for (const char *s : strOnly)
+                if (name == s)
+                    stringish = true;
+            // contains / push with text or a character: a String
+            if ((name == "contains" || name == "push") && !args.empty())
+            {
+                V a0 = peel(args[0]);
+                if (a0.k == V_CHAR || (name == "contains" && a0.k == V_STR))
+                    stringish = true;
+            }
+            V fresh;
+            if (stringish)
+                fresh = mkStr("", true);
+            else if (name == "push" || name == "extend" || name == "extend_from_slice" || name == "sort" || name == "iter" ||
+                name == "len" || name == "is_empty" || name == "last" || name == "contains" || name == "append")
+                fresh = mkSeq(V_VEC, std::vector<V>());
+            else if (name == "push_back" || name == "push_front")
+                fresh = mkSeq(V_DEQUE, std::vector<V>());
+            else if (name == "insert" || name == "entry")
+                fresh = mkMap(false, args.size() == 1 && name == "insert");
+            if (fresh.k != V_UNIT)
+            {
+                slotAt(sp.o, sp.i) = fresh;
+                continue;
+            }
+        }
+        if (!n->tys.empty() && (name == "into" || name == "try_into" || name == "to_string" || name == "clone" ||
+                                name == "unwrap" || name == "expect" || name == "len" || name == "to_owned"))
+            errAt(n, "E0107", "method takes 0 generic arguments but " + std::to_string(n->tys.size()) +
+                                  " generic argument" + (n->tys.size() == 1 ? " was" : "s were") + " supplied",
+                  "expected 0 generic arguments");
+        V out;
+        if (builtinMethod(sp, sv, n, args, hint, out))
+            return out;
+        // a type with next() is an iterator: the adapters and consumers apply
+        if ((sv.k == V_STRUCT || sv.k == V_ENUM) && findMethodFor(sv, "next"))
+        {
+            IterObj *it = newIter(IT_USER);
+            it->a = mkRef(sp.o, sp.i, true);
+            if (iterMethod(iterV(it), n, args, hint, out))
+                return out;
+        }
+        // through a Box or Rc to what it holds, or through the type's Deref
+        if (sv.k == V_BOX || sv.k == V_RC)
+        {
+            sp.o = sv.p;
+            sp.i = 0;
+            if (sv.k == V_RC)
+                sp.ref = true;
+            for (;;)
+            {
+                V &s = slotAt(sp.o, sp.i);
+                if (s.k != V_REF)
+                    break;
+                sp.o = s.p;
+                sp.i = s.hi;
+                sp.ref = true;
+            }
+            continue;
+        }
+        if (sv.k == V_STRUCT || sv.k == V_ENUM)
+        {
+            if (FnDef *d = findMethodFor(sv, "deref"))
+            {
+                std::vector<V> dargs(1, mkRef(sp.o, sp.i, false));
+                V r = callFn(d, dargs, typeDefOf(sv), n, nullptr);
+                if (r.k == V_REF)
+                {
+                    sp.o = r.p;
+                    sp.i = r.hi;
+                    sp.ref = true;
+                    continue;
+                }
+                sp.o = newCell(r);
+                sp.i = 0;
+                continue;
+            }
+        }
+        noMethod(n, sv);
+    }
+    noMethod(n, slotAt(sp.o, sp.i));
+}
+
+// T::name(args) for a type known only now
+V callAssoc(Ty *ty, const std::string &name, std::vector<V> &args, const Node *at, Ty *hint)
+{
+    ty = tyResolve(ty);
+    if (!ty)
+        errAt(at, "E0283", "type annotations needed", "cannot infer the type this is called on");
+    if (TypeDef *td = tyDef(ty))
+    {
+        if (FnDef *f = findMethod(td, name))
+        {
+            f = pickOverload(f, args);
+            return callFn(f, args, td, at, hint);
+        }
+        if (name == "default")
+            return defaultFor(ty, at);
+        if (!args.empty())
+        {
+            std::vector<V> rest(args.begin() + 1, args.end());
+            return callMethodOn(args[0], name, rest, at, hint);
+        }
+        errAt(at, "E0599", "no function or associated item named `" + name + "` found for `" + td->name + "`");
+    }
+    std::string head = tyHead(ty);
+    if (head.empty() || head == "&" || head == "()" || head == "[]" || head == "[;]")
+    {
+        if (name == "default")
+            return defaultFor(ty, at);
+        errAt(at, "E0599", "no function or associated item named `" + name + "` found for `" + tyText(ty) + "`");
+    }
+    // the program's impl for a library type
+    auto it = G.builtinTypes.find(head);
+    if (it != G.builtinTypes.end())
+        if (FnDef *f = findMethod(it->second, name))
+        {
+            f = pickOverload(f, args);
+            return callFn(f, args, it->second, at, hint);
+        }
+    V out;
+    if (name == "default" && !builtinCall(head + "::default", args, at, ty, nullptr, out))
+        return defaultFor(ty, at);
+    if (builtinCall(head + "::" + name, args, at, hint ? hint : ty, nullptr, out))
+        return out;
+    if (!args.empty())
+    {
+        std::vector<V> rest(args.begin() + 1, args.end());
+        return callMethodOn(args[0], name, rest, at, hint);
+    }
+    errAt(at, "E0599", "no function or associated item named `" + name + "` found for `" + head + "`");
+}
+
+Ty *genericTy(const std::string &name)
+{
+    for (const GenBind &g : G.fr->gen)
+        if (g.name == name && !g.isConst)
+            return g.ty;
+    return nullptr;
+}
+
+V fnValue(FnDef *f, TypeDef *self)
+{
+    FnObj *o = new FnObj();
+    o->fn = f;
+    o->self = self;
+    V v;
+    v.k = V_FN;
+    v.p = o;
+    return v;
+}
+
+V ctorValue(TypeDef *def, int variant)
+{
+    FnObj *o = new FnObj();
+    o->ctor = def;
+    o->variant = variant;
+    V v;
+    v.k = V_FN;
+    v.p = o;
+    return v;
+}
+
+V construct(TypeDef *def, int variant, std::vector<V> &args, const Node *at)
+{
+    const std::vector<FieldDef> &fields = variant >= 0 ? def->variants[(size_t)variant].fields : def->fields;
+    if (fields.size() != args.size())
+        errAt(at, "E0061", std::string("this ") + (variant >= 0 ? "enum variant" : "struct") + " takes " +
+                               std::to_string(fields.size()) + " argument" + (fields.size() == 1 ? "" : "s") + " but " +
+                               std::to_string(args.size()) + (args.size() == 1 ? " argument was" : " arguments were") +
+                               " supplied");
+    for (size_t k = 0; k < args.size(); ++k)
+        if (fields[k].ty)
+            args[k] = coerce(args[k], fields[k].ty, at);
+    return variant >= 0 ? mkVariant(def, variant, args) : mkStruct(def, args);
+}
+
+// the hint for the arguments of Some(..) / Ok(..) / Err(..) / a tuple struct
+Ty *ctorArgHint(TypeDef *def, int variant, size_t k, Ty *hint)
+{
+    if (def == G.optionDef)
+        return tyArg(hint, 0);
+    if (def == G.resultDef)
+        return tyArg(hint, (size_t)variant);
+    const std::vector<FieldDef> &fields = variant >= 0 ? def->variants[(size_t)variant].fields : def->fields;
+    return k < fields.size() ? fields[k].ty : nullptr;
+}
+
+std::string assertText(const Node *n) { return n->names.empty() ? std::string() : n->names[0]; }
+
+} // namespace
+
+// ─── looking up methods ────────────────────────────────────────────────────
+
+FnDef *findMethod(TypeDef *td, const std::string &name)
+{
+    if (!td)
+        return nullptr;
+    auto it = td->methods.find(name);
+    if (it != td->methods.end())
+        return it->second;
+    for (TraitDef *t : td->traits)
+        if (FnDef *f = traitDefault(t, name, 0))
+            return f;
+    return nullptr;
+}
+
+TypeDef *typeDefOf(V v)
+{
+    switch (v.k)
+    {
+    case V_STRUCT:
+        return static_cast<StructObj *>(v.p)->def;
+    case V_ENUM:
+        return static_cast<EnumObj *>(v.p)->def;
+    }
+    if (G.builtinTypes.empty())
+        return nullptr;
+    const char *key = nullptr, *alt = nullptr;
+    switch (v.k)
+    {
+    case V_INT: key = primName(v.t ? v.t : (uint8_t)PR_I32); break;
+    case V_FLOAT: key = primName(v.t ? v.t : (uint8_t)PR_F64); break;
+    case V_BOOL: key = "bool"; break;
+    case V_CHAR: key = "char"; break;
+    case V_STR: key = v.x ? "String" : "str"; alt = v.x ? "str" : "String"; break;
+    case V_VEC: key = "Vec"; alt = "[]"; break;
+    case V_ARRAY:
+    case V_SLICE: key = "[]"; alt = "Vec"; break;
+    case V_TUPLE:
+    case V_UNIT: key = "()"; break;
+    case V_MAP: key = static_cast<MapObj *>(v.p)->sorted ? "BTreeMap" : "HashMap"; break;
+    case V_SET: key = static_cast<MapObj *>(v.p)->sorted ? "BTreeSet" : "HashSet"; break;
+    case V_BOX: key = "Box"; break;
+    case V_RC: key = "Rc"; alt = "Arc"; break;
+    case V_DEQUE: key = "VecDeque"; break;
+    case V_CLOSURE:
+    case V_FN: key = "fn"; break;
+    default: return nullptr;
+    }
+    auto it = G.builtinTypes.find(key);
+    if (it != G.builtinTypes.end())
+        return it->second;
+    if (alt)
+    {
+        it = G.builtinTypes.find(alt);
+        if (it != G.builtinTypes.end())
+            return it->second;
+    }
+    return nullptr;
+}
+
+FnDef *findMethodFor(V v, const std::string &name)
+{
+    TypeDef *td = typeDefOf(v);
+    if (FnDef *f = findMethod(td, name))
+        return f;
+    if (!G.builtinTypes.empty())
+    {
+        // an unsuffixed literal is whatever number type has the method
+        if ((v.k == V_INT || v.k == V_FLOAT) && v.t == 0)
+            for (uint8_t p = v.k == V_INT ? (uint8_t)PR_I8 : (uint8_t)PR_F32; p <= (v.k == V_INT ? PR_USIZE : PR_F64); ++p)
+            {
+                auto it = G.builtinTypes.find(primName(p));
+                if (it != G.builtinTypes.end())
+                    if (FnDef *f = findMethod(it->second, name))
+                        return f;
+            }
+        // &str and String share their impls here
+        if (v.k == V_STR)
+            for (const char *key : {"str", "String"})
+            {
+                auto it = G.builtinTypes.find(key);
+                if (it != G.builtinTypes.end())
+                    if (FnDef *f = findMethod(it->second, name))
+                        return f;
+            }
+    }
+    // impl<T> Trait for T
+    for (ImplDef *im : G.blanketImpls)
+    {
+        for (FnDef *f : im->fns)
+            if (f->name == name)
+                return f;
+        if (im->traitDef)
+            if (FnDef *f = traitDefault(im->traitDef, name, 0))
+                return f;
+    }
+    return nullptr;
+}
+
+// ─── calling ───────────────────────────────────────────────────────────────
+
+V callFn(FnDef *f, std::vector<V> &args, TypeDef *self, const Node *at, Ty *hint, const std::vector<Ty *> *targs)
+{
+    bool enter = takeAsyncEntry();
+    f = pickOverload(f, args);
+    if (!f->body)
+        errAt(at, "E0790", "cannot call associated function `" + f->name + "` on a trait without specifying the type",
+              "the trait's method has no body: it has to be called on a type that implements it");
+    size_t selfArg = f->selfKind != SK_NONE ? 1 : 0;
+    if (f->params.size() + selfArg != args.size())
+        errAt(at, "E0061", "this function takes " + std::to_string(f->params.size() + selfArg) + " argument" +
+                               (f->params.size() + selfArg == 1 ? "" : "s") + " but " + std::to_string(args.size()) +
+                               " argument" + (args.size() == 1 ? " was" : "s were") + " supplied");
+    if (f->isAsync && !enter)
+        return asyncFnFuture(f, args, self, at, hint, targs); // runs when it is awaited
+    if (++G.depth > kMaxDepth)
+        panicAt(at, "\x01stack overflow");
+    Frame fr;
+    fr.slots.resize((size_t)f->nslots, nullptr);
+    fr.fn = f;
+    fr.self = self ? self : f->owner;
+    fr.mod = f->mod;
+    fr.ret = f->ret;
+    Frame *saved = G.fr;
+    if (f->impl && !f->impl->generics.empty() && selfArg)
+        bindImplGenerics(fr, f->impl, args[0]);
+    if (!f->generics.empty())
+    {
+        // the caller's bindings still apply while the turbofish is read
+        bindGenerics(fr, f, args, targs, hint);
+    }
+    G.fr = &fr;
+    if (selfArg)
+        fr.slots[0] = newCell(args[0]);
+    for (size_t k = 0; k < f->params.size(); ++k)
+    {
+        V v = coerce(args[selfArg + k], f->params[k].ty, at);
+        Pat *pat = f->params[k].pat;
+        if (pat->k == P_BIND && !pat->sub && !pat->byRef)
+            fr.slots[(size_t)pat->slot] = newCell(v);
+        else if (pat->k != P_WILD)
+        {
+            Place pl;
+            pl.o = newCell(v);
+            pl.i = 0;
+            if (!matchPat(pat, pl, M_MOVE, at))
+                errAt(at, "E0005", "refutable pattern in function argument");
+        }
+    }
+    V result = evalBlock(f->body, f->ret);
+    if (G.flow == FL_RETURN)
+    {
+        result = G.flowVal;
+        G.flow = FL_NONE;
+        G.flowVal = V();
+    }
+    else if (G.flow != FL_NONE)
+    {
+        G.flow = FL_NONE;
+        G.flowLabel = nullptr;
+    }
+    if (f->ret)
+        result = coerce(result, f->ret, at);
+    else if (result.k != V_UNIT)
+        errPos(f->line, f->col, (int)f->name.size(), "E0308",
+               "mismatched types: expected `()`, found `" + typeName(result) + "`",
+               "`" + f->name + "` returns nothing, but its body ends in a value: add `;` after the last "
+                               "expression, or give the function a return type");
+    if (G.trackDrops)
+        for (size_t k = fr.slots.size(); k-- > 0;)
+            if (fr.slots[k])
+                dropSlot(fr.slots[k]->items[0], at);
+    G.fr = saved;
+    --G.depth;
+    return result;
+}
+
+V callValue(V f, std::vector<V> &args, const Node *at)
+{
+    f = peelAll(f);
+    if (f.k == V_CLOSURE)
+        return callClosure(static_cast<ClosureObj *>(f.p), args, at);
+    if (f.k == V_FN)
+    {
+        FnObj *o = static_cast<FnObj *>(f.p);
+        if (o->fn)
+            return callFn(o->fn, args, o->self, at, nullptr);
+        if (o->ctor)
+            return construct(o->ctor, o->variant, args, at);
+        V out;
+        if (builtinCall(o->name, args, at, nullptr, nullptr, out))
+            return out;
+        // a method used as a function: str::len, i32::abs
+        size_t sep = o->name.rfind("::");
+        if (sep != std::string::npos && !args.empty())
+        {
+            std::vector<V> rest(args.begin() + 1, args.end());
+            return callMethodOn(args[0], o->name.substr(sep + 2), rest, at);
+        }
+        errAt(at, "E0425", "`" + o->name + "` is not a library function Quantum's Rust front-end knows");
+    }
+    errAt(at, "E0618", "expected function, found `" + typeName(f) + "`", "call expression requires function");
+}
+
+V callMethodOn(V recv, const std::string &name, std::vector<V> &args, const Node *at, Ty *hint)
+{
+    Node call;
+    call.k = N_MCALL;
+    call.s = name;
+    if (at)
+    {
+        call.line = at->line;
+        call.col = at->col;
+    }
+    Place rp;
+    rp.o = newCell(recv);
+    rp.i = 0;
+    return dispatchMethod(rp, &call, nullptr, &args, hint);
+}
+
+V evalMethodCall(Node *n, Ty *hint)
+{
+    G.cur = n;
+    Place rp;
+    if (!placeOf(n->a, rp))
+    {
+        if (G.flow)
+            return V();
+        Ty *recvHint = nullptr;
+        if (hint && (n->a->k == N_MCALL || n->a->k == N_CALL || n->a->k == N_AWAIT))
+        {
+            const std::string &m = n->s;
+            if (m == "unwrap" || m == "expect" || m == "unwrap_or" || m == "unwrap_or_else" || m == "unwrap_or_default")
+                recvHint = resultHint(hint);
+            else if (m == "ok" && tyHead(hint) == "Option")
+                recvHint = resultHint(tyArg(hint, 0));
+            else if (m == "map_err" || m == "or_else" || m == "context")
+                recvHint = hint;
+        }
+        V recv = eval(n->a, recvHint);
+        if (G.flow)
+            return V();
+        rp.o = newCell(recv);
+        rp.i = 0;
+        rp.ref = false;
+    }
+    else if (G.flow)
+        return V();
+    V out = dispatchMethod(rp, n, &n->kids, nullptr, hint);
+    G.cur = n;
+    return out;
+}
+
+V evalClosure(Node *n)
+{
+    ClosureObj *c = new ClosureObj();
+    c->def = n;
+    c->self = G.fr->self;
+    c->mod = G.fr->mod;
+    c->gen = G.fr->gen;
+    c->caps.reserve(n->capOuter.size());
+    for (size_t k = 0; k < n->capOuter.size(); ++k)
+    {
+        Obj *&cell = G.fr->slots[(size_t)n->capOuter[k]];
+        if (!cell)
+        {
+            // named before it has a value (a closure that calls itself, `let x;`)
+            cell = newCell(V());
+            cell->items[0].k = V_MOVED;
+            cell->items[0].n = 1;
+        }
+        if (n->flag && cell->items[0].k != V_MOVED)
+            c->caps.push_back(newCell(takeFrom(cell->items[0], n, "a captured variable")));
+        else
+            c->caps.push_back(cell);
+    }
+    V v;
+    v.k = V_CLOSURE;
+    v.p = c;
+    return v;
+}
+
+V evalCall(Node *n, Ty *hint)
+{
+    G.cur = n;
+    Node *c = n->a;
+    std::vector<V> args;
+    if (c->k != N_PATH || c->slot >= 0)
+    {
+        // a closure or function value
+        V f = c->k == N_PATH ? evalBorrow(c, nullptr) : eval(c, nullptr);
+        if (G.flow)
+            return V();
+        V callee = peelAll(f);
+        if (callee.k == V_CLOSURE)
+        {
+            Node *d = static_cast<ClosureObj *>(callee.p)->def;
+            for (size_t k = 0; k < n->kids.size(); ++k)
+            {
+                args.push_back(eval(n->kids[k], k < d->tys.size() ? d->tys[k] : nullptr));
+                if (G.flow)
+                    return V();
+            }
+        }
+        else
+        {
+            evalArgs(n->kids, args, callee.k == V_FN ? static_cast<FnObj *>(callee.p)->fn : nullptr, 0);
+            if (G.flow)
+                return V();
+        }
+        V out = callValue(f, args, n);
+        G.cur = n;
+        return out;
+    }
+    const std::vector<Ty *> *targs = c->path->segs.back().hasArgs ? &c->path->segs.back().args : nullptr;
+    switch (c->cacheKind)
+    {
+    case CK_FN:
+    {
+        FnDef *f = static_cast<FnDef *>(c->cache);
+        evalArgs(n->kids, args, f, 0);
+        if (G.flow)
+            return V();
+        return callFn(f, args, nullptr, n, hint, targs);
+    }
+    case CK_METHOD:
+    {
+        FnDef *f = static_cast<FnDef *>(c->cache);
+        evalArgs(n->kids, args, f, f->selfKind != SK_NONE ? 1 : 0);
+        if (G.flow)
+            return V();
+        return callFn(f, args, static_cast<TypeDef *>(c->cache2), n, hint, targs);
+    }
+    case CK_CTOR:
+    case CK_VARIANT:
+    {
+        TypeDef *def = static_cast<TypeDef *>(c->cache);
+        int variant = c->cacheKind == CK_VARIANT ? c->cacheIdx : -1;
+        for (size_t k = 0; k < n->kids.size(); ++k)
+        {
+            args.push_back(eval(n->kids[k], ctorArgHint(def, variant, k, hint)));
+            if (G.flow)
+                return V();
+        }
+        if (def == G.optionDef || def == G.resultDef)
+        {
+            if (args.size() != 1)
+                errAt(n, "E0061", "this enum variant takes 1 argument but " + std::to_string(args.size()) +
+                                      " arguments were supplied");
+            Ty *want = ctorArgHint(def, variant, 0, hint);
+            if (want)
+                args[0] = coerce(args[0], want, n->kids[0]);
+            return mkVariant(def, variant, args);
+        }
+        return construct(def, variant, args, n);
+    }
+    case CK_BUILTIN:
+    {
+        const std::string &key = c->s;
+        // what the arguments are wanted as, where that is known
+        Ty *inner = nullptr;
+        if (key == "Box::new" || key == "Rc::new" || key == "Arc::new" || key == "RefCell::new" || key == "Cell::new" ||
+            key == "Mutex::new" || key == "Some")
+            inner = tyArg(hint, 0);
+        if (!inner && key.size() > 6 && key.compare(key.size() - 6, 6, "::from") == 0 && hint == nullptr)
+            inner = nullptr;
+        for (Node *kid : n->kids)
+        {
+            args.push_back(eval(kid, inner));
+            if (G.flow)
+                return V();
+        }
+        // the program's own impl for a library type: i32::zero(), String::from(point)
+        {
+            size_t at = key.rfind("::");
+            auto bt = at == std::string::npos ? G.builtinTypes.end() : G.builtinTypes.find(key.substr(0, at));
+            if (bt != G.builtinTypes.end())
+                if (FnDef *f = findMethod(bt->second, key.substr(at + 2)))
+                {
+                    FnDef *pick = pickOverload(f, args);
+                    size_t self = pick->selfKind != SK_NONE ? 1 : 0;
+                    bool fits = pick->params.size() + self == args.size();
+                    for (size_t k = 0; fits && k < pick->params.size(); ++k)
+                        fits = tyMatches(pick->params[k].ty, args[self + k]) != 0;
+                    if (fits)
+                        return callFn(pick, args, bt->second, n, hint, targs);
+                }
+        }
+        V out;
+        if (builtinCall(key, args, n, hint, targs, out))
+        {
+            G.cur = n;
+            return out;
+        }
+        size_t sep = key.rfind("::");
+        if (sep != std::string::npos && !args.empty())
+        {
+            // Type::method(receiver, ..) of a library type or trait
+            std::vector<V> rest(args.begin() + 1, args.end());
+            return callMethodOn(args[0], key.substr(sep + 2), rest, n, hint);
+        }
+        errAt(n, "E0425", "`" + key + "` is not a library function Quantum's Rust front-end knows", "not supported");
+    }
+    case CK_TYPEFN:
+    {
+        TypeDef *td = static_cast<TypeDef *>(c->cache);
+        evalArgs(n->kids, args, nullptr, 0);
+        if (G.flow)
+            return V();
+        Ty *self = tyOfValue(td->kind == TD_ENUM ? mkVariant(td, 0, std::vector<V>()) : mkStruct(td, std::vector<V>()));
+        if (c->s == "default" && args.empty())
+            return defaultFor(self, n);
+        if ((c->s == "from" || c->s == "try_from") && args.size() == 1)
+            return convertInto(args[0], self, n, c->s == "try_from");
+        if (args.empty())
+            errAt(n, "E0599", "no function or associated item named `" + c->s + "` found for `" + td->name + "`");
+        std::vector<V> rest(args.begin() + 1, args.end());
+        return callMethodOn(args[0], c->s, rest, n, hint);
+    }
+    case CK_GENERIC:
+    {
+        evalArgs(n->kids, args, nullptr, 0);
+        if (G.flow)
+            return V();
+        Ty *ty = genericTy(c->names[0]);
+        if (!ty)
+        {
+            // not known from the arguments of the enclosing call: from this one's
+            if (!args.empty())
+            {
+                std::vector<V> rest(args.begin() + 1, args.end());
+                return callMethodOn(args[0], c->s, rest, n, hint);
+            }
+            if (hint)
+                ty = tyResolve(hint);
+        }
+        return callAssoc(ty, c->s, args, n, hint);
+    }
+    case CK_SELF:
+    {
+        evalArgs(n->kids, args, nullptr, 0);
+        if (G.flow)
+            return V();
+        TypeDef *td = G.fr->self;
+        if (!td)
+            errAt(n, "E0433", "failed to resolve: `Self` is only available in impls, traits, or type definitions");
+        if (FnDef *f = findMethod(td, c->s))
+            return callFn(f, args, td, n, hint, targs);
+        if (td->kind == TD_ENUM)
+        {
+            auto v = td->variantIndex.find(c->s);
+            if (v != td->variantIndex.end())
+                return construct(td, v->second, args, n);
+        }
+        if (td->kind == TD_BUILTIN)
+        {
+            V out;
+            if (builtinCall(td->name + "::" + c->s, args, n, hint, targs, out))
+                return out;
+        }
+        if (!args.empty())
+        {
+            std::vector<V> rest(args.begin() + 1, args.end());
+            return callMethodOn(args[0], c->s, rest, n, hint);
+        }
+        if (c->s == "default")
+            return defaultFor(tyOfValue(td->kind == TD_ENUM ? mkVariant(td, 0, std::vector<V>()) : mkStruct(td, std::vector<V>())), n);
+        errAt(n, "E0599", "no function or associated item named `" + c->s + "` found for `" + td->name + "`");
+    }
+    case CK_TRAIT:
+    {
+        TraitDef *tr = static_cast<TraitDef *>(c->cache);
+        evalArgs(n->kids, args, nullptr, 0);
+        if (G.flow)
+            return V();
+        auto decl = tr->methods.find(c->s);
+        if (decl != tr->methods.end() && decl->second->selfKind != SK_NONE && !args.empty())
+        {
+            std::vector<V> rest(args.begin() + 1, args.end());
+            return callMethodOn(args[0], c->s, rest, n, hint);
+        }
+        // a function without self: the type comes from what the result is wanted as
+        if (TypeDef *td = tyDef(hint))
+            if (FnDef *f = findMethod(td, c->s))
+                return callFn(f, args, td, n, hint, targs);
+        errAt(n, "E0790", "cannot call associated function on trait without specifying the corresponding `impl` type",
+              "cannot call associated function of trait `" + tr->name + "`: use `<Type as " + tr->name + ">::" + c->s + "(..)`");
+    }
+    case CK_QSELF:
+    {
+        evalArgs(n->kids, args, nullptr, 0);
+        if (G.flow)
+            return V();
+        return callAssoc(c->path->qself, c->s, args, n, hint);
+    }
+    case CK_UNIT:
+        errAt(n, "E0618", "expected function, found struct `" + static_cast<TypeDef *>(c->cache)->name + "`",
+              "call expression requires function");
+    case CK_CONST:
+    {
+        V f = constValue(static_cast<ConstDef *>(c->cache), c);
+        evalArgs(n->kids, args, nullptr, 0);
+        if (G.flow)
+            return V();
+        return callValue(f, args, n);
+    }
+    }
+    errAt(n, "E0618", "expected function", "call expression requires function");
+}
+
+// ─── paths as values ───────────────────────────────────────────────────────
+
+Obj *constCell(ConstDef *c, const Node *at)
+{
+    if (c->cell)
+        return static_cast<Obj *>(c->cell);
+    if (!c->init)
+        errAt(at, "E0046", "the constant `" + c->name + "` has no value: the trait declares it without a default");
+    if (c->busy)
+        errAt(at, "E0391", "cycle detected when evaluating the initializer of `" + c->name + "`");
+    c->busy = true;
+    Frame fr;
+    fr.slots.resize((size_t)c->nslots, nullptr);
+    fr.self = c->owner;
+    fr.mod = c->mod;
+    Frame *saved = G.fr;
+    G.fr = &fr;
+    V v = eval(c->init, c->ty);
+    v = coerce(v, c->ty, c->init);
+    G.fr = saved;
+    c->busy = false;
+    c->cell = newCell(v);
+    return static_cast<Obj *>(c->cell);
+}
+
+V constValue(ConstDef *c, const Node *at)
+{
+    V &v = constCell(c, at)->items[0];
+    // a constant is a fresh value wherever it is named; a static is one place
+    if (c->isStatic)
+        return isCopy(v) ? copyShell(v) : v;
+    return isCopy(v) ? copyShell(v) : cloneValue(v, at);
+}
+
+V evalPathValue(Node *n, Ty *hint)
+{
+    switch (n->cacheKind)
+    {
+    case CK_CONST:
+        return constValue(static_cast<ConstDef *>(n->cache), n);
+    case CK_UNIT:
+        return mkStruct(static_cast<TypeDef *>(n->cache), std::vector<V>());
+    case CK_VARIANT:
+    {
+        TypeDef *def = static_cast<TypeDef *>(n->cache);
+        if (def->variants[(size_t)n->cacheIdx].form == FORM_UNIT)
+        {
+            if (def == G.optionDef)
+                return mkNone();
+            return mkVariant(def, n->cacheIdx, std::vector<V>());
+        }
+        return ctorValue(def, n->cacheIdx);
+    }
+    case CK_CTOR:
+        return ctorValue(static_cast<TypeDef *>(n->cache), -1);
+    case CK_FN:
+        return fnValue(static_cast<FnDef *>(n->cache), nullptr);
+    case CK_METHOD:
+        return fnValue(static_cast<FnDef *>(n->cache), static_cast<TypeDef *>(n->cache2));
+    case CK_BUILTIN:
+    {
+        V v;
+        if (builtinConst(n->s, v))
+            return v;
+        return mkBuiltinFn(n->s);
+    }
+    case CK_TYPEFN:
+        return mkBuiltinFn(static_cast<TypeDef *>(n->cache)->name + "::" + n->s);
+    case CK_GENERIC:
+    {
+        const std::string &g = n->names[0];
+        if (n->s.empty())
+        {
+            for (const GenBind &b : G.fr->gen)
+                if (b.name == g && b.isConst)
+                    return b.val;
+            errAt(n, "E0423", "expected value, found type parameter `" + g + "`");
+        }
+        Ty *ty = genericTy(g);
+        if (!ty && hint)
+            ty = tyResolve(hint);
+        if (!ty)
+            errAt(n, "E0283", "type annotations needed", "cannot tell which type `" + g + "` is here");
+        if (TypeDef *td = tyDef(ty))
+        {
+            auto c = td->consts.find(n->s);
+            if (c != td->consts.end())
+                return constValue(c->second, n);
+            for (TraitDef *t : td->traits)
+            {
+                auto tc = t->consts.find(n->s);
+                if (tc != t->consts.end() && tc->second->init)
+                    return constValue(tc->second, n);
+            }
+            if (FnDef *f = findMethod(td, n->s))
+                return fnValue(f, td);
+        }
+        std::string head = tyHead(ty);
+        auto bt = G.builtinTypes.find(head);
+        if (bt != G.builtinTypes.end())
+        {
+            auto c = bt->second->consts.find(n->s);
+            if (c != bt->second->consts.end())
+                return constValue(c->second, n);
+            if (FnDef *f = findMethod(bt->second, n->s))
+                return fnValue(f, bt->second);
+        }
+        V v;
+        if (builtinConst(head + "::" + n->s, v))
+            return v;
+        return mkBuiltinFn(head + "::" + n->s);
+    }
+    case CK_SELF:
+    {
+        TypeDef *td = G.fr->self;
+        if (!td)
+            errAt(n, "E0433", "failed to resolve: `Self` is only available in impls, traits, or type definitions");
+        auto c = td->consts.find(n->s);
+        if (c != td->consts.end())
+            return constValue(c->second, n);
+        for (TraitDef *t : td->traits)
+        {
+            auto tc = t->consts.find(n->s);
+            if (tc != t->consts.end() && tc->second->init)
+                return constValue(tc->second, n);
+        }
+        if (td->kind == TD_ENUM)
+        {
+            auto v = td->variantIndex.find(n->s);
+            if (v != td->variantIndex.end())
+                return td->variants[(size_t)v->second].form == FORM_UNIT ? mkVariant(td, v->second, std::vector<V>())
+                                                                        : ctorValue(td, v->second);
+        }
+        if (FnDef *f = findMethod(td, n->s))
+            return fnValue(f, td);
+        if (td->kind == TD_BUILTIN)
+        {
+            V v;
+            if (builtinConst(td->name + "::" + n->s, v))
+                return v;
+        }
+        errAt(n, "E0599", "no associated item named `" + n->s + "` found for `" + td->name + "`");
+    }
+    case CK_QSELF:
+    {
+        Ty *ty = tyResolve(n->path->qself);
+        if (TypeDef *td = tyDef(ty))
+        {
+            auto c = td->consts.find(n->s);
+            if (c != td->consts.end())
+                return constValue(c->second, n);
+            for (TraitDef *t : td->traits)
+            {
+                auto tc = t->consts.find(n->s);
+                if (tc != t->consts.end() && tc->second->init)
+                    return constValue(tc->second, n);
+            }
+            if (FnDef *f = findMethod(td, n->s))
+                return fnValue(f, td);
+        }
+        V v;
+        if (builtinConst(tyHead(ty) + "::" + n->s, v))
+            return v;
+        return mkBuiltinFn(tyHead(ty) + "::" + n->s);
+    }
+    case CK_TRAIT:
+    {
+        // Trait::CONST: of the type the value is wanted as
+        TraitDef *tr = static_cast<TraitDef *>(n->cache);
+        if (TypeDef *td = tyDef(hint))
+        {
+            auto c = td->consts.find(n->s);
+            if (c != td->consts.end())
+                return constValue(c->second, n);
+        }
+        auto tc = tr->consts.find(n->s);
+        if (tc != tr->consts.end() && tc->second->init)
+            return constValue(tc->second, n);
+        return mkBuiltinFn(tr->name + "::" + n->s);
+    }
+    case CK_DISCARD:
+        errAt(n, "", "in expressions, `_` can only be used on the left-hand side of an assignment",
+              "`_` not allowed here");
+    }
+    errAt(n, "E0425", "cannot find value `" + n->path->segs.back().name + "` in this scope", "not found in this scope");
+}
+
+// ─── Default and conversions ───────────────────────────────────────────────
+
+V defaultFor(Ty *ty, const Node *at)
+{
+    ty = tyResolve(ty);
+    if (!ty)
+        errAt(at, "E0283", "type annotations needed", "cannot infer the type `Default::default()` is wanted as");
+    switch (ty->k)
+    {
+    case TY_TUPLE:
+    {
+        std::vector<V> items;
+        for (Ty *item : ty->items)
+            items.push_back(defaultFor(item, at));
+        return mkTuple(items);
+    }
+    case TY_ARRAY:
+    {
+        int64_t len = ty->len ? toIndex(eval(ty->len, nullptr), at) : 0;
+        std::vector<V> items;
+        for (int64_t k = 0; k < len; ++k)
+            items.push_back(defaultFor(ty->elem, at));
+        return mkSeq(V_ARRAY, items);
+    }
+    case TY_REF:
+        if (tyPrim(ty->elem) == PR_STR)
+            return mkStr("", false);
+        break;
+    case TY_PATH:
+    {
+        uint8_t prim = ty->prim;
+        if (isIntPrim(prim))
+            return mkInt(0, prim);
+        if (isFloatPrim(prim))
+            return mkFloat(0, prim);
+        if (prim == PR_BOOL)
+            return mkBool(false);
+        if (prim == PR_CHAR)
+            return mkChar(0);
+        if (TypeDef *td = ty->def)
+        {
+            if (FnDef *f = findMethod(td, "default"))
+            {
+                std::vector<V> none;
+                return callFn(f, none, td, at, ty);
+            }
+            if (!(td->derives & D_DEFAULT))
+                errAt(at, "E0277", "the trait bound `" + td->name + ": Default` is not satisfied",
+                      "the trait `Default` is not implemented for `" + td->name + "`: add `#[derive(Default)]`");
+            if (td->kind == TD_ENUM)
+            {
+                if (td->defaultVariant < 0)
+                    errAt(at, "E0665", "`#[derive(Default)]` on enum with no `#[default]`");
+                return mkVariant(td, td->defaultVariant, std::vector<V>());
+            }
+            std::vector<V> items;
+            for (const FieldDef &fd : td->fields)
+                items.push_back(defaultFor(fd.ty, at));
+            return mkStruct(td, items);
+        }
+        const std::string head = tyHead(ty);
+        if (head == "String")
+            return mkStr("", true);
+        if (head == "Vec")
+            return mkSeq(V_VEC, std::vector<V>());
+        if (head == "VecDeque")
+            return mkSeq(V_DEQUE, std::vector<V>());
+        if (head == "BinaryHeap")
+            return mkSeq(V_HEAP, std::vector<V>());
+        if (head == "Option")
+            return mkNone();
+        if (head == "HashMap" || head == "BTreeMap")
+            return mkMap(head == "BTreeMap", false);
+        if (head == "HashSet" || head == "BTreeSet")
+            return mkMap(head == "BTreeSet", true);
+        if (head == "Box")
+            return mkBox(defaultFor(tyArg(ty, 0), at));
+        if (head == "Rc" || head == "Arc")
+            return mkRc(defaultFor(tyArg(ty, 0), at));
+        if (head == "RefCell" || head == "Cell" || head == "Mutex")
+            return mkCell(defaultFor(tyArg(ty, 0), at), head == "Cell" ? 1 : head == "Mutex" ? 2 : 0);
+        auto bt = G.builtinTypes.find(head);
+        if (bt != G.builtinTypes.end())
+            if (FnDef *f = findMethod(bt->second, "default"))
+            {
+                std::vector<V> none;
+                return callFn(f, none, bt->second, at, ty);
+            }
+        break;
+    }
+    }
+    errAt(at, "E0277", "the trait bound `" + tyText(ty) + ": Default` is not satisfied");
+}
+
+V convertInto(V v, Ty *to, const Node *at, bool tryForm)
+{
+    to = tyResolve(to);
+    if (!to)
+        return v;
+    V x = peel(v);
+    auto done = [&](V r) -> V { return tryForm ? mkOk(r) : r; };
+    if (to->k == TY_PATH)
+    {
+        uint8_t prim = to->prim;
+        if (isIntPrim(prim))
+        {
+            if (x.k == V_INT)
+            {
+                x = fixInt(x);
+                if (intFits(x, prim))
+                    return done(intConvert(x, prim));
+                if (tryForm)
+                    return mkErr(mkNative("TryFromIntError", "TryFromIntError(())"));
+                errAt(at, "E0277", std::string("the trait bound `") + primName(prim) + ": From<" + typeName(x) +
+                                       ">` is not satisfied",
+                      "this conversion can lose information: use `try_from` or `as`");
+            }
+            if (x.k == V_BOOL || x.k == V_CHAR)
+                return done(intConvert(mkUint(x.lo, PR_U32), prim));
+        }
+        else if (isFloatPrim(prim))
+        {
+            if (x.k == V_INT)
+                return done(mkFloat((double)(int64_t)x.lo, prim));
+            if (x.k == V_FLOAT)
+                return done(mkFloat(fval(x), prim));
+        }
+        else if (prim == PR_CHAR)
+        {
+            if (x.k == V_CHAR)
+                return done(x);
+            if (x.k == V_INT)
+            {
+                bool ok = x.hi == 0 && x.lo <= 0x10FFFF && !(x.lo >= 0xD800 && x.lo <= 0xDFFF) &&
+                          (tryForm || x.t == PR_U8 || (x.t == 0 && x.lo < 256));
+                if (ok)
+                    return done(mkChar((uint32_t)x.lo));
+                if (tryForm)
+                    return mkErr(mkNative("CharTryFromError", "CharTryFromError(())"));
+            }
+        }
+        else if (prim == PR_BOOL && x.k == V_BOOL)
+            return done(x);
+        if (TypeDef *td = to->def)
+        {
+            TypeDef *got = x.k == V_STRUCT ? static_cast<StructObj *>(x.p)->def
+                           : x.k == V_ENUM ? static_cast<EnumObj *>(x.p)->def : nullptr;
+            if (FnDef *f = findMethod(td, tryForm ? "try_from" : "from"))
+            {
+                std::vector<V> args(1, v);
+                FnDef *pick = pickOverload(f, args);
+                if (got != td || tyMatches(pick->params.empty() ? nullptr : pick->params[0].ty, v) == 2)
+                    return callFn(pick, args, td, at, to);
+            }
+            if (got == td)
+                return done(v);
+            // Into on the source type: impl Into<Target> for Source
+            if (FnDef *into = findMethodFor(x, "into"))
+            {
+                std::vector<V> args(1, v);
+                return done(callFn(into, args, typeDefOf(x), at, to));
+            }
+            errAt(at, "E0277", "the trait bound `" + td->name + ": From<" + typeName(x) + ">` is not satisfied",
+                  "the trait `From<" + typeName(x) + ">` is not implemented for `" + td->name + "`");
+        }
+        const std::string head = tyHead(to);
+        if ((head == "PathBuf" || head == "Path") && x.k == V_STR)
+            return done(mkNative("Path", static_cast<StrObj *>(x.p)->s)); // "dir".into(): a PathBuf
+        if (head == "String")
+        {
+            if (x.k == V_STR)
+                return done(mkStr(static_cast<StrObj *>(x.p)->s, true));
+            if (x.k == V_CHAR)
+            {
+                std::string s;
+                utf8Append(s, (uint32_t)x.lo);
+                return done(mkStr(s, true));
+            }
+            if (x.k == V_BOX && x.p->items[0].k == V_STR)
+                return done(mkStr(strOf(x), true));
+        }
+        else if (head == "Vec" || head == "VecDeque" || head == "BinaryHeap")
+        {
+            uint8_t kind = head == "Vec" ? V_VEC : head == "VecDeque" ? V_DEQUE : V_HEAP;
+            Obj *o = nullptr;
+            int64_t start = 0, len = 0;
+            if (x.k == V_STR)
+            {
+                std::vector<V> bytes;
+                for (unsigned char c : static_cast<StrObj *>(x.p)->s)
+                    bytes.push_back(mkUint(c, PR_U8));
+                return done(mkSeq(kind, bytes));
+            }
+            if (seqOf(x, o, start, len))
+            {
+                std::vector<V> items;
+                bool owned = v.k != V_REF && x.k != V_SLICE;
+                for (int64_t k = 0; k < len; ++k)
+                    items.push_back(owned ? o->items[(size_t)(start + k)] : cloneValue(o->items[(size_t)(start + k)], at));
+                V out = mkSeq(kind, items);
+                if (kind == V_HEAP)
+                {
+                    std::vector<V> none;
+                    return done(callMethodOn(mkSeq(V_VEC, items), "into_heap", none, at));
+                }
+                return done(out);
+            }
+        }
+        else if (head == "Box")
+        {
+            if (x.k == V_BOX)
+                return done(v);
+            // Box<dyn Error> from text: an error that shows the text
+            Ty *inner = tyResolve(tyArg(to, 0));
+            if (x.k == V_STR && inner && (inner->k == TY_DYN || tyPrim(inner) != PR_STR))
+                return done(mkBox(mkNative("Error", static_cast<StrObj *>(x.p)->s)));
+            return done(mkBox(v));
+        }
+        else if (head == "Rc" || head == "Arc")
+            return done(x.k == V_RC ? v : mkRc(v));
+        else if (head == "Option")
+            return done(x.k == V_ENUM && static_cast<EnumObj *>(x.p)->def == G.optionDef ? v : mkSome(v));
+        else if (head == "HashMap" || head == "BTreeMap" || head == "HashSet" || head == "BTreeSet")
+        {
+            if (x.k == V_MAP || x.k == V_SET)
+                return done(v);
+            V it = toIter(v, at);
+            std::vector<V> items;
+            iterDrain(static_cast<IterObj *>(it.p), items, at);
+            return done(collectInto(items, to, at));
+        }
+        else if (head == "PathBuf" || head == "OsString")
+            return done(x.k == V_STR ? mkStr(static_cast<StrObj *>(x.p)->s, true) : v);
+        // the program's own impl for a library type
+        auto bt = G.builtinTypes.find(head);
+        if (bt != G.builtinTypes.end())
+            if (FnDef *f = findMethod(bt->second, tryForm ? "try_from" : "from"))
+            {
+                std::vector<V> args(1, v);
+                return callFn(f, args, bt->second, at, to);
+            }
+    }
+    else if (to->k == TY_REF && tyPrim(to->elem) == PR_STR && x.k == V_STR)
+        return done(v.k == V_REF ? v : mkStr(static_cast<StrObj *>(x.p)->s, false));
+    // impl Into<Target> for the value's own type
+    if (x.k == V_STRUCT || x.k == V_ENUM)
+        if (FnDef *into = findMethodFor(x, tryForm ? "try_into" : "into"))
+        {
+            std::vector<V> args(1, v);
+            return callFn(into, args, typeDefOf(x), at, to);
+        }
+    return done(v);
+}
+
+// ─── macros ────────────────────────────────────────────────────────────────
+
+V evalMacro(Node *n, Ty *hint)
+{
+    G.cur = n;
+    const std::string &name = n->s;
+    if (name == "join" || name == "try_join" || name == "select" || name == "pin")
+    {
+        V out;
+        if (taskMacro(n, hint, out))
+            return out;
+    }
+    if (name == "json")
+        return jsonMacro(n->a, n);
+    if (name == "env" || name == "option_env")
+    {
+        std::string value;
+        bool found = !n->names.empty() && compileEnv(n->names[0], value);
+        if (name == "option_env")
+            return found ? mkSome(mkStr(value, false)) : mkNone();
+        if (!found)
+            errAt(n, "", n->names.size() > 1 ? n->names[1]
+                                              : "environment variable `" + (n->names.empty() ? std::string() : n->names[0]) +
+                                                    "` not defined at compile time",
+                  "use `std::env::var(\"" + (n->names.empty() ? std::string() : n->names[0]) +
+                      "\")` to read the variable at run time");
+        return mkStr(value, false);
+    }
+    // the formatting macros look at their arguments: nothing is moved
+    auto fmtArgs = [&](std::vector<V> &args) -> bool
+    {
+        args.reserve(n->kids.size());
+        for (Node *kid : n->kids)
+        {
+            args.push_back(evalBorrow(kid, nullptr));
+            if (G.flow)
+                return false;
+        }
+        return true;
+    };
+    if (name == "println" || name == "print" || name == "eprintln" || name == "eprint")
+    {
+        std::vector<V> args;
+        if (!fmtArgs(args))
+            return V();
+        std::string text = formatArgs(n, 0, args);
+        if (name == "println" || name == "eprintln")
+            text += "\n";
+        if (name[0] == 'e')
+            writeErr(text);
+        else
+            writeOut(text);
+        return V();
+    }
+    if (name == "format" || name == "format_args")
+    {
+        std::vector<V> args;
+        if (!fmtArgs(args))
+            return V();
+        return mkStr(formatArgs(n, 0, args), true);
+    }
+    if (name == "panic" || name == "unreachable" || name == "todo" || name == "unimplemented")
+    {
+        std::vector<V> args;
+        if (!fmtArgs(args))
+            return V();
+        std::string text = n->fmt ? formatArgs(n, 0, args) : std::string();
+        if (name == "panic")
+            panicAt(n, n->fmt ? text : "explicit panic");
+        const char *base = name == "unreachable" ? "internal error: entered unreachable code"
+                           : name == "todo" ? "not yet implemented" : "not implemented";
+        panicAt(n, n->fmt ? std::string(base) + ": " + text : base);
+    }
+    if (name == "assert" || name == "debug_assert")
+    {
+        V c = peel(eval(n->kids[0], nullptr));
+        if (G.flow)
+            return V();
+        if (c.k != V_BOOL)
+            errAt(n->kids[0], "E0308", "mismatched types: expected `bool`, found `" + typeName(c) + "`");
+        if (c.lo)
+            return V();
+        if (n->fmt)
+        {
+            std::vector<V> args;
+            if (!fmtArgs(args))
+                return V();
+            panicAt(n, formatArgs(n, 1, args));
+        }
+        panicAt(n, "assertion failed: " + assertText(n));
+    }
+    if (name == "assert_eq" || name == "assert_ne" || name == "debug_assert_eq" || name == "debug_assert_ne")
+    {
+        V a = evalBorrow(n->kids[0], nullptr);
+        if (G.flow)
+            return V();
+        V b = evalBorrow(n->kids[1], nullptr);
+        if (G.flow)
+            return V();
+        V x = peelAll(a), y = peelAll(b);
+        if ((x.k == V_INT && y.k == V_INT) || (x.k == V_FLOAT && y.k == V_FLOAT))
+            unifyNum(x, y, n, "this assertion");
+        bool same = valueEq(x, y, n);
+        bool wantSame = name.find("_eq") != std::string::npos;
+        if (same == wantSame)
+            return V();
+        std::string text = std::string("assertion `left ") + (wantSame ? "==" : "!=") + " right` failed";
+        if (n->fmt)
+        {
+            std::vector<V> args;
+            args.push_back(a);
+            args.push_back(b);
+            for (size_t k = 2; k < n->kids.size(); ++k)
+            {
+                args.push_back(evalBorrow(n->kids[k], nullptr));
+                if (G.flow)
+                    return V();
+            }
+            text += ": " + formatArgs(n, 2, args);
+        }
+        text += "\n  left: " + debugStr(x, false, n) + "\n right: " + debugStr(y, false, n);
+        panicAt(n, text);
+    }
+    if (name == "vec")
+    {
+        Ty *elem = tyHead(hint) == "Vec" ? tyArg(hint, 0) : nullptr;
+        std::vector<V> items;
+        if (n->flag)
+        {
+            V v = eval(n->kids[0], elem);
+            if (G.flow)
+                return V();
+            V count = eval(n->kids[1], nullptr);
+            if (G.flow)
+                return V();
+            int64_t len = toIndex(count, n->kids[1]);
+            items.reserve((size_t)len);
+            for (int64_t k = 0; k < len; ++k)
+                items.push_back(k + 1 == len ? v : cloneValue(v, n));
+            return mkSeq(V_VEC, items);
+        }
+        items.reserve(n->kids.size());
+        uint8_t firm = 0;
+        for (Node *kid : n->kids)
+        {
+            V v = eval(kid, elem);
+            if (G.flow)
+                return V();
+            if (elem)
+                v = coerce(v, elem, kid);
+            if ((v.k == V_INT || v.k == V_FLOAT) && v.t)
+                firm = v.t;
+            items.push_back(v);
+        }
+        if (firm)
+            for (V &v : items)
+                if ((v.k == V_INT || v.k == V_FLOAT) && v.t == 0)
+                    v = v.k == V_INT ? intConvert(v, firm) : mkFloat(fval(v), firm);
+        return mkSeq(V_VEC, items);
+    }
+    if (name == "matches")
+    {
+        Place pl;
+        if (!placeOf(n->a, pl))
+        {
+            V v = eval(n->a, nullptr);
+            if (G.flow)
+                return V();
+            pl.o = newCell(v);
+            pl.i = 0;
+        }
+        bool ok = matchPat(n->pat, pl, M_PEEK, n);
+        if (ok && n->b)
+            ok = evalCond(n->b);
+        return mkBool(ok);
+    }
+    if (name == "write" || name == "writeln")
+    {
+        V dest = evalBorrow(n->kids[0], nullptr);
+        if (G.flow)
+            return V();
+        std::vector<V> args;
+        if (!fmtArgs(args))
+            return V();
+        std::string text = formatArgs(n, 1, args);
+        if (name == "writeln")
+            text += "\n";
+        V d = peelAll(dest);
+        V written;
+        if (d.k == V_NATIVE && fsWrite(static_cast<NativeObj *>(d.p), text, written))
+            return written;
+        if (d.k == V_NATIVE)
+        {
+            NativeObj *o = static_cast<NativeObj *>(d.p);
+            if (o->buf)
+                *o->buf += text; // a Formatter
+            else if (o->type == "Stderr")
+                writeErr(text);
+            else
+                writeOut(text);
+        }
+        else if (d.k == V_STR)
+            static_cast<StrObj *>(d.p)->s += text;
+        else if (d.k == V_VEC)
+            for (unsigned char c : text)
+                d.p->items.push_back(mkUint(c, PR_U8));
+        else
+        {
+            // a type with its own write_str / write_all
+            std::vector<V> wargs(1, mkStr(text, false));
+            if (findMethodFor(d, "write_str"))
+                return callMethodOn(dest, "write_str", wargs, n);
+            errAt(n, "E0599", "cannot write into a `" + typeName(d) + "`: it implements neither `fmt::Write` nor `io::Write`");
+        }
+        return mkOk(V());
+    }
+    if (name == "dbg")
+    {
+        V last;
+        for (Node *kid : n->kids)
+        {
+            V v = eval(kid, hint);
+            if (G.flow)
+                return V();
+            writeErr("[" + srcPos(n->line, n->col) + "] " +
+                     debugStr(v, true, n) + "\n");
+            last = v;
+        }
+        return last;
+    }
+    if (name == "line")
+        return mkUint((uint64_t)srcLine(n->line), PR_U32);
+    if (name == "column")
+        return mkUint((uint64_t)n->col, PR_U32);
+    if (name == "file")
+    {
+        int f = srcFile(n->line);
+        return mkStr(f > 0 && (size_t)f < G.files.size() ? G.files[(size_t)f] : G.fileName, false);
+    }
+    if (name == "module_path")
+        return mkStr("main", false);
+    if (name == "stringify")
+        return mkStr(assertText(n), false);
+    if (name == "cfg")
+        return mkBool(false);
+    if (name == "concat")
+    {
+        std::string text;
+        for (Node *kid : n->kids)
+        {
+            V v = eval(kid, nullptr);
+            text += displayStr(v, n);
+        }
+        return mkStr(text, false);
+    }
+    errAt(n, "", "cannot find macro `" + name + "` in this scope");
+}
+
+} // namespace rust

@@ -1,0 +1,693 @@
+// quantum: cpp
+// Rust front-end: the lexer. Source text to tokens: identifiers (raw ones
+// too), lifetimes, numbers with their suffixes (integers to 128 bits),
+// strings in every form (escapes decoded), characters, bytes, punctuation.
+// Comments nest. A mistake is a CompileErr worded as rustc words it.
+#include "RustAst.h.sa"
+
+#include <cstdlib>
+
+namespace rust
+{
+
+uint8_t primOf(const std::string &n)
+{
+    if (n.size() < 2 || n.size() > 5)
+        return PR_NONE;
+    switch (n[0])
+    {
+    case 'i':
+        if (n == "i8") return PR_I8;
+        if (n == "i16") return PR_I16;
+        if (n == "i32") return PR_I32;
+        if (n == "i64") return PR_I64;
+        if (n == "i128") return PR_I128;
+        if (n == "isize") return PR_ISIZE;
+        break;
+    case 'u':
+        if (n == "u8") return PR_U8;
+        if (n == "u16") return PR_U16;
+        if (n == "u32") return PR_U32;
+        if (n == "u64") return PR_U64;
+        if (n == "u128") return PR_U128;
+        if (n == "usize") return PR_USIZE;
+        break;
+    case 'f':
+        if (n == "f32") return PR_F32;
+        if (n == "f64") return PR_F64;
+        break;
+    case 'b':
+        if (n == "bool") return PR_BOOL;
+        break;
+    case 'c':
+        if (n == "char") return PR_CHAR;
+        break;
+    case 's':
+        if (n == "str") return PR_STR;
+        break;
+    }
+    return PR_NONE;
+}
+
+const char *primName(uint8_t p)
+{
+    static const char *const names[] = {"",     "i8",  "i16",  "i32",   "i64", "i128", "isize", "u8",   "u16",
+                                        "u32",  "u64", "u128", "usize", "f32", "f64",  "bool",  "char", "str"};
+    return p <= PR_STR ? names[p] : "";
+}
+
+namespace
+{
+
+bool identStart(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80; }
+bool identChar(unsigned char c) { return identStart(c) || (c >= '0' && c <= '9'); }
+bool digit(unsigned char c) { return c >= '0' && c <= '9'; }
+
+int digitValue(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return 99;
+}
+
+void appendUtf8(std::string &out, uint32_t cp)
+{
+    if (cp < 0x80)
+        out += (char)cp;
+    else if (cp < 0x800)
+    {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+    else if (cp < 0x10000)
+    {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+    else
+    {
+        out += (char)(0xF0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+struct Lexer
+{
+    const std::string &src;
+    size_t i = 0;
+    int line = 1, col = 1;
+    std::vector<Tok> out;
+    bool space = false;
+
+    explicit Lexer(const std::string &s) : src(s) {}
+
+    [[noreturn]] void fail(const std::string &msg, int l, int c, int width = 1)
+    {
+        CompileErr e;
+        e.message = msg;
+        e.line = l;
+        e.col = c;
+        e.width = width;
+        throw e;
+    }
+
+    char at(size_t k) const { return k < src.size() ? src[k] : '\0'; }
+
+    void adv()
+    {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '\n')
+        {
+            ++line;
+            col = 1;
+        }
+        else if ((c & 0xC0) != 0x80)
+            ++col;
+        ++i;
+    }
+
+    void advN(size_t n)
+    {
+        while (n-- > 0 && i < src.size())
+            adv();
+    }
+
+    Tok &push(uint8_t k, int l, int c)
+    {
+        Tok t;
+        t.k = k;
+        t.line = l;
+        t.col = c;
+        t.spaceBefore = space;
+        space = false;
+        out.push_back(t);
+        return out.back();
+    }
+
+    // one code point of the source at i (not consumed); n: its bytes
+    uint32_t codePoint(size_t at0, size_t &n) const
+    {
+        unsigned char c = (unsigned char)src[at0];
+        if (c < 0x80)
+        {
+            n = 1;
+            return c;
+        }
+        int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
+        uint32_t cp = c & (0x3F >> extra);
+        n = 1;
+        for (int k = 0; k < extra && at0 + n < src.size(); ++k, ++n)
+            cp = (cp << 6) | ((unsigned char)src[at0 + n] & 0x3F);
+        return cp;
+    }
+
+    // An escape after its backslash (i is on the character after it).
+    // `bytes`: in a byte literal, \xNN goes to 0xFF and there is no \u.
+    // Returns false for a line continuation (nothing to add).
+    bool escape(uint32_t &cp, bool bytes)
+    {
+        int l = line, c = col - 1;
+        char e = at(i);
+        adv();
+        switch (e)
+        {
+        case 'n': cp = '\n'; return true;
+        case 'r': cp = '\r'; return true;
+        case 't': cp = '\t'; return true;
+        case '\\': cp = '\\'; return true;
+        case '0': cp = 0; return true;
+        case '\'': cp = '\''; return true;
+        case '"': cp = '"'; return true;
+        case 'x':
+        {
+            int a = digitValue(at(i)), b = digitValue(at(i + 1));
+            if (a > 15 || b > 15)
+                fail("numeric character escape is too short", l, c, 2);
+            advN(2);
+            cp = (uint32_t)(a * 16 + b);
+            if (!bytes && cp > 0x7F)
+                fail("out of range hex escape", l, c, 4);
+            return true;
+        }
+        case 'u':
+        {
+            if (bytes)
+                fail("unicode escape in byte string", l, c, 2);
+            if (at(i) != '{')
+                fail("incorrect unicode escape sequence", l, c, 2);
+            adv();
+            cp = 0;
+            int digits = 0;
+            while (at(i) != '}')
+            {
+                if (at(i) == '_')
+                {
+                    adv();
+                    continue;
+                }
+                int d = digitValue(at(i));
+                if (d > 15 || i >= src.size())
+                    fail("invalid character in unicode escape", line, col);
+                cp = cp * 16 + (uint32_t)d;
+                ++digits;
+                adv();
+            }
+            adv();
+            if (digits == 0 || digits > 6 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+                fail("invalid unicode character escape", l, c, 2);
+            return true;
+        }
+        case '\n':
+            // line continuation: the newline and the next line's indentation go
+            while (i < src.size() && (at(i) == ' ' || at(i) == '\t' || at(i) == '\n' || at(i) == '\r'))
+                adv();
+            return false;
+        case '\r':
+            if (at(i) == '\n')
+            {
+                adv();
+                while (i < src.size() && (at(i) == ' ' || at(i) == '\t' || at(i) == '\n' || at(i) == '\r'))
+                    adv();
+                return false;
+            }
+            break;
+        }
+        fail(std::string("unknown character escape: `") + e + "`", l, c + 1);
+        return false;
+    }
+
+    void string(bool bytes, int l, int c)
+    {
+        adv(); // "
+        std::string v;
+        for (;;)
+        {
+            if (i >= src.size())
+                fail(bytes ? "unterminated double quote byte string" : "unterminated double quote string", l, c);
+            char ch = src[i];
+            if (ch == '"')
+            {
+                adv();
+                break;
+            }
+            if (ch == '\\')
+            {
+                adv();
+                uint32_t cp = 0;
+                if (escape(cp, bytes))
+                {
+                    if (bytes)
+                        v += (char)cp;
+                    else
+                        appendUtf8(v, cp);
+                }
+                continue;
+            }
+            if (ch == '\r' && at(i + 1) == '\n')
+            {
+                adv(); // a CRLF in a string is a newline
+                continue;
+            }
+            v += ch;
+            adv();
+        }
+        Tok &t = push(bytes ? T_BSTR : T_STR, l, c);
+        t.s = v;
+    }
+
+    // r"..." / r#"..."# (i is on the first # or the quote)
+    void rawString(bool bytes, int l, int c)
+    {
+        size_t hashes = 0;
+        while (at(i) == '#')
+        {
+            ++hashes;
+            adv();
+        }
+        if (at(i) != '"')
+            fail("found invalid character; only `#` is allowed in raw string delimitation", line, col);
+        adv();
+        std::string v;
+        for (;;)
+        {
+            if (i >= src.size())
+                fail("unterminated raw string", l, c);
+            if (src[i] == '"')
+            {
+                size_t k = 0;
+                while (k < hashes && at(i + 1 + k) == '#')
+                    ++k;
+                if (k == hashes)
+                {
+                    advN(1 + hashes);
+                    break;
+                }
+            }
+            if (src[i] == '\r' && at(i + 1) == '\n')
+            {
+                adv();
+                continue;
+            }
+            v += src[i];
+            adv();
+        }
+        Tok &t = push(bytes ? T_BSTR : T_STR, l, c);
+        t.s = v;
+    }
+
+    void number(int l, int c)
+    {
+        size_t start = i;
+        int base = 10;
+        if (at(i) == '0' && (at(i + 1) == 'x' || at(i + 1) == 'o' || at(i + 1) == 'b'))
+        {
+            base = at(i + 1) == 'x' ? 16 : at(i + 1) == 'o' ? 8 : 2;
+            advN(2);
+        }
+        std::string digits;
+        while (i < src.size())
+        {
+            char ch = src[i];
+            if (ch == '_')
+            {
+                adv();
+                continue;
+            }
+            if (base == 16 ? digitValue(ch) < 16 : digit((unsigned char)ch))
+            {
+                digits += ch;
+                adv();
+                continue;
+            }
+            break;
+        }
+        if (digits.empty())
+            fail("no valid digits found for number", l, c, (int)(i - start));
+        bool isFloat = false;
+        if (base == 10)
+        {
+            // 1.5, 1. (but not 1..2 and not 1.method())
+            if (at(i) == '.' && at(i + 1) != '.' && !identStart((unsigned char)at(i + 1)))
+            {
+                isFloat = true;
+                digits += '.';
+                adv();
+                while (digit((unsigned char)at(i)) || at(i) == '_')
+                {
+                    if (at(i) != '_')
+                        digits += at(i);
+                    adv();
+                }
+            }
+            if ((at(i) == 'e' || at(i) == 'E') &&
+                (digit((unsigned char)at(i + 1)) ||
+                 ((at(i + 1) == '+' || at(i + 1) == '-') && digit((unsigned char)at(i + 2))) ||
+                 (at(i + 1) == '_' && digit((unsigned char)at(i + 2)))))
+            {
+                isFloat = true;
+                digits += 'e';
+                adv();
+                if (at(i) == '+' || at(i) == '-')
+                {
+                    digits += at(i);
+                    adv();
+                }
+                while (digit((unsigned char)at(i)) || at(i) == '_')
+                {
+                    if (at(i) != '_')
+                        digits += at(i);
+                    adv();
+                }
+            }
+        }
+        std::string suffix;
+        int sufCol = col;
+        while (identChar((unsigned char)at(i)))
+        {
+            suffix += at(i);
+            adv();
+        }
+        if (!suffix.empty())
+        {
+            uint8_t p = primOf(suffix);
+            bool intSuffix = p >= PR_I8 && p <= PR_USIZE, floatSuffix = p == PR_F32 || p == PR_F64;
+            if (!intSuffix && !floatSuffix)
+                fail("invalid suffix `" + suffix + "` for number literal", l, sufCol, (int)suffix.size());
+            if (floatSuffix && base != 10)
+                fail("invalid suffix `" + suffix + "` for number literal", l, sufCol, (int)suffix.size());
+            if (intSuffix && isFloat)
+                fail("invalid suffix `" + suffix + "` for float literal", l, sufCol, (int)suffix.size());
+            if (floatSuffix)
+                isFloat = true;
+        }
+        Tok &t = push(isFloat ? T_FLOAT : T_INT, l, c);
+        t.s = digits;
+        t.suf = suffix;
+        t.len = col - c;
+        if (isFloat)
+        {
+            t.f = std::strtod(digits.c_str(), nullptr);
+            return;
+        }
+        uint64_t hi = 0, lo = 0;
+        for (char ch : digits)
+        {
+            int d = digitValue(ch);
+            if (d >= base)
+                fail(std::string("invalid digit for a base ") + std::to_string(base) + " literal", l, c,
+                     (int)(i - start));
+            // (hi:lo) * base + d, in 32-bit pieces
+            uint64_t parts[4] = {lo & 0xFFFFFFFFULL, lo >> 32, hi & 0xFFFFFFFFULL, hi >> 32};
+            uint64_t carry = (uint64_t)d;
+            for (int k = 0; k < 4; ++k)
+            {
+                uint64_t v = parts[k] * (uint64_t)base + carry;
+                parts[k] = v & 0xFFFFFFFFULL;
+                carry = v >> 32;
+            }
+            if (carry)
+                fail("integer literal is too large", l, c, (int)(i - start));
+            lo = parts[0] | (parts[1] << 32);
+            hi = parts[2] | (parts[3] << 32);
+        }
+        t.lo = lo;
+        t.hi = hi;
+    }
+
+    // 'x' (a character) or 'x (a lifetime or loop label)
+    // rustc's E0762: the literal runs to its quote, or stops before a `/` or the line's end
+    [[noreturn]] void unterminatedChar(size_t start, int l, int c)
+    {
+        size_t k = start + 1;
+        while (k < src.size())
+        {
+            char ch = src[k];
+            if (ch == '\'')
+            {
+                ++k;
+                break;
+            }
+            if (ch == '/' || ch == '\n')
+                break;
+            k += ch == '\\' ? 2 : 1;
+        }
+        CompileErr e;
+        e.code = "E0762";
+        e.message = "unterminated character literal";
+        e.line = l;
+        e.col = c;
+        e.width = (int)(k - start);
+        throw e;
+    }
+
+    void quote(int l, int c)
+    {
+        size_t start = i;
+        if (at(i + 1) == '\\')
+        {
+            advN(2);
+            uint32_t cp = 0;
+            if (!escape(cp, false))
+                fail("empty character literal", l, c);
+            if (at(i) != '\'')
+                unterminatedChar(start, l, c);
+            adv();
+            Tok &t = push(T_CHAR, l, c);
+            t.lo = cp;
+            t.len = col - c;
+            return;
+        }
+        if (i + 1 < src.size() && at(i + 1) != '\'' && at(i + 1) != '\n')
+        {
+            size_t n = 1;
+            uint32_t cp = codePoint(i + 1, n);
+            if (at(i + 1 + n) == '\'')
+            {
+                advN(2 + n);
+                Tok &t = push(T_CHAR, l, c);
+                t.lo = cp;
+                t.len = 3;
+                return;
+            }
+        }
+        if (at(i + 1) == '\'')
+            fail("empty character literal", l, c, 2);
+        if (!identStart((unsigned char)at(i + 1)))
+            unterminatedChar(start, l, c);
+        adv();
+        std::string name = "'";
+        while (identChar((unsigned char)at(i)))
+        {
+            name += at(i);
+            adv();
+        }
+        Tok &t = push(T_LIFE, l, c);
+        t.s = name;
+        t.len = (int)name.size();
+    }
+
+    void run()
+    {
+        // a shebang line (but not #![attribute])
+        if (at(0) == '#' && at(1) == '!' && at(2) != '[')
+            while (i < src.size() && src[i] != '\n')
+                adv();
+        static const char *const three[] = {"<<=", ">>=", "...", "..="};
+        static const char *const two[] = {"::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=",
+                                          "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", ".."};
+        while (i < src.size())
+        {
+            unsigned char ch = (unsigned char)src[i];
+            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
+            {
+                space = true;
+                adv();
+                continue;
+            }
+            if (ch == '/' && at(i + 1) == '/')
+            {
+                while (i < src.size() && src[i] != '\n')
+                    adv();
+                space = true;
+                continue;
+            }
+            if (ch == '/' && at(i + 1) == '*')
+            {
+                int l = line, c = col, depth = 0;
+                for (;;)
+                {
+                    if (i >= src.size())
+                        fail("unterminated block comment", l, c, 2);
+                    if (src[i] == '/' && at(i + 1) == '*')
+                    {
+                        ++depth;
+                        advN(2);
+                    }
+                    else if (src[i] == '*' && at(i + 1) == '/')
+                    {
+                        advN(2);
+                        if (--depth == 0)
+                            break;
+                    }
+                    else
+                        adv();
+                }
+                space = true;
+                continue;
+            }
+            int l = line, c = col;
+            if (digit(ch))
+            {
+                number(l, c);
+                continue;
+            }
+            if (ch == '"')
+            {
+                string(false, l, c);
+                continue;
+            }
+            if (ch == '\'')
+            {
+                quote(l, c);
+                continue;
+            }
+            if (ch == 'b' && at(i + 1) == '"')
+            {
+                adv();
+                string(true, l, c);
+                continue;
+            }
+            if (ch == 'b' && at(i + 1) == '\'')
+            {
+                advN(2);
+                uint32_t cp = 0;
+                if (at(i) == '\\')
+                {
+                    adv();
+                    escape(cp, true);
+                }
+                else
+                {
+                    cp = (unsigned char)at(i);
+                    if (cp >= 0x80)
+                        fail("non-ASCII character in byte literal", l, c);
+                    adv();
+                }
+                if (at(i) != '\'')
+                    fail("unterminated byte constant", l, c);
+                adv();
+                Tok &t = push(T_BYTE, l, c);
+                t.lo = cp;
+                t.len = col - c;
+                continue;
+            }
+            if (ch == 'b' && at(i + 1) == 'r' && (at(i + 2) == '"' || at(i + 2) == '#'))
+            {
+                advN(2);
+                rawString(true, l, c);
+                continue;
+            }
+            if (ch == 'r' && (at(i + 1) == '"' || (at(i + 1) == '#' && (at(i + 2) == '"' || at(i + 2) == '#'))))
+            {
+                adv();
+                rawString(false, l, c);
+                continue;
+            }
+            if (identStart(ch))
+            {
+                bool raw = false;
+                if (ch == 'r' && at(i + 1) == '#' && identStart((unsigned char)at(i + 2)))
+                {
+                    raw = true;
+                    advN(2);
+                }
+                std::string name;
+                while (identChar((unsigned char)at(i)))
+                {
+                    name += at(i);
+                    adv();
+                }
+                Tok &t = push(T_IDENT, l, c);
+                t.s = name;
+                t.raw = raw;
+                t.len = col - c;
+                continue;
+            }
+            // punctuation, longest first
+            const char *found = nullptr;
+            for (const char *p3 : three)
+                if (src.compare(i, 3, p3) == 0)
+                {
+                    found = p3;
+                    break;
+                }
+            if (!found)
+                for (const char *p2 : two)
+                    if (src.compare(i, 2, p2) == 0)
+                    {
+                        found = p2;
+                        break;
+                    }
+            std::string text;
+            if (found)
+                text = found;
+            else
+            {
+                static const std::string singles = "+-*/%^!&|=<>@.,;:#$?~()[]{}";
+                if (singles.find((char)ch) == std::string::npos)
+                {
+                    size_t n = 1;
+                    uint32_t cp = codePoint(i, n);
+                    std::string shown;
+                    appendUtf8(shown, cp);
+                    fail("unknown start of token: " + shown, l, c);
+                }
+                text = std::string(1, (char)ch);
+            }
+            advN(text.size());
+            Tok &t = push(T_PUNCT, l, c);
+            t.s = text;
+            t.len = (int)text.size();
+        }
+        Tok &end = push(T_EOF, line, col);
+        end.s = "";
+    }
+};
+
+} // namespace
+
+std::vector<Tok> lex(const std::string &source)
+{
+    Lexer lx(source);
+    lx.run();
+    return lx.out;
+}
+
+} // namespace rust

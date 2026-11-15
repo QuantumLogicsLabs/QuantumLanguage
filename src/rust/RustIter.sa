@@ -1,0 +1,1603 @@
+// quantum: cpp
+// Rust front-end: iterators. An iterator is an object that yields its next
+// item on request: over a range, a sequence (by value, by reference, by
+// mutable reference), a list of values made ahead (the characters of a
+// string, the entries of a map), or another iterator through an adapter
+// (map, filter, zip ...). Nothing is computed until an item is asked for,
+// as in Rust. The consumers (sum, fold, collect ...) are here too.
+#include "RustRt.h.sa"
+
+namespace rust
+{
+
+V call0(V f, const Node *at)
+{
+    std::vector<V> args;
+    return callValue(f, args, at);
+}
+
+V call1(V f, V a, const Node *at)
+{
+    std::vector<V> args(1, a);
+    return callValue(f, args, at);
+}
+
+V call2(V f, V a, V b, const Node *at)
+{
+    std::vector<V> args;
+    args.push_back(a);
+    args.push_back(b);
+    return callValue(f, args, at);
+}
+
+bool isTrue(V v, const Node *at)
+{
+    v = peel(v);
+    if (v.k != V_BOOL)
+        errAt(at, "E0308", "mismatched types: expected `bool`, found `" + typeName(v) + "`");
+    return v.lo != 0;
+}
+
+std::string charString(uint32_t c)
+{
+    std::string s;
+    utf8Append(s, c);
+    return s;
+}
+
+bool takeSelf(Place sp, V sv)
+{
+    if (sp.ref || isCopy(sv))
+        return false;
+    V &slot = slotAt(sp.o, sp.i);
+    slot.k = V_MOVED;
+    slot.n = 0;
+    return true;
+}
+
+Ty *resultHint(Ty *inner)
+{
+    static std::unordered_map<Ty *, Ty *> *made = nullptr;
+    if (!made)
+        made = new std::unordered_map<Ty *, Ty *>();
+    auto it = made->find(inner);
+    if (it != made->end())
+        return it->second;
+    Ty *t = new Ty();
+    t->k = TY_PATH;
+    t->path = new Path();
+    PathSeg seg;
+    seg.name = "Result";
+    seg.args.push_back(inner);
+    seg.hasArgs = true;
+    t->path->segs.push_back(seg);
+    t->defKnown = true;
+    (*made)[inner] = t;
+    return t;
+}
+
+// a stable merge sort: by cmpFn(&a, &b) -> Ordering, by keyFn(&a), or by the values' own order
+void sortValues(std::vector<V> &items, size_t from, size_t to, V *cmpFn, V *keyFn, const Node *at)
+{
+    size_t n = to - from;
+    if (n < 2)
+        return;
+    std::vector<V> keys;
+    if (keyFn)
+    {
+        keys.reserve(n);
+        for (size_t k = from; k < to; ++k)
+            keys.push_back(call1(*keyFn, mkRefTo(items[k], false), at));
+    }
+    std::vector<size_t> order(n), tmp(n);
+    for (size_t k = 0; k < n; ++k)
+        order[k] = k;
+    auto less = [&](size_t a, size_t b) -> bool // strictly: b goes before a
+    {
+        int c;
+        if (keyFn)
+            c = valueCmp(keys[b], keys[a], at);
+        else if (cmpFn)
+        {
+            V r = peel(call2(*cmpFn, mkRefTo(items[from + b], false), mkRefTo(items[from + a], false), at));
+            if (r.k != V_ENUM || static_cast<EnumObj *>(r.p)->def != G.orderingDef)
+                errAt(at, "E0308", "mismatched types: expected `Ordering`, found `" + typeName(r) + "`");
+            c = static_cast<EnumObj *>(r.p)->variant - 1;
+        }
+        else
+            c = valueCmp(items[from + b], items[from + a], at);
+        return c < 0;
+    };
+    for (size_t width = 1; width < n; width *= 2)
+    {
+        for (size_t lo = 0; lo < n; lo += 2 * width)
+        {
+            size_t mid = lo + width < n ? lo + width : n, hi = lo + 2 * width < n ? lo + 2 * width : n;
+            size_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi)
+            {
+                if (less(order[i], order[j]))
+                    tmp[k++] = order[j++];
+                else
+                    tmp[k++] = order[i++];
+            }
+            while (i < mid)
+                tmp[k++] = order[i++];
+            while (j < hi)
+                tmp[k++] = order[j++];
+        }
+        order = tmp;
+    }
+    std::vector<V> sorted;
+    sorted.reserve(n);
+    for (size_t k = 0; k < n; ++k)
+        sorted.push_back(items[from + order[k]]);
+    for (size_t k = 0; k < n; ++k)
+        items[from + k] = sorted[k];
+}
+
+IterObj *newIter(uint8_t kind)
+{
+    IterObj *it = new IterObj();
+    it->ik = kind;
+    return it;
+}
+
+V iterV(IterObj *it)
+{
+    V v;
+    v.k = V_ITER;
+    v.p = it;
+    return v;
+}
+
+namespace
+{
+
+IterObj *valuesIter(const std::vector<V> &items)
+{
+    IterObj *it = newIter(IT_VALUES);
+    it->items = items;
+    it->end = (int64_t)items.size();
+    return it;
+}
+
+V stepUp(V a, const Node *at)
+{
+    if (a.k == V_CHAR)
+    {
+        a.lo = a.lo == 0xD7FF ? 0xE000 : a.lo + 1;
+        return a;
+    }
+    return intBinary(O_ADD, a, mkInt(1, a.t), at);
+}
+
+V stepDown(V a, const Node *at)
+{
+    if (a.k == V_CHAR)
+    {
+        a.lo = a.lo == 0xE000 ? 0xD7FF : a.lo - 1;
+        return a;
+    }
+    return intBinary(O_SUB, a, mkInt(1, a.t), at);
+}
+
+IterObj *rangeIter(RangeObj *r, const Node *at)
+{
+    if (!r->hasLo)
+        errAt(at, "E0277", "`RangeTo<_>` is not an iterator", "a range without a start cannot be iterated");
+    V lo = r->items[0], hi = r->items[1];
+    if (lo.k != V_INT && lo.k != V_CHAR)
+        errAt(at, "E0277", "the trait bound `" + typeName(lo) + ": Step` is not satisfied",
+              "a range of `" + typeName(lo) + "` is not an iterator");
+    IterObj *it = newIter(IT_RANGE);
+    it->a = lo;
+    if (!r->hasHi)
+        return it;
+    it->mode = 1;
+    int c = valueCmp(lo, hi, at);
+    if (r->inclusive ? c > 0 : c >= 0)
+    {
+        it->done = true;
+        return it;
+    }
+    it->b = r->inclusive ? hi : stepDown(hi, at);
+    return it;
+}
+
+// everything it still has, kept in it: it then is a list of values
+void materialize(IterObj *it, const Node *at)
+{
+    if (it->ik == IT_VALUES)
+        return;
+    std::vector<V> rest;
+    V x;
+    while (iterNext(it, x, at))
+        rest.push_back(x);
+    it->ik = IT_VALUES;
+    it->items = rest;
+    it->i = 0;
+    it->end = (int64_t)rest.size();
+    it->src = it->src2 = nullptr;
+    it->done = false;
+}
+
+// how many items are left, when that is known without running it; -1 otherwise
+int64_t knownLen(IterObj *it)
+{
+    switch (it->ik)
+    {
+    case IT_RANGE:
+        if (it->done)
+            return 0;
+        if (it->mode != 1 || it->a.k != V_INT)
+            return -1;
+        return (int64_t)(it->b.lo - it->a.lo) + 1;
+    case IT_SEQ:
+    {
+        int64_t end = it->end < (int64_t)it->seq->items.size() ? it->end : (int64_t)it->seq->items.size();
+        return end > it->i ? end - it->i : 0;
+    }
+    case IT_VALUES:
+        return it->end - it->i;
+    case IT_MAP:
+    case IT_ENUMERATE:
+    case IT_CLONED:
+    case IT_REV:
+    case IT_INSPECT:
+        return knownLen(it->src);
+    case IT_ZIP:
+    {
+        int64_t a = knownLen(it->src), b = knownLen(it->src2);
+        return a < 0 || b < 0 ? -1 : a < b ? a : b;
+    }
+    case IT_TAKE:
+    {
+        int64_t a = knownLen(it->src);
+        return a < 0 ? -1 : a < it->n ? a : it->n;
+    }
+    case IT_SKIP:
+    {
+        int64_t a = knownLen(it->src);
+        return a < 0 ? -1 : a > it->n ? a - it->n : 0;
+    }
+    case IT_CHAIN:
+    {
+        int64_t a = it->flag ? 0 : knownLen(it->src), b = knownLen(it->src2);
+        return a < 0 || b < 0 ? -1 : a + b;
+    }
+    }
+    return -1;
+}
+
+IterObj *adapt(uint8_t kind, IterObj *src, V f)
+{
+    IterObj *it = newIter(kind);
+    it->src = src;
+    it->f = f;
+    return it;
+}
+
+bool optionPayload(V r, V &out, const Node *at)
+{
+    r = peel(r);
+    if (r.k != V_ENUM || static_cast<EnumObj *>(r.p)->def != G.optionDef)
+        errAt(at, "E0308", "mismatched types: expected `Option<_>`, found `" + typeName(r) + "`");
+    EnumObj *e = static_cast<EnumObj *>(r.p);
+    if (e->variant == 0)
+        return false;
+    out = e->items[0];
+    return true;
+}
+
+uint8_t numHint(const Node *n, Ty *hint)
+{
+    if (n && !n->tys.empty())
+        return tyPrim(n->tys[0]);
+    return hint ? tyPrim(hint) : (uint8_t)PR_NONE;
+}
+
+// Extend<&T> for a collection of T (T: Copy): the items are copied out
+void derefCopies(std::vector<V> &items, Ty *collection)
+{
+    Ty *elem = tyArg(collection, 0);
+    Ty *e = tyResolve(elem);
+    if (!e || e->k == TY_REF || e->k == TY_INFER)
+        return;
+    for (V &item : items)
+        if (item.k == V_REF)
+        {
+            V inner = peel(item);
+            if (isCopy(inner) && inner.k != V_REF && inner.k != V_SLICE && !(inner.k == V_STR && !inner.x))
+                item = copyShell(inner);
+        }
+}
+
+V typedZero(uint8_t prim, bool one)
+{
+    if (isFloatPrim(prim))
+        return mkFloat(one ? 1 : 0, prim);
+    return mkInt(one ? 1 : 0, isIntPrim(prim) ? prim : (uint8_t)0);
+}
+
+V entryTuple(V a, V b)
+{
+    std::vector<V> pair;
+    pair.push_back(a);
+    pair.push_back(b);
+    return mkTuple(pair);
+}
+
+} // namespace
+
+V toIter(V v, const Node *at)
+{
+    switch (v.k)
+    {
+    case V_ITER:
+        return v;
+    case V_RANGE:
+        return iterV(rangeIter(static_cast<RangeObj *>(v.p), at));
+    case V_VEC:
+    case V_ARRAY:
+    case V_DEQUE:
+    case V_HEAP:
+    {
+        IterObj *it = newIter(IT_SEQ);
+        it->seq = v.p;
+        it->end = (int64_t)v.p->items.size();
+        return iterV(it);
+    }
+    case V_SLICE:
+    {
+        IterObj *it = newIter(IT_SEQ);
+        it->seq = v.p;
+        it->i = v.hi;
+        it->end = v.hi + (int64_t)v.lo;
+        it->mode = v.x ? 2 : 1;
+        return iterV(it);
+    }
+    case V_BOX:
+        return toIter(v.p->items[0], at);
+    case V_NATIVE:
+    {
+        NativeObj *o = static_cast<NativeObj *>(v.p);
+        if (o->type == "Receiver")
+        {
+            IterObj *it = newIter(IT_RECV);
+            it->a = v;
+            return iterV(it);
+        }
+        break;
+    }
+    case V_MAP:
+    case V_SET:
+    {
+        MapObj *m = static_cast<MapObj *>(v.p);
+        std::vector<V> items;
+        for (size_t k = 0; k < m->keys.size(); ++k)
+            if (m->keys[k].k != V_MOVED)
+                items.push_back(m->isSet ? m->keys[k] : entryTuple(m->keys[k], m->items[k]));
+        return iterV(valuesIter(items));
+    }
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(v.p);
+        if (e->def == G.optionDef || e->def == G.resultDef)
+        {
+            std::vector<V> items;
+            if (e->variant == (e->def == G.optionDef ? 1 : 0))
+                items.push_back(e->items[0]);
+            return iterV(valuesIter(items));
+        }
+        break;
+    }
+    case V_REF:
+    {
+        V t = slotAt(v.p, v.hi);
+        bool mut = v.x != 0;
+        switch (t.k)
+        {
+        case V_NATIVE:
+            return toIter(t, at);
+        case V_REF:
+        case V_BOX:
+        case V_RC:
+        case V_ITER:
+        case V_SLICE:
+            if (t.k == V_BOX || t.k == V_RC)
+                return toIter(mkRef(t.p, 0, mut), at);
+            return toIter(t, at);
+        case V_RANGE:
+            return toIter(t, at);
+        case V_VEC:
+        case V_ARRAY:
+        case V_DEQUE:
+        case V_HEAP:
+        {
+            IterObj *it = newIter(IT_SEQ);
+            it->seq = t.p;
+            it->end = (int64_t)t.p->items.size();
+            it->mode = mut ? 2 : 1;
+            return iterV(it);
+        }
+        case V_MAP:
+        case V_SET:
+        {
+            MapObj *m = static_cast<MapObj *>(t.p);
+            std::vector<V> items;
+            for (size_t k = 0; k < m->keys.size(); ++k)
+                if (m->keys[k].k != V_MOVED)
+                    items.push_back(m->isSet ? mkRefTo(m->keys[k], false)
+                                             : entryTuple(mkRefTo(m->keys[k], false), mkRef(m, (int64_t)k, mut)));
+            return iterV(valuesIter(items));
+        }
+        case V_ENUM:
+        {
+            EnumObj *e = static_cast<EnumObj *>(t.p);
+            if (e->def == G.optionDef || e->def == G.resultDef)
+            {
+                std::vector<V> items;
+                if (e->variant == (e->def == G.optionDef ? 1 : 0))
+                    items.push_back(mkRef(e, 0, mut));
+                return iterV(valuesIter(items));
+            }
+            break;
+        }
+        }
+        if (t.k == V_STRUCT || t.k == V_ENUM)
+        {
+            if (findMethodFor(t, "into_iter"))
+            {
+                std::vector<V> none;
+                return toIter(callMethodOn(v, "into_iter", none, at), at);
+            }
+            if (findMethodFor(t, "next"))
+            {
+                IterObj *it = newIter(IT_USER);
+                it->a = v;
+                return iterV(it);
+            }
+            if (findMethodFor(t, "iter"))
+            {
+                std::vector<V> none;
+                return toIter(callMethodOn(v, "iter", none, at), at);
+            }
+        }
+        v = t;
+        break;
+    }
+    case V_STRUCT:
+        if (findMethodFor(v, "into_iter"))
+        {
+            std::vector<V> none;
+            return toIter(callMethodOn(v, "into_iter", none, at), at);
+        }
+        if (findMethodFor(v, "next"))
+        {
+            IterObj *it = newIter(IT_USER);
+            it->a = mkRefTo(v, true);
+            return iterV(it);
+        }
+        break;
+    }
+    if (v.k == V_STR)
+        errAt(at, "E0277", std::string("`") + typeName(v) + "` is not an iterator",
+              "`" + typeName(v) + "` is not an iterator; try calling `.chars()` or `.bytes()`");
+    errAt(at, "E0277", "`" + typeName(v) + "` is not an iterator",
+          "`" + typeName(v) + "` is not an iterator");
+}
+
+bool iterNext(IterObj *it, V &out, const Node *at)
+{
+    switch (it->ik)
+    {
+    case IT_RECV:
+        return recvIterNext(it, out, at);
+    case IT_NET:
+        return netNext(it, out, at);
+    case IT_RANGE:
+        if (it->done)
+            return false;
+        out = it->a;
+        if (it->mode == 1 && it->a.lo == it->b.lo && it->a.hi == it->b.hi)
+        {
+            it->done = true;
+            return true;
+        }
+        it->a = stepUp(it->a, at);
+        return true;
+    case IT_SEQ:
+    {
+        if (it->i >= it->end || (size_t)it->i >= it->seq->items.size())
+            return false;
+        int64_t i = it->i++;
+        if (it->mode == 0)
+        {
+            V &item = it->seq->items[(size_t)i];
+            out = isCopy(item) ? copyShell(item) : item;
+        }
+        else
+            out = mkRef(it->seq, i, it->mode == 2);
+        return true;
+    }
+    case IT_VALUES:
+        if (it->i >= it->end)
+            return false;
+        out = it->items[(size_t)it->i++];
+        return true;
+    case IT_MAP:
+    {
+        V x;
+        if (!iterNext(it->src, x, at))
+            return false;
+        out = call1(it->f, x, at);
+        return true;
+    }
+    case IT_FILTER:
+    {
+        V x;
+        while (iterNext(it->src, x, at))
+            if (isTrue(call1(it->f, mkRefTo(x, false), at), at))
+            {
+                out = x;
+                return true;
+            }
+        return false;
+    }
+    case IT_FILTER_MAP:
+    {
+        V x;
+        while (iterNext(it->src, x, at))
+            if (optionPayload(call1(it->f, x, at), out, at))
+                return true;
+        return false;
+    }
+    case IT_ENUMERATE:
+    {
+        V x;
+        if (!iterNext(it->src, x, at))
+            return false;
+        out = entryTuple(mkUint((uint64_t)it->i++, PR_USIZE), x);
+        return true;
+    }
+    case IT_ZIP:
+    {
+        V a, b;
+        if (!iterNext(it->src, a, at) || !iterNext(it->src2, b, at))
+            return false;
+        out = entryTuple(a, b);
+        return true;
+    }
+    case IT_CHAIN:
+        if (!it->flag)
+        {
+            if (iterNext(it->src, out, at))
+                return true;
+            it->flag = true;
+        }
+        return iterNext(it->src2, out, at);
+    case IT_TAKE:
+        if (it->n <= 0)
+            return false;
+        --it->n;
+        return iterNext(it->src, out, at);
+    case IT_SKIP:
+        while (it->n > 0)
+        {
+            --it->n;
+            V skipped;
+            if (!iterNext(it->src, skipped, at))
+                return false;
+        }
+        return iterNext(it->src, out, at);
+    case IT_TAKE_WHILE:
+    {
+        if (it->done)
+            return false;
+        V x;
+        if (!iterNext(it->src, x, at) || !isTrue(call1(it->f, mkRefTo(x, false), at), at))
+        {
+            it->done = true;
+            return false;
+        }
+        out = x;
+        return true;
+    }
+    case IT_SKIP_WHILE:
+    {
+        if (it->flag)
+            return iterNext(it->src, out, at);
+        V x;
+        while (iterNext(it->src, x, at))
+            if (!isTrue(call1(it->f, mkRefTo(x, false), at), at))
+            {
+                it->flag = true;
+                out = x;
+                return true;
+            }
+        return false;
+    }
+    case IT_MAP_WHILE:
+    {
+        if (it->done)
+            return false;
+        V x;
+        if (!iterNext(it->src, x, at) || !optionPayload(call1(it->f, x, at), out, at))
+        {
+            it->done = true;
+            return false;
+        }
+        return true;
+    }
+    case IT_STEP_BY:
+    {
+        if (!it->flag)
+        {
+            it->flag = true;
+            return iterNext(it->src, out, at);
+        }
+        V skipped;
+        for (int64_t k = 1; k < it->n; ++k)
+            if (!iterNext(it->src, skipped, at))
+                return false;
+        return iterNext(it->src, out, at);
+    }
+    case IT_REV:
+        return iterNextBack(it->src, out, at);
+    case IT_PEEKABLE:
+        if (it->flag)
+        {
+            it->flag = false;
+            if (it->done)
+                return false;
+            out = it->items[0];
+            return true;
+        }
+        return iterNext(it->src, out, at);
+    case IT_CLONED:
+    {
+        V x;
+        if (!iterNext(it->src, x, at))
+            return false;
+        out = cloneValue(peel(x), at);
+        return true;
+    }
+    case IT_FLAT_MAP:
+    case IT_FLATTEN:
+        for (;;)
+        {
+            if (it->src2 && iterNext(it->src2, out, at))
+                return true;
+            V x;
+            if (!iterNext(it->src, x, at))
+                return false;
+            V inner = it->ik == IT_FLAT_MAP ? call1(it->f, x, at) : x;
+            it->src2 = static_cast<IterObj *>(toIter(inner, at).p);
+        }
+    case IT_INSPECT:
+        if (!iterNext(it->src, out, at))
+            return false;
+        call1(it->f, mkRefTo(out, false), at);
+        return true;
+    case IT_SCAN:
+    {
+        if (it->done)
+            return false;
+        V x;
+        if (!iterNext(it->src, x, at) || !optionPayload(call2(it->f, mkRef(it, 0, true), x, at), out, at))
+        {
+            it->done = true;
+            return false;
+        }
+        return true;
+    }
+    case IT_CYCLE:
+        if (it->items.empty())
+            return false;
+        out = cloneValue(it->items[(size_t)it->i], at);
+        it->i = (it->i + 1) % (int64_t)it->items.size();
+        return true;
+    case IT_REPEAT:
+        if (it->n == 0)
+            return false;
+        if (it->n > 0)
+            --it->n;
+        out = cloneValue(it->a, at);
+        return true;
+    case IT_FROM_FN:
+        return optionPayload(call0(it->f, at), out, at);
+    case IT_SUCCESSORS:
+    {
+        if (!it->flag)
+            return false;
+        out = it->a;
+        V next;
+        if (optionPayload(call1(it->f, mkRefTo(out, false), at), next, at))
+            it->a = next;
+        else
+            it->flag = false;
+        return true;
+    }
+    case IT_USER:
+    {
+        std::vector<V> none;
+        return optionPayload(callMethodOn(it->a, "next", none, at), out, at);
+    }
+    case IT_STDIN_LINES:
+    {
+        if (testMode())
+            return false;
+        flushOut();
+        std::string line;
+        int c;
+        bool any = false;
+        while ((c = fgetc(stdin)) != EOF)
+        {
+            any = true;
+            if (c == '\n')
+                break;
+            line += (char)c;
+        }
+        if (!any)
+            return false;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        out = mkOk(mkStr(line, true));
+        return true;
+    }
+    }
+    return false;
+}
+
+bool iterNextBack(IterObj *it, V &out, const Node *at)
+{
+    switch (it->ik)
+    {
+    case IT_RANGE:
+        if (it->done)
+            return false;
+        if (it->mode != 1)
+            errAt(at, "E0599", "the method `rev` exists for this range, but it has no end to start from");
+        out = it->b;
+        if (it->a.lo == it->b.lo && it->a.hi == it->b.hi)
+        {
+            it->done = true;
+            return true;
+        }
+        it->b = stepDown(it->b, at);
+        return true;
+    case IT_SEQ:
+    {
+        if (it->end > (int64_t)it->seq->items.size())
+            it->end = (int64_t)it->seq->items.size();
+        if (it->i >= it->end)
+            return false;
+        --it->end;
+        int64_t i = it->end;
+        if (it->mode == 0)
+        {
+            V &item = it->seq->items[(size_t)i];
+            out = isCopy(item) ? copyShell(item) : item;
+        }
+        else
+            out = mkRef(it->seq, i, it->mode == 2);
+        return true;
+    }
+    case IT_VALUES:
+        if (it->i >= it->end)
+            return false;
+        --it->end;
+        out = it->items[(size_t)it->end];
+        return true;
+    case IT_REV:
+        return iterNext(it->src, out, at);
+    case IT_MAP:
+    {
+        V x;
+        if (!iterNextBack(it->src, x, at))
+            return false;
+        out = call1(it->f, x, at);
+        return true;
+    }
+    case IT_CLONED:
+    {
+        V x;
+        if (!iterNextBack(it->src, x, at))
+            return false;
+        out = cloneValue(peel(x), at);
+        return true;
+    }
+    }
+    materialize(it, at);
+    return iterNextBack(it, out, at);
+}
+
+void iterDrain(IterObj *it, std::vector<V> &out, const Node *at)
+{
+    V x;
+    while (iterNext(it, x, at))
+        out.push_back(x);
+}
+
+V collectInto(std::vector<V> &items, Ty *hint, const Node *at)
+{
+    Ty *h = tyResolve(hint);
+    std::string head = h ? tyHead(h) : std::string();
+    if (h && h->k == TY_TUPLE && h->items.empty())
+        return V();
+    if (head == "String")
+    {
+        std::string s;
+        for (const V &item : items)
+        {
+            V x = peelAll(item);
+            if (x.k == V_CHAR)
+                utf8Append(s, (uint32_t)x.lo);
+            else if (x.k == V_STR)
+                s += static_cast<StrObj *>(x.p)->s;
+            else
+                errAt(at, "E0277", "a value of type `String` cannot be built from an iterator over elements of type `" +
+                                       typeName(x) + "`");
+        }
+        return mkStr(s, true);
+    }
+    if (head == "HashMap" || head == "BTreeMap")
+    {
+        V out = mkMap(head == "BTreeMap", false);
+        MapObj *m = static_cast<MapObj *>(out.p);
+        m->valTy = tyArg(h, 1);
+        Ty *kt = tyArg(h, 0);
+        for (const V &item : items)
+        {
+            V x = peel(item);
+            if (x.k != V_TUPLE || x.p->items.size() != 2)
+                errAt(at, "E0277", "a value of type `" + head + "<_, _>` cannot be built from an iterator over elements of type `" +
+                                       typeName(x) + "`",
+                      "the items have to be `(key, value)` pairs");
+            mapInsert(m, kt ? coerce(x.p->items[0], kt, at) : x.p->items[0],
+                      m->valTy ? coerce(x.p->items[1], m->valTy, at) : x.p->items[1], at);
+        }
+        return out;
+    }
+    if (head == "HashSet" || head == "BTreeSet")
+    {
+        V out = mkMap(head == "BTreeSet", true);
+        MapObj *m = static_cast<MapObj *>(out.p);
+        Ty *kt = tyArg(h, 0);
+        for (const V &item : items)
+            mapInsert(m, kt ? coerce(item, kt, at) : item, V(), at);
+        return out;
+    }
+    if (head == "Result" || head == "Option")
+    {
+        bool isResult = head == "Result";
+        std::vector<V> inner;
+        for (const V &item : items)
+        {
+            V x = peel(item);
+            if (x.k != V_ENUM || static_cast<EnumObj *>(x.p)->def != (isResult ? G.resultDef : G.optionDef))
+                errAt(at, "E0277", "a value of type `" + head + "<_>` cannot be built from an iterator over elements of type `" +
+                                       typeName(x) + "`");
+            EnumObj *e = static_cast<EnumObj *>(x.p);
+            if (e->variant != (isResult ? 0 : 1))
+                return isResult ? mkErr(e->items[0]) : mkNone();
+            inner.push_back(e->items[0]);
+        }
+        V collected = collectInto(inner, tyArg(h, 0), at);
+        return isResult ? mkOk(collected) : mkSome(collected);
+    }
+    Ty *elem = (head == "Vec" || head == "VecDeque" || head == "BinaryHeap" || head == "Box") ? tyArg(h, 0) : nullptr;
+    if (head == "Box" && elem)
+    {
+        Ty *inner = tyResolve(elem);
+        elem = inner && inner->k == TY_SLICE ? inner->elem : nullptr;
+    }
+    if (elem && tyPrim(elem) != PR_NONE)
+        for (V &item : items)
+            item = coerce(item, elem, at);
+    if (head == "VecDeque")
+        return mkSeq(V_DEQUE, items);
+    if (head == "BinaryHeap")
+    {
+        sortValues(items, 0, items.size(), nullptr, nullptr, at);
+        return mkSeq(V_HEAP, items);
+    }
+    if (head == "Box")
+        return mkBox(mkSeq(V_VEC, items));
+    if (head == "Rc" || head == "Arc")
+        return mkRc(mkSeq(V_VEC, items));
+    if (TypeDef *td = tyDef(h))
+        if (FnDef *f = findMethod(td, "from_iter"))
+        {
+            std::vector<V> args(1, iterV(valuesIter(items)));
+            return callFn(f, args, td, at, h);
+        }
+    return mkSeq(V_VEC, items);
+}
+
+// ─── methods of iterators ──────────────────────────────────────────────────
+
+bool iterMethod(V self, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    if (self.k == V_RANGE)
+    {
+        RangeObj *r = static_cast<RangeObj *>(self.p);
+        if (m == "contains")
+        {
+            V x = peel(argAt(args, 0, n));
+            bool ok = true;
+            if (r->hasLo)
+            {
+                V lo = r->items[0];
+                if (x.k == V_INT && lo.k == V_INT)
+                    unifyNum(x, lo, n, "contains");
+                ok = valueCmp(x, lo, n) >= 0;
+            }
+            if (ok && r->hasHi)
+            {
+                V hi = r->items[1];
+                if (x.k == V_INT && hi.k == V_INT)
+                    unifyNum(x, hi, n, "contains");
+                int c = valueCmp(x, hi, n);
+                ok = c != 2 && (r->inclusive ? c <= 0 : c < 0);
+            }
+            out = mkBool(ok);
+            return true;
+        }
+        if (m == "is_empty")
+        {
+            int c = valueCmp(r->items[0], r->items[1], n);
+            out = mkBool(r->inclusive ? c > 0 : c >= 0);
+            return true;
+        }
+        if (m == "start" || m == "end")
+        {
+            out = mkRef(r, m == "start" ? 0 : 1, false);
+            return true;
+        }
+        if (m == "clone")
+        {
+            out = cloneValue(self, n);
+            return true;
+        }
+        if (m == "next")
+        {
+            // the range itself moves on
+            if (!r->hasLo || (r->hasHi && (r->inclusive ? valueCmp(r->items[0], r->items[1], n) > 0
+                                                        : valueCmp(r->items[0], r->items[1], n) >= 0)))
+            {
+                out = mkNone();
+                return true;
+            }
+            out = mkSome(r->items[0]);
+            if (r->hasHi && r->inclusive && valueCmp(r->items[0], r->items[1], n) == 0)
+            {
+                r->inclusive = false; // now empty
+                return true;
+            }
+            r->items[0] = stepUp(r->items[0], n);
+            return true;
+        }
+        self = toIter(self, n);
+    }
+    IterObj *it = static_cast<IterObj *>(self.p);
+    auto wrap = [&](IterObj *made) -> bool
+    {
+        out = iterV(made);
+        return true;
+    };
+    V x;
+    // the case a name is handled under (a few share a case with others)
+    char key = m[0];
+    if (m == "take")
+        key = 's';
+    else if (m == "ne")
+        key = 'e';
+    else if (m == "partial_cmp")
+        key = 'c';
+    else if (m == "rposition")
+        key = 'p';
+    switch (key)
+    {
+    case 'a':
+        if (m == "as_str" && it->ik == IT_VALUES)
+        {
+            std::string rest;
+            for (int64_t k = it->i; k < it->end; ++k)
+            {
+                V c = it->items[(size_t)k];
+                if (c.k != V_CHAR)
+                    return false;
+                utf8Append(rest, (uint32_t)c.lo);
+            }
+            out = mkStr(rest, false);
+            return true;
+        }
+        if (m == "any" || m == "all")
+        {
+            bool any = m == "any";
+            V f = argAt(args, 0, n);
+            while (iterNext(it, x, n))
+                if (isTrue(call1(f, x, n), n) == any)
+                {
+                    out = mkBool(any);
+                    return true;
+                }
+            out = mkBool(!any);
+            return true;
+        }
+        break;
+    case 'b':
+        if (m == "by_ref")
+        {
+            out = self;
+            return true;
+        }
+        break;
+    case 'c':
+        if (m == "collect")
+        {
+            std::vector<V> items;
+            iterDrain(it, items, n);
+            out = collectInto(items, !n->tys.empty() ? n->tys[0] : hint, n);
+            return true;
+        }
+        if (m == "count")
+        {
+            int64_t count = knownLen(it);
+            if (count < 0)
+            {
+                count = 0;
+                while (iterNext(it, x, n))
+                    ++count;
+            }
+            out = mkUint((uint64_t)count, PR_USIZE);
+            return true;
+        }
+        if (m == "chain")
+        {
+            IterObj *made = adapt(IT_CHAIN, it, V());
+            made->src2 = static_cast<IterObj *>(toIter(argAt(args, 0, n), n).p);
+            return wrap(made);
+        }
+        if (m == "cloned" || m == "copied")
+            return wrap(adapt(IT_CLONED, it, V()));
+        if (m == "cycle")
+        {
+            IterObj *made = newIter(IT_CYCLE);
+            iterDrain(it, made->items, n);
+            return wrap(made);
+        }
+        if (m == "cmp" || m == "partial_cmp")
+        {
+            IterObj *other = static_cast<IterObj *>(toIter(argAt(args, 0, n), n).p);
+            V y;
+            int c = 0;
+            for (;;)
+            {
+                bool a = iterNext(it, x, n), b = iterNext(other, y, n);
+                if (!a || !b)
+                {
+                    c = a ? 1 : b ? -1 : 0;
+                    break;
+                }
+                c = valueCmp(x, y, n);
+                if (c != 0)
+                    break;
+            }
+            out = m == "cmp" ? mkOrdering(c) : c == 2 ? mkNone() : mkSome(mkOrdering(c));
+            return true;
+        }
+        if (m == "clone")
+        {
+            out = cloneValue(self, n);
+            return true;
+        }
+        break;
+    case 'e':
+        if (m == "enumerate")
+            return wrap(adapt(IT_ENUMERATE, it, V()));
+        if (m == "eq" || m == "ne")
+        {
+            IterObj *other = static_cast<IterObj *>(toIter(argAt(args, 0, n), n).p);
+            V y;
+            bool same = true;
+            for (;;)
+            {
+                bool a = iterNext(it, x, n), b = iterNext(other, y, n);
+                if (!a || !b)
+                {
+                    same = a == b;
+                    break;
+                }
+                if (!valueEq(x, y, n))
+                {
+                    same = false;
+                    break;
+                }
+            }
+            out = mkBool(same == (m == "eq"));
+            return true;
+        }
+        break;
+    case 'f':
+        if (m == "filter")
+            return wrap(adapt(IT_FILTER, it, argAt(args, 0, n)));
+        if (m == "filter_map")
+            return wrap(adapt(IT_FILTER_MAP, it, argAt(args, 0, n)));
+        if (m == "flat_map")
+            return wrap(adapt(IT_FLAT_MAP, it, argAt(args, 0, n)));
+        if (m == "flatten")
+            return wrap(adapt(IT_FLATTEN, it, V()));
+        if (m == "fuse")
+        {
+            out = self;
+            return true;
+        }
+        if (m == "fold")
+        {
+            V acc = argAt(args, 0, n), f = argAt(args, 1, n);
+            while (iterNext(it, x, n))
+                acc = call2(f, acc, x, n);
+            out = acc;
+            return true;
+        }
+        if (m == "for_each")
+        {
+            V f = argAt(args, 0, n);
+            while (iterNext(it, x, n))
+                call1(f, x, n);
+            out = V();
+            return true;
+        }
+        if (m == "find")
+        {
+            V f = argAt(args, 0, n);
+            while (iterNext(it, x, n))
+                if (isTrue(call1(f, mkRefTo(x, false), n), n))
+                {
+                    out = mkSome(x);
+                    return true;
+                }
+            out = mkNone();
+            return true;
+        }
+        if (m == "find_map")
+        {
+            V f = argAt(args, 0, n);
+            V found;
+            while (iterNext(it, x, n))
+                if (optionPayload(call1(f, x, n), found, n))
+                {
+                    out = mkSome(found);
+                    return true;
+                }
+            out = mkNone();
+            return true;
+        }
+        break;
+    case 'g':
+    case 'l':
+        if (m == "last")
+        {
+            bool any = false;
+            V last;
+            if (it->ik == IT_SEQ || it->ik == IT_VALUES || it->ik == IT_RANGE)
+                any = iterNextBack(it, last, n);
+            else
+                while (iterNext(it, x, n))
+                {
+                    last = x;
+                    any = true;
+                }
+            out = mkOption(any, last);
+            return true;
+        }
+        if (m == "len")
+        {
+            int64_t count = knownLen(it);
+            if (count < 0)
+            {
+                materialize(it, n);
+                count = it->end - it->i;
+            }
+            out = mkUint((uint64_t)count, PR_USIZE);
+            return true;
+        }
+        if (m == "lt" || m == "le" || m == "gt" || m == "ge")
+        {
+            IterObj *other = static_cast<IterObj *>(toIter(argAt(args, 0, n), n).p);
+            V y;
+            int c = 0;
+            for (;;)
+            {
+                bool a = iterNext(it, x, n), b = iterNext(other, y, n);
+                if (!a || !b)
+                {
+                    c = a ? 1 : b ? -1 : 0;
+                    break;
+                }
+                c = valueCmp(x, y, n);
+                if (c != 0)
+                    break;
+            }
+            out = mkBool(c == 2 ? false : m == "lt" ? c < 0 : m == "le" ? c <= 0 : m == "gt" ? c > 0 : c >= 0);
+            return true;
+        }
+        break;
+    case 'i':
+        if (m == "inspect")
+            return wrap(adapt(IT_INSPECT, it, argAt(args, 0, n)));
+        if (m == "into_iter" || m == "iter")
+        {
+            out = self;
+            return true;
+        }
+        if (m == "is_sorted")
+        {
+            bool sorted = true;
+            V prev;
+            bool first = true;
+            while (iterNext(it, x, n))
+            {
+                if (!first && valueCmp(prev, x, n) > 0)
+                    sorted = false;
+                prev = x;
+                first = false;
+            }
+            out = mkBool(sorted);
+            return true;
+        }
+        break;
+    case 'm':
+        if (m == "map")
+            return wrap(adapt(IT_MAP, it, argAt(args, 0, n)));
+        if (m == "map_while")
+            return wrap(adapt(IT_MAP_WHILE, it, argAt(args, 0, n)));
+        if (m == "max" || m == "min" || m == "max_by_key" || m == "min_by_key" || m == "max_by" || m == "min_by")
+        {
+            bool wantMax = m[1] == 'a';
+            bool byKey = m.size() > 6 && m.compare(m.size() - 4, 4, "_key") == 0, by = !byKey && m.size() > 3;
+            V f = byKey || by ? argAt(args, 0, n) : V();
+            bool any = false;
+            V best, bestKey;
+            while (iterNext(it, x, n))
+            {
+                V key = byKey ? call1(f, mkRefTo(x, false), n) : V();
+                if (!any)
+                {
+                    any = true;
+                    best = x;
+                    bestKey = key;
+                    continue;
+                }
+                int c;
+                if (byKey)
+                    c = valueCmp(key, bestKey, n);
+                else if (by)
+                {
+                    V r = peel(call2(f, mkRefTo(x, false), mkRefTo(best, false), n));
+                    if (r.k != V_ENUM || static_cast<EnumObj *>(r.p)->def != G.orderingDef)
+                        errAt(n, "E0308", "mismatched types: expected `Ordering`, found `" + typeName(r) + "`");
+                    c = static_cast<EnumObj *>(r.p)->variant - 1;
+                }
+                else
+                    c = valueCmp(x, best, n);
+                // the last of equal maxima, the first of equal minima
+                if (wantMax ? c >= 0 && c != 2 : c < 0)
+                {
+                    best = x;
+                    bestKey = key;
+                }
+            }
+            out = mkOption(any, best);
+            return true;
+        }
+        break;
+    case 'n':
+        if (m == "next")
+        {
+            bool any = iterNext(it, x, n);
+            out = mkOption(any, x);
+            return true;
+        }
+        if (m == "next_back")
+        {
+            bool any = iterNextBack(it, x, n);
+            out = mkOption(any, x);
+            return true;
+        }
+        if (m == "nth")
+        {
+            int64_t skip = toIndex(argAt(args, 0, n), n);
+            bool any = true;
+            for (int64_t k = 0; k <= skip && any; ++k)
+                any = iterNext(it, x, n);
+            out = mkOption(any, x);
+            return true;
+        }
+        if (m == "next_if" || m == "next_if_eq")
+        {
+            if (it->ik != IT_PEEKABLE)
+                return false;
+            if (!it->flag)
+            {
+                it->items.resize(1);
+                it->done = !iterNext(it->src, it->items[0], n);
+                it->flag = true;
+            }
+            if (it->done)
+            {
+                out = mkNone();
+                return true;
+            }
+            bool take = m == "next_if" ? isTrue(call1(argAt(args, 0, n), mkRef(it, 0, false), n), n)
+                                       : valueEq(it->items[0], argAt(args, 0, n), n);
+            if (take)
+            {
+                it->flag = false;
+                out = mkSome(it->items[0]);
+            }
+            else
+                out = mkNone();
+            return true;
+        }
+        if (m == "ne")
+            break;
+        break;
+    case 'p':
+        if (m == "peekable")
+            return wrap(adapt(IT_PEEKABLE, it, V()));
+        if (m == "peek" || m == "peek_mut")
+        {
+            if (it->ik != IT_PEEKABLE)
+                return false;
+            if (!it->flag)
+            {
+                it->items.resize(1);
+                it->done = !iterNext(it->src, it->items[0], n);
+                it->flag = true;
+            }
+            out = it->done ? mkNone() : mkSome(mkRef(it, 0, m == "peek_mut"));
+            return true;
+        }
+        if (m == "position" || m == "rposition")
+        {
+            V f = argAt(args, 0, n);
+            if (m == "rposition")
+            {
+                int64_t len = knownLen(it);
+                if (len < 0)
+                {
+                    materialize(it, n);
+                    len = it->end - it->i;
+                }
+                while (iterNextBack(it, x, n))
+                {
+                    --len;
+                    if (isTrue(call1(f, x, n), n))
+                    {
+                        out = mkSome(mkUint((uint64_t)len, PR_USIZE));
+                        return true;
+                    }
+                }
+                out = mkNone();
+                return true;
+            }
+            uint64_t idx = 0;
+            while (iterNext(it, x, n))
+            {
+                if (isTrue(call1(f, x, n), n))
+                {
+                    out = mkSome(mkUint(idx, PR_USIZE));
+                    return true;
+                }
+                ++idx;
+            }
+            out = mkNone();
+            return true;
+        }
+        if (m == "product")
+        {
+            uint8_t prim = numHint(n, hint);
+            V acc = typedZero(prim, true);
+            bool first = true;
+            while (iterNext(it, x, n))
+            {
+                V v = peelAll(x);
+                if (first && v.k == V_FLOAT && acc.k == V_INT)
+                    acc = mkFloat(1, isFloatPrim(prim) ? prim : v.t);
+                acc = binaryOp(O_MUL, acc, v, n);
+                first = false;
+            }
+            out = acc;
+            return true;
+        }
+        if (m == "partition")
+        {
+            V f = argAt(args, 0, n);
+            std::vector<V> yes, no;
+            while (iterNext(it, x, n))
+            {
+                if (isTrue(call1(f, mkRefTo(x, false), n), n))
+                    yes.push_back(x);
+                else
+                    no.push_back(x);
+            }
+            Ty *h = tyResolve(!n->tys.empty() ? n->tys[0] : hint);
+            Ty *each = h && h->k == TY_TUPLE && !h->items.empty() ? h->items[0] : h && h->k != TY_TUPLE ? h : nullptr;
+            derefCopies(yes, each);
+            derefCopies(no, each);
+            out = entryTuple(collectInto(yes, each, n), collectInto(no, each, n));
+            return true;
+        }
+        break;
+    case 'r':
+        if (m == "rev")
+            return wrap(adapt(IT_REV, it, V()));
+        if (m == "reduce")
+        {
+            V f = argAt(args, 0, n);
+            V acc;
+            if (!iterNext(it, acc, n))
+            {
+                out = mkNone();
+                return true;
+            }
+            while (iterNext(it, x, n))
+                acc = call2(f, acc, x, n);
+            out = mkSome(acc);
+            return true;
+        }
+        if (m == "rfind")
+        {
+            V f = argAt(args, 0, n);
+            while (iterNextBack(it, x, n))
+                if (isTrue(call1(f, mkRefTo(x, false), n), n))
+                {
+                    out = mkSome(x);
+                    return true;
+                }
+            out = mkNone();
+            return true;
+        }
+        if (m == "rfold")
+        {
+            V acc = argAt(args, 0, n), f = argAt(args, 1, n);
+            while (iterNextBack(it, x, n))
+                acc = call2(f, acc, x, n);
+            out = acc;
+            return true;
+        }
+        break;
+    case 's':
+        if (m == "sum")
+        {
+            uint8_t prim = numHint(n, hint);
+            V acc = typedZero(prim, false);
+            bool first = true;
+            while (iterNext(it, x, n))
+            {
+                V v = peelAll(x);
+                if (first && v.k == V_FLOAT && acc.k == V_INT)
+                    acc = mkFloat(0, isFloatPrim(prim) ? prim : v.t);
+                if (first && (v.k == V_STRUCT || v.k == V_ENUM))
+                    acc = v; // the type's own Add
+                else
+                    acc = binaryOp(O_ADD, acc, v, n);
+                first = false;
+            }
+            out = acc;
+            return true;
+        }
+        if (m == "skip" || m == "take" || m == "step_by")
+        {
+            IterObj *made = adapt(m == "skip" ? IT_SKIP : m == "take" ? IT_TAKE : IT_STEP_BY, it, V());
+            made->n = toIndex(argAt(args, 0, n), n);
+            if (m == "step_by" && made->n == 0)
+                panicAt(n, "assertion failed: step != 0");
+            return wrap(made);
+        }
+        if (m == "skip_while")
+            return wrap(adapt(IT_SKIP_WHILE, it, argAt(args, 0, n)));
+        if (m == "scan")
+        {
+            IterObj *made = adapt(IT_SCAN, it, argAt(args, 1, n));
+            made->items.push_back(argAt(args, 0, n));
+            return wrap(made);
+        }
+        if (m == "size_hint")
+        {
+            int64_t len = knownLen(it);
+            out = entryTuple(mkUint((uint64_t)(len < 0 ? 0 : len), PR_USIZE),
+                             len < 0 ? mkNone() : mkSome(mkUint((uint64_t)len, PR_USIZE)));
+            return true;
+        }
+        break;
+    case 't':
+        if (m == "take_while")
+            return wrap(adapt(IT_TAKE_WHILE, it, argAt(args, 0, n)));
+        if (m == "try_fold")
+        {
+            V acc = argAt(args, 0, n), f = argAt(args, 1, n);
+            V last;
+            bool any = false;
+            while (iterNext(it, x, n))
+            {
+                V r = peel(call2(f, acc, x, n));
+                if (isNoneV(r) || isErrV(r))
+                {
+                    out = r;
+                    return true;
+                }
+                if (r.k != V_ENUM || r.p->items.empty())
+                    errAt(n, "E0277", "the closure of `try_fold` has to return an `Option` or a `Result`");
+                acc = r.p->items[0];
+                last = r;
+                any = true;
+            }
+            if (any)
+                out = last;
+            else
+            {
+                Ty *h = tyResolve(hint);
+                out = h && tyHead(h) == "Result" ? mkOk(acc) : mkSome(acc);
+            }
+            return true;
+        }
+        if (m == "try_for_each")
+        {
+            V f = argAt(args, 0, n);
+            while (iterNext(it, x, n))
+            {
+                V r = peel(call1(f, x, n));
+                if (isNoneV(r) || isErrV(r))
+                {
+                    out = r;
+                    return true;
+                }
+            }
+            Ty *h = tyResolve(hint);
+            out = h && tyHead(h) == "Option" ? mkSome(V()) : mkOk(V());
+            return true;
+        }
+        break;
+    case 'u':
+        if (m == "unzip")
+        {
+            std::vector<V> left, right;
+            while (iterNext(it, x, n))
+            {
+                V pair = peel(x);
+                if (pair.k != V_TUPLE || pair.p->items.size() != 2)
+                    errAt(n, "E0277", "`unzip` needs an iterator over pairs, found `" + typeName(pair) + "`");
+                left.push_back(pair.p->items[0]);
+                right.push_back(pair.p->items[1]);
+            }
+            Ty *h = tyResolve(!n->tys.empty() ? n->tys[0] : hint);
+            bool pair = h && h->k == TY_TUPLE && h->items.size() == 2;
+            if (pair)
+            {
+                derefCopies(left, h->items[0]);
+                derefCopies(right, h->items[1]);
+            }
+            out = entryTuple(collectInto(left, pair ? h->items[0] : nullptr, n),
+                             collectInto(right, pair ? h->items[1] : nullptr, n));
+            return true;
+        }
+        break;
+    case 'z':
+        if (m == "zip")
+        {
+            IterObj *made = adapt(IT_ZIP, it, V());
+            made->src2 = static_cast<IterObj *>(toIter(argAt(args, 0, n), n).p);
+            return wrap(made);
+        }
+        break;
+    }
+    return false;
+}
+
+} // namespace rust

@@ -1,0 +1,556 @@
+// quantum: cpp
+#pragma once
+// Rust front-end: tokens and the syntax tree the parser builds. The tree is
+// one node type per family (expression/statement, pattern, type) with a kind
+// tag: the evaluator switches on it. Fields the later stages fill in (a
+// local's slot, what a path names) sit in the nodes too.
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace rust
+{
+
+// A program rustc would reject, found by the parser, by the checks made
+// before the program starts, or (types are checked as the program runs) at
+// the operation that is wrong.
+struct CompileErr
+{
+    std::string code;    // "E0425"; "" for a syntax error
+    std::string message;
+    int line = 0, col = 0, width = 1;
+    std::string label;   // printed after the carets
+    std::string help;    // a `= help:` line, if any
+};
+
+// ─── Tokens ────────────────────────────────────────────────────────────────
+
+enum TK : uint8_t
+{
+    T_EOF,
+    T_IDENT,
+    T_LIFE,  // 'a
+    T_INT,
+    T_FLOAT,
+    T_STR,
+    T_BSTR,  // b"..."
+    T_CHAR,
+    T_BYTE,  // b'x'
+    T_PUNCT
+};
+
+struct Tok
+{
+    uint8_t k = T_EOF;
+    bool raw = false;        // r#ident: never a keyword
+    bool spaceBefore = false;
+    std::string s;           // identifier, punctuation, decoded string
+    std::string suf;         // a number's suffix (u8, f64 ...)
+    uint64_t lo = 0, hi = 0; // integer value (128 bits), a char's code point
+    double f = 0;
+    int line = 1, col = 1, len = 1;
+};
+
+std::vector<Tok> lex(const std::string &source);
+
+// A program may be several files (`mod name;` reads name.rs): a line number
+// carries its file, file k's lines being k * kFileLine + line
+const int kFileLine = 1 << 24;
+inline int srcLine(int line) { return line % kFileLine; }
+inline int srcFile(int line) { return line / kFileLine; }
+// the file of a module: its text, and its number (RustLib.sa); false: no such file
+bool loadModuleFile(const std::string &path, std::string &text, int &fileIdx);
+std::string moduleRootDir(); // where the crate's root file is
+
+// ─── Types as written ──────────────────────────────────────────────────────
+
+struct Node;
+struct Ty;
+struct TypeDef;
+struct TraitDef;
+struct FnDef;
+struct ModDef;
+struct ImplDef;
+struct ConstDef;
+
+struct PathSeg
+{
+    std::string name;
+    std::vector<Ty *> args; // <A, B>, or the (A, B) of Fn(A, B) -> R
+    Ty *ret = nullptr;      // the R of Fn(A) -> R
+    bool hasArgs = false;
+};
+
+struct Path
+{
+    std::vector<PathSeg> segs;
+    Ty *qself = nullptr;     // <T as Trait>::name: the T
+    Path *qtrait = nullptr;  // ... and the Trait
+    int line = 0, col = 0;
+};
+
+enum TyK : uint8_t
+{
+    TY_PATH,
+    TY_REF,   // &T, &mut T
+    TY_PTR,   // *const T, *mut T
+    TY_TUPLE, // (A, B); () is the unit type
+    TY_ARRAY, // [T; N]
+    TY_SLICE, // [T]
+    TY_FN,    // fn(A) -> R
+    TY_DYN,   // dyn Trait
+    TY_IMPL,  // impl Trait
+    TY_NEVER, // !
+    TY_INFER  // _
+};
+
+// primitive types (0: not one)
+enum Prim : uint8_t
+{
+    PR_NONE = 0,
+    PR_I8,
+    PR_I16,
+    PR_I32,
+    PR_I64,
+    PR_I128,
+    PR_ISIZE,
+    PR_U8,
+    PR_U16,
+    PR_U32,
+    PR_U64,
+    PR_U128,
+    PR_USIZE,
+    PR_F32,
+    PR_F64,
+    PR_BOOL,
+    PR_CHAR,
+    PR_STR
+};
+
+struct Ty
+{
+    uint8_t k = TY_PATH;
+    bool mut = false;
+    uint8_t prim = PR_NONE;  // TY_PATH naming a primitive
+    bool primKnown = false;
+    Path *path = nullptr;    // TY_PATH; TY_DYN / TY_IMPL: the first bound
+    Ty *elem = nullptr;      // TY_REF, TY_PTR, TY_ARRAY, TY_SLICE
+    Node *len = nullptr;     // TY_ARRAY
+    std::vector<Ty *> items; // TY_TUPLE; TY_FN parameters
+    Ty *ret = nullptr;       // TY_FN
+    TypeDef *def = nullptr;  // the struct / enum it names, once looked up
+    bool defKnown = false;
+    std::vector<std::string> params; // the target of a type alias: the alias's generic parameters
+    int line = 0, col = 0;
+};
+
+struct GenericParam
+{
+    std::string name;
+    bool isLifetime = false, isConst = false;
+    std::vector<Ty *> bounds;
+};
+
+// ─── Patterns ──────────────────────────────────────────────────────────────
+
+enum PK : uint8_t
+{
+    P_WILD,    // _
+    P_BIND,    // x, mut x, ref x, x @ sub
+    P_LIT,     // 1, "a", 'c', true, -1 (lo)
+    P_RANGE,   // lo..=hi, lo.., ..=hi
+    P_TUPLE,   // (a, b, ..)
+    P_PATH,    // None, Color::Red, CONST
+    P_TSTRUCT, // Some(x), Point(x, y)
+    P_STRUCT,  // Point { x, y: 0, .. }
+    P_REF,     // &p, &mut p
+    P_SLICE,   // [a, b, rest @ ..]
+    P_OR,      // a | b
+    P_REST     // .. inside a tuple or slice
+};
+
+struct Pat
+{
+    uint8_t k = P_WILD;
+    bool byRef = false, mut = false, hasRest = false, inclusive = false;
+    int line = 0, col = 0;
+    std::string name;                // P_BIND
+    int slot = -1;                   // P_BIND: where the value goes
+    Pat *sub = nullptr;              // P_BIND `x @ sub`; P_REF: the inner pattern
+    Path *path = nullptr;
+    std::vector<Pat *> items;        // elements, struct field patterns, alternatives
+    std::vector<std::string> fields; // P_STRUCT: the field of each item
+    Node *lo = nullptr, *hi = nullptr;
+    // what the path names (filled in on first use)
+    TypeDef *def = nullptr;
+    int variant = -1;
+    ConstDef *cst = nullptr;
+    bool resolved = false;
+};
+
+// ─── Expressions and statements ────────────────────────────────────────────
+
+enum NK : uint8_t
+{
+    N_INT,
+    N_FLOAT,
+    N_STR,
+    N_BSTR,
+    N_CHAR,
+    N_BYTE,
+    N_BOOL,
+    N_PATH,     // path; slot >= 0: a local variable
+    N_BLOCK,    // kids; flag: the last one is the block's value; s: label
+    N_LET,      // pat, ty, a: initializer, b: the else block of let-else
+    N_ITEM,     // an item declared in a block (no code)
+    N_SEMI,     // a;
+    N_IF,       // a: condition, b: then, c: else
+    N_LETCOND,  // `let pat = a` in a condition
+    N_WHILE,    // a, b: body, s: label
+    N_LOOP,     // b, s
+    N_FOR,      // pat, a: iterated, b, s
+    N_MATCH,    // a, arms
+    N_BREAK,    // s: label, a: value
+    N_CONTINUE, // s
+    N_RETURN,   // a
+    N_CALL,     // a: callee, kids: arguments
+    N_MCALL,    // a: receiver, s: method, kids, tys: turbofish
+    N_FIELD,    // a.s
+    N_TFIELD,   // a.0 (lo)
+    N_INDEX,    // a[b]
+    N_UNARY,    // op a
+    N_REF,      // &a, &mut a
+    N_BINARY,   // a op b
+    N_ASSIGN,   // a = b
+    N_OPASSIGN, // a op= b
+    N_CAST,     // a as ty
+    N_RANGE,    // a..b, a..=b (flag); a and b may be null
+    N_TUPLE,    // (kids); no kids: ()
+    N_ARRAY,    // [kids]
+    N_REPEAT,   // [a; b]
+    N_STRUCT,   // path { names: kids, ..b }
+    N_CLOSURE,  // pats, tys, a: body, flag: move; op 1: an async block, 2: an async closure
+    N_TRY,      // a?
+    N_MACRO,    // s!(kids), fmt
+    N_AWAIT     // a.await
+};
+
+enum Op : uint8_t
+{
+    O_ADD,
+    O_SUB,
+    O_MUL,
+    O_DIV,
+    O_REM,
+    O_BITAND,
+    O_BITOR,
+    O_BITXOR,
+    O_SHL,
+    O_SHR,
+    O_EQ,
+    O_NE,
+    O_LT,
+    O_LE,
+    O_GT,
+    O_GE,
+    O_AND, // &&
+    O_OR,  // ||
+    O_NEG,
+    O_NOT,
+    O_DEREF
+};
+
+// One {} of a format string, with the literal text in front of it
+struct FmtPiece
+{
+    std::string lit;
+    int arg = -1;        // which argument; -1: text only
+    char ty = 0;         // 0 Display, '?' Debug, x X o b e E
+    bool alt = false, zero = false, plus = false;
+    char align = 0;      // < > ^
+    uint32_t fill = ' ';
+    int width = -1, widthArg = -1;
+    int prec = -1, precArg = -1;
+};
+
+struct Fmt
+{
+    std::vector<FmtPiece> pieces;
+};
+
+struct Arm
+{
+    Pat *pat = nullptr;
+    Node *guard = nullptr;
+    Node *body = nullptr;
+};
+
+struct Node
+{
+    uint8_t k = 0, op = 0;
+    bool mut = false, flag = false;
+    uint8_t t = 0;                  // a literal's suffix type (Prim)
+    int line = 0, col = 0;
+    std::string s;
+    Node *a = nullptr, *b = nullptr, *c = nullptr;
+    std::vector<Node *> kids;
+    std::vector<std::string> names; // N_STRUCT: the field of each kid
+    std::vector<Arm> arms;
+    Ty *ty = nullptr;
+    Pat *pat = nullptr;
+    Path *path = nullptr;
+    std::vector<Pat *> pats;
+    std::vector<Ty *> tys;
+    uint64_t lo = 0;
+    int64_t hi = 0;
+    double f = 0;
+    Fmt *fmt = nullptr;
+    // filled in by the resolver
+    int slot = -1;                  // N_PATH: the local's slot
+    int nslots = 0;                 // N_CLOSURE: its frame
+    std::vector<int> capOuter, capInner; // N_CLOSURE: captured slots (theirs, ours)
+    std::vector<int> scopeSlots;    // N_BLOCK / loops / arms: the locals declared in it
+    ModDef *items = nullptr;        // N_BLOCK: the items declared in it (a scope of their own)
+    // filled in on first evaluation
+    void *cache = nullptr;
+    void *cache2 = nullptr;
+    int cacheKind = 0;
+    int cacheIdx = 0;
+};
+
+// ─── Items ─────────────────────────────────────────────────────────────────
+
+enum SelfKind : uint8_t
+{
+    SK_NONE,
+    SK_VALUE, // self, mut self, self: Box<Self>
+    SK_REF,   // &self
+    SK_MUT    // &mut self
+};
+
+struct Param
+{
+    Pat *pat = nullptr;
+    Ty *ty = nullptr;
+};
+
+struct FnDef
+{
+    std::string name;
+    std::vector<GenericParam> generics;
+    std::vector<Param> params; // without self
+    uint8_t selfKind = SK_NONE;
+    bool selfMut = false;
+    bool isPub = false;
+    Ty *ret = nullptr;
+    Node *body = nullptr;      // null: a trait method without a default
+    int line = 0, col = 0;
+    int nslots = 0;            // locals; slot 0 is self when it has one
+    TypeDef *owner = nullptr;  // the Self of the impl it is in
+    TraitDef *trait = nullptr; // the trait it is declared in or implements
+    ImplDef *impl = nullptr;
+    FnDef *overload = nullptr; // the same method of another impl: From<A>, From<B>
+    bool ofTrait = false;      // in a trait impl: as public as the trait
+    bool isAsync = false;      // async fn: a call makes a future
+    bool runtimeMain = false;  // #[tokio::main] / #[async_std::main]
+    ModDef *mod = nullptr;
+    bool resolved = false;
+};
+
+enum Derive : unsigned
+{
+    D_DEBUG = 1,
+    D_CLONE = 2,
+    D_COPY = 4,
+    D_PARTIALEQ = 8,
+    D_EQ = 16,
+    D_PARTIALORD = 32,
+    D_ORD = 64,
+    D_HASH = 128,
+    D_DEFAULT = 256,
+    D_SERIALIZE = 512,  // serde
+    D_DESERIALIZE = 1024
+};
+
+struct FieldDef
+{
+    std::string name;
+    Ty *ty = nullptr;
+    bool isPub = false;
+    std::string serde; // #[serde(...)]: "rename=x;default;" ...
+};
+
+enum Form : uint8_t
+{
+    FORM_NAMED, // { a: T }
+    FORM_TUPLE, // (T, U)
+    FORM_UNIT
+};
+
+struct VariantDef
+{
+    std::string name;
+    uint8_t form = FORM_UNIT;
+    std::vector<FieldDef> fields;
+    Node *disc = nullptr;  // = 5
+    int64_t discVal = 0;
+    bool discKnown = false;
+    std::string serde;
+};
+
+enum TDK : uint8_t
+{
+    TD_STRUCT,
+    TD_ENUM,
+    TD_BUILTIN // i32, String, Vec ...: only to hang user impls on
+};
+
+struct TypeDef
+{
+    std::string name;
+    uint8_t kind = TD_STRUCT;
+    uint8_t form = FORM_NAMED;
+    bool isPub = false;
+    std::vector<GenericParam> generics;
+    std::vector<FieldDef> fields;
+    std::vector<VariantDef> variants;
+    unsigned derives = 0;
+    int defaultVariant = -1; // #[default]
+    std::unordered_map<std::string, int> fieldIndex;
+    std::unordered_map<std::string, int> variantIndex;
+    // every method of its impl blocks, inherent and of traits
+    std::unordered_map<std::string, FnDef *> methods;
+    std::unordered_map<std::string, ConstDef *> consts;
+    std::unordered_map<std::string, Ty *> assocTypes;
+    std::vector<TraitDef *> traits; // implemented
+    std::vector<std::string> traitNames; // ... and those of the library: Display, Drop
+    bool hasDrop = false;
+    std::vector<ImplDef *> impls;
+    ModDef *mod = nullptr;
+    int line = 0, col = 0;
+    int id = 0;
+    std::string serde;
+};
+
+struct TraitDef
+{
+    std::string name;
+    bool isPub = false;
+    std::vector<GenericParam> generics;
+    std::vector<Path *> supers;
+    std::unordered_map<std::string, FnDef *> methods; // defaults have a body
+    std::unordered_map<std::string, ConstDef *> consts;
+    std::vector<ImplDef *> blanket; // impl<T> Trait for T
+    ModDef *mod = nullptr;
+    int line = 0, col = 0;
+};
+
+struct ConstDef
+{
+    std::string name;
+    bool isStatic = false, mut = false, isPub = false;
+    Ty *ty = nullptr;
+    Node *init = nullptr;  // null: a trait's constant without a default
+    int nslots = 0;        // locals of the initializer
+    TypeDef *owner = nullptr;
+    ModDef *mod = nullptr;
+    int line = 0, col = 0;
+    // run time
+    void *cell = nullptr;  // the value, once computed
+    bool busy = false;
+};
+
+struct ImplDef
+{
+    std::vector<GenericParam> generics;
+    Ty *selfTy = nullptr;
+    Path *trait = nullptr;
+    std::vector<FnDef *> fns;
+    std::vector<ConstDef *> consts;
+    std::vector<std::pair<std::string, Ty *>> types;
+    ModDef *mod = nullptr;
+    TypeDef *target = nullptr;
+    TraitDef *traitDef = nullptr;
+    std::string traitName;  // the trait's name, whoever defines it
+    bool blanket = false;   // impl<T> Trait for T
+    int line = 0, col = 0;
+};
+
+struct UseDecl
+{
+    std::vector<std::string> path; // crate, a, b ...
+    std::string alias;             // the name it brings in ("" for a glob)
+    bool glob = false, isPub = false;
+    int line = 0, col = 0;
+};
+
+// macro_rules!: one rule's matcher and body as token lists
+struct MacroRule
+{
+    std::vector<Tok> matcher, body;
+};
+
+struct MacroDef
+{
+    std::string name;
+    std::vector<MacroRule> rules;
+    int line = 0, col = 0;
+};
+
+enum SymK : uint8_t
+{
+    S_NONE,
+    S_FN,
+    S_TYPE,    // struct or enum
+    S_TRAIT,
+    S_CONST,   // const or static
+    S_MOD,
+    S_VARIANT, // through `use Enum::*`
+    S_ALIAS,   // type alias
+    S_BUILTIN  // a name of the standard library (text: its full path)
+};
+
+struct Sym
+{
+    uint8_t k = S_NONE;
+    bool isPub = false;
+    FnDef *fn = nullptr;
+    TypeDef *type = nullptr;
+    TraitDef *trait = nullptr;
+    ConstDef *cst = nullptr;
+    ModDef *mod = nullptr;
+    Ty *alias = nullptr;
+    int variant = -1;
+    std::string text;
+    ModDef *home = nullptr; // where it was declared (privacy)
+};
+
+struct ModDef
+{
+    std::string name;
+    ModDef *parent = nullptr;
+    bool isPub = false;
+    bool isBlock = false; // the items of a block: names not found here are looked up outside it
+    std::unordered_map<std::string, Sym> names;
+    std::vector<FnDef *> fns;
+    std::vector<TypeDef *> types;
+    std::vector<TraitDef *> traits;
+    std::vector<ImplDef *> impls;
+    std::vector<ConstDef *> consts;
+    std::vector<ModDef *> mods;
+    std::vector<UseDecl> uses;
+    std::vector<std::pair<std::string, Ty *>> aliases;
+    std::vector<MacroDef *> macros;
+    int line = 0, col = 0;
+};
+
+// The file: its root module. `all` gets every module in it, the scopes of
+// blocks that declare items included. Throws CompileErr.
+ModDef *parseProgram(const std::string &source, std::vector<ModDef *> &all);
+
+// Whether `name` is a primitive type, and which
+uint8_t primOf(const std::string &name);
+const char *primName(uint8_t prim);
+
+} // namespace rust

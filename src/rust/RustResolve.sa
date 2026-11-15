@@ -1,0 +1,2198 @@
+// quantum: cpp
+// Rust front-end: names. Before a program runs, this pass
+//   - brings in what every `use` names (items of the program, and the
+//     library's, which are known by their path),
+//   - hangs each impl block on its type and checks it against its trait,
+//   - gives every local variable a slot in its function's frame, and every
+//     closure the list of variables it captures,
+//   - works out what each path names (a function, a constant, a variant, a
+//     library item ...) and leaves the answer in the node,
+// and reports what rustc reports at this stage: names that do not exist
+// (E0425, E0412, E0433), private items (E0603), wrong argument counts
+// (E0061), struct literals with missing or unknown fields (E0063, E0560),
+// assignment to a variable that is not `mut` (E0384, E0596), `break` outside
+// a loop (E0268), impls that leave a trait's methods out (E0046).
+#include "RustRt.h.sa"
+
+namespace rust
+{
+
+namespace
+{
+
+bool inList(const std::string &n, const char *const *names, size_t count)
+{
+    for (size_t k = 0; k < count; ++k)
+        if (n == names[k])
+            return true;
+    return false;
+}
+
+// names every program can use without importing them
+bool preludeType(const std::string &n)
+{
+    static const char *const names[] = {
+        "Option", "Result", "Vec", "String", "Box", "Clone", "Copy", "Send", "Sized", "Sync", "Unpin", "Drop",
+        "Fn", "FnMut", "FnOnce", "AsMut", "AsRef", "From", "Into", "DoubleEndedIterator", "ExactSizeIterator",
+        "Extend", "IntoIterator", "Iterator", "Default", "Eq", "Ord", "PartialEq", "PartialOrd", "ToOwned",
+        "ToString", "TryFrom", "TryInto", "FromIterator"};
+    return inList(n, names, sizeof names / sizeof names[0]);
+}
+
+bool preludeValue(const std::string &n)
+{
+    return n == "Some" || n == "None" || n == "Ok" || n == "Err" || n == "drop";
+}
+
+// the standard library, and the crates Quantum has built in (tokio, serde ...)
+bool crateRoot(const std::string &n)
+{
+    return n == "std" || n == "core" || n == "alloc" || n == "tokio" || n == "futures" || n == "serde" ||
+           n == "serde_json" || n == "async_std";
+}
+
+// what `use <module>::*` of a library module brings in
+const char *globNames(const std::string &module)
+{
+    if (module == "collections") return "HashMap HashSet BTreeMap BTreeSet VecDeque BinaryHeap LinkedList";
+    if (module == "fmt") return "Display Debug Formatter Write Binary LowerHex UpperHex Octal LowerExp UpperExp";
+    if (module == "cmp") return "Ordering Reverse max min";
+    if (module == "io::prelude") return "Read Write BufRead Seek";
+    if (module == "io") return "stdin stdout stderr Read Write BufRead BufReader BufWriter";
+    if (module == "rc") return "Rc Weak";
+    if (module == "cell") return "RefCell Cell OnceCell";
+    if (module == "sync") return "Arc Mutex RwLock";
+    if (module == "ops")
+        return "Add Sub Mul Div Rem Neg Not BitAnd BitOr BitXor Shl Shr AddAssign SubAssign MulAssign DivAssign "
+               "RemAssign Index IndexMut Deref DerefMut Range RangeInclusive Fn FnMut FnOnce Drop";
+    if (module == "f64::consts" || module == "f32::consts")
+        return "PI E TAU SQRT_2 LN_2 LN_10 LOG2_E LOG10_E FRAC_PI_2 FRAC_PI_3 FRAC_PI_4 FRAC_PI_6 FRAC_PI_8 "
+               "FRAC_1_PI FRAC_2_PI FRAC_1_SQRT_2";
+    if (module == "mem") return "swap replace take drop size_of size_of_val";
+    if (module == "iter") return "repeat once empty from_fn successors zip repeat_n";
+    if (module == "convert") return "From Into TryFrom TryInto AsRef AsMut";
+    if (module == "str") return "FromStr";
+    if (module == "time") return "Duration Instant";
+    if (module == "thread") return "spawn sleep";
+    if (module == "process") return "exit";
+    if (module == "env") return "args";
+    if (module == "error") return "Error";
+    if (module == "hash") return "Hash Hasher";
+    if (module == "marker") return "PhantomData Copy Send Sync Sized";
+    if (module == "borrow") return "Cow Borrow ToOwned";
+    if (module == "any") return "Any type_name";
+    return "";
+}
+
+std::string joinPath(const std::vector<std::string> &parts)
+{
+    std::string out;
+    for (size_t k = 0; k < parts.size(); ++k)
+        out += (k ? "::" : "") + parts[k];
+    return out;
+}
+
+Path *singlePath(const std::string &name, int line, int col)
+{
+    Path *p = new Path();
+    p->line = line;
+    p->col = col;
+    PathSeg seg;
+    seg.name = name;
+    p->segs.push_back(seg);
+    return p;
+}
+
+enum ResK
+{
+    R_FAIL,
+    R_FN,
+    R_CONST,
+    R_TYPE,
+    R_VARIANT,
+    R_MOD,
+    R_TRAIT,
+    R_ALIAS,
+    R_BUILTIN,
+    R_TYPE_MEMBER,
+    R_TRAIT_MEMBER,
+    R_GENERIC,
+    R_GENERIC_MEMBER,
+    R_SELF,
+    R_SELF_MEMBER
+};
+
+struct PathRes
+{
+    int k = R_FAIL;
+    FnDef *fn = nullptr;
+    ConstDef *cst = nullptr;
+    TypeDef *type = nullptr;
+    TraitDef *trait = nullptr;
+    ModDef *mod = nullptr;
+    Ty *alias = nullptr;
+    int variant = -1;
+    std::string builtin, member, generic;
+    size_t failedAt = 0;  // the segment that names nothing
+    std::string privateWhat; // "function `f`": it exists but is private
+    ModDef *inMod = nullptr; // the module the failed segment was looked for in
+};
+
+struct Local
+{
+    std::string name;
+    int slot = 0;
+    bool mut = false;
+    bool deferred = false; // declared without a value: `let x;`
+};
+
+struct FnCtx
+{
+    FnCtx *outer = nullptr; // the function a closure is written in
+    Node *closure = nullptr;
+    std::vector<Local> locals;
+    std::vector<size_t> marks;
+    std::vector<std::string> labels;
+    int loops = 0;
+    int nslots = 0;
+};
+
+struct Resolver
+{
+    ModDef *root = nullptr;
+    std::vector<ModDef *> *all = nullptr;
+    ModDef *mod = nullptr;         // where names are looked up from
+    FnCtx *ctx = nullptr;
+    TypeDef *owner = nullptr;      // Self, when it is known
+    bool selfUnknown = false;      // in a trait's own methods: Self is whoever implements it
+    std::vector<std::string> generics; // type / const parameters in scope
+    std::vector<std::vector<int> *> slotLists; // where declared slots are recorded
+    std::vector<Ty *> aliasBusy;
+
+    [[noreturn]] void fail(int line, int col, int width, const char *code, const std::string &msg,
+                           const std::string &label = "")
+    {
+        errPos(line, col, width, code, msg, label);
+    }
+
+    // ── scopes ──
+
+    static ModDef *namedMod(ModDef *m)
+    {
+        while (m && m->isBlock)
+            m = m->parent;
+        return m;
+    }
+
+    static bool within(ModDef *from, ModDef *home)
+    {
+        for (ModDef *m = from; m; m = m->parent)
+            if (m == home)
+                return true;
+        return false;
+    }
+
+    bool isGeneric(const std::string &name) const
+    {
+        for (size_t k = generics.size(); k-- > 0;)
+            if (generics[k] == name)
+                return true;
+        return false;
+    }
+
+    void pushScope() { ctx->marks.push_back(ctx->locals.size()); }
+    void popScope()
+    {
+        ctx->locals.resize(ctx->marks.back());
+        ctx->marks.pop_back();
+    }
+
+    int declare(const std::string &name, bool mut, bool deferred)
+    {
+        Local l;
+        l.name = name;
+        l.slot = ctx->nslots++;
+        l.mut = mut;
+        l.deferred = deferred;
+        ctx->locals.push_back(l);
+        if (!slotLists.empty())
+            slotLists.back()->push_back(l.slot);
+        return l.slot;
+    }
+
+    // The local `name` as seen from c: its own, or one of an enclosing
+    // function that this closure then captures.
+    Local *findLocal(FnCtx *c, const std::string &name)
+    {
+        for (size_t k = c->locals.size(); k-- > 0;)
+            if (c->locals[k].name == name)
+                return &c->locals[k];
+        if (!c->outer)
+            return nullptr;
+        Local *up = findLocal(c->outer, name);
+        if (!up)
+            return nullptr;
+        Local captured;
+        captured.name = name;
+        captured.slot = c->nslots++;
+        captured.mut = up->mut;
+        captured.deferred = up->deferred;
+        c->closure->capOuter.push_back(up->slot);
+        c->closure->capInner.push_back(captured.slot);
+        // at the bottom: visible in the whole closure
+        c->locals.insert(c->locals.begin(), captured);
+        for (size_t &mark : c->marks)
+            ++mark;
+        return &c->locals[0];
+    }
+
+    // ── paths ──
+
+    static Sym modSym(ModDef *m)
+    {
+        Sym s;
+        s.k = S_MOD;
+        s.mod = m;
+        s.isPub = true;
+        return s;
+    }
+
+    static Sym typeSym(TypeDef *t)
+    {
+        Sym s;
+        s.k = S_TYPE;
+        s.type = t;
+        s.isPub = true;
+        return s;
+    }
+
+    static const char *symWhat(const Sym &s)
+    {
+        switch (s.k)
+        {
+        case S_FN: return "function";
+        case S_TYPE: return s.type && s.type->kind == TD_ENUM ? "enum" : "struct";
+        case S_TRAIT: return "trait";
+        case S_CONST: return s.cst && s.cst->isStatic ? "static" : "constant";
+        case S_MOD: return "module";
+        case S_ALIAS: return "type alias";
+        }
+        return "item";
+    }
+
+    PathRes resolvePath(const Path *p)
+    {
+        PathRes r;
+        const std::vector<PathSeg> &segs = p->segs;
+        size_t n = segs.size(), i = 0;
+        Sym cur;
+        bool isBuiltin = false;
+        std::string builtin;
+        ModDef *named = namedMod(mod);
+        const std::string &first = segs[0].name;
+        if (first == "crate")
+        {
+            cur = modSym(root);
+            i = 1;
+        }
+        else if (first == "self" && n > 1)
+        {
+            cur = modSym(named);
+            i = 1;
+        }
+        else if (first == "super")
+        {
+            ModDef *m = named;
+            while (i < n && segs[i].name == "super")
+            {
+                m = m ? namedMod(m->parent) : nullptr;
+                if (!m)
+                {
+                    r.failedAt = i;
+                    return r;
+                }
+                ++i;
+            }
+            cur = modSym(m);
+        }
+        else if (first == "Self")
+        {
+            if (owner && !selfUnknown)
+            {
+                cur = typeSym(owner);
+                i = 1;
+            }
+            else
+            {
+                if (n > 2)
+                    return r;
+                r.k = n == 1 ? R_SELF : R_SELF_MEMBER;
+                if (n > 1)
+                    r.member = segs[1].name;
+                return r;
+            }
+        }
+        else if (isGeneric(first))
+        {
+            if (n > 2)
+            {
+                r.failedAt = 2;
+                return r;
+            }
+            r.k = n == 1 ? R_GENERIC : R_GENERIC_MEMBER;
+            r.generic = first;
+            if (n > 1)
+                r.member = segs[1].name;
+            return r;
+        }
+        else if (Sym *s = lookupName(mod, first))
+        {
+            cur = *s;
+            i = 1;
+        }
+        else if (crateRoot(first) || primOf(first) != PR_NONE || preludeType(first) || preludeValue(first))
+        {
+            isBuiltin = true;
+            builtin = first;
+            i = 1;
+        }
+        else
+        {
+            r.failedAt = 0;
+            r.inMod = nullptr;
+            return r;
+        }
+        for (; i < n; ++i)
+        {
+            const std::string &seg = segs[i].name;
+            if (isBuiltin)
+            {
+                builtin += "::" + seg;
+                continue;
+            }
+            switch (cur.k)
+            {
+            case S_MOD:
+            {
+                auto it = cur.mod->names.find(seg);
+                if (it == cur.mod->names.end())
+                {
+                    r.failedAt = i;
+                    r.inMod = cur.mod;
+                    return r;
+                }
+                if (!it->second.isPub && !within(mod, cur.mod))
+                {
+                    r.failedAt = i;
+                    r.privateWhat = std::string(symWhat(it->second)) + " `" + seg + "`";
+                    return r;
+                }
+                cur = it->second;
+                break;
+            }
+            case S_BUILTIN:
+                isBuiltin = true;
+                builtin = cur.text + "::" + seg;
+                break;
+            case S_ALIAS:
+            {
+                Ty *t = cur.alias;
+                resolveAlias(t);
+                if (t->k == TY_PATH && t->def)
+                {
+                    cur = typeSym(t->def);
+                    --i; // this segment again, on the type
+                    break;
+                }
+                isBuiltin = true;
+                builtin = (t->k == TY_PATH && t->path ? t->path->segs.back().name : std::string("_")) + "::" + seg;
+                break;
+            }
+            case S_TYPE:
+            {
+                if (cur.type->kind == TD_ENUM)
+                {
+                    auto v = cur.type->variantIndex.find(seg);
+                    if (v != cur.type->variantIndex.end())
+                    {
+                        if (i + 1 != n)
+                        {
+                            r.failedAt = i + 1;
+                            return r;
+                        }
+                        r.k = R_VARIANT;
+                        r.type = cur.type;
+                        r.variant = v->second;
+                        return r;
+                    }
+                }
+                if (i + 1 != n)
+                {
+                    r.failedAt = i + 1;
+                    return r;
+                }
+                r.k = R_TYPE_MEMBER;
+                r.type = cur.type;
+                r.member = seg;
+                return r;
+            }
+            case S_TRAIT:
+                if (i + 1 != n)
+                {
+                    r.failedAt = i + 1;
+                    return r;
+                }
+                r.k = R_TRAIT_MEMBER;
+                r.trait = cur.trait;
+                r.member = seg;
+                return r;
+            default:
+                r.failedAt = i;
+                return r;
+            }
+        }
+        if (isBuiltin)
+        {
+            r.k = R_BUILTIN;
+            r.builtin = builtin;
+            return r;
+        }
+        switch (cur.k)
+        {
+        case S_FN:
+            r.k = R_FN;
+            r.fn = cur.fn;
+            break;
+        case S_CONST:
+            r.k = R_CONST;
+            r.cst = cur.cst;
+            break;
+        case S_TYPE:
+            r.k = R_TYPE;
+            r.type = cur.type;
+            break;
+        case S_VARIANT:
+            r.k = R_VARIANT;
+            r.type = cur.type;
+            r.variant = cur.variant;
+            break;
+        case S_MOD:
+            r.k = R_MOD;
+            r.mod = cur.mod;
+            break;
+        case S_TRAIT:
+            r.k = R_TRAIT;
+            r.trait = cur.trait;
+            break;
+        case S_ALIAS:
+            r.k = R_ALIAS;
+            r.alias = cur.alias;
+            break;
+        case S_BUILTIN:
+            r.k = R_BUILTIN;
+            r.builtin = cur.text;
+            break;
+        }
+        return r;
+    }
+
+    // a library enum's variant, by its key: Some, Ordering::Less ...
+    static bool builtinVariant(const std::string &key, TypeDef *&def, int &variant)
+    {
+        if (key == "Some" || key == "Option::Some") { def = G.optionDef; variant = 1; return true; }
+        if (key == "None" || key == "Option::None") { def = G.optionDef; variant = 0; return true; }
+        if (key == "Ok" || key == "Result::Ok") { def = G.resultDef; variant = 0; return true; }
+        if (key == "Err" || key == "Result::Err") { def = G.resultDef; variant = 1; return true; }
+        if (key == "Ordering::Less") { def = G.orderingDef; variant = 0; return true; }
+        if (key == "Ordering::Equal") { def = G.orderingDef; variant = 1; return true; }
+        if (key == "Ordering::Greater") { def = G.orderingDef; variant = 2; return true; }
+        std::string k = key.compare(0, 7, "tokio::") == 0 ? key.substr(7) : key;
+        if (k == "TryRecvError::Empty") { def = G.tryRecvErrorDef; variant = 0; return true; }
+        if (k == "TryRecvError::Disconnected") { def = G.tryRecvErrorDef; variant = 1; return true; }
+        if (k == "RecvTimeoutError::Timeout") { def = G.recvTimeoutErrorDef; variant = 0; return true; }
+        if (k == "RecvTimeoutError::Disconnected") { def = G.recvTimeoutErrorDef; variant = 1; return true; }
+        if (key.compare(0, 19, "serde_json::Value::") == 0 && G.jsonValueDef)
+        {
+            auto it = G.jsonValueDef->variantIndex.find(key.substr(19));
+            if (it != G.jsonValueDef->variantIndex.end())
+            {
+                def = G.jsonValueDef;
+                variant = it->second;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[noreturn]] void pathError(const Path *p, const PathRes &r, const char *what)
+    {
+        const PathSeg &seg = p->segs[r.failedAt < p->segs.size() ? r.failedAt : p->segs.size() - 1];
+        int width = (int)seg.name.size();
+        if (!r.privateWhat.empty())
+            fail(p->line, p->col, width, "E0603", r.privateWhat + " is private", "private " + r.privateWhat.substr(0, r.privateWhat.find(' ')));
+        bool last = r.failedAt + 1 >= p->segs.size();
+        if (r.inMod)
+            fail(p->line, p->col, width, last ? "E0425" : "E0433",
+                 last ? std::string("cannot find ") + what + " `" + seg.name + "` in module `" + r.inMod->name + "`"
+                      : "failed to resolve: could not find `" + seg.name + "` in `" + r.inMod->name + "`",
+                 "not found in `" + r.inMod->name + "`");
+        if (p->segs.size() == 1)
+        {
+            std::string w = what;
+            const char *code = w == "type" ? "E0412" : w == "trait" ? "E0405" : w == "struct, variant or union type" ? "E0422" : "E0425";
+            fail(p->line, p->col, width, code, std::string("cannot find ") + what + " `" + seg.name + "` in this scope",
+                 "not found in this scope");
+        }
+        bool typeLike = !seg.name.empty() && seg.name[0] >= 'A' && seg.name[0] <= 'Z';
+        fail(p->line, p->col, width, "E0433",
+             typeLike ? "failed to resolve: use of undeclared type `" + seg.name + "`"
+                      : "failed to resolve: use of unresolved module or unlinked crate `" + seg.name + "`",
+             typeLike ? "use of undeclared type `" + seg.name + "`"
+                      : "use of unresolved module or unlinked crate `" + seg.name + "`");
+    }
+
+    // ── types ──
+
+    void resolveAlias(Ty *alias)
+    {
+        std::vector<std::string> saved = generics;
+        for (const std::string &p : alias->params)
+            generics.push_back(p);
+        resolveTy(alias);
+        generics = saved;
+    }
+
+    // a copy of `t` with each alias parameter replaced by its argument
+    static Ty *substTy(Ty *t, const std::vector<std::string> &params, const std::vector<Ty *> &args)
+    {
+        if (!t)
+            return t;
+        if (t->k == TY_PATH && t->path && !t->path->qself && t->path->segs.size() == 1 &&
+            t->path->segs[0].args.empty())
+            for (size_t k = 0; k < params.size() && k < args.size(); ++k)
+                if (t->path->segs[0].name == params[k])
+                    return args[k];
+        Ty *c = new Ty();
+        *c = *t;
+        c->params.clear();
+        c->elem = substTy(t->elem, params, args);
+        c->ret = substTy(t->ret, params, args);
+        for (size_t k = 0; k < c->items.size(); ++k)
+            c->items[k] = substTy(t->items[k], params, args);
+        if (t->path)
+        {
+            Path *p = new Path();
+            *p = *t->path;
+            for (PathSeg &seg : p->segs)
+            {
+                for (size_t k = 0; k < seg.args.size(); ++k)
+                    seg.args[k] = substTy(seg.args[k], params, args);
+                seg.ret = substTy(seg.ret, params, args);
+            }
+            c->path = p;
+        }
+        return c;
+    }
+
+    void resolveTy(Ty *t)
+    {
+        if (!t)
+            return;
+        switch (t->k)
+        {
+        case TY_REF:
+        case TY_PTR:
+        case TY_SLICE:
+            resolveTy(t->elem);
+            return;
+        case TY_ARRAY:
+            resolveTy(t->elem);
+            if (t->len)
+                expr(t->len);
+            return;
+        case TY_TUPLE:
+        case TY_FN:
+            for (Ty *item : t->items)
+                resolveTy(item);
+            resolveTy(t->ret);
+            return;
+        case TY_NEVER:
+            return;
+        case TY_INFER:
+            if (t->len)
+                expr(t->len); // a const generic argument
+            return;
+        }
+        if (!t->path || t->defKnown)
+            return;
+        t->defKnown = true;
+        if (t->path->qself)
+        {
+            resolveTy(t->path->qself);
+            return; // <T as Trait>::Name: known only when it runs
+        }
+        for (PathSeg &seg : t->path->segs)
+        {
+            for (Ty *arg : seg.args)
+                resolveTy(arg);
+            resolveTy(seg.ret);
+        }
+        if (t->k != TY_PATH)
+        {
+            // dyn Trait / impl Trait: the trait has to exist
+            PathRes r = resolvePath(t->path);
+            if (r.k == R_FAIL)
+                pathError(t->path, r, "trait");
+            return;
+        }
+        if (t->primKnown)
+            return;
+        PathRes r = resolvePath(t->path);
+        switch (r.k)
+        {
+        case R_TYPE:
+            if (r.type->kind == TD_BUILTIN)
+            {
+                // Self in `impl Trait for i32`: the type i32
+                Path *p = new Path();
+                p->line = t->path->line;
+                p->col = t->path->col;
+                PathSeg seg;
+                seg.name = r.type->name;
+                p->segs.push_back(seg);
+                t->path = p;
+                t->prim = primOf(seg.name);
+                t->primKnown = t->prim != PR_NONE;
+                return;
+            }
+            t->def = r.type;
+            return;
+        case R_ALIAS:
+        {
+            // the alias stands for its target
+            for (Ty *busy : aliasBusy)
+                if (busy == r.alias)
+                    fail(t->line, t->col, 1, "E0391", "cycle detected when expanding type alias");
+            aliasBusy.push_back(r.alias);
+            resolveAlias(r.alias);
+            aliasBusy.pop_back();
+            int line = t->line, col = t->col;
+            Ty *body = r.alias;
+            if (!r.alias->params.empty())
+                body = substTy(r.alias, r.alias->params, t->path->segs.back().args);
+            *t = *body;
+            t->params.clear();
+            t->line = line;
+            t->col = col;
+            t->defKnown = true;
+            return;
+        }
+        case R_SELF:
+        case R_GENERIC:
+        case R_BUILTIN:
+        case R_SELF_MEMBER:
+        case R_GENERIC_MEMBER:
+        case R_TYPE_MEMBER:
+        case R_TRAIT_MEMBER:
+            return; // a library type, or one known only when it runs
+        case R_TRAIT:
+            fail(t->line, t->col, (int)t->path->segs.back().name.size(), "E0782",
+                 "expected a type, found a trait", "you can add the `dyn` keyword if you want a trait object");
+        case R_FAIL:
+            pathError(t->path, r, "type");
+        }
+        fail(t->line, t->col, 1, "E0573", "expected type, found `" + t->path->segs.back().name + "`");
+    }
+
+    // ── patterns ──
+
+    void patternPath(Pat *p)
+    {
+        if (p->path->qself)
+            return;
+        PathRes r = resolvePath(p->path);
+        p->resolved = true;
+        switch (r.k)
+        {
+        case R_VARIANT:
+            p->def = r.type;
+            p->variant = r.variant;
+            return;
+        case R_TYPE:
+            p->def = r.type;
+            if (r.type->kind == TD_ENUM)
+                fail(p->line, p->col, 1, "E0532", "expected unit struct, unit variant or constant, found enum `" + r.type->name + "`");
+            return;
+        case R_CONST:
+            if (p->k != P_PATH)
+                break;
+            p->cst = r.cst;
+            return;
+        case R_BUILTIN:
+        {
+            std::string key = builtinKey(r.builtin);
+            if (builtinVariant(key, p->def, p->variant))
+                return;
+            if (key == "Reverse" || key == "cmp::Reverse")
+            {
+                p->def = G.reverseDef;
+                return;
+            }
+            if (p->k == P_PATH)
+            {
+                // a library constant: i32::MAX
+                Node *lit = new Node();
+                lit->k = N_PATH;
+                lit->line = p->line;
+                lit->col = p->col;
+                lit->path = p->path;
+                expr(lit);
+                p->k = P_LIT;
+                p->lo = lit;
+                return;
+            }
+            break;
+        }
+        case R_TYPE_MEMBER:
+        {
+            // an associated constant: Self::LIMIT, Type::ZERO
+            auto c = r.type->consts.find(r.member);
+            if (p->k == P_PATH && c != r.type->consts.end())
+            {
+                p->cst = c->second;
+                return;
+            }
+            fail(p->line, p->col, (int)r.member.size(), "E0599",
+                 "no variant or associated item named `" + r.member + "` found for " +
+                     (r.type->kind == TD_ENUM ? "enum" : "struct") + " `" + r.type->name + "` in the current scope",
+                 "variant or associated item not found in `" + r.type->name + "`");
+        }
+        case R_FAIL:
+            pathError(p->path, r, p->k == P_PATH ? "unit struct, unit variant or constant" : "tuple struct or tuple variant");
+        }
+        fail(p->line, p->col, 1, "E0532", "expected a pattern, found `" + p->path->segs.back().name + "`");
+    }
+
+    // `first`: the names the first alternative of an or-pattern bound, when
+    // this is a later alternative (they share the slots).
+    void declarePat(Pat *p, std::vector<Local> *first)
+    {
+        if (!p)
+            return;
+        switch (p->k)
+        {
+        case P_BIND:
+        {
+            if (!p->byRef && !p->mut && !p->sub)
+            {
+                // a name that is a unit variant, unit struct or constant matches it
+                Sym *s = lookupName(mod, p->name);
+                bool isPath = false;
+                if (s)
+                    isPath = s->k == S_VARIANT || (s->k == S_CONST && !s->cst->isStatic) ||
+                             (s->k == S_TYPE && s->type->kind == TD_STRUCT && s->type->form == FORM_UNIT);
+                else if (p->name == "None")
+                    isPath = true;
+                if (isPath && !findLocal(ctx, p->name))
+                {
+                    p->k = P_PATH;
+                    p->path = singlePath(p->name, p->line, p->col);
+                    patternPath(p);
+                    return;
+                }
+            }
+            if (first)
+            {
+                for (const Local &l : *first)
+                    if (l.name == p->name)
+                    {
+                        p->slot = l.slot;
+                        declarePat(p->sub, first);
+                        return;
+                    }
+                fail(p->line, p->col, (int)p->name.size(), "E0408",
+                     "variable `" + p->name + "` is not bound in all patterns",
+                     "pattern doesn't bind `" + p->name + "`");
+            }
+            p->slot = declare(p->name, p->mut, false);
+            declarePat(p->sub, first);
+            return;
+        }
+        case P_LIT:
+            expr(p->lo);
+            return;
+        case P_RANGE:
+            expr(p->lo);
+            expr(p->hi);
+            return;
+        case P_REF:
+            declarePat(p->sub, first);
+            return;
+        case P_TUPLE:
+        case P_SLICE:
+            for (Pat *item : p->items)
+                declarePat(item, first);
+            return;
+        case P_OR:
+        {
+            size_t before = ctx->locals.size();
+            declarePat(p->items[0], first);
+            std::vector<Local> bound(ctx->locals.begin() + (std::ptrdiff_t)before, ctx->locals.end());
+            for (size_t k = 1; k < p->items.size(); ++k)
+                declarePat(p->items[k], first ? first : &bound);
+            return;
+        }
+        case P_PATH:
+            patternPath(p);
+            return;
+        case P_TSTRUCT:
+        {
+            patternPath(p);
+            if (p->def)
+            {
+                const std::vector<FieldDef> &fields =
+                    p->variant >= 0 ? p->def->variants[(size_t)p->variant].fields : p->def->fields;
+                uint8_t form = p->variant >= 0 ? p->def->variants[(size_t)p->variant].form : p->def->form;
+                bool library = p->def == G.optionDef || p->def == G.resultDef;
+                size_t want = library ? 1 : fields.size();
+                bool rest = false;
+                for (Pat *item : p->items)
+                    if (item->k == P_REST)
+                        rest = true;
+                if (!library && form != FORM_TUPLE)
+                    fail(p->line, p->col, 1, "E0532",
+                         "expected tuple struct or tuple variant, found " +
+                             std::string(form == FORM_UNIT ? "unit" : "struct") + " `" +
+                             p->path->segs.back().name + "`");
+                size_t given = p->items.size() - (rest ? 1 : 0);
+                if (rest ? given > want : given != want)
+                    fail(p->line, p->col, 1, "E0023",
+                         "this pattern has " + std::to_string(given) + " field" + (given == 1 ? "" : "s") +
+                             ", but the corresponding tuple " + (p->variant >= 0 ? "variant" : "struct") + " has " +
+                             std::to_string(want) + " field" + (want == 1 ? "" : "s"),
+                         "expected " + std::to_string(want) + " field" + (want == 1 ? "" : "s") + ", found " +
+                             std::to_string(given));
+            }
+            for (Pat *item : p->items)
+                declarePat(item, first);
+            return;
+        }
+        case P_STRUCT:
+        {
+            patternPath(p);
+            if (p->def)
+            {
+                const std::vector<FieldDef> &fields =
+                    p->variant >= 0 ? p->def->variants[(size_t)p->variant].fields : p->def->fields;
+                const std::string &tname = p->variant >= 0 ? p->def->variants[(size_t)p->variant].name : p->def->name;
+                for (const std::string &f : p->fields)
+                {
+                    bool found = false;
+                    for (const FieldDef &fd : fields)
+                        if (fd.name == f)
+                            found = true;
+                    if (!found)
+                        fail(p->line, p->col, 1, "E0026",
+                             std::string(p->variant >= 0 ? "variant" : "struct") + " `" + tname +
+                                 "` does not have a field named `" + f + "`",
+                             std::string(p->variant >= 0 ? "variant" : "struct") + " `" + tname +
+                                 "` does not have this field");
+                }
+                if (!p->hasRest)
+                    for (const FieldDef &fd : fields)
+                    {
+                        bool found = false;
+                        for (const std::string &f : p->fields)
+                            if (fd.name == f)
+                                found = true;
+                        if (!found)
+                            fail(p->line, p->col, 1, "E0027", "pattern does not mention field `" + fd.name + "`",
+                                 "missing field `" + fd.name + "`");
+                    }
+            }
+            for (Pat *item : p->items)
+                declarePat(item, first);
+            return;
+        }
+        }
+    }
+
+    // ── expressions ──
+
+    void pathExpr(Node *n, bool callee, int argc)
+    {
+        Path *p = n->path;
+        if (p->qself)
+        {
+            resolveTy(p->qself);
+            if (p->qtrait)
+            {
+                PathRes tr = resolvePath(p->qtrait);
+                if (tr.k == R_FAIL)
+                    pathError(p->qtrait, tr, "trait");
+            }
+            n->cacheKind = CK_QSELF;
+            n->s = p->segs.back().name;
+            return;
+        }
+        for (PathSeg &seg : p->segs)
+            for (Ty *arg : seg.args)
+                resolveTy(arg);
+        const std::string &first = p->segs[0].name;
+        if (p->segs.size() == 1)
+        {
+            if (first == "_")
+            {
+                n->cacheKind = CK_DISCARD;
+                return;
+            }
+            Local *l = findLocal(ctx, first);
+            if (l)
+            {
+                n->slot = l->slot;
+                return;
+            }
+            if (first == "self")
+                fail(n->line, n->col, 4, "E0424", "expected value, found module `self`",
+                     "`self` value is a keyword only available in methods with a `self` parameter");
+        }
+        PathRes r = resolvePath(p);
+        const std::string &last = p->segs.back().name;
+        switch (r.k)
+        {
+        case R_FN:
+            n->cacheKind = CK_FN;
+            n->cache = r.fn;
+            if (callee && (int)r.fn->params.size() != argc)
+                arityError(n, "function", r.fn->params.size(), (size_t)argc);
+            return;
+        case R_CONST:
+            n->cacheKind = CK_CONST;
+            n->cache = r.cst;
+            return;
+        case R_TYPE:
+            if (r.type->kind == TD_STRUCT && r.type->form == FORM_UNIT)
+            {
+                n->cacheKind = CK_UNIT;
+                n->cache = r.type;
+                return;
+            }
+            if (r.type->kind == TD_STRUCT && r.type->form == FORM_TUPLE)
+            {
+                n->cacheKind = CK_CTOR;
+                n->cache = r.type;
+                if (callee && (int)r.type->fields.size() != argc)
+                    arityError(n, "struct", r.type->fields.size(), (size_t)argc);
+                return;
+            }
+            fail(n->line, n->col, (int)last.size(), "E0423",
+                 std::string("expected value, found ") + (r.type->kind == TD_ENUM ? "enum" : "struct") + " `" + last + "`",
+                 r.type->kind == TD_ENUM ? "an enum is not a value: name one of its variants"
+                                         : "use struct literal syntax instead: `" + last + " { /* fields */ }`");
+        case R_VARIANT:
+        {
+            const VariantDef &v = r.type->variants[(size_t)r.variant];
+            n->cacheKind = CK_VARIANT;
+            n->cache = r.type;
+            n->cacheIdx = r.variant;
+            if (v.form == FORM_NAMED)
+                fail(n->line, n->col, (int)last.size(), "E0533",
+                     "expected value, found struct variant `" + r.type->name + "::" + v.name + "`", "not a value");
+            if (callee && v.form == FORM_TUPLE && (int)v.fields.size() != argc)
+                arityError(n, "enum variant", v.fields.size(), (size_t)argc);
+            if (callee && v.form == FORM_UNIT)
+                fail(n->line, n->col, (int)last.size(), "E0618",
+                     "expected function, found enum variant `" + r.type->name + "::" + v.name + "`",
+                     "call expression requires function");
+            return;
+        }
+        case R_TYPE_MEMBER:
+        {
+            FnDef *f = findMethod(r.type, r.member);
+            if (f)
+            {
+                if (!f->isPub && !f->ofTrait && f->impl && !within(mod, f->impl->mod))
+                    fail(n->line, n->col, (int)r.member.size(), "E0624",
+                         std::string(f->selfKind == SK_NONE ? "associated function" : "method") + " `" + r.member + "` is private",
+                         std::string("private ") + (f->selfKind == SK_NONE ? "associated function" : "method"));
+                n->cacheKind = CK_METHOD;
+                n->cache = f;
+                n->cache2 = r.type;
+                size_t want = f->params.size() + (f->selfKind != SK_NONE ? 1 : 0);
+                if (callee && !f->overload && want != (size_t)argc)
+                    arityError(n, "function", want, (size_t)argc);
+                return;
+            }
+            auto c = r.type->consts.find(r.member);
+            if (c != r.type->consts.end())
+            {
+                n->cacheKind = CK_CONST;
+                n->cache = c->second;
+                return;
+            }
+            // a trait's constant with a default
+            for (TraitDef *t : r.type->traits)
+            {
+                auto tc = t->consts.find(r.member);
+                if (tc != t->consts.end() && tc->second->init)
+                {
+                    n->cacheKind = CK_CONST;
+                    n->cache = tc->second;
+                    return;
+                }
+            }
+            // what every type gets from the library: default(), from(), clone() ...
+            static const char *const common[] = {"default", "from", "clone", "to_string", "eq", "ne", "cmp",
+                                                 "partial_cmp", "fmt", "into", "try_from", "from_str", "hash",
+                                                 "to_owned", "from_iter", "max", "min", "lt", "le", "gt", "ge",
+                                                 "clamp", "type_id", "borrow", "as_ref", "drop"};
+            if (inList(r.member, common, sizeof common / sizeof common[0]))
+            {
+                n->cacheKind = CK_TYPEFN;
+                n->cache = r.type;
+                n->s = r.member;
+                return;
+            }
+            fail(n->line, n->col, (int)r.member.size(), "E0599",
+                 std::string("no ") + (r.type->kind == TD_ENUM ? "variant or associated item" : "function or associated item") +
+                     " named `" + r.member + "` found for " + (r.type->kind == TD_ENUM ? "enum" : "struct") + " `" +
+                     r.type->name + "` in the current scope",
+                 std::string(r.type->kind == TD_ENUM ? "variant or associated item" : "function or associated item") +
+                     " not found in `" + r.type->name + "`");
+        }
+        case R_TRAIT_MEMBER:
+            if (!r.trait->methods.count(r.member) && !r.trait->consts.count(r.member))
+                fail(n->line, n->col, (int)r.member.size(), "E0576",
+                     "cannot find method or associated constant `" + r.member + "` in trait `" + r.trait->name + "`",
+                     "not found in `" + r.trait->name + "`");
+            n->cacheKind = CK_TRAIT;
+            n->cache = r.trait;
+            n->s = r.member;
+            return;
+        case R_GENERIC:
+        case R_GENERIC_MEMBER:
+            n->cacheKind = CK_GENERIC;
+            n->names.clear();
+            n->names.push_back(r.generic);
+            n->s = r.member;
+            return;
+        case R_SELF_MEMBER:
+            n->cacheKind = CK_SELF;
+            n->s = r.member;
+            return;
+        case R_SELF:
+            // Self as a value: a unit or tuple struct's constructor
+            if (owner && owner->kind == TD_STRUCT && owner->form != FORM_NAMED)
+            {
+                n->cacheKind = owner->form == FORM_UNIT ? CK_UNIT : CK_CTOR;
+                n->cache = owner;
+                return;
+            }
+            fail(n->line, n->col, 4, "E0423", "expected value, found `Self`");
+        case R_BUILTIN:
+        {
+            std::string key = builtinKey(r.builtin);
+            TypeDef *def = nullptr;
+            int variant = -1;
+            if (builtinVariant(key, def, variant))
+            {
+                n->cacheKind = CK_VARIANT;
+                n->cache = def;
+                n->cacheIdx = variant;
+                return;
+            }
+            if (key.find("channel") != std::string::npos || key == "tokio::Semaphore::new")
+                G.trackDrops = true; // a channel ends when its senders are dropped
+            if (key == "Rc::strong_count" || key == "Rc::weak_count" || key == "Arc::strong_count" ||
+                key == "Arc::weak_count" || key == "Rc::downgrade" || key == "Arc::downgrade" ||
+                key == "Weak::new" || key == "Rc::try_unwrap" || key == "Rc::ptr_eq")
+                G.trackDrops = true;
+            V ignored;
+            // Type::method (a method used as a function) is looked up when called
+            bool typeLike = key.find("::") != std::string::npos && key[0] >= 'A' && key[0] <= 'Z';
+            bool primLike = key.find("::") != std::string::npos && primOf(key.substr(0, key.find("::"))) != PR_NONE;
+            if (!knownBuiltinFn(key) && !builtinConst(key, ignored) && !typeLike && !primLike)
+                fail(n->line, n->col, (int)last.size(), callee ? "E0425" : "E0425",
+                     "`" + r.builtin + "` is not a library item Quantum's Rust front-end knows", "not supported");
+            n->cacheKind = CK_BUILTIN;
+            n->s = key;
+            return;
+        }
+        case R_MOD:
+            fail(n->line, n->col, (int)last.size(), "E0423", "expected value, found module `" + last + "`", "not a value");
+        case R_TRAIT:
+            fail(n->line, n->col, (int)last.size(), "E0423", "expected value, found trait `" + last + "`", "not a value");
+        case R_ALIAS:
+        {
+            // an alias of a tuple or unit struct used as its constructor
+            Ty *t = r.alias;
+            resolveAlias(t);
+            if (t->k == TY_PATH && t->def && t->def->kind == TD_STRUCT && t->def->form != FORM_NAMED)
+            {
+                n->cacheKind = t->def->form == FORM_UNIT ? CK_UNIT : CK_CTOR;
+                n->cache = t->def;
+                return;
+            }
+            fail(n->line, n->col, (int)last.size(), "E0423", "expected value, found type alias `" + last + "`");
+        }
+        case R_FAIL:
+            pathError(p, r, callee ? "function" : "value");
+        }
+        pathError(p, r, callee ? "function" : "value");
+    }
+
+    [[noreturn]] void arityError(const Node *n, const char *what, size_t want, size_t given)
+    {
+        fail(n->line, n->col, 1, "E0061",
+             std::string("this ") + what + " takes " + std::to_string(want) + " argument" + (want == 1 ? "" : "s") +
+                 " but " + std::to_string(given) + " argument" + (given == 1 ? " was" : "s were") + " supplied",
+             given < want ? "argument missing" : "unexpected argument");
+    }
+
+    void structLit(Node *n)
+    {
+        PathRes r = resolvePath(n->path);
+        TypeDef *def = nullptr;
+        int variant = -1;
+        if (r.k == R_TYPE)
+            def = r.type;
+        else if (r.k == R_VARIANT)
+        {
+            def = r.type;
+            variant = r.variant;
+        }
+        else if (r.k == R_ALIAS)
+        {
+            resolveAlias(r.alias);
+            if (r.alias->k == TY_PATH)
+                def = r.alias->def;
+        }
+        else if (r.k == R_SELF)
+        {
+            // Self { .. } in a trait's own method: the type is known when it runs
+            for (Node *kid : n->kids)
+                expr(kid);
+            expr(n->b);
+            return;
+        }
+        if (!def)
+        {
+            if (r.k == R_FAIL)
+                pathError(n->path, r, "struct, variant or union type");
+            fail(n->line, n->col, 1, "E0574", "expected struct, variant or union type, found `" +
+                                                  n->path->segs.back().name + "`");
+        }
+        if (def->kind == TD_ENUM && variant < 0)
+            fail(n->line, n->col, 1, "E0574", "expected struct, variant or union type, found enum `" + def->name + "`",
+                 "not a struct, variant or union type");
+        const std::vector<FieldDef> &fields = variant >= 0 ? def->variants[(size_t)variant].fields : def->fields;
+        const std::string tname = variant >= 0 ? def->name + "::" + def->variants[(size_t)variant].name : def->name;
+        n->cache = def;
+        n->cacheIdx = variant;
+        n->scopeSlots.clear();
+        for (size_t k = 0; k < n->names.size(); ++k)
+        {
+            int index = -1;
+            for (size_t f = 0; f < fields.size(); ++f)
+                if (fields[f].name == n->names[k])
+                    index = (int)f;
+            if (index < 0)
+                fail(n->kids[k]->line, n->kids[k]->col, (int)n->names[k].size(), "E0560",
+                     std::string(variant >= 0 ? "variant" : "struct") + " `" + tname + "` has no field named `" +
+                         n->names[k] + "`",
+                     fields.empty() ? "`" + tname + "` has no fields" : "unknown field");
+            n->scopeSlots.push_back(index);
+        }
+        if (!n->b)
+        {
+            std::string missing;
+            int count = 0;
+            for (const FieldDef &fd : fields)
+            {
+                bool given = false;
+                for (const std::string &name : n->names)
+                    if (name == fd.name)
+                        given = true;
+                if (!given)
+                {
+                    missing += (count ? ", " : "") + ("`" + fd.name + "`");
+                    ++count;
+                }
+            }
+            if (count)
+                fail(n->line, n->col, 1, "E0063",
+                     std::string("missing field") + (count == 1 ? " " : "s ") + missing + " in initializer of `" + tname + "`",
+                     "missing " + missing);
+        }
+        for (Node *kid : n->kids)
+            expr(kid);
+        expr(n->b);
+    }
+
+    // the left side of an assignment
+    void assignTarget(Node *lhs, bool compound)
+    {
+        if (lhs->k == N_TUPLE || lhs->k == N_ARRAY)
+        {
+            for (Node *kid : lhs->kids)
+                assignTarget(kid, compound);
+            return;
+        }
+        if (lhs->k == N_PATH && lhs->path->segs.size() == 1 && !lhs->path->qself)
+        {
+            Local *l = findLocal(ctx, lhs->path->segs[0].name);
+            if (l && !l->mut && (!l->deferred || compound))
+                fail(lhs->line, lhs->col, (int)l->name.size(), "E0384",
+                     "cannot assign twice to immutable variable `" + l->name + "`",
+                     "cannot assign twice to immutable variable");
+        }
+        expr(lhs);
+    }
+
+    void block(Node *n)
+    {
+        ModDef *savedMod = mod;
+        if (n->items)
+            mod = n->items;
+        pushScope();
+        n->scopeSlots.clear();
+        slotLists.push_back(&n->scopeSlots);
+        bool labeled = !n->s.empty();
+        if (labeled)
+            ctx->labels.push_back(n->s);
+        for (Node *kid : n->kids)
+            expr(kid);
+        if (labeled)
+            ctx->labels.pop_back();
+        slotLists.pop_back();
+        popScope();
+        mod = savedMod;
+    }
+
+    void checkLabel(const Node *n)
+    {
+        if (n->s.empty())
+        {
+            if (ctx->loops == 0)
+                fail(n->line, n->col, n->k == N_BREAK ? 5 : 8, "E0268",
+                     std::string("`") + (n->k == N_BREAK ? "break" : "continue") + "` outside of a loop" +
+                         (n->k == N_BREAK ? " or labeled block" : ""),
+                     std::string("cannot `") + (n->k == N_BREAK ? "break" : "continue") + "` outside of a loop" +
+                         (n->k == N_BREAK ? " or labeled block" : ""));
+            return;
+        }
+        for (const std::string &l : ctx->labels)
+            if (l == n->s)
+                return;
+        fail(n->line, n->col, (int)n->s.size(), "E0426", "use of undeclared label `" + n->s + "`",
+             "undeclared label `" + n->s + "`");
+    }
+
+    void expr(Node *n)
+    {
+        if (!n)
+            return;
+        switch (n->k)
+        {
+        case N_INT:
+        case N_FLOAT:
+        case N_STR:
+        case N_BSTR:
+        case N_CHAR:
+        case N_BYTE:
+        case N_BOOL:
+        case N_ITEM:
+            return;
+        case N_PATH:
+            pathExpr(n, false, 0);
+            return;
+        case N_BLOCK:
+            block(n);
+            return;
+        case N_LET:
+            resolveTy(n->ty);
+            expr(n->a);
+            if (n->b)
+                block(n->b);
+            if (n->pat->k == P_BIND && !n->a)
+            {
+                n->pat->slot = declare(n->pat->name, n->pat->mut, true);
+                return;
+            }
+            declarePat(n->pat, nullptr);
+            return;
+        case N_SEMI:
+            expr(n->a);
+            return;
+        case N_IF:
+            pushScope();
+            n->scopeSlots.clear();
+            slotLists.push_back(&n->scopeSlots);
+            expr(n->a);
+            slotLists.pop_back();
+            block(n->b);
+            popScope();
+            expr(n->c);
+            return;
+        case N_LETCOND:
+            expr(n->a);
+            declarePat(n->pat, nullptr);
+            return;
+        case N_WHILE:
+            pushScope();
+            n->scopeSlots.clear();
+            slotLists.push_back(&n->scopeSlots);
+            expr(n->a);
+            slotLists.pop_back();
+            ++ctx->loops;
+            if (!n->s.empty())
+                ctx->labels.push_back(n->s);
+            block(n->b);
+            if (!n->s.empty())
+                ctx->labels.pop_back();
+            --ctx->loops;
+            popScope();
+            return;
+        case N_LOOP:
+            ++ctx->loops;
+            if (!n->s.empty())
+                ctx->labels.push_back(n->s);
+            block(n->b);
+            if (!n->s.empty())
+                ctx->labels.pop_back();
+            --ctx->loops;
+            return;
+        case N_FOR:
+            expr(n->a);
+            pushScope();
+            n->scopeSlots.clear();
+            slotLists.push_back(&n->scopeSlots);
+            declarePat(n->pat, nullptr);
+            slotLists.pop_back();
+            ++ctx->loops;
+            if (!n->s.empty())
+                ctx->labels.push_back(n->s);
+            block(n->b);
+            if (!n->s.empty())
+                ctx->labels.pop_back();
+            --ctx->loops;
+            popScope();
+            return;
+        case N_MATCH:
+            expr(n->a);
+            n->scopeSlots.clear();
+            for (Arm &arm : n->arms)
+            {
+                pushScope();
+                slotLists.push_back(&n->scopeSlots);
+                declarePat(arm.pat, nullptr);
+                slotLists.pop_back();
+                expr(arm.guard);
+                expr(arm.body);
+                popScope();
+            }
+            return;
+        case N_BREAK:
+            if (!(n->s.empty() && ctx->loops == 0 && false))
+                checkLabel(n);
+            expr(n->a);
+            return;
+        case N_CONTINUE:
+            checkLabel(n);
+            return;
+        case N_RETURN:
+            expr(n->a);
+            return;
+        case N_CALL:
+            if (n->a->k == N_PATH)
+                pathExpr(n->a, true, (int)n->kids.size());
+            else
+                expr(n->a);
+            for (Node *kid : n->kids)
+                expr(kid);
+            return;
+        case N_MCALL:
+            expr(n->a);
+            // the library's methods without generic parameters take no turbofish
+            if (!n->tys.empty() && (n->s == "into" || n->s == "try_into" || n->s == "to_string" ||
+                                    n->s == "clone" || n->s == "unwrap" || n->s == "expect" || n->s == "len" ||
+                                    n->s == "to_owned"))
+                fail(n->line, n->col, (int)n->s.size(), "E0107",
+                     "method takes 0 generic arguments but " + std::to_string(n->tys.size()) + " generic argument" +
+                         (n->tys.size() == 1 ? " was" : "s were") + " supplied",
+                     "expected 0 generic arguments");
+            for (Ty *t : n->tys)
+                resolveTy(t);
+            for (Node *kid : n->kids)
+                expr(kid);
+            if (n->s == "upgrade" || n->s == "downgrade")
+                G.trackDrops = true;
+            return;
+        case N_FIELD:
+        case N_TFIELD:
+        case N_UNARY:
+        case N_TRY:
+        case N_AWAIT:
+            expr(n->a);
+            return;
+        case N_REF:
+            if (n->mut && n->a->k == N_PATH && n->a->path->segs.size() == 1 && !n->a->path->qself)
+            {
+                Local *l = findLocal(ctx, n->a->path->segs[0].name);
+                if (l && !l->mut && l->name != "self")
+                    fail(n->a->line, n->a->col, (int)l->name.size(), "E0596",
+                         "cannot borrow `" + l->name + "` as mutable, as it is not declared as mutable",
+                         "cannot borrow as mutable");
+            }
+            expr(n->a);
+            return;
+        case N_INDEX:
+        case N_BINARY:
+        case N_RANGE:
+        case N_REPEAT:
+            expr(n->a);
+            expr(n->b);
+            return;
+        case N_ASSIGN:
+            expr(n->b);
+            assignTarget(n->a, false);
+            return;
+        case N_OPASSIGN:
+            expr(n->b);
+            assignTarget(n->a, true);
+            return;
+        case N_CAST:
+            expr(n->a);
+            resolveTy(n->ty);
+            return;
+        case N_TUPLE:
+        case N_ARRAY:
+            for (Node *kid : n->kids)
+                expr(kid);
+            return;
+        case N_STRUCT:
+            structLit(n);
+            return;
+        case N_CLOSURE:
+        {
+            FnCtx inner;
+            inner.outer = ctx;
+            inner.closure = n;
+            n->capOuter.clear();
+            n->capInner.clear();
+            FnCtx *saved = ctx;
+            std::vector<std::vector<int> *> savedLists = slotLists;
+            slotLists.clear();
+            ctx = &inner;
+            pushScope();
+            for (size_t k = 0; k < n->pats.size(); ++k)
+            {
+                resolveTy(n->tys[k]);
+                declarePat(n->pats[k], nullptr);
+            }
+            resolveTy(n->ty);
+            expr(n->a);
+            popScope();
+            n->nslots = inner.nslots;
+            ctx = saved;
+            slotLists = savedLists;
+            return;
+        }
+        case N_MACRO:
+            for (Node *kid : n->kids)
+                expr(kid);
+            expr(n->a);
+            if (n->pat)
+            {
+                pushScope();
+                n->scopeSlots.clear();
+                slotLists.push_back(&n->scopeSlots);
+                declarePat(n->pat, nullptr);
+                slotLists.pop_back();
+                expr(n->b);
+                popScope();
+            }
+            else
+                expr(n->b); // select!'s else branch
+            if (!n->arms.empty())
+            {
+                // select!: each branch's pattern names what its handler sees
+                n->scopeSlots.clear();
+                for (Arm &arm : n->arms)
+                {
+                    expr(arm.guard);
+                    pushScope();
+                    slotLists.push_back(&n->scopeSlots);
+                    declarePat(arm.pat, nullptr);
+                    slotLists.pop_back();
+                    expr(arm.body);
+                    popScope();
+                }
+            }
+            if (n->s == "json" || n->s == "select" || n->s == "join" || n->s == "try_join")
+                G.trackDrops = true;
+            if (n->s == "pin")
+            {
+                // tokio::pin!(x): x is a `Pin<&mut _>` from here on, borrowed as `&mut x`
+                for (Node *kid : n->kids)
+                    if (kid->k == N_PATH && kid->path->segs.size() == 1 && !kid->path->qself)
+                        if (Local *l = findLocal(ctx, kid->path->segs[0].name))
+                            l->mut = true;
+            }
+            return;
+        }
+    }
+
+    // ── items ──
+
+    void resolveFn(FnDef *f, ModDef *m, TypeDef *self, bool unknownSelf, const std::vector<GenericParam> *outerGenerics)
+    {
+        if (f->resolved)
+            return;
+        f->resolved = true;
+        ModDef *savedMod = mod;
+        TypeDef *savedOwner = owner;
+        bool savedUnknown = selfUnknown;
+        std::vector<std::string> savedGenerics = generics;
+        FnCtx *savedCtx = ctx;
+        std::vector<std::vector<int> *> savedLists = slotLists;
+        slotLists.clear();
+        mod = m;
+        owner = self;
+        selfUnknown = unknownSelf;
+        generics.clear();
+        if (outerGenerics)
+            for (const GenericParam &g : *outerGenerics)
+                if (!g.isLifetime)
+                    generics.push_back(g.name);
+        for (const GenericParam &g : f->generics)
+            if (!g.isLifetime)
+                generics.push_back(g.name);
+        FnCtx fc;
+        ctx = &fc;
+        pushScope();
+        if (f->selfKind != SK_NONE)
+            declare("self", f->selfMut, false);
+        for (Param &prm : f->params)
+        {
+            resolveTy(prm.ty);
+            declarePat(prm.pat, nullptr);
+        }
+        resolveTy(f->ret);
+        if (f->body)
+            block(f->body);
+        popScope();
+        f->nslots = fc.nslots;
+        mod = savedMod;
+        owner = savedOwner;
+        selfUnknown = savedUnknown;
+        generics = savedGenerics;
+        ctx = savedCtx;
+        slotLists = savedLists;
+    }
+
+    void resolveConst(ConstDef *c, ModDef *m, TypeDef *self, const std::vector<GenericParam> *outerGenerics)
+    {
+        ModDef *savedMod = mod;
+        TypeDef *savedOwner = owner;
+        std::vector<std::string> savedGenerics = generics;
+        FnCtx *savedCtx = ctx;
+        mod = m;
+        owner = self;
+        generics.clear();
+        if (outerGenerics)
+            for (const GenericParam &g : *outerGenerics)
+                if (!g.isLifetime)
+                    generics.push_back(g.name);
+        FnCtx fc;
+        ctx = &fc;
+        pushScope();
+        resolveTy(c->ty);
+        expr(c->init);
+        popScope();
+        c->nslots = fc.nslots;
+        c->owner = self;
+        mod = savedMod;
+        owner = savedOwner;
+        generics = savedGenerics;
+        ctx = savedCtx;
+    }
+
+    // a constant expression's value: enum discriminants, array lengths
+    bool constInt(Node *n, int64_t &out)
+    {
+        if (!n)
+            return false;
+        if (n->k == N_INT)
+        {
+            out = n->flag ? -(int64_t)n->lo : (int64_t)n->lo;
+            return true;
+        }
+        if (n->k == N_UNARY && n->op == O_NEG)
+        {
+            if (!constInt(n->a, out))
+                return false;
+            out = -out;
+            return true;
+        }
+        if (n->k == N_BINARY)
+        {
+            int64_t a = 0, b = 0;
+            if (!constInt(n->a, a) || !constInt(n->b, b))
+                return false;
+            switch (n->op)
+            {
+            case O_ADD: out = a + b; return true;
+            case O_SUB: out = a - b; return true;
+            case O_MUL: out = a * b; return true;
+            case O_SHL: out = a << b; return true;
+            case O_BITOR: out = a | b; return true;
+            }
+        }
+        return false;
+    }
+
+    void use(ModDef *m, UseDecl &u, bool finalRound, bool &progress, bool &pending)
+    {
+        if (u.path.empty())
+            return;
+        // a library path: known by its text
+        if (crateRoot(u.path[0]) && !(u.path[0] != "std" && u.path[0] != "core" && m->names.count(u.path[0]) &&
+                                      m->names[u.path[0]].k == S_MOD))
+        {
+            if (u.glob)
+            {
+                std::vector<std::string> rest(u.path.begin() + 1, u.path.end());
+                std::string module = joinPath(rest);
+                std::string list = globNames(module);
+                size_t at0 = 0;
+                while (at0 < list.size())
+                {
+                    size_t sp = list.find(' ', at0);
+                    if (sp == std::string::npos)
+                        sp = list.size();
+                    std::string name = list.substr(at0, sp - at0);
+                    at0 = sp + 1;
+                    if (name.empty() || m->names.count(name))
+                        continue;
+                    Sym s;
+                    s.k = S_BUILTIN;
+                    s.text = joinPath(u.path) + "::" + name;
+                    s.isPub = u.isPub;
+                    s.home = m;
+                    m->names[name] = s;
+                }
+            }
+            else if (u.alias != "_" && !m->names.count(u.alias))
+            {
+                Sym s;
+                s.k = S_BUILTIN;
+                s.text = joinPath(u.path);
+                s.isPub = u.isPub;
+                s.home = m;
+                m->names[u.alias] = s;
+            }
+            u.path.clear();
+            progress = true;
+            return;
+        }
+        Path p;
+        p.line = u.line;
+        p.col = u.col;
+        for (const std::string &name : u.path)
+        {
+            PathSeg seg;
+            seg.name = name;
+            p.segs.push_back(seg);
+        }
+        ModDef *savedMod = mod;
+        mod = m;
+        // a `use` names things from the module's own point of view: a block's
+        // `use a::b` may start at a name of the block or of the module
+        PathRes r = resolvePath(&p);
+        mod = savedMod;
+        if (r.k == R_FAIL)
+        {
+            if (!finalRound)
+            {
+                pending = true;
+                return;
+            }
+            if (!r.privateWhat.empty())
+                pathError(&p, r, "item");
+            const std::string &bad = u.path[r.failedAt < u.path.size() ? r.failedAt : u.path.size() - 1];
+            fail(u.line, u.col, (int)bad.size(), "E0432", "unresolved import `" + joinPath(u.path) + "`",
+                 r.failedAt == 0 ? "use of unresolved module or unlinked crate `" + bad + "`"
+                                 : "no `" + bad + "` in `" + u.path[r.failedAt - 1] + "`");
+        }
+        if (u.glob)
+        {
+            if (r.k == R_MOD)
+            {
+                for (auto &entry : r.mod->names)
+                {
+                    if (!entry.second.isPub && !within(m, r.mod))
+                        continue;
+                    if (m->names.count(entry.first))
+                        continue;
+                    Sym s = entry.second;
+                    s.isPub = u.isPub;
+                    m->names[entry.first] = s;
+                    progress = true;
+                }
+                // what the module itself brings in later counts too
+                if (!finalRound)
+                    pending = true;
+                else
+                    u.path.clear();
+                return;
+            }
+            if (r.k == R_TYPE && r.type->kind == TD_ENUM)
+            {
+                for (size_t k = 0; k < r.type->variants.size(); ++k)
+                {
+                    const std::string &name = r.type->variants[k].name;
+                    if (m->names.count(name))
+                        continue;
+                    Sym s;
+                    s.k = S_VARIANT;
+                    s.type = r.type;
+                    s.variant = (int)k;
+                    s.isPub = u.isPub;
+                    s.home = m;
+                    m->names[name] = s;
+                }
+                u.path.clear();
+                progress = true;
+                return;
+            }
+            if (r.k == R_BUILTIN)
+            {
+                u.path.clear();
+                return;
+            }
+            fail(u.line, u.col, 1, "E0432", "unresolved import `" + joinPath(u.path) + "`", "not a module or an enum");
+        }
+        Sym s;
+        s.isPub = u.isPub;
+        s.home = m;
+        switch (r.k)
+        {
+        case R_FN: s.k = S_FN; s.fn = r.fn; break;
+        case R_CONST: s.k = S_CONST; s.cst = r.cst; break;
+        case R_TYPE: s.k = S_TYPE; s.type = r.type; break;
+        case R_VARIANT: s.k = S_VARIANT; s.type = r.type; s.variant = r.variant; break;
+        case R_MOD: s.k = S_MOD; s.mod = r.mod; break;
+        case R_TRAIT: s.k = S_TRAIT; s.trait = r.trait; break;
+        case R_ALIAS: s.k = S_ALIAS; s.alias = r.alias; break;
+        case R_BUILTIN: s.k = S_BUILTIN; s.text = r.builtin; break;
+        default:
+            fail(u.line, u.col, 1, "E0432", "unresolved import `" + joinPath(u.path) + "`");
+        }
+        if (u.alias != "_")
+        {
+            auto existing = m->names.find(u.alias);
+            if (existing == m->names.end())
+                m->names[u.alias] = s;
+        }
+        u.path.clear();
+        progress = true;
+    }
+
+    // the type an impl is for; null for a blanket impl (impl<T> Trait for T)
+    TypeDef *implTarget(ImplDef *im)
+    {
+        Ty *t = im->selfTy;
+        while (t->k == TY_REF || t->k == TY_PTR)
+            t = t->elem;
+        if (t->k == TY_SLICE || t->k == TY_ARRAY)
+            return builtinType("[]");
+        if (t->k == TY_TUPLE)
+            return builtinType("()");
+        if (t->k == TY_FN)
+            return builtinType("fn");
+        if (!t->path)
+            return builtinType("?");
+        if (t->k == TY_DYN || t->k == TY_IMPL)
+            return builtinType("dyn " + t->path->segs.back().name);
+        if (t->primKnown)
+            return builtinType(primName(t->prim));
+        if (t->path->segs.size() == 1)
+            for (const GenericParam &g : im->generics)
+                if (!g.isLifetime && g.name == t->path->segs[0].name)
+                    return nullptr;
+        if (t->def)
+            return t->def;
+        return builtinType(t->path->segs.back().name);
+    }
+
+    void registerImpl(ImplDef *im, ModDef *m)
+    {
+        ModDef *savedMod = mod;
+        std::vector<std::string> savedGenerics = generics;
+        mod = m;
+        generics.clear();
+        for (const GenericParam &g : im->generics)
+            if (!g.isLifetime)
+                generics.push_back(g.name);
+        resolveTy(im->selfTy);
+        if (im->trait)
+        {
+            for (PathSeg &seg : im->trait->segs)
+                for (Ty *arg : seg.args)
+                    resolveTy(arg);
+            PathRes r = resolvePath(im->trait);
+            im->traitName = im->trait->segs.back().name;
+            if (r.k == R_TRAIT)
+                im->traitDef = r.trait;
+            else if (r.k == R_FAIL)
+                pathError(im->trait, r, "trait");
+            else if (r.k != R_BUILTIN)
+                fail(im->line, im->col, 4, "E0404", "expected trait, found `" + im->traitName + "`", "not a trait");
+        }
+        TypeDef *target = implTarget(im);
+        im->target = target;
+        mod = savedMod;
+        generics = savedGenerics;
+        if (im->traitName == "Drop")
+            G.trackDrops = true;
+        if (!target)
+        {
+            im->blanket = true;
+            G.blanketImpls.push_back(im);
+            for (FnDef *f : im->fns)
+            {
+                f->impl = im;
+                f->ofTrait = true;
+                f->trait = im->traitDef;
+            }
+            if (im->traitDef)
+                im->traitDef->blanket.push_back(im);
+            return;
+        }
+        target->impls.push_back(im);
+        if (im->traitDef)
+            target->traits.push_back(im->traitDef);
+        else if (im->trait)
+            target->traitNames.push_back(im->traitName);
+        if (im->traitName == "Copy")
+            target->derives |= D_COPY;
+        if (im->traitName == "Drop")
+            target->hasDrop = true;
+        for (FnDef *f : im->fns)
+        {
+            f->owner = target;
+            f->impl = im;
+            f->ofTrait = im->trait != nullptr;
+            f->trait = im->traitDef;
+            auto existing = target->methods.find(f->name);
+            if (existing == target->methods.end())
+            {
+                target->methods[f->name] = f;
+                continue;
+            }
+            FnDef *head = existing->second;
+            if (!f->ofTrait && !head->ofTrait)
+                fail(f->line, f->col, (int)f->name.size(), "E0592", "duplicate definitions with name `" + f->name + "`",
+                     "duplicate definitions for `" + f->name + "`");
+            if (!f->ofTrait)
+            {
+                // the type's own method comes first: it wins over a trait's
+                f->overload = head;
+                target->methods[f->name] = f;
+                continue;
+            }
+            while (head->overload)
+                head = head->overload;
+            head->overload = f;
+        }
+        for (ConstDef *c : im->consts)
+        {
+            c->owner = target;
+            target->consts[c->name] = c;
+        }
+        for (auto &entry : im->types)
+            target->assocTypes[entry.first] = entry.second;
+        if (im->traitDef)
+        {
+            std::string missing;
+            int count = 0;
+            for (auto &entry : im->traitDef->methods)
+            {
+                if (entry.second->body)
+                    continue;
+                bool given = false;
+                for (FnDef *f : im->fns)
+                    if (f->name == entry.first)
+                        given = true;
+                if (!given)
+                {
+                    missing += (count ? ", " : "") + ("`" + entry.first + "`");
+                    ++count;
+                }
+            }
+            if (count)
+                fail(im->line, im->col, 4, "E0046", "not all trait items implemented, missing: " + missing,
+                     "missing " + missing + " in implementation");
+            for (FnDef *f : im->fns)
+                if (!im->traitDef->methods.count(f->name))
+                    fail(f->line, f->col, (int)f->name.size(), "E0407",
+                         "method `" + f->name + "` is not a member of trait `" + im->traitDef->name + "`",
+                         "not a member of trait `" + im->traitDef->name + "`");
+        }
+    }
+
+    void run(ModDef *r, std::vector<ModDef *> &mods)
+    {
+        root = r;
+        all = &mods;
+        mod = root;
+        FnCtx top;
+        ctx = &top;
+        pushScope();
+        // 1. `use`: until nothing more comes in (one may go through another)
+        for (int round = 0; round < 12; ++round)
+        {
+            bool progress = false, pending = false;
+            for (ModDef *m : mods)
+                for (UseDecl &u : m->uses)
+                    use(m, u, false, progress, pending);
+            if (!pending || !progress)
+                break;
+        }
+        {
+            bool progress = false, pending = false;
+            for (ModDef *m : mods)
+                for (UseDecl &u : m->uses)
+                    use(m, u, true, progress, pending);
+        }
+        // 2. type aliases, then types: ids, field types, discriminants
+        for (ModDef *m : mods)
+            for (auto &entry : m->aliases)
+            {
+                mod = m;
+                generics.clear();
+                resolveAlias(entry.second);
+            }
+        for (ModDef *m : mods)
+            for (TypeDef *t : m->types)
+            {
+                t->id = G.nextTypeId++;
+                mod = m;
+                generics.clear();
+                for (const GenericParam &g : t->generics)
+                    if (!g.isLifetime)
+                        generics.push_back(g.name);
+                owner = t;
+                for (FieldDef &fd : t->fields)
+                    resolveTy(fd.ty);
+                int64_t next = 0;
+                for (VariantDef &v : t->variants)
+                {
+                    for (FieldDef &fd : v.fields)
+                        resolveTy(fd.ty);
+                    if (v.disc)
+                    {
+                        if (!constInt(v.disc, next))
+                            fail(v.disc->line, v.disc->col, 1, "",
+                                 "this discriminant is not a constant Quantum's Rust front-end can evaluate");
+                    }
+                    v.discVal = next++;
+                    v.discKnown = true;
+                }
+                owner = nullptr;
+                generics.clear();
+            }
+        // 3. impls onto their types
+        for (ModDef *m : mods)
+            for (ImplDef *im : m->impls)
+                registerImpl(im, m);
+        // 4. bodies
+        for (ModDef *m : mods)
+        {
+            for (ConstDef *c : m->consts)
+                resolveConst(c, m, nullptr, nullptr);
+            for (FnDef *f : m->fns)
+                resolveFn(f, m, nullptr, false, nullptr);
+            for (TraitDef *t : m->traits)
+            {
+                for (auto &entry : t->methods)
+                    resolveFn(entry.second, m, nullptr, true, &t->generics);
+                for (auto &entry : t->consts)
+                    resolveConst(entry.second, m, nullptr, &t->generics);
+            }
+            for (ImplDef *im : m->impls)
+            {
+                for (ConstDef *c : im->consts)
+                    resolveConst(c, m, im->target, &im->generics);
+                for (FnDef *f : im->fns)
+                    resolveFn(f, m, im->target, im->target == nullptr, &im->generics);
+            }
+        }
+        popScope();
+    }
+};
+
+TypeDef *libraryEnum(const char *name, const char *v0, const char *v1, const char *v2, bool payload0, bool payload1)
+{
+    TypeDef *t = new TypeDef();
+    t->name = name;
+    t->kind = TD_ENUM;
+    t->isPub = true;
+    t->derives = D_DEBUG | D_CLONE | D_PARTIALEQ | D_EQ | D_PARTIALORD | D_ORD | D_HASH;
+    t->id = G.nextTypeId++;
+    const char *names[3] = {v0, v1, v2};
+    bool payloads[3] = {payload0, payload1, false};
+    for (int k = 0; k < 3; ++k)
+    {
+        if (!names[k])
+            continue;
+        VariantDef v;
+        v.name = names[k];
+        v.form = payloads[k] ? FORM_TUPLE : FORM_UNIT;
+        if (payloads[k])
+        {
+            FieldDef fd;
+            fd.name = "0";
+            v.fields.push_back(fd);
+        }
+        v.discVal = k;
+        v.discKnown = true;
+        t->variantIndex[v.name] = (int)t->variants.size();
+        t->variants.push_back(v);
+    }
+    return t;
+}
+
+} // namespace
+
+void initBuiltins()
+{
+    if (G.optionDef)
+        return;
+    G.optionDef = libraryEnum("Option", "None", "Some", nullptr, false, true);
+    G.resultDef = libraryEnum("Result", "Ok", "Err", nullptr, true, true);
+    G.orderingDef = libraryEnum("Ordering", "Less", "Equal", "Greater", false, false);
+    G.orderingDef->variants[0].discVal = -1;
+    G.orderingDef->variants[1].discVal = 0;
+    G.orderingDef->variants[2].discVal = 1;
+    G.orderingDef->derives |= D_COPY;
+    G.tryRecvErrorDef = libraryEnum("TryRecvError", "Empty", "Disconnected", nullptr, false, false);
+    G.tryRecvErrorDef->derives |= D_COPY;
+    G.recvTimeoutErrorDef = libraryEnum("RecvTimeoutError", "Timeout", "Disconnected", nullptr, false, false);
+    G.recvTimeoutErrorDef->derives |= D_COPY;
+    // std::cmp::Reverse(x)
+    TypeDef *rev = new TypeDef();
+    rev->name = "Reverse";
+    rev->kind = TD_STRUCT;
+    rev->form = FORM_TUPLE;
+    rev->isPub = true;
+    rev->derives = D_DEBUG | D_CLONE | D_PARTIALEQ | D_EQ | D_PARTIALORD | D_ORD | D_HASH;
+    rev->id = G.nextTypeId++;
+    FieldDef fd;
+    fd.name = "0";
+    fd.isPub = true;
+    rev->fields.push_back(fd);
+    rev->fieldIndex["0"] = 0;
+    G.reverseDef = rev;
+    // serde_json::Value
+    TypeDef *jv = new TypeDef();
+    jv->name = "Value";
+    jv->kind = TD_ENUM;
+    jv->isPub = true;
+    jv->derives = D_CLONE | D_PARTIALEQ | D_EQ | D_SERIALIZE | D_DESERIALIZE;
+    jv->id = G.nextTypeId++;
+    const char *jnames[6] = {"Null", "Bool", "Number", "String", "Array", "Object"};
+    for (int k = 0; k < 6; ++k)
+    {
+        VariantDef v;
+        v.name = jnames[k];
+        v.form = k == 0 ? FORM_UNIT : FORM_TUPLE;
+        if (k > 0)
+        {
+            FieldDef f;
+            f.name = "0";
+            v.fields.push_back(f);
+        }
+        v.discVal = k;
+        v.discKnown = true;
+        jv->variantIndex[v.name] = k;
+        jv->variants.push_back(v);
+    }
+    G.jsonValueDef = jv;
+}
+
+Sym *lookupName(ModDef *m, const std::string &name)
+{
+    for (ModDef *s = m; s; s = s->parent)
+    {
+        auto it = s->names.find(name);
+        if (it != s->names.end())
+            return &it->second;
+        if (!s->isBlock)
+            break;
+    }
+    return nullptr;
+}
+
+// std::mem::swap -> mem::swap; std::collections::HashMap::new -> HashMap::new;
+// std::f64::consts::PI -> f64::consts::PI
+std::string builtinKey(const std::string &full)
+{
+    std::vector<std::string> parts;
+    size_t at0 = 0;
+    while (at0 <= full.size())
+    {
+        size_t sep = full.find("::", at0);
+        if (sep == std::string::npos)
+        {
+            parts.push_back(full.substr(at0));
+            break;
+        }
+        parts.push_back(full.substr(at0, sep - at0));
+        at0 = sep + 2;
+    }
+    // a crate other than std keeps its name: tokio::time::sleep -> tokio::time::sleep,
+    // tokio::sync::mpsc::channel -> tokio::mpsc::channel
+    std::string crate;
+    if (parts.size() > 1 && crateRoot(parts[0]))
+    {
+        if (parts[0] != "std" && parts[0] != "core" && parts[0] != "alloc")
+            crate = parts[0] + "::";
+        parts.erase(parts.begin());
+    }
+    size_t n = parts.size();
+    if (n >= 3 && parts[n - 2] == "consts")
+        return crate + parts[n - 3] + "::consts::" + parts[n - 1];
+    if (n >= 2)
+        return crate + parts[n - 2] + "::" + parts[n - 1];
+    return crate + (parts.empty() ? full : parts[0]);
+}
+
+TypeDef *builtinType(const std::string &name)
+{
+    if (name == "Option")
+        return G.optionDef;
+    if (name == "Result")
+        return G.resultDef;
+    if (name == "Ordering")
+        return G.orderingDef;
+    auto it = G.builtinTypes.find(name);
+    if (it != G.builtinTypes.end())
+        return it->second;
+    TypeDef *t = new TypeDef();
+    t->name = name;
+    t->kind = TD_BUILTIN;
+    t->isPub = true;
+    t->id = G.nextTypeId++;
+    G.builtinTypes[name] = t;
+    return t;
+}
+
+void resolveProgram(ModDef *root, std::vector<ModDef *> &all)
+{
+    Resolver r;
+    r.run(root, all);
+}
+
+} // namespace rust

@@ -1,0 +1,1689 @@
+// quantum: cpp
+// Rust front-end: collections. The methods of Vec, arrays, slices, VecDeque
+// and BinaryHeap (a heap is kept sorted: its greatest item is the last);
+// of HashMap / BTreeMap and the sets (a hash map keeps insertion order here:
+// Rust promises no order, so a program may not depend on one); and of Option
+// and Result.
+#include "RustRt.h.sa"
+
+namespace rust
+{
+
+namespace
+{
+
+V someRef(Obj *o, int64_t i, bool mut) { return mkSome(mkRef(o, i, mut)); }
+
+V pairOf(V a, V b)
+{
+    std::vector<V> pair;
+    pair.push_back(a);
+    pair.push_back(b);
+    return mkTuple(pair);
+}
+
+IterObj *valuesOf(const std::vector<V> &items)
+{
+    IterObj *it = newIter(IT_VALUES);
+    it->items = items;
+    it->end = (int64_t)items.size();
+    return it;
+}
+
+// a..b of a sequence of `len` items, checked
+void rangeBounds(V r, int64_t len, int64_t &lo, int64_t &hi, const Node *n)
+{
+    r = peel(r);
+    if (r.k != V_RANGE)
+        errAt(n, "E0308", "mismatched types: expected a range, found `" + typeName(r) + "`");
+    RangeObj *range = static_cast<RangeObj *>(r.p);
+    lo = range->hasLo ? toIndex(range->items[0], n) : 0;
+    hi = range->hasHi ? toIndex(range->items[1], n) + (range->inclusive ? 1 : 0) : len;
+    if (lo > hi)
+        panicAt(n, "slice index starts at " + std::to_string(lo) + " but ends at " + std::to_string(hi));
+    if (hi > len)
+        panicAt(n, "range end index " + std::to_string(hi) + " out of range for slice of length " + std::to_string(len));
+}
+
+// a new element takes the number type of the ones already there
+V likeItems(const std::vector<V> &items, V x)
+{
+    if (!items.empty() && x.t == 0)
+    {
+        const V &first = items[0];
+        if (x.k == V_INT && first.k == V_INT && first.t && intFits(x, first.t))
+            return intConvert(x, first.t);
+        if (x.k == V_FLOAT && first.k == V_FLOAT && first.t)
+            return mkFloat(fval(x), first.t);
+    }
+    return x;
+}
+
+void heapInsert(std::vector<V> &items, V x, const Node *n)
+{
+    size_t lo = 0, hi = items.size();
+    while (lo < hi)
+    {
+        size_t mid = (lo + hi) / 2;
+        if (valueCmp(items[mid], x, n) <= 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    items.insert(items.begin() + (std::ptrdiff_t)lo, x);
+}
+
+[[noreturn]] void notGrowable(const Node *n, V sv)
+{
+    errAt(n, "E0599", "no method named `" + n->s + "` found for `" + typeName(sv) + "` in the current scope",
+          "method not found in `" + typeName(sv) + "`: its length is fixed");
+}
+
+V orderingToInt(V r, const Node *n, int &c)
+{
+    r = peel(r);
+    if (r.k != V_ENUM || static_cast<EnumObj *>(r.p)->def != G.orderingDef)
+        errAt(n, "E0308", "mismatched types: expected `Ordering`, found `" + typeName(r) + "`");
+    c = static_cast<EnumObj *>(r.p)->variant - 1;
+    return r;
+}
+
+} // namespace
+
+// ─── Vec, arrays, slices, VecDeque, BinaryHeap ─────────────────────────────
+
+bool seqMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    Obj *o = nullptr;
+    int64_t start = 0, len = 0;
+    seqOf(sv, o, start, len);
+    std::vector<V> &items = o->items;
+    bool growable = sv.k == V_VEC || sv.k == V_DEQUE || sv.k == V_HEAP;
+    bool isHeap = sv.k == V_HEAP, isDeque = sv.k == V_DEQUE;
+    bool mutRef = sv.k != V_SLICE || sv.x;
+    auto num = [&](uint64_t r) -> bool
+    {
+        out = mkUint(r, PR_USIZE);
+        return true;
+    };
+    auto unit = [&]() -> bool
+    {
+        out = V();
+        return true;
+    };
+    auto sliceV = [&](int64_t from, int64_t count) -> V { return mkSlice(o, start + from, count, mutRef); };
+    switch (m[0])
+    {
+    case 'a':
+        if (m == "as_slice" || m == "as_mut_slice" || m == "as_ref" || m == "as_mut")
+        {
+            out = sliceV(0, len);
+            return true;
+        }
+        if (m == "append")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            V other = peelAll(argAt(args, 0, n));
+            Obj *oo = nullptr;
+            int64_t os = 0, ol = 0;
+            if (!seqOf(other, oo, os, ol))
+                errAt(n, "E0308", "mismatched types: expected `&mut Vec<_>`, found `" + typeName(other) + "`");
+            std::vector<V> moved(oo->items.begin() + (std::ptrdiff_t)os, oo->items.begin() + (std::ptrdiff_t)(os + ol));
+            oo->items.clear();
+            for (const V &x : moved)
+            {
+                if (isHeap)
+                    heapInsert(items, x, n);
+                else
+                    items.push_back(x);
+            }
+            return unit();
+        }
+        break;
+    case 'b':
+        if (m == "back" || m == "back_mut")
+        {
+            out = len ? someRef(o, start + len - 1, m == "back_mut") : mkNone();
+            return true;
+        }
+        if (m == "binary_search" || m == "binary_search_by" || m == "binary_search_by_key")
+        {
+            V key = m == "binary_search_by" ? V() : argAt(args, 0, n);
+            V f = m == "binary_search" ? V() : argAt(args, m == "binary_search_by" ? 0 : 1, n);
+            int64_t lo = 0, hi = len;
+            while (lo < hi)
+            {
+                int64_t mid = (lo + hi) / 2;
+                V item = mkRef(o, start + mid, false);
+                int c;
+                if (m == "binary_search")
+                    c = valueCmp(item, key, n);
+                else if (m == "binary_search_by")
+                    orderingToInt(call1(f, item, n), n, c);
+                else
+                    c = valueCmp(call1(f, item, n), key, n);
+                if (c == 0)
+                {
+                    out = mkOk(mkUint((uint64_t)mid, PR_USIZE));
+                    return true;
+                }
+                if (c < 0)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            out = mkErr(mkUint((uint64_t)lo, PR_USIZE));
+            return true;
+        }
+        break;
+    case 'c':
+        if (m == "clear")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            items.clear();
+            return unit();
+        }
+        if (m == "contains")
+        {
+            V x = argAt(args, 0, n);
+            for (int64_t k = 0; k < len; ++k)
+                if (valueEq(items[(size_t)(start + k)], x, n))
+                {
+                    out = mkBool(true);
+                    return true;
+                }
+            out = mkBool(false);
+            return true;
+        }
+        if (m == "capacity")
+            return num((uint64_t)items.capacity());
+        if (m == "chunks" || m == "chunks_exact")
+        {
+            int64_t size = toIndex(argAt(args, 0, n), n);
+            if (size == 0)
+                panicAt(n, "chunk size must be non-zero");
+            std::vector<V> parts;
+            for (int64_t k = 0; k < len; k += size)
+            {
+                int64_t count = k + size <= len ? size : len - k;
+                if (count < size && m == "chunks_exact")
+                    break;
+                parts.push_back(sliceV(k, count));
+            }
+            out = iterV(valuesOf(parts));
+            return true;
+        }
+        if (m == "concat")
+        {
+            if (len > 0 && isStr(items[(size_t)start]))
+            {
+                std::string s;
+                for (int64_t k = 0; k < len; ++k)
+                    s += strOf(items[(size_t)(start + k)]);
+                out = mkStr(s, true);
+                return true;
+            }
+            std::vector<V> all;
+            for (int64_t k = 0; k < len; ++k)
+            {
+                Obj *io = nullptr;
+                int64_t is = 0, il = 0;
+                if (!seqOf(items[(size_t)(start + k)], io, is, il))
+                    errAt(n, "E0599", "the method `concat` needs a slice of strings or of slices");
+                for (int64_t j = 0; j < il; ++j)
+                    all.push_back(cloneValue(io->items[(size_t)(is + j)], n));
+            }
+            out = mkSeq(V_VEC, all);
+            return true;
+        }
+        if (m == "copy_from_slice" || m == "clone_from_slice")
+        {
+            Obj *oo = nullptr;
+            int64_t os = 0, ol = 0;
+            if (!seqOf(argAt(args, 0, n), oo, os, ol))
+                errAt(n, "E0308", "mismatched types: expected a slice");
+            if (ol != len)
+                panicAt(n, "source slice length (" + std::to_string(ol) + ") does not match destination slice length (" +
+                               std::to_string(len) + ")");
+            for (int64_t k = 0; k < len; ++k)
+                items[(size_t)(start + k)] = cloneValue(oo->items[(size_t)(os + k)], n);
+            return unit();
+        }
+        break;
+    case 'd':
+        if (m == "drain")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            int64_t lo = 0, hi = len;
+            if (!args.empty())
+                rangeBounds(args[0], len, lo, hi, n);
+            std::vector<V> taken(items.begin() + (std::ptrdiff_t)lo, items.begin() + (std::ptrdiff_t)hi);
+            items.erase(items.begin() + (std::ptrdiff_t)lo, items.begin() + (std::ptrdiff_t)hi);
+            out = iterV(valuesOf(taken));
+            return true;
+        }
+        if (m == "dedup" || m == "dedup_by_key" || m == "dedup_by")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            std::vector<V> kept;
+            V lastKey;
+            for (size_t k = 0; k < items.size(); ++k)
+            {
+                bool same = false;
+                V key;
+                if (m == "dedup_by_key")
+                    key = call1(args[0], mkRef(o, (int64_t)k, true), n);
+                if (!kept.empty())
+                {
+                    if (m == "dedup")
+                        same = valueEq(kept.back(), items[k], n);
+                    else if (m == "dedup_by_key")
+                        same = valueEq(lastKey, key, n);
+                    else
+                        same = isTrue(call2(args[0], mkRef(o, (int64_t)k, true), mkRefTo(kept.back(), true), n), n);
+                }
+                if (!same)
+                {
+                    kept.push_back(items[k]);
+                    lastKey = key;
+                }
+            }
+            items = kept;
+            return unit();
+        }
+        break;
+    case 'e':
+        if (m == "extend" || m == "extend_from_slice")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            V src = argAt(args, 0, n);
+            bool cloneItems = m == "extend_from_slice";
+            V it = toIter(src, n);
+            std::vector<V> more;
+            iterDrain(static_cast<IterObj *>(it.p), more, n);
+            for (V x : more)
+            {
+                // extending from references copies what they refer to
+                if (cloneItems || (x.k == V_REF && !items.empty() && items[0].k != V_REF))
+                    x = cloneValue(peel(x), n);
+                else if (x.k == V_REF && items.empty() && isCopy(peel(x)) && peel(x).k != V_REF && peel(x).k != V_STR)
+                    x = copyShell(peel(x));
+                if (isHeap)
+                    heapInsert(items, x, n);
+                else
+                    items.push_back(likeItems(items, x));
+            }
+            return unit();
+        }
+        if (m == "ends_with")
+        {
+            Obj *oo = nullptr;
+            int64_t os = 0, ol = 0;
+            if (!seqOf(argAt(args, 0, n), oo, os, ol))
+                errAt(n, "E0308", "mismatched types: expected a slice");
+            bool ok = ol <= len;
+            for (int64_t k = 0; ok && k < ol; ++k)
+                ok = valueEq(items[(size_t)(start + len - ol + k)], oo->items[(size_t)(os + k)], n);
+            out = mkBool(ok);
+            return true;
+        }
+        break;
+    case 'f':
+        if (m == "first" || m == "first_mut" || m == "front" || m == "front_mut")
+        {
+            out = len ? someRef(o, start, m.find("_mut") != std::string::npos) : mkNone();
+            return true;
+        }
+        if (m == "fill")
+        {
+            V x = argAt(args, 0, n);
+            for (int64_t k = 0; k < len; ++k)
+                items[(size_t)(start + k)] = k + 1 == len ? x : cloneValue(x, n);
+            return unit();
+        }
+        break;
+    case 'g':
+        if (m == "get" || m == "get_mut")
+        {
+            V idx = peel(argAt(args, 0, n));
+            if (idx.k == V_RANGE)
+            {
+                RangeObj *range = static_cast<RangeObj *>(idx.p);
+                int64_t lo = range->hasLo ? toIndex(range->items[0], n) : 0;
+                int64_t hi = range->hasHi ? toIndex(range->items[1], n) + (range->inclusive ? 1 : 0) : len;
+                out = lo <= hi && hi <= len ? mkSome(sliceV(lo, hi - lo)) : mkNone();
+                return true;
+            }
+            int64_t i = toIndex(idx, n);
+            out = i < len ? someRef(o, start + i, m == "get_mut") : mkNone();
+            return true;
+        }
+        break;
+    case 'i':
+        if (m == "is_empty")
+        {
+            out = mkBool(len == 0);
+            return true;
+        }
+        if (m == "iter" || m == "iter_mut")
+        {
+            IterObj *it = newIter(IT_SEQ);
+            it->seq = o;
+            it->i = start;
+            it->end = start + len;
+            it->mode = m == "iter_mut" ? 2 : 1;
+            out = iterV(it);
+            return true;
+        }
+        if (m == "into_iter")
+        {
+            IterObj *it = newIter(IT_SEQ);
+            it->seq = o;
+            it->i = start;
+            it->end = start + len;
+            // of a borrowed collection: its items by reference
+            it->mode = sv.k == V_SLICE ? (sv.x ? 2 : 1) : sp.ref ? 1 : 0;
+            if (it->mode == 0)
+                takeSelf(sp, sv);
+            out = iterV(it);
+            return true;
+        }
+        if (m == "insert")
+        {
+            if (sv.k != V_VEC && !isDeque)
+                notGrowable(n, sv);
+            int64_t i = toIndex(argAt(args, 0, n), n);
+            if (i > len)
+                panicAt(n, "insertion index (is " + std::to_string(i) + ") should be <= len (is " + std::to_string(len) + ")");
+            items.insert(items.begin() + (std::ptrdiff_t)i, likeItems(items, argAt(args, 1, n)));
+            return unit();
+        }
+        if (m == "into_boxed_slice" || m == "into_vec" || m == "into_sorted_vec")
+        {
+            std::vector<V> copy(items.begin() + (std::ptrdiff_t)start, items.begin() + (std::ptrdiff_t)(start + len));
+            takeSelf(sp, sv);
+            out = mkSeq(V_VEC, copy);
+            return true;
+        }
+        if (m == "into_heap")
+        {
+            std::vector<V> copy(items.begin() + (std::ptrdiff_t)start, items.begin() + (std::ptrdiff_t)(start + len));
+            sortValues(copy, 0, copy.size(), nullptr, nullptr, n);
+            out = mkSeq(V_HEAP, copy);
+            return true;
+        }
+        if (m == "is_sorted")
+        {
+            bool sorted = true;
+            for (int64_t k = 1; k < len && sorted; ++k)
+                sorted = valueCmp(items[(size_t)(start + k - 1)], items[(size_t)(start + k)], n) <= 0;
+            out = mkBool(sorted);
+            return true;
+        }
+        break;
+    case 'j':
+        if (m == "join")
+        {
+            const std::string sep = args.empty() ? std::string() : (peel(args[0]).k == V_CHAR ? charString((uint32_t)peel(args[0]).lo) : strOf(args[0]));
+            std::string s;
+            for (int64_t k = 0; k < len; ++k)
+            {
+                V item = peelAll(items[(size_t)(start + k)]);
+                if (item.k != V_STR)
+                    errAt(n, "E0599", "the method `join` exists for a slice of strings, but its elements are `" +
+                                          typeName(item) + "`",
+                          "convert the elements first: `.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(..)`");
+                if (k)
+                    s += sep;
+                s += static_cast<StrObj *>(item.p)->s;
+            }
+            out = mkStr(s, true);
+            return true;
+        }
+        break;
+    case 'l':
+        if (m == "len")
+            return num((uint64_t)len);
+        if (m == "last" || m == "last_mut")
+        {
+            out = len ? someRef(o, start + len - 1, m == "last_mut") : mkNone();
+            return true;
+        }
+        break;
+    case 'm':
+        if (m == "map" && sv.k == V_ARRAY)
+        {
+            std::vector<V> mapped;
+            for (int64_t k = 0; k < len; ++k)
+                mapped.push_back(call1(args[0], items[(size_t)(start + k)], n));
+            out = mkSeq(V_ARRAY, mapped);
+            return true;
+        }
+        if (m == "make_contiguous")
+        {
+            out = sliceV(0, len);
+            return true;
+        }
+        break;
+    case 'p':
+        if (m == "push" || m == "push_back")
+        {
+            if (!growable || (m == "push_back" && !isDeque) || (m == "push" && isDeque))
+                notGrowable(n, sv);
+            V x = argAt(args, 0, n);
+            if (isHeap)
+                heapInsert(items, x, n);
+            else
+                items.push_back(likeItems(items, x));
+            return unit();
+        }
+        if (m == "push_front")
+        {
+            if (!isDeque)
+                notGrowable(n, sv);
+            items.insert(items.begin(), likeItems(items, argAt(args, 0, n)));
+            return unit();
+        }
+        if (m == "pop" || m == "pop_back")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            if (items.empty())
+            {
+                out = mkNone();
+                return true;
+            }
+            out = mkSome(items.back());
+            items.pop_back();
+            return true;
+        }
+        if (m == "pop_front")
+        {
+            if (!isDeque)
+                notGrowable(n, sv);
+            if (items.empty())
+            {
+                out = mkNone();
+                return true;
+            }
+            out = mkSome(items[0]);
+            items.erase(items.begin());
+            return true;
+        }
+        if (m == "peek")
+        {
+            out = len ? someRef(o, start + len - 1, false) : mkNone();
+            return true;
+        }
+        break;
+    case 'r':
+        if (m == "remove")
+        {
+            if (sv.k != V_VEC && !isDeque)
+                notGrowable(n, sv);
+            int64_t i = toIndex(argAt(args, 0, n), n);
+            if (isDeque)
+            {
+                if (i >= len)
+                {
+                    out = mkNone();
+                    return true;
+                }
+                out = mkSome(items[(size_t)i]);
+            }
+            else
+            {
+                if (i >= len)
+                    panicAt(n, "removal index (is " + std::to_string(i) + ") should be < len (is " + std::to_string(len) + ")");
+                out = items[(size_t)i];
+            }
+            items.erase(items.begin() + (std::ptrdiff_t)i);
+            return true;
+        }
+        if (m == "rchunks" || m == "rchunks_exact")
+        {
+            // chunks from the end: the short one, if any, comes last and holds the front
+            int64_t size = toIndex(argAt(args, 0, n), n);
+            if (size == 0)
+                panicAt(n, "chunk size must be non-zero");
+            std::vector<V> parts;
+            for (int64_t end = len; end > 0; end -= size)
+            {
+                int64_t from = end - size > 0 ? end - size : 0;
+                if (end - from < size && m == "rchunks_exact")
+                    break;
+                parts.push_back(sliceV(from, end - from));
+            }
+            out = iterV(valuesOf(parts));
+            return true;
+        }
+        if (m == "reverse")
+        {
+            for (int64_t a = 0, z = len - 1; a < z; ++a, --z)
+            {
+                V t = items[(size_t)(start + a)];
+                items[(size_t)(start + a)] = items[(size_t)(start + z)];
+                items[(size_t)(start + z)] = t;
+            }
+            return unit();
+        }
+        if (m == "retain" || m == "retain_mut")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            std::vector<V> kept;
+            for (size_t k = 0; k < items.size(); ++k)
+                if (isTrue(call1(args[0], mkRef(o, (int64_t)k, m == "retain_mut"), n), n))
+                    kept.push_back(items[k]);
+            items = kept;
+            return unit();
+        }
+        if (m == "resize")
+        {
+            if (sv.k != V_VEC && !isDeque)
+                notGrowable(n, sv);
+            int64_t size = toIndex(argAt(args, 0, n), n);
+            V x = argAt(args, 1, n);
+            if (size < len)
+                items.resize((size_t)size);
+            while ((int64_t)items.size() < size)
+                items.push_back(likeItems(items, cloneValue(x, n)));
+            return unit();
+        }
+        if (m == "rotate_left" || m == "rotate_right")
+        {
+            int64_t k = toIndex(argAt(args, 0, n), n);
+            if (k > len)
+                panicAt(n, "assertion failed: mid <= self.len()");
+            if (len > 0)
+            {
+                if (m == "rotate_right")
+                    k = (len - k) % len;
+                std::vector<V> rotated;
+                for (int64_t j = 0; j < len; ++j)
+                    rotated.push_back(items[(size_t)(start + (j + k) % len)]);
+                for (int64_t j = 0; j < len; ++j)
+                    items[(size_t)(start + j)] = rotated[(size_t)j];
+            }
+            return unit();
+        }
+        if (m == "repeat")
+        {
+            int64_t count = toIndex(argAt(args, 0, n), n);
+            std::vector<V> all;
+            for (int64_t c = 0; c < count; ++c)
+                for (int64_t k = 0; k < len; ++k)
+                    all.push_back(cloneValue(items[(size_t)(start + k)], n));
+            out = mkSeq(V_VEC, all);
+            return true;
+        }
+        if (m == "reserve" || m == "reserve_exact")
+            return unit();
+        break;
+    case 's':
+        if (m == "sort" || m == "sort_unstable" || m == "sort_by" || m == "sort_unstable_by" || m == "sort_by_key" ||
+            m == "sort_unstable_by_key" || m == "sort_by_cached_key")
+        {
+            bool byKey = m.find("_key") != std::string::npos, by = !byKey && m.find("_by") != std::string::npos;
+            V f = byKey || by ? argAt(args, 0, n) : V();
+            // on a copy: the closure may look at the collection
+            std::vector<V> part(items.begin() + (std::ptrdiff_t)start, items.begin() + (std::ptrdiff_t)(start + len));
+            sortValues(part, 0, part.size(), by ? &f : nullptr, byKey ? &f : nullptr, n);
+            for (int64_t k = 0; k < len && (size_t)(start + k) < items.size(); ++k)
+                items[(size_t)(start + k)] = part[(size_t)k];
+            return unit();
+        }
+        if (m == "swap")
+        {
+            int64_t a = toIndex(argAt(args, 0, n), n), z = toIndex(argAt(args, 1, n), n);
+            if (a >= len || z >= len)
+                panicAt(n, "index out of bounds: the len is " + std::to_string(len) + " but the index is " +
+                               std::to_string(a >= len ? a : z));
+            V t = items[(size_t)(start + a)];
+            items[(size_t)(start + a)] = items[(size_t)(start + z)];
+            items[(size_t)(start + z)] = t;
+            return unit();
+        }
+        if (m == "swap_remove")
+        {
+            if (sv.k != V_VEC)
+                notGrowable(n, sv);
+            int64_t i = toIndex(argAt(args, 0, n), n);
+            if (i >= len)
+                panicAt(n, "swap_remove index (is " + std::to_string(i) + ") should be < len (is " + std::to_string(len) + ")");
+            out = items[(size_t)i];
+            items[(size_t)i] = items.back();
+            items.pop_back();
+            return true;
+        }
+        if (m == "split_at" || m == "split_at_mut")
+        {
+            int64_t mid = toIndex(argAt(args, 0, n), n);
+            if (mid > len)
+                panicAt(n, "mid > len");
+            out = pairOf(sliceV(0, mid), sliceV(mid, len - mid));
+            return true;
+        }
+        if (m == "split_first" || m == "split_last")
+        {
+            if (len == 0)
+            {
+                out = mkNone();
+                return true;
+            }
+            bool first = m == "split_first";
+            out = mkSome(pairOf(mkRef(o, start + (first ? 0 : len - 1), false), sliceV(first ? 1 : 0, len - 1)));
+            return true;
+        }
+        if (m == "split_off")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            int64_t at0 = toIndex(argAt(args, 0, n), n);
+            if (at0 > len)
+                panicAt(n, "`at` split index (is " + std::to_string(at0) + ") should be <= len (is " + std::to_string(len) + ")");
+            std::vector<V> tail(items.begin() + (std::ptrdiff_t)at0, items.end());
+            items.resize((size_t)at0);
+            out = mkSeq(sv.k, tail);
+            return true;
+        }
+        if (m == "starts_with")
+        {
+            Obj *oo = nullptr;
+            int64_t os = 0, ol = 0;
+            if (!seqOf(argAt(args, 0, n), oo, os, ol))
+                errAt(n, "E0308", "mismatched types: expected a slice");
+            bool ok = ol <= len;
+            for (int64_t k = 0; ok && k < ol; ++k)
+                ok = valueEq(items[(size_t)(start + k)], oo->items[(size_t)(os + k)], n);
+            out = mkBool(ok);
+            return true;
+        }
+        if (m == "shrink_to_fit" || m == "shrink_to")
+            return unit();
+        if (m == "split")
+        {
+            // slices between the items the closure picks
+            std::vector<V> parts;
+            int64_t from = 0;
+            for (int64_t k = 0; k < len; ++k)
+                if (isTrue(call1(args[0], mkRef(o, start + k, false), n), n))
+                {
+                    parts.push_back(sliceV(from, k - from));
+                    from = k + 1;
+                }
+            parts.push_back(sliceV(from, len - from));
+            out = iterV(valuesOf(parts));
+            return true;
+        }
+        break;
+    case 't':
+        if (m == "to_vec" || m == "to_owned")
+        {
+            std::vector<V> copy;
+            copy.reserve((size_t)len);
+            for (int64_t k = 0; k < len; ++k)
+                copy.push_back(cloneValue(items[(size_t)(start + k)], n));
+            out = mkSeq(V_VEC, copy);
+            return true;
+        }
+        if (m == "truncate")
+        {
+            if (!growable)
+                notGrowable(n, sv);
+            int64_t size = toIndex(argAt(args, 0, n), n);
+            if (size < len)
+                items.resize((size_t)size);
+            return unit();
+        }
+        break;
+    case 'w':
+        if (m == "windows")
+        {
+            int64_t size = toIndex(argAt(args, 0, n), n);
+            if (size == 0)
+                panicAt(n, "window size must be non-zero");
+            std::vector<V> parts;
+            for (int64_t k = 0; k + size <= len; ++k)
+                parts.push_back(sliceV(k, size));
+            out = iterV(valuesOf(parts));
+            return true;
+        }
+        break;
+    }
+    (void)hint;
+    return false;
+}
+
+// ─── HashMap, BTreeMap and the sets ────────────────────────────────────────
+
+namespace
+{
+
+// the value a missing entry gets from or_default()
+V mapDefault(MapObj *m, Ty *hint, const Node *n)
+{
+    if (m->valTy)
+        return defaultFor(m->valTy, n);
+    if (hint)
+    {
+        Ty *h = tyResolve(hint);
+        if (h->k == TY_REF)
+            h = tyResolve(h->elem);
+        if (h && h->k != TY_INFER)
+            return defaultFor(h, n);
+    }
+    // like the values it already has
+    for (size_t k = 0; k < m->keys.size(); ++k)
+    {
+        if (m->keys[k].k == V_MOVED)
+            continue;
+        V v = m->items[k];
+        switch (v.k)
+        {
+        case V_INT: return mkInt(0, v.t);
+        case V_FLOAT: return mkFloat(0, v.t);
+        case V_STR: return mkStr("", true);
+        case V_BOOL: return mkBool(false);
+        case V_VEC:
+        case V_DEQUE: return mkSeq(v.k, std::vector<V>());
+        case V_MAP:
+        case V_SET: return mkMap(static_cast<MapObj *>(v.p)->sorted, v.k == V_SET);
+        }
+        break;
+    }
+    return openDefault();
+}
+
+V setFrom(MapObj *like, const std::vector<V> &keys, const Node *n)
+{
+    IterObj *it = newIter(IT_VALUES);
+    for (const V &k : keys)
+        it->items.push_back(mkRefTo(k, false));
+    it->end = (int64_t)it->items.size();
+    (void)like;
+    (void)n;
+    return iterV(it);
+}
+
+} // namespace
+
+bool entryMethod(NativeObj *e, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    MapObj *map = static_cast<MapObj *>(e->items[0].p);
+    V key = e->items[1];
+    int idx = mapFind(map, key, n);
+    if (m == "or_insert" || m == "or_insert_with" || m == "or_default" || m == "or_insert_with_key")
+    {
+        if (idx < 0)
+        {
+            V value = m == "or_insert" ? argAt(args, 0, n)
+                      : m == "or_default" ? mapDefault(map, hint, n)
+                      : m == "or_insert_with" ? call0(argAt(args, 0, n), n) : call1(argAt(args, 0, n), mkRefTo(key, false), n);
+            if (map->valTy)
+                value = coerce(value, map->valTy, n);
+            idx = mapInsert(map, key, value, n);
+        }
+        out = mkRef(map, idx, true);
+        return true;
+    }
+    if (m == "and_modify")
+    {
+        if (idx >= 0)
+            call1(argAt(args, 0, n), mkRef(map, idx, true), n);
+        V self;
+        self.k = V_NATIVE;
+        self.p = e;
+        out = self;
+        return true;
+    }
+    if (m == "key")
+    {
+        out = mkRefTo(key, false);
+        return true;
+    }
+    return false;
+}
+
+bool mapMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    MapObj *map = static_cast<MapObj *>(sv.p);
+    bool isSet = map->isSet;
+    auto unit = [&]() -> bool
+    {
+        out = V();
+        return true;
+    };
+    auto live = [&](std::vector<int> &ids) { mapEntries(map, ids); };
+    char key = m[0];
+    if (m == "symmetric_difference")
+        key = 'd';
+    else if (m == "last_key_value" || m == "last")
+        key = 'f';
+    else if (m == "take")
+        key = 'r';
+    switch (key)
+    {
+    case 'a':
+        if (m == "append")
+        {
+            V other = peelAll(argAt(args, 0, n));
+            if (other.k != sv.k)
+                errAt(n, "E0308", "mismatched types: expected `" + typeName(sv) + "`, found `" + typeName(other) + "`");
+            MapObj *from = static_cast<MapObj *>(other.p);
+            for (size_t k = 0; k < from->keys.size(); ++k)
+                if (from->keys[k].k != V_MOVED)
+                    mapInsert(map, from->keys[k], isSet ? V() : from->items[k], n);
+            from->keys.clear();
+            from->items.clear();
+            from->index.clear();
+            from->holes = 0;
+            return unit();
+        }
+        break;
+    case 'c':
+        if (m == "contains_key" || m == "contains")
+        {
+            out = mkBool(mapFind(map, argAt(args, 0, n), n) >= 0);
+            return true;
+        }
+        if (m == "clear")
+        {
+            map->keys.clear();
+            map->items.clear();
+            map->index.clear();
+            map->holes = 0;
+            return unit();
+        }
+        if (m == "capacity")
+        {
+            out = mkUint((uint64_t)mapLive(map), PR_USIZE);
+            return true;
+        }
+        break;
+    case 'd':
+        if (m == "difference" || m == "symmetric_difference")
+        {
+            V other = peelAll(argAt(args, 0, n));
+            if (other.k != V_SET)
+                errAt(n, "E0308", "mismatched types: expected a set, found `" + typeName(other) + "`");
+            MapObj *o = static_cast<MapObj *>(other.p);
+            std::vector<V> keys;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+                if (map->keys[k].k != V_MOVED && mapFind(o, map->keys[k], n) < 0)
+                    keys.push_back(map->keys[k]);
+            if (m == "symmetric_difference")
+                for (size_t k = 0; k < o->keys.size(); ++k)
+                    if (o->keys[k].k != V_MOVED && mapFind(map, o->keys[k], n) < 0)
+                        keys.push_back(o->keys[k]);
+            if (map->sorted)
+                sortValues(keys, 0, keys.size(), nullptr, nullptr, n);
+            out = setFrom(map, keys, n);
+            return true;
+        }
+        if (m == "drain")
+        {
+            std::vector<V> all;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+                if (map->keys[k].k != V_MOVED)
+                    all.push_back(isSet ? map->keys[k] : pairOf(map->keys[k], map->items[k]));
+            map->keys.clear();
+            map->items.clear();
+            map->index.clear();
+            map->holes = 0;
+            out = iterV(valuesOf(all));
+            return true;
+        }
+        break;
+    case 'e':
+        if (m == "entry" && !isSet)
+        {
+            out = mkNative("Entry", "");
+            out.p->items.push_back(sv);
+            out.p->items.push_back(argAt(args, 0, n));
+            return true;
+        }
+        if (m == "extend")
+        {
+            V it = toIter(argAt(args, 0, n), n);
+            V x;
+            while (iterNext(static_cast<IterObj *>(it.p), x, n))
+            {
+                if (isSet)
+                {
+                    mapInsert(map, x.k == V_REF ? cloneValue(peel(x), n) : x, V(), n);
+                    continue;
+                }
+                V pair = peel(x);
+                if (pair.k != V_TUPLE || pair.p->items.size() != 2)
+                    errAt(n, "E0277", "a map is extended with `(key, value)` pairs, found `" + typeName(pair) + "`");
+                V key = pair.p->items[0], value = pair.p->items[1];
+                if (key.k == V_REF && value.k == V_REF)
+                {
+                    key = cloneValue(peel(key), n);
+                    value = cloneValue(peel(value), n);
+                }
+                mapInsert(map, key, value, n);
+            }
+            return unit();
+        }
+        break;
+    case 'f':
+        if (m == "first_key_value" || m == "first" || m == "last_key_value" || m == "last")
+        {
+            std::vector<int> ids;
+            live(ids);
+            if (ids.empty())
+            {
+                out = mkNone();
+                return true;
+            }
+            int idx = m[0] == 'f' ? ids[0] : ids.back();
+            out = mkSome(isSet ? mkRefTo(map->keys[(size_t)idx], false)
+                               : pairOf(mkRefTo(map->keys[(size_t)idx], false), mkRef(map, idx, false)));
+            return true;
+        }
+        break;
+    case 'g':
+        if (m == "get" || m == "get_mut")
+        {
+            int idx = mapFind(map, argAt(args, 0, n), n);
+            if (idx < 0)
+                out = mkNone();
+            else
+                out = mkSome(isSet ? mkRefTo(map->keys[(size_t)idx], false) : mkRef(map, idx, m == "get_mut"));
+            return true;
+        }
+        if (m == "get_key_value")
+        {
+            int idx = mapFind(map, argAt(args, 0, n), n);
+            out = idx < 0 ? mkNone() : mkSome(pairOf(mkRefTo(map->keys[(size_t)idx], false), mkRef(map, idx, false)));
+            return true;
+        }
+        if (m == "get_or_insert_with" && !isSet)
+            break;
+        break;
+    case 'i':
+        if (m == "insert")
+        {
+            V key = argAt(args, 0, n);
+            if (isSet)
+            {
+                bool fresh = mapFind(map, key, n) < 0;
+                if (fresh)
+                    mapInsert(map, key, V(), n);
+                out = mkBool(fresh);
+                return true;
+            }
+            V value = argAt(args, 1, n);
+            if (map->valTy)
+                value = coerce(value, map->valTy, n);
+            int idx = mapFind(map, key, n);
+            if (idx >= 0)
+            {
+                out = mkSome(map->items[(size_t)idx]);
+                map->items[(size_t)idx] = value;
+            }
+            else
+            {
+                mapInsert(map, key, value, n);
+                out = mkNone();
+            }
+            return true;
+        }
+        if (m == "is_empty")
+        {
+            out = mkBool(mapLive(map) == 0);
+            return true;
+        }
+        if (m == "iter" || m == "iter_mut" || m == "into_iter")
+        {
+            bool byRef = m != "into_iter" || sp.ref;
+            if (!byRef)
+            {
+                takeSelf(sp, sv);
+                out = toIter(sv, n);
+            }
+            else
+                out = toIter(mkRef(sp.o, sp.i, m == "iter_mut"), n);
+            return true;
+        }
+        if (m == "intersection")
+        {
+            V other = peelAll(argAt(args, 0, n));
+            if (other.k != V_SET)
+                errAt(n, "E0308", "mismatched types: expected a set, found `" + typeName(other) + "`");
+            MapObj *o = static_cast<MapObj *>(other.p);
+            std::vector<V> keys;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+                if (map->keys[k].k != V_MOVED && mapFind(o, map->keys[k], n) >= 0)
+                    keys.push_back(map->keys[k]);
+            out = setFrom(map, keys, n);
+            return true;
+        }
+        if (m == "is_subset" || m == "is_superset" || m == "is_disjoint")
+        {
+            V other = peelAll(argAt(args, 0, n));
+            if (other.k != V_SET)
+                errAt(n, "E0308", "mismatched types: expected a set, found `" + typeName(other) + "`");
+            MapObj *a = map, *z = static_cast<MapObj *>(other.p);
+            if (m == "is_superset")
+            {
+                a = z;
+                z = map;
+            }
+            bool ok = true;
+            for (size_t k = 0; k < a->keys.size() && ok; ++k)
+                if (a->keys[k].k != V_MOVED)
+                    ok = (mapFind(z, a->keys[k], n) >= 0) == (m != "is_disjoint");
+            out = mkBool(ok);
+            return true;
+        }
+        if (m == "into_keys" || m == "into_values")
+        {
+            std::vector<V> all;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+                if (map->keys[k].k != V_MOVED)
+                    all.push_back(m == "into_keys" ? map->keys[k] : map->items[k]);
+            takeSelf(sp, sv);
+            out = iterV(valuesOf(all));
+            return true;
+        }
+        break;
+    case 'k':
+        if (m == "keys")
+        {
+            std::vector<V> all;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+                if (map->keys[k].k != V_MOVED)
+                    all.push_back(mkRefTo(map->keys[k], false));
+            out = iterV(valuesOf(all));
+            return true;
+        }
+        break;
+    case 'l':
+        if (m == "len")
+        {
+            out = mkUint((uint64_t)mapLive(map), PR_USIZE);
+            return true;
+        }
+        break;
+    case 'p':
+        if (m == "pop_first" || m == "pop_last")
+        {
+            std::vector<int> ids;
+            live(ids);
+            if (ids.empty())
+            {
+                out = mkNone();
+                return true;
+            }
+            int idx = m == "pop_first" ? ids[0] : ids.back();
+            V key = map->keys[(size_t)idx], value = isSet ? V() : map->items[(size_t)idx];
+            mapRemove(map, key, nullptr, n);
+            out = mkSome(isSet ? key : pairOf(key, value));
+            return true;
+        }
+        break;
+    case 'r':
+        if (m == "remove" || m == "take")
+        {
+            V old;
+            bool had = mapRemove(map, argAt(args, 0, n), &old, n);
+            out = isSet && m == "remove" ? mkBool(had) : mkOption(had, old);
+            return true;
+        }
+        if (m == "remove_entry")
+        {
+            int idx = mapFind(map, argAt(args, 0, n), n);
+            if (idx < 0)
+            {
+                out = mkNone();
+                return true;
+            }
+            V key = map->keys[(size_t)idx], value = map->items[(size_t)idx];
+            mapRemove(map, key, nullptr, n);
+            out = mkSome(pairOf(key, value));
+            return true;
+        }
+        if (m == "retain")
+        {
+            std::vector<V> gone;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+            {
+                if (map->keys[k].k == V_MOVED)
+                    continue;
+                bool keep = isSet ? isTrue(call1(args[0], mkRefTo(map->keys[k], false), n), n)
+                                  : isTrue(call2(args[0], mkRefTo(map->keys[k], false), mkRef(map, (int64_t)k, true), n), n);
+                if (!keep)
+                    gone.push_back(map->keys[k]);
+            }
+            for (const V &key : gone)
+                mapRemove(map, key, nullptr, n);
+            return unit();
+        }
+        if (m == "range")
+        {
+            V r = peel(argAt(args, 0, n));
+            if (r.k != V_RANGE)
+                errAt(n, "E0308", "mismatched types: expected a range, found `" + typeName(r) + "`");
+            RangeObj *range = static_cast<RangeObj *>(r.p);
+            std::vector<V> all;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+            {
+                if (map->keys[k].k == V_MOVED)
+                    continue;
+                if (range->hasLo && valueCmp(map->keys[k], range->items[0], n) < 0)
+                    continue;
+                if (range->hasHi)
+                {
+                    int c = valueCmp(map->keys[k], range->items[1], n);
+                    if (range->inclusive ? c > 0 : c >= 0)
+                        continue;
+                }
+                all.push_back(isSet ? mkRefTo(map->keys[k], false) : pairOf(mkRefTo(map->keys[k], false), mkRef(map, (int64_t)k, false)));
+            }
+            out = iterV(valuesOf(all));
+            return true;
+        }
+        if (m == "reserve")
+            return unit();
+        if (m == "replace" && isSet)
+        {
+            V key = argAt(args, 0, n);
+            V old;
+            bool had = mapRemove(map, key, &old, n);
+            mapInsert(map, key, V(), n);
+            out = mkOption(had, old);
+            return true;
+        }
+        break;
+    case 's':
+        if (m == "shrink_to_fit")
+            return unit();
+        break;
+    case 'u':
+        if (m == "union")
+        {
+            V other = peelAll(argAt(args, 0, n));
+            if (other.k != V_SET)
+                errAt(n, "E0308", "mismatched types: expected a set, found `" + typeName(other) + "`");
+            MapObj *o = static_cast<MapObj *>(other.p);
+            std::vector<V> keys;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+                if (map->keys[k].k != V_MOVED)
+                    keys.push_back(map->keys[k]);
+            for (size_t k = 0; k < o->keys.size(); ++k)
+                if (o->keys[k].k != V_MOVED && mapFind(map, o->keys[k], n) < 0)
+                    keys.push_back(o->keys[k]);
+            if (map->sorted)
+                sortValues(keys, 0, keys.size(), nullptr, nullptr, n);
+            out = setFrom(map, keys, n);
+            return true;
+        }
+        break;
+    case 'v':
+        if (m == "values" || m == "values_mut")
+        {
+            std::vector<V> all;
+            for (size_t k = 0; k < map->keys.size(); ++k)
+                if (map->keys[k].k != V_MOVED)
+                    all.push_back(mkRef(map, (int64_t)k, m == "values_mut"));
+            out = iterV(valuesOf(all));
+            return true;
+        }
+        break;
+    }
+    (void)hint;
+    return false;
+}
+
+// ─── Option and Result ─────────────────────────────────────────────────────
+
+bool optionMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    EnumObj *e = static_cast<EnumObj *>(sv.p);
+    bool some = e->variant == 1;
+    auto payload = [&]() -> V
+    {
+        V v = e->items[0];
+        if (!takeSelf(sp, sv) && isCopy(v))
+            v = copyShell(v);
+        return v;
+    };
+    auto opt = [&](bool has, V v) -> bool
+    {
+        out = mkOption(has, v);
+        return true;
+    };
+    char key = m[0];
+    if (m == "insert")
+        key = 'g';
+    switch (key)
+    {
+    case 'a':
+        if (m == "as_ref" || m == "as_mut" || m == "as_deref" || m == "as_deref_mut" || m == "iter" || m == "iter_mut")
+            break;
+        if (m == "and_then")
+        {
+            out = some ? call1(argAt(args, 0, n), payload(), n) : mkNone();
+            return true;
+        }
+        if (m == "and")
+        {
+            out = some ? argAt(args, 0, n) : mkNone();
+            return true;
+        }
+        break;
+    case 'c':
+        if (m == "cloned" || m == "copied")
+            return opt(some, some ? cloneValue(peel(e->items[0]), n) : V());
+        if (m == "clone")
+        {
+            out = cloneValue(sv, n);
+            return true;
+        }
+        break;
+    case 'e':
+        if (m == "expect")
+        {
+            if (!some)
+                panicAt(n, strOf(argAt(args, 0, n)));
+            out = payload();
+            return true;
+        }
+        break;
+    case 'f':
+        if (m == "filter")
+        {
+            if (some && isTrue(call1(argAt(args, 0, n), mkRef(e, 0, false), n), n))
+                return opt(true, payload());
+            return opt(false, V());
+        }
+        if (m == "flatten")
+        {
+            out = some ? payload() : mkNone();
+            return true;
+        }
+        break;
+    case 'g':
+        if (m == "get_or_insert" || m == "get_or_insert_with" || m == "insert")
+        {
+            if (!some || m == "insert")
+            {
+                V v = m == "get_or_insert_with" ? call0(argAt(args, 0, n), n) : argAt(args, 0, n);
+                V fresh = mkSome(v);
+                slotAt(sp.o, sp.i) = fresh;
+                e = static_cast<EnumObj *>(fresh.p);
+            }
+            out = mkRef(e, 0, true);
+            return true;
+        }
+        break;
+    case 'i':
+        if (m == "is_some")
+        {
+            out = mkBool(some);
+            return true;
+        }
+        if (m == "is_none")
+        {
+            out = mkBool(!some);
+            return true;
+        }
+        if (m == "is_some_and" || m == "is_none_or")
+        {
+            bool yes = some ? isTrue(call1(argAt(args, 0, n), payload(), n), n) : m == "is_none_or";
+            out = mkBool(yes);
+            return true;
+        }
+        if (m == "into_iter")
+        {
+            out = toIter(sv, n);
+            return true;
+        }
+        if (m == "inspect")
+        {
+            if (some)
+                call1(argAt(args, 0, n), mkRef(e, 0, false), n);
+            out = sv;
+            return true;
+        }
+        break;
+    case 'm':
+        if (m == "map")
+        {
+            if (some)
+                return opt(true, call1(argAt(args, 0, n), payload(), n));
+            return opt(false, V());
+        }
+        if (m == "map_or")
+        {
+            out = some ? call1(argAt(args, 1, n), payload(), n) : argAt(args, 0, n);
+            return true;
+        }
+        if (m == "map_or_else")
+        {
+            out = some ? call1(argAt(args, 1, n), payload(), n) : call0(argAt(args, 0, n), n);
+            return true;
+        }
+        break;
+    case 'o':
+        if (m == "ok_or")
+        {
+            out = some ? mkOk(payload()) : mkErr(argAt(args, 0, n));
+            return true;
+        }
+        if (m == "ok_or_else")
+        {
+            out = some ? mkOk(payload()) : mkErr(call0(argAt(args, 0, n), n));
+            return true;
+        }
+        if (m == "or")
+        {
+            out = some ? sv : argAt(args, 0, n);
+            return true;
+        }
+        if (m == "or_else")
+        {
+            out = some ? sv : call0(argAt(args, 0, n), n);
+            return true;
+        }
+        break;
+    case 'r':
+        if (m == "replace")
+        {
+            V old = sv;
+            slotAt(sp.o, sp.i) = mkSome(argAt(args, 0, n));
+            out = old;
+            return true;
+        }
+        break;
+    case 't':
+        if (m == "take")
+        {
+            slotAt(sp.o, sp.i) = mkNone();
+            out = sv;
+            return true;
+        }
+        if (m == "transpose")
+        {
+            // Option<Result<T, E>> to Result<Option<T>, E>
+            if (!some)
+            {
+                out = mkOk(mkNone());
+                return true;
+            }
+            V inner = peel(e->items[0]);
+            out = isOkV(inner) ? mkOk(mkSome(inner.p->items[0])) : inner;
+            return true;
+        }
+        break;
+    case 'u':
+        if (m == "unwrap")
+        {
+            if (!some)
+                panicAt(n, "called `Option::unwrap()` on a `None` value");
+            out = payload();
+            return true;
+        }
+        if (m == "unwrap_or")
+        {
+            out = some ? payload() : argAt(args, 0, n);
+            return true;
+        }
+        if (m == "unwrap_or_else")
+        {
+            out = some ? payload() : call0(argAt(args, 0, n), n);
+            return true;
+        }
+        if (m == "unwrap_or_default")
+        {
+            out = some ? payload() : hint ? defaultFor(hint, n) : openDefault();
+            return true;
+        }
+        if (m == "unzip")
+        {
+            if (!some)
+            {
+                out = pairOf(mkNone(), mkNone());
+                return true;
+            }
+            V pair = peel(e->items[0]);
+            out = pairOf(mkSome(pair.p->items[0]), mkSome(pair.p->items[1]));
+            return true;
+        }
+        break;
+    case 'x':
+        if (m == "xor")
+        {
+            V other = argAt(args, 0, n);
+            bool otherSome = isSomeV(other);
+            out = some && !otherSome ? sv : !some && otherSome ? other : mkNone();
+            return true;
+        }
+        break;
+    case 'z':
+        if (m == "zip")
+        {
+            V other = peel(argAt(args, 0, n));
+            if (some && isSomeV(other))
+                return opt(true, pairOf(payload(), other.p->items[0]));
+            return opt(false, V());
+        }
+        break;
+    }
+    // a reference to what it holds
+    if (m == "as_ref" || m == "as_deref")
+        return opt(some, some ? mkRef(e, 0, false) : V());
+    if (m == "as_mut" || m == "as_deref_mut")
+        return opt(some, some ? mkRef(e, 0, true) : V());
+    if (m == "iter" || m == "iter_mut")
+    {
+        out = toIter(mkRef(sp.o, sp.i, m == "iter_mut"), n);
+        return true;
+    }
+    return false;
+}
+
+bool resultMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    EnumObj *e = static_cast<EnumObj *>(sv.p);
+    bool ok = e->variant == 0;
+    auto payload = [&]() -> V
+    {
+        V v = e->items[0];
+        if (!takeSelf(sp, sv) && isCopy(v))
+            v = copyShell(v);
+        return v;
+    };
+    switch (m[0])
+    {
+    case 'a':
+        if (m == "and_then")
+        {
+            out = ok ? call1(argAt(args, 0, n), payload(), n) : sv;
+            return true;
+        }
+        if (m == "and")
+        {
+            out = ok ? argAt(args, 0, n) : sv;
+            return true;
+        }
+        if (m == "as_ref" || m == "as_deref")
+        {
+            out = ok ? mkOk(mkRef(e, 0, false)) : mkErr(mkRef(e, 0, false));
+            return true;
+        }
+        if (m == "as_mut")
+        {
+            out = ok ? mkOk(mkRef(e, 0, true)) : mkErr(mkRef(e, 0, true));
+            return true;
+        }
+        break;
+    case 'c':
+        if (m == "cloned" || m == "copied")
+        {
+            out = ok ? mkOk(cloneValue(peel(e->items[0]), n)) : sv;
+            return true;
+        }
+        if (m == "clone")
+        {
+            out = cloneValue(sv, n);
+            return true;
+        }
+        break;
+    case 'e':
+        if (m == "expect")
+        {
+            if (!ok)
+                panicAt(n, strOf(argAt(args, 0, n)) + ": " + debugStr(e->items[0], false, n));
+            out = payload();
+            return true;
+        }
+        if (m == "expect_err")
+        {
+            if (ok)
+                panicAt(n, strOf(argAt(args, 0, n)) + ": " + debugStr(e->items[0], false, n));
+            out = payload();
+            return true;
+        }
+        if (m == "err")
+        {
+            out = ok ? mkNone() : mkSome(payload());
+            return true;
+        }
+        break;
+    case 'i':
+        if (m == "is_ok")
+        {
+            out = mkBool(ok);
+            return true;
+        }
+        if (m == "is_err")
+        {
+            out = mkBool(!ok);
+            return true;
+        }
+        if (m == "is_ok_and")
+        {
+            out = mkBool(ok && isTrue(call1(argAt(args, 0, n), payload(), n), n));
+            return true;
+        }
+        if (m == "is_err_and")
+        {
+            out = mkBool(!ok && isTrue(call1(argAt(args, 0, n), payload(), n), n));
+            return true;
+        }
+        if (m == "into_iter" || m == "iter")
+        {
+            out = m == "iter" ? toIter(mkRef(sp.o, sp.i, false), n) : toIter(sv, n);
+            return true;
+        }
+        if (m == "inspect" || m == "inspect_err")
+        {
+            if (ok == (m == "inspect"))
+                call1(argAt(args, 0, n), mkRef(e, 0, false), n);
+            out = sv;
+            return true;
+        }
+        break;
+    case 'm':
+        if (m == "map")
+        {
+            out = ok ? mkOk(call1(argAt(args, 0, n), payload(), n)) : sv;
+            return true;
+        }
+        if (m == "map_err")
+        {
+            out = ok ? sv : mkErr(call1(argAt(args, 0, n), payload(), n));
+            return true;
+        }
+        if (m == "map_or")
+        {
+            out = ok ? call1(argAt(args, 1, n), payload(), n) : argAt(args, 0, n);
+            return true;
+        }
+        if (m == "map_or_else")
+        {
+            out = ok ? call1(argAt(args, 1, n), payload(), n) : call1(argAt(args, 0, n), payload(), n);
+            return true;
+        }
+        break;
+    case 'o':
+        if (m == "ok")
+        {
+            out = ok ? mkSome(payload()) : mkNone();
+            return true;
+        }
+        if (m == "or")
+        {
+            out = ok ? sv : argAt(args, 0, n);
+            return true;
+        }
+        if (m == "or_else")
+        {
+            out = ok ? sv : call1(argAt(args, 0, n), payload(), n);
+            return true;
+        }
+        break;
+    case 't':
+        if (m == "transpose")
+        {
+            // Result<Option<T>, E> to Option<Result<T, E>>
+            if (!ok)
+            {
+                out = mkSome(sv);
+                return true;
+            }
+            V inner = peel(e->items[0]);
+            out = isSomeV(inner) ? mkSome(mkOk(inner.p->items[0])) : mkNone();
+            return true;
+        }
+        break;
+    case 'u':
+        if (m == "unwrap")
+        {
+            if (!ok)
+                panicAt(n, "called `Result::unwrap()` on an `Err` value: " + debugStr(e->items[0], false, n));
+            out = payload();
+            return true;
+        }
+        if (m == "unwrap_err")
+        {
+            if (ok)
+                panicAt(n, "called `Result::unwrap_err()` on an `Ok` value: " + debugStr(e->items[0], false, n));
+            out = payload();
+            return true;
+        }
+        if (m == "unwrap_or")
+        {
+            out = ok ? payload() : argAt(args, 0, n);
+            return true;
+        }
+        if (m == "unwrap_or_else")
+        {
+            out = ok ? payload() : call1(argAt(args, 0, n), payload(), n);
+            return true;
+        }
+        if (m == "unwrap_or_default")
+        {
+            out = ok ? payload() : hint ? defaultFor(hint, n) : openDefault();
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+} // namespace rust

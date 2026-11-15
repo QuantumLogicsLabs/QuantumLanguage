@@ -1,0 +1,1738 @@
+// quantum: cpp
+// Rust front-end: numbers. Integers are 128 bits wide in two's complement
+// (a signed type sign-extended, an unsigned one zero-extended) with the type
+// beside them; an operation works out the exact result and then asks whether
+// the type can hold it: if not, it panics as a debug build does
+// ("attempt to add with overflow"), or wraps / saturates / says None for the
+// wrapping_, saturating_ and checked_ methods. Floats are doubles, rounded to
+// single precision after each step when the type is f32. Also here: casts
+// (`as`), parsing, and the text of a number as Rust prints it.
+#include "RustRt.h.sa"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+namespace rust
+{
+
+namespace
+{
+
+struct U128
+{
+    uint64_t hi = 0, lo = 0;
+};
+
+// sign and magnitude: what the checked operations work on
+struct Wide
+{
+    bool neg = false;
+    U128 m;
+};
+
+bool ult(const U128 &a, const U128 &b) { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
+bool uzero(const U128 &a) { return a.hi == 0 && a.lo == 0; }
+
+U128 uadd(const U128 &a, const U128 &b, bool &carry)
+{
+    U128 r;
+    r.lo = a.lo + b.lo;
+    uint64_t c = r.lo < a.lo ? 1 : 0;
+    uint64_t t = a.hi + b.hi;
+    bool c1 = t < a.hi;
+    r.hi = t + c;
+    carry = c1 || r.hi < t;
+    return r;
+}
+
+U128 usub(const U128 &a, const U128 &b) // a >= b
+{
+    U128 r;
+    r.lo = a.lo - b.lo;
+    r.hi = a.hi - b.hi - (a.lo < b.lo ? 1 : 0);
+    return r;
+}
+
+U128 umul(const U128 &a, const U128 &b, bool &overflow)
+{
+    const uint64_t M = 0xFFFFFFFFULL;
+    uint64_t x[4] = {a.lo & M, a.lo >> 32, a.hi & M, a.hi >> 32};
+    uint64_t y[4] = {b.lo & M, b.lo >> 32, b.hi & M, b.hi >> 32};
+    uint64_t r[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < 4; ++i)
+    {
+        uint64_t carry = 0;
+        for (int j = 0; j < 4; ++j)
+        {
+            uint64_t t = x[i] * y[j] + r[i + j] + carry;
+            r[i + j] = t & M;
+            carry = t >> 32;
+        }
+        r[i + 4] += carry;
+    }
+    overflow = (r[4] | r[5] | r[6] | r[7]) != 0;
+    U128 out;
+    out.lo = r[0] | (r[1] << 32);
+    out.hi = r[2] | (r[3] << 32);
+    return out;
+}
+
+U128 ushl(const U128 &a, int n)
+{
+    U128 r;
+    if (n <= 0)
+        return a;
+    if (n >= 128)
+        return r;
+    if (n >= 64)
+    {
+        r.hi = a.lo << (n - 64);
+        r.lo = 0;
+    }
+    else
+    {
+        r.hi = (a.hi << n) | (a.lo >> (64 - n));
+        r.lo = a.lo << n;
+    }
+    return r;
+}
+
+U128 ushr(const U128 &a, int n)
+{
+    U128 r;
+    if (n <= 0)
+        return a;
+    if (n >= 128)
+        return r;
+    if (n >= 64)
+    {
+        r.lo = a.hi >> (n - 64);
+        r.hi = 0;
+    }
+    else
+    {
+        r.lo = (a.lo >> n) | (a.hi << (64 - n));
+        r.hi = a.hi >> n;
+    }
+    return r;
+}
+
+void udivmod(const U128 &a, const U128 &b, U128 &q, U128 &r)
+{
+    q = U128();
+    r = U128();
+    if (a.hi == 0 && b.hi == 0)
+    {
+        q.lo = a.lo / b.lo;
+        r.lo = a.lo % b.lo;
+        return;
+    }
+    for (int i = 127; i >= 0; --i)
+    {
+        r = ushl(r, 1);
+        uint64_t bit = i >= 64 ? (a.hi >> (i - 64)) & 1 : (a.lo >> i) & 1;
+        r.lo |= bit;
+        if (!ult(r, b))
+        {
+            r = usub(r, b);
+            if (i >= 64)
+                q.hi |= 1ULL << (i - 64);
+            else
+                q.lo |= 1ULL << i;
+        }
+    }
+}
+
+U128 uneg(const U128 &a) // two's complement
+{
+    U128 r;
+    r.lo = ~a.lo + 1;
+    r.hi = ~a.hi + (r.lo == 0 ? 1 : 0);
+    return r;
+}
+
+U128 bitsOf(const V &v)
+{
+    U128 r;
+    r.hi = (uint64_t)v.hi;
+    r.lo = v.lo;
+    return r;
+}
+
+Wide toWide(const V &v)
+{
+    Wide w;
+    if (v.t != PR_U128 && v.hi < 0)
+    {
+        w.neg = true;
+        w.m = uneg(bitsOf(v));
+    }
+    else
+        w.m = bitsOf(v);
+    return w;
+}
+
+// the value of a sign and magnitude as a `t`; ok: it fits
+V fromWide(const Wide &w, uint8_t t, bool &ok)
+{
+    int bits = t ? primBits(t) : 128;
+    bool isSigned = t ? primSigned(t) : true;
+    ok = true;
+    bool zero = uzero(w.m);
+    if (!isSigned)
+    {
+        if (w.neg && !zero)
+            ok = false;
+        else if (bits < 128)
+        {
+            U128 limit;
+            limit.lo = 1;
+            limit = ushl(limit, bits);
+            if (!ult(w.m, limit))
+                ok = false;
+        }
+    }
+    else
+    {
+        U128 limit;
+        limit.lo = 1;
+        limit = ushl(limit, bits - 1); // 2^(bits-1)
+        if (w.neg && !zero)
+        {
+            if (ult(limit, w.m))
+                ok = false;
+        }
+        else if (!ult(w.m, limit))
+            ok = false;
+    }
+    V v;
+    v.k = V_INT;
+    v.t = t;
+    U128 b = (w.neg && !zero) ? uneg(w.m) : w.m;
+    v.lo = b.lo;
+    v.hi = (int64_t)b.hi;
+    return v;
+}
+
+bool fits64(const V &v)
+{
+    if (v.t == PR_U128)
+        return v.hi == 0 && (int64_t)v.lo >= 0;
+    return (v.hi == 0 && (int64_t)v.lo >= 0) || (v.hi == -1 && (int64_t)v.lo < 0);
+}
+
+// whether an int64 is a value of type t (t of at most 64 bits, or untyped)
+bool inRange64(int64_t r, uint8_t t)
+{
+    switch (t)
+    {
+    case PR_I8: return r >= -128 && r <= 127;
+    case PR_I16: return r >= -32768 && r <= 32767;
+    case PR_I32: return r >= -2147483647LL - 1 && r <= 2147483647LL;
+    case PR_U8: return r >= 0 && r <= 255;
+    case PR_U16: return r >= 0 && r <= 65535;
+    case PR_U32: return r >= 0 && r <= 4294967295LL;
+    case PR_U64:
+    case PR_USIZE:
+    case PR_U128:
+        return r >= 0;
+    }
+    return true;
+}
+
+// 128 bits cut to the width of t and extended again by its sign
+V wrapTo(U128 b, uint8_t t)
+{
+    int bits = t ? primBits(t) : 128;
+    bool isSigned = t ? primSigned(t) : true;
+    V v;
+    v.k = V_INT;
+    v.t = t;
+    if (bits < 64)
+    {
+        uint64_t mask = (1ULL << bits) - 1;
+        uint64_t low = b.lo & mask;
+        if (isSigned && (low >> (bits - 1)) & 1)
+        {
+            v.lo = low | ~mask;
+            v.hi = -1;
+        }
+        else
+        {
+            v.lo = low;
+            v.hi = 0;
+        }
+    }
+    else if (bits == 64)
+    {
+        v.lo = b.lo;
+        v.hi = (isSigned && (int64_t)b.lo < 0) ? -1 : 0;
+    }
+    else
+    {
+        v.lo = b.lo;
+        v.hi = (int64_t)b.hi;
+    }
+    return v;
+}
+
+const char *opName(uint8_t op)
+{
+    switch (op)
+    {
+    case O_ADD: return "add";
+    case O_SUB: return "subtract";
+    case O_MUL: return "multiply";
+    case O_DIV: return "divide";
+    case O_REM: return "calculate the remainder";
+    case O_SHL: return "shift left";
+    case O_SHR: return "shift right";
+    case O_NEG: return "negate";
+    }
+    return "compute";
+}
+
+// the exact result of + - * / %; false: it does not fit the type (or n / 0)
+bool exact(uint8_t op, const V &a, const V &b, V &out, bool &divZero)
+{
+    uint8_t t = a.t;
+    divZero = false;
+    if (fits64(a) && fits64(b))
+    {
+        int64_t x = (int64_t)a.lo, y = (int64_t)b.lo, r = 0;
+        bool fast = false;
+        switch (op)
+        {
+        case O_ADD:
+            r = (int64_t)((uint64_t)x + (uint64_t)y);
+            fast = (((x ^ r) & (y ^ r)) >= 0);
+            break;
+        case O_SUB:
+            r = (int64_t)((uint64_t)x - (uint64_t)y);
+            fast = (((x ^ y) & (x ^ r)) >= 0);
+            break;
+        case O_MUL:
+            if (x > -2147483648LL && x < 2147483648LL && y > -2147483648LL && y < 2147483648LL)
+            {
+                r = x * y;
+                fast = true;
+            }
+            break;
+        case O_DIV:
+        case O_REM:
+            if (y == 0)
+            {
+                divZero = true;
+                return false;
+            }
+            if (!(x == (-9223372036854775807LL - 1) && y == -1))
+            {
+                r = op == O_DIV ? x / y : x % y;
+                fast = true;
+            }
+            break;
+        }
+        if (fast)
+        {
+            if (!inRange64(r, t))
+                return false;
+            out = mkInt(r, t);
+            return true;
+        }
+    }
+    Wide x = toWide(a), y = toWide(b), r;
+    bool overflow = false;
+    switch (op)
+    {
+    case O_SUB:
+        y.neg = !y.neg;
+        // fall through: a - b is a + (-b)
+    case O_ADD:
+        if (x.neg == y.neg)
+        {
+            bool carry = false;
+            r.m = uadd(x.m, y.m, carry);
+            r.neg = x.neg;
+            overflow = carry;
+        }
+        else if (!ult(x.m, y.m))
+        {
+            r.m = usub(x.m, y.m);
+            r.neg = x.neg;
+        }
+        else
+        {
+            r.m = usub(y.m, x.m);
+            r.neg = y.neg;
+        }
+        break;
+    case O_MUL:
+        r.m = umul(x.m, y.m, overflow);
+        r.neg = x.neg != y.neg;
+        break;
+    case O_DIV:
+    case O_REM:
+    {
+        if (uzero(y.m))
+        {
+            divZero = true;
+            return false;
+        }
+        U128 q, rem;
+        udivmod(x.m, y.m, q, rem);
+        if (op == O_DIV)
+        {
+            r.m = q;
+            r.neg = x.neg != y.neg;
+        }
+        else
+        {
+            r.m = rem;
+            r.neg = x.neg;
+        }
+        break;
+    }
+    }
+    if (overflow)
+        return false;
+    bool ok = true;
+    out = fromWide(r, t, ok);
+    return ok;
+}
+
+// the digits of a magnitude in a base
+std::string digitsOf(U128 m, int base, bool upper)
+{
+    if (uzero(m))
+        return "0";
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    std::string out;
+    if (m.hi == 0)
+    {
+        uint64_t x = m.lo;
+        while (x)
+        {
+            out += digits[x % (uint64_t)base];
+            x /= (uint64_t)base;
+        }
+    }
+    else
+    {
+        U128 b;
+        b.lo = (uint64_t)base;
+        while (!uzero(m))
+        {
+            U128 q, r;
+            udivmod(m, b, q, r);
+            out += digits[r.lo];
+            m = q;
+        }
+    }
+    return std::string(out.rbegin(), out.rend());
+}
+
+V intArg(std::vector<V> &args, size_t k, const Node *at)
+{
+    if (k >= args.size())
+        errAt(at, "E0061", "this method takes more arguments than were supplied");
+    V v = peel(args[k]);
+    if (v.k != V_INT)
+        errAt(at, "E0308", "mismatched types: expected integer, found `" + typeName(v) + "`");
+    return v;
+}
+
+double floatArg(std::vector<V> &args, size_t k, const Node *at)
+{
+    if (k >= args.size())
+        errAt(at, "E0061", "this method takes more arguments than were supplied");
+    V v = peel(args[k]);
+    if (v.k != V_FLOAT)
+        errAt(at, "E0308", "mismatched types: expected floating-point number, found `" + typeName(v) + "`");
+    return fval(v);
+}
+
+int popcount(const V &v, int bits)
+{
+    U128 b = bitsOf(v);
+    int n = 0;
+    for (int i = 0; i < bits; ++i)
+        n += (int)((i >= 64 ? (b.hi >> (i - 64)) : (b.lo >> i)) & 1);
+    return n;
+}
+
+int bitAt(const V &v, int i) { return (int)((i >= 64 ? ((uint64_t)v.hi >> (i - 64)) : (v.lo >> i)) & 1); }
+
+// the unsigned type as wide as t
+uint8_t unsignedOf(uint8_t t)
+{
+    switch (t)
+    {
+    case PR_I8: return PR_U8;
+    case PR_I16: return PR_U16;
+    case PR_I32: return PR_U32;
+    case PR_I64: return PR_U64;
+    case PR_I128: return PR_U128;
+    case PR_ISIZE: return PR_USIZE;
+    }
+    return t;
+}
+
+} // namespace
+
+// ─── types ─────────────────────────────────────────────────────────────────
+
+bool isIntPrim(uint8_t p) { return p >= PR_I8 && p <= PR_USIZE; }
+bool isFloatPrim(uint8_t p) { return p == PR_F32 || p == PR_F64; }
+
+int primBits(uint8_t p)
+{
+    switch (p)
+    {
+    case PR_I8:
+    case PR_U8:
+        return 8;
+    case PR_I16:
+    case PR_U16:
+        return 16;
+    case PR_I32:
+    case PR_U32:
+    case PR_F32:
+        return 32;
+    case PR_I128:
+    case PR_U128:
+        return 128;
+    }
+    return 64;
+}
+
+bool primSigned(uint8_t p) { return p >= PR_I8 && p <= PR_ISIZE; }
+
+bool intFits(const V &v, uint8_t prim)
+{
+    bool ok = true;
+    fromWide(toWide(v), prim, ok);
+    return ok;
+}
+
+V intConvert(V v, uint8_t prim) { return wrapTo(bitsOf(v), prim); }
+
+V intLimit(uint8_t prim, bool max)
+{
+    int bits = primBits(prim);
+    U128 b;
+    if (primSigned(prim))
+    {
+        U128 one;
+        one.lo = 1;
+        U128 top = ushl(one, bits - 1); // 2^(bits-1)
+        if (max)
+            b = usub(top, one);
+        else
+            b = uneg(top);
+    }
+    else if (max)
+    {
+        b.lo = ~0ULL;
+        b.hi = ~0ULL;
+    }
+    return wrapTo(b, prim);
+}
+
+V fixInt(V v)
+{
+    if (v.k == V_INT && v.t == 0)
+        v.t = intFits(v, PR_I32) ? PR_I32 : intFits(v, PR_I64) ? PR_I64 : PR_I128;
+    return v;
+}
+
+V fixFloat(V v)
+{
+    if (v.k == V_FLOAT && v.t == 0)
+        v.t = PR_F64;
+    return v;
+}
+
+int64_t asI64(const V &v) { return (int64_t)v.lo; }
+uint64_t asU64(const V &v) { return v.lo; }
+
+int64_t toIndex(const V &raw, const Node *at)
+{
+    V v = peel(raw);
+    if (v.k != V_INT)
+        errAt(at, "E0277", "the type `[_]` cannot be indexed by `" + typeName(v) + "`",
+              "slice indices are of type `usize` or ranges of `usize`");
+    if (v.t != 0 && v.t != PR_USIZE)
+        errAt(at, "E0277", std::string("the type `[_]` cannot be indexed by `") + primName(v.t) + "`",
+              "slice indices are of type `usize` or ranges of `usize`");
+    if (v.hi != 0 || (int64_t)v.lo < 0)
+        errAt(at, "E0277", "a negative number cannot be an index: slice indices are of type `usize`");
+    return (int64_t)v.lo;
+}
+
+void unifyNum(V &a, V &b, const Node *at, const char *what)
+{
+    if (a.t == b.t)
+        return;
+    if (a.k == V_INT && b.k == V_INT)
+    {
+        if (a.t == 0)
+        {
+            if (!intFits(a, b.t))
+                errAt(at, "", std::string("literal out of range for `") + primName(b.t) + "`");
+            a = intConvert(a, b.t);
+            return;
+        }
+        if (b.t == 0)
+        {
+            if (!intFits(b, a.t))
+                errAt(at, "", std::string("literal out of range for `") + primName(a.t) + "`");
+            b = intConvert(b, a.t);
+            return;
+        }
+    }
+    else if (a.k == V_FLOAT && b.k == V_FLOAT)
+    {
+        if (a.t == 0)
+        {
+            a = mkFloat(fval(a), b.t);
+            return;
+        }
+        if (b.t == 0)
+        {
+            b = mkFloat(fval(b), a.t);
+            return;
+        }
+    }
+    errAt(at, "E0308", std::string("mismatched types: expected `") + primName(a.t) + "`, found `" + primName(b.t) + "`",
+          std::string(what) + " needs both operands to have the same type");
+}
+
+int intCmp(const V &a, const V &b)
+{
+    if (a.t == PR_U128 || b.t == PR_U128)
+    {
+        if ((uint64_t)a.hi != (uint64_t)b.hi)
+            return (uint64_t)a.hi < (uint64_t)b.hi ? -1 : 1;
+    }
+    else if (a.hi != b.hi)
+        return a.hi < b.hi ? -1 : 1;
+    return a.lo < b.lo ? -1 : a.lo > b.lo ? 1 : 0;
+}
+
+// ─── integer arithmetic ────────────────────────────────────────────────────
+
+V intBinary(uint8_t op, V a, V b, const Node *at)
+{
+    switch (op)
+    {
+    case O_ADD:
+    case O_SUB:
+    case O_MUL:
+    case O_DIV:
+    case O_REM:
+    {
+        V out;
+        bool divZero = false;
+        if (exact(op, a, b, out, divZero))
+            return out;
+        if (divZero)
+            panicAt(at, op == O_DIV ? "attempt to divide by zero"
+                                    : "attempt to calculate the remainder with a divisor of zero");
+        panicAt(at, std::string("attempt to ") + opName(op) + " with overflow");
+    }
+    case O_BITAND:
+        a.lo &= b.lo;
+        a.hi &= b.hi;
+        return a;
+    case O_BITOR:
+        a.lo |= b.lo;
+        a.hi |= b.hi;
+        return a;
+    case O_BITXOR:
+        a.lo ^= b.lo;
+        a.hi ^= b.hi;
+        return a;
+    case O_SHL:
+    case O_SHR:
+    {
+        int bits = a.t ? primBits(a.t) : 128;
+        if (b.hi != 0 || b.lo >= (uint64_t)bits)
+            panicAt(at, std::string("attempt to ") + opName(op) + " with overflow");
+        int n = (int)b.lo;
+        if (op == O_SHL)
+            return wrapTo(ushl(bitsOf(a), n), a.t);
+        bool arithmetic = a.t != PR_U128 && a.hi < 0;
+        U128 r;
+        if (arithmetic)
+        {
+            U128 inv = bitsOf(a);
+            inv.lo = ~inv.lo;
+            inv.hi = ~inv.hi;
+            r = ushr(inv, n);
+            r.lo = ~r.lo;
+            r.hi = ~r.hi;
+        }
+        else
+            r = ushr(bitsOf(a), n);
+        a.lo = r.lo;
+        a.hi = (int64_t)r.hi;
+        return a;
+    }
+    }
+    errAt(at, "E0369", "this operator cannot be applied to integers");
+}
+
+V intWrapping(uint8_t op, V a, V b)
+{
+    U128 x = bitsOf(a), y = bitsOf(b), r;
+    bool ignored = false;
+    switch (op)
+    {
+    case O_ADD:
+        r = uadd(x, y, ignored);
+        break;
+    case O_SUB:
+        r = uadd(x, uneg(y), ignored);
+        break;
+    case O_MUL:
+        r = umul(x, y, ignored);
+        break;
+    default:
+        r = x;
+    }
+    return wrapTo(r, a.t);
+}
+
+bool intChecked(uint8_t op, V a, V b, V &out)
+{
+    bool divZero = false;
+    return exact(op, a, b, out, divZero);
+}
+
+V intNeg(V a, const Node *at)
+{
+    if (a.t && !primSigned(a.t))
+        errAt(at, "E0600", std::string("cannot apply unary operator `-` to type `") + primName(a.t) + "`",
+              "unsigned values cannot be negated");
+    Wide w = toWide(a);
+    w.neg = !w.neg;
+    bool ok = true;
+    V out = fromWide(w, a.t, ok);
+    if (!ok)
+        panicAt(at, "attempt to negate with overflow");
+    return out;
+}
+
+V intNot(V a)
+{
+    U128 b = bitsOf(a);
+    b.lo = ~b.lo;
+    b.hi = ~b.hi;
+    return wrapTo(b, a.t);
+}
+
+// ─── floats ────────────────────────────────────────────────────────────────
+
+V floatBinary(uint8_t op, V a, V b, const Node *at)
+{
+    double x = fval(a), y = fval(b), r = 0;
+    switch (op)
+    {
+    case O_ADD: r = x + y; break;
+    case O_SUB: r = x - y; break;
+    case O_MUL: r = x * y; break;
+    case O_DIV: r = x / y; break;
+    case O_REM: r = std::fmod(x, y); break;
+    default:
+        errAt(at, "E0369", std::string("no implementation for `") + (a.t ? primName(a.t) : "f64") +
+                               "` with this operator");
+    }
+    return mkFloat(r, a.t);
+}
+
+// ─── casts ─────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+double intToDouble(const V &v)
+{
+    if (fits64(v))
+        return (double)(int64_t)v.lo;
+    Wide w = toWide(v);
+    double d = (double)w.m.hi * 18446744073709551616.0 + (double)w.m.lo;
+    return w.neg ? -d : d;
+}
+
+// f as an integer type: toward zero, saturating, NaN is 0
+V floatToInt(double f, uint8_t prim)
+{
+    if (f != f)
+        return mkInt(0, prim);
+    f = std::trunc(f);
+    Wide w;
+    w.neg = f < 0;
+    double m = w.neg ? -f : f;
+    if (m >= 340282366920938463463374607431768211456.0) // 2^128
+        return intLimit(prim, !w.neg);
+    w.m.hi = (uint64_t)(m / 18446744073709551616.0);
+    w.m.lo = (uint64_t)(m - (double)w.m.hi * 18446744073709551616.0);
+    bool ok = true;
+    V out = fromWide(w, prim, ok);
+    return ok ? out : intLimit(prim, !w.neg);
+}
+
+} // namespace
+
+V numCast(V v, Ty *to, const Node *at)
+{
+    uint8_t prim = tyPrim(to);
+    v = peel(v);
+    if (prim == PR_NONE)
+        return v; // a pointer cast, `as _`: nothing changes here
+    if (isIntPrim(prim))
+    {
+        switch (v.k)
+        {
+        case V_INT:
+            return intConvert(v, prim);
+        case V_FLOAT:
+            return floatToInt(fval(v), prim);
+        case V_CHAR:
+        case V_BOOL:
+            return intConvert(mkUint(v.lo, PR_U32), prim);
+        case V_ENUM:
+        {
+            EnumObj *e = static_cast<EnumObj *>(v.p);
+            if (!e->items.empty())
+                errAt(at, "E0605", "non-primitive cast: `" + e->def->name + "` as `" + primName(prim) + "`",
+                      "an `as` expression can only be used to convert between primitive types or to coerce to "
+                      "a specific trait object");
+            return intConvert(mkInt(e->def->variants[(size_t)e->variant].discVal, PR_I64), prim);
+        }
+        }
+        errAt(at, "E0605", "non-primitive cast: `" + typeName(v) + "` as `" + primName(prim) + "`");
+    }
+    if (isFloatPrim(prim))
+    {
+        if (v.k == V_INT)
+            return mkFloat(intToDouble(v), prim);
+        if (v.k == V_FLOAT)
+            return mkFloat(fval(v), prim);
+        errAt(at, "E0606", "casting `" + typeName(v) + "` as `" + primName(prim) + "` is invalid");
+    }
+    if (prim == PR_CHAR)
+    {
+        if (v.k == V_CHAR)
+            return v;
+        if (v.k == V_INT && (v.t == PR_U8 || (v.t == 0 && v.hi == 0 && v.lo < 256)))
+            return mkChar((uint32_t)v.lo);
+        errAt(at, "E0604", "only `u8` can be cast as `char`, not `" + typeName(v) + "`", "invalid cast");
+    }
+    if (prim == PR_BOOL)
+    {
+        if (v.k == V_BOOL)
+            return v;
+        errAt(at, "E0054", "cannot cast `" + typeName(v) + "` as `bool`", "unsupported cast");
+    }
+    return v;
+}
+
+// ─── text ──────────────────────────────────────────────────────────────────
+
+std::string intToString(const V &v)
+{
+    Wide w = toWide(v);
+    std::string s = digitsOf(w.m, 10, false);
+    return w.neg ? "-" + s : s;
+}
+
+std::string intToRadix(const V &v, int base, bool upper)
+{
+    // a negative number shows its two's complement at the type's width
+    U128 b = bitsOf(v);
+    int bits = v.t ? primBits(v.t) : 32;
+    if (v.t != PR_U128 && v.hi < 0 && bits < 128)
+    {
+        if (bits < 64)
+        {
+            b.lo &= (1ULL << bits) - 1;
+            b.hi = 0;
+        }
+        else
+            b.hi = 0;
+    }
+    return digitsOf(b, base, upper);
+}
+
+namespace
+{
+
+// The shortest digits that read back as d (> 0, finite) and the exponent of
+// the first: d = D.DDD x 10^e
+void shortest(double d, bool f32, std::string &digits, int &e)
+{
+    char buf[64];
+    int limit = f32 ? 9 : 17;
+    for (int p = 1; p <= limit; ++p)
+    {
+        std::snprintf(buf, sizeof buf, "%.*e", p - 1, d);
+        double back = std::strtod(buf, nullptr);
+        if (f32 ? (float)back == (float)d : back == d)
+            break;
+    }
+    digits.clear();
+    const char *s = buf;
+    for (; *s && *s != 'e'; ++s)
+        if (*s >= '0' && *s <= '9')
+            digits += *s;
+    e = *s == 'e' ? std::atoi(s + 1) : 0;
+    while (digits.size() > 1 && digits.back() == '0')
+        digits.pop_back();
+}
+
+} // namespace
+
+// Display: positional, as many digits as it takes, never an exponent.
+// Debug: a ".0" on whole numbers, and an exponent for the very large / small.
+std::string floatToString(double d, bool f32, bool debug)
+{
+    if (d != d)
+        return "NaN";
+    if (std::isinf(d))
+        return d < 0 ? "-inf" : "inf";
+    std::string sign = std::signbit(d) ? "-" : "";
+    double m = std::fabs(d);
+    if (m == 0)
+        return sign + (debug ? "0.0" : "0");
+    std::string digits;
+    int e = 0;
+    shortest(m, f32, digits, e);
+    if (debug && (e >= 16 || e < -4))
+    {
+        std::string out = sign + digits.substr(0, 1);
+        if (digits.size() > 1)
+            out += "." + digits.substr(1);
+        return out + "e" + std::to_string(e);
+    }
+    std::string out = sign;
+    if (e >= 0)
+    {
+        size_t whole = (size_t)e + 1;
+        if (digits.size() <= whole)
+        {
+            out += digits + std::string(whole - digits.size(), '0');
+            if (debug)
+                out += ".0";
+        }
+        else
+            out += digits.substr(0, whole) + "." + digits.substr(whole);
+    }
+    else
+        out += "0." + std::string((size_t)(-e - 1), '0') + digits;
+    return out;
+}
+
+std::string floatFixed(double d, int prec)
+{
+    if (d != d)
+        return "NaN";
+    if (std::isinf(d))
+        return d < 0 ? "-inf" : "inf";
+    std::vector<char> buf(400 + (size_t)prec);
+    std::snprintf(buf.data(), buf.size(), "%.*f", prec, d);
+    return std::string(buf.data());
+}
+
+// {:e}: 1.2345e3. prec < 0: the shortest digits.
+std::string floatExp(double d, bool f32, int prec, bool upper)
+{
+    if (d != d)
+        return "NaN";
+    if (std::isinf(d))
+        return d < 0 ? "-inf" : "inf";
+    std::string sign = std::signbit(d) ? "-" : "";
+    double m = std::fabs(d);
+    std::string digits;
+    int e = 0;
+    if (prec < 0)
+    {
+        if (m == 0)
+            digits = "0";
+        else
+            shortest(m, f32, digits, e);
+    }
+    else
+    {
+        std::vector<char> buf(64 + (size_t)prec);
+        std::snprintf(buf.data(), buf.size(), "%.*e", prec, m);
+        const char *s = buf.data();
+        for (; *s && *s != 'e'; ++s)
+            if (*s >= '0' && *s <= '9')
+                digits += *s;
+        e = *s == 'e' ? std::atoi(s + 1) : 0;
+    }
+    std::string out = sign + digits.substr(0, 1);
+    if (digits.size() > 1)
+        out += "." + digits.substr(1);
+    return out + (upper ? "E" : "e") + std::to_string(e);
+}
+
+// str::parse::<integer>(). kind: Empty, InvalidDigit, PosOverflow, NegOverflow
+bool parseInt(const std::string &s, int radix, uint8_t prim, V &out, std::string &kind)
+{
+    if (s.empty())
+    {
+        kind = "Empty";
+        return false;
+    }
+    size_t i = 0;
+    bool neg = false;
+    if (s[0] == '+' || s[0] == '-')
+    {
+        neg = s[0] == '-';
+        i = 1;
+        if (s.size() == 1 || (neg && !primSigned(prim)))
+        {
+            kind = "InvalidDigit";
+            return false;
+        }
+    }
+    Wide w;
+    w.neg = neg;
+    U128 base;
+    base.lo = (uint64_t)radix;
+    bool tooBig = false;
+    for (; i < s.size(); ++i)
+    {
+        char c = s[i];
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10 : c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 99;
+        if (d >= radix)
+        {
+            kind = "InvalidDigit";
+            return false;
+        }
+        if (tooBig)
+            continue;
+        bool overflow = false, carry = false;
+        U128 digit;
+        digit.lo = (uint64_t)d;
+        w.m = uadd(umul(w.m, base, overflow), digit, carry);
+        if (overflow || carry)
+            tooBig = true;
+    }
+    bool ok = !tooBig;
+    if (ok)
+        out = fromWide(w, prim, ok);
+    if (!ok)
+    {
+        kind = neg ? "NegOverflow" : "PosOverflow";
+        return false;
+    }
+    return true;
+}
+
+bool parseFloat(const std::string &s, uint8_t prim, V &out)
+{
+    if (s.empty())
+        return false;
+    size_t i = 0;
+    if (s[0] == '+' || s[0] == '-')
+        i = 1;
+    std::string body;
+    for (size_t k = i; k < s.size(); ++k)
+        body += (char)std::tolower((unsigned char)s[k]);
+    double d = 0;
+    if (body == "inf" || body == "infinity")
+        d = HUGE_VAL;
+    else if (body == "nan")
+        d = nanValue();
+    else
+    {
+        // digits [. digits] [e [+-] digits], with a digit somewhere
+        size_t k = 0;
+        bool digitsSeen = false;
+        while (k < body.size() && body[k] >= '0' && body[k] <= '9')
+        {
+            ++k;
+            digitsSeen = true;
+        }
+        if (k < body.size() && body[k] == '.')
+        {
+            ++k;
+            while (k < body.size() && body[k] >= '0' && body[k] <= '9')
+            {
+                ++k;
+                digitsSeen = true;
+            }
+        }
+        if (!digitsSeen)
+            return false;
+        if (k < body.size() && body[k] == 'e')
+        {
+            ++k;
+            if (k < body.size() && (body[k] == '+' || body[k] == '-'))
+                ++k;
+            size_t expStart = k;
+            while (k < body.size() && body[k] >= '0' && body[k] <= '9')
+                ++k;
+            if (k == expStart)
+                return false;
+        }
+        if (k != body.size())
+            return false;
+        d = std::strtod(body.c_str(), nullptr);
+    }
+    if (s[0] == '-')
+        d = -d;
+    out = mkFloat(d, prim);
+    return true;
+}
+
+// ─── integer methods ───────────────────────────────────────────────────────
+
+bool numMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    (void)sp;
+    (void)hint;
+    const std::string &m = n->s;
+    // an unsuffixed literal keeps its open type (the other operand may fix
+    // it: `0.max(len)` is a usize) and counts as an i32 for what needs a width
+    V a = sv;
+    bool open = a.t == 0;
+    uint8_t t = open ? PR_I32 : a.t;
+    int bits = primBits(t);
+    auto other = [&](size_t k) -> V
+    {
+        V b = intArg(args, k, n);
+        unifyNum(a, b, n, "this method");
+        if (open && a.t)
+        {
+            t = a.t;
+            bits = primBits(t);
+            open = false;
+        }
+        return b;
+    };
+    if (m == "abs")
+    {
+        out = (primSigned(t) && a.hi < 0) ? intNeg(a, n) : a;
+        return true;
+    }
+    if (m == "pow" || m == "checked_pow" || m == "wrapping_pow" || m == "saturating_pow" || m == "overflowing_pow")
+    {
+        V e = intArg(args, 0, n);
+        if (e.t != 0 && e.t != PR_U32)
+            errAt(n, "E0308", std::string("mismatched types: expected `u32`, found `") + primName(e.t) + "`");
+        uint64_t exp = e.lo;
+        V result = mkInt(1, t);
+        bool overflowed = false;
+        for (uint64_t k = 0; k < exp; ++k)
+        {
+            V next;
+            if (intChecked(O_MUL, result, a, next))
+                result = next;
+            else if (m == "pow")
+                panicAt(n, "attempt to multiply with overflow");
+            else if (m == "checked_pow")
+            {
+                out = mkNone();
+                return true;
+            }
+            else if (m == "saturating_pow")
+            {
+                bool negative = primSigned(t) && a.hi < 0 && (exp % 2 == 1);
+                out = intLimit(t, !negative);
+                return true;
+            }
+            else
+            {
+                overflowed = true;
+                result = intWrapping(O_MUL, result, a);
+            }
+        }
+        if (m == "checked_pow")
+            out = mkSome(result);
+        else if (m == "overflowing_pow")
+        {
+            std::vector<V> pair;
+            pair.push_back(result);
+            pair.push_back(mkBool(overflowed));
+            out = mkTuple(pair);
+        }
+        else
+            out = result;
+        return true;
+    }
+    // checked_ / wrapping_ / saturating_ / overflowing_ + - * / %
+    {
+        size_t us = m.find('_');
+        if (us != std::string::npos && us + 1 < m.size())
+        {
+            std::string kind = m.substr(0, us), what = m.substr(us + 1);
+            int op = what == "add" ? O_ADD : what == "sub" ? O_SUB : what == "mul" ? O_MUL : what == "div" ? O_DIV :
+                     what == "rem" ? O_REM : -1;
+            bool known = kind == "checked" || kind == "wrapping" || kind == "saturating" || kind == "overflowing";
+            if (known && op >= 0)
+            {
+                V b = other(0);
+                V exactResult;
+                bool divZero = false;
+                bool ok = exact((uint8_t)op, a, b, exactResult, divZero);
+                if (kind == "checked")
+                {
+                    out = ok ? mkSome(exactResult) : mkNone();
+                    return true;
+                }
+                if (divZero)
+                    panicAt(n, op == O_DIV ? "attempt to divide by zero"
+                                           : "attempt to calculate the remainder with a divisor of zero");
+                if (kind == "wrapping")
+                {
+                    // MIN / -1 wraps to MIN, MIN % -1 is 0
+                    out = ok ? exactResult : op == O_DIV ? a : op == O_REM ? mkInt(0, t) : intWrapping((uint8_t)op, a, b);
+                    return true;
+                }
+                if (kind == "saturating")
+                {
+                    if (ok)
+                        out = exactResult;
+                    else
+                    {
+                        bool an = primSigned(t) && a.hi < 0, bn = primSigned(t) && b.hi < 0;
+                        bool negative = op == O_ADD ? an : op == O_SUB ? (an || !primSigned(t)) : (an != bn);
+                        out = intLimit(t, !negative);
+                    }
+                    return true;
+                }
+                std::vector<V> pair;
+                pair.push_back(ok ? exactResult : op == O_DIV ? a : op == O_REM ? mkInt(0, t) : intWrapping((uint8_t)op, a, b));
+                pair.push_back(mkBool(!ok));
+                out = mkTuple(pair);
+                return true;
+            }
+            if (known && what == "neg")
+            {
+                Wide w = toWide(a);
+                w.neg = !w.neg;
+                bool ok = true;
+                V r = fromWide(w, t, ok);
+                if (kind == "checked")
+                    out = ok ? mkSome(r) : mkNone();
+                else if (kind == "wrapping")
+                    out = ok ? r : wrapTo(uneg(bitsOf(a)), t);
+                else if (kind == "saturating")
+                    out = ok ? r : intLimit(t, true);
+                else
+                {
+                    std::vector<V> pair;
+                    pair.push_back(ok ? r : wrapTo(uneg(bitsOf(a)), t));
+                    pair.push_back(mkBool(!ok));
+                    out = mkTuple(pair);
+                }
+                return true;
+            }
+            if (known && what == "abs")
+            {
+                bool negative = primSigned(t) && a.hi < 0;
+                Wide w = toWide(a);
+                w.neg = false;
+                bool ok = true;
+                V r = negative ? fromWide(w, t, ok) : a;
+                if (kind == "checked")
+                    out = ok ? mkSome(r) : mkNone();
+                else if (kind == "saturating")
+                    out = ok ? r : intLimit(t, true);
+                else
+                    out = ok ? r : a;
+                return true;
+            }
+            if ((kind == "checked" || kind == "wrapping") && (what == "shl" || what == "shr"))
+            {
+                V b = intArg(args, 0, n);
+                bool tooFar = b.hi != 0 || b.lo >= (uint64_t)bits;
+                if (kind == "checked" && tooFar)
+                {
+                    out = mkNone();
+                    return true;
+                }
+                V amount = mkUint(b.lo % (uint64_t)bits, PR_U32);
+                V r = intBinary(what == "shl" ? O_SHL : O_SHR, a, amount, n);
+                out = kind == "checked" ? mkSome(r) : r;
+                return true;
+            }
+        }
+    }
+    if (m == "min" || m == "max")
+    {
+        V b = other(0);
+        int c = intCmp(a, b);
+        out = (m == "min") == (c <= 0) ? a : b;
+        return true;
+    }
+    if (m == "clamp")
+    {
+        V lo = other(0), hi = other(1);
+        if (intCmp(lo, hi) > 0)
+            panicAt(n, "assertion failed: min <= max");
+        out = intCmp(a, lo) < 0 ? lo : intCmp(a, hi) > 0 ? hi : a;
+        return true;
+    }
+    if (m == "signum")
+    {
+        out = mkInt(a.hi < 0 && primSigned(t) ? -1 : (a.lo == 0 && a.hi == 0) ? 0 : 1, t);
+        return true;
+    }
+    if (m == "is_positive")
+    {
+        out = mkBool(!(primSigned(t) && a.hi < 0) && !(a.lo == 0 && a.hi == 0));
+        return true;
+    }
+    if (m == "is_negative")
+    {
+        out = mkBool(primSigned(t) && a.hi < 0);
+        return true;
+    }
+    if (m == "count_ones" || m == "count_zeros")
+    {
+        int ones = popcount(a, bits);
+        out = mkUint((uint64_t)(m == "count_ones" ? ones : bits - ones), PR_U32);
+        return true;
+    }
+    if (m == "leading_zeros" || m == "leading_ones" || m == "trailing_zeros" || m == "trailing_ones")
+    {
+        int want = (m == "leading_ones" || m == "trailing_ones") ? 1 : 0;
+        bool leading = m[0] == 'l';
+        int count = 0;
+        for (int i = 0; i < bits; ++i)
+        {
+            if (bitAt(a, leading ? bits - 1 - i : i) != want)
+                break;
+            ++count;
+        }
+        out = mkUint((uint64_t)count, PR_U32);
+        return true;
+    }
+    if (m == "rotate_left" || m == "rotate_right")
+    {
+        V b = intArg(args, 0, n);
+        int k = (int)(b.lo % (uint64_t)bits);
+        if (m == "rotate_right")
+            k = (bits - k) % bits;
+        U128 x = bitsOf(a);
+        if (bits < 128)
+        {
+            // keep only the type's bits
+            if (bits < 64)
+            {
+                x.lo &= (1ULL << bits) - 1;
+                x.hi = 0;
+            }
+            else
+                x.hi = 0;
+        }
+        U128 left = ushl(x, k), right = ushr(x, bits - k);
+        U128 r;
+        r.lo = left.lo | (k == 0 ? 0 : right.lo);
+        r.hi = left.hi | (k == 0 ? 0 : right.hi);
+        out = wrapTo(r, t);
+        return true;
+    }
+    if (m == "swap_bytes" || m == "reverse_bits" || m == "to_be" || m == "to_le")
+    {
+        if (m == "to_le")
+        {
+            out = a;
+            return true;
+        }
+        U128 x = bitsOf(a), r;
+        int unit = m == "reverse_bits" ? 1 : 8;
+        for (int i = 0; i < bits; i += unit)
+        {
+            for (int j = 0; j < unit; ++j)
+            {
+                int from = i + j, to = bits - unit - i + j;
+                uint64_t bit = from >= 64 ? (x.hi >> (from - 64)) & 1 : (x.lo >> from) & 1;
+                if (to >= 64)
+                    r.hi |= bit << (to - 64);
+                else
+                    r.lo |= bit << to;
+            }
+        }
+        out = wrapTo(r, t);
+        return true;
+    }
+    if (m == "rem_euclid" || m == "div_euclid" || m == "checked_rem_euclid" || m == "checked_div_euclid")
+    {
+        V b = other(0);
+        bool checked = m[0] == 'c';
+        if (b.lo == 0 && b.hi == 0)
+        {
+            if (checked)
+            {
+                out = mkNone();
+                return true;
+            }
+            panicAt(n, m == "rem_euclid" ? "attempt to calculate the remainder with a divisor of zero"
+                                         : "attempt to divide by zero");
+        }
+        V q, r;
+        bool dz = false;
+        if (!exact(O_DIV, a, b, q, dz) || !exact(O_REM, a, b, r, dz))
+        {
+            if (checked)
+            {
+                out = mkNone();
+                return true;
+            }
+            panicAt(n, m == "rem_euclid" ? "attempt to calculate the remainder with overflow"
+                                         : "attempt to divide with overflow");
+        }
+        if (primSigned(t) && r.hi < 0)
+        {
+            // a negative remainder: step toward the positive one
+            bool bneg = b.hi < 0;
+            V absb = bneg ? intNeg(b, n) : b;
+            r = intBinary(O_ADD, r, absb, n);
+            q = intBinary(bneg ? O_ADD : O_SUB, q, mkInt(1, t), n);
+        }
+        V result = (m == "rem_euclid" || m == "checked_rem_euclid") ? r : q;
+        out = checked ? mkSome(result) : result;
+        return true;
+    }
+    if (m == "is_power_of_two")
+    {
+        out = mkBool(!(a.lo == 0 && a.hi == 0) && popcount(a, bits) == 1 && !(primSigned(t) && a.hi < 0));
+        return true;
+    }
+    if (m == "next_power_of_two" || m == "checked_next_power_of_two")
+    {
+        V p = mkInt(1, t);
+        bool ok = true;
+        while (intCmp(p, a) < 0)
+        {
+            V next;
+            if (!intChecked(O_MUL, p, mkInt(2, t), next))
+            {
+                ok = false;
+                break;
+            }
+            p = next;
+        }
+        if (m[0] == 'c')
+            out = ok ? mkSome(p) : mkNone();
+        else if (!ok)
+            panicAt(n, "attempt to add with overflow");
+        else
+            out = p;
+        return true;
+    }
+    if (m == "abs_diff")
+    {
+        V b = other(0);
+        V lo = intCmp(a, b) <= 0 ? a : b, hi = intCmp(a, b) <= 0 ? b : a;
+        // the difference always fits the unsigned type
+        V wide = intWrapping(O_SUB, intConvert(hi, PR_I128), intConvert(lo, PR_I128));
+        out = intConvert(wide, unsignedOf(t));
+        return true;
+    }
+    if (m == "unsigned_abs")
+    {
+        Wide w = toWide(a);
+        w.neg = false;
+        bool ok = true;
+        out = fromWide(w, unsignedOf(t), ok);
+        return true;
+    }
+    if (m == "isqrt")
+    {
+        if (primSigned(t) && a.hi < 0)
+            panicAt(n, "argument of integer square root cannot be negative");
+        U128 x = bitsOf(a), r, bit;
+        bit.lo = 1;
+        bit = ushl(bit, 126);
+        while (ult(x, bit))
+            bit = ushr(bit, 2);
+        while (!uzero(bit))
+        {
+            bool c = false;
+            U128 sum = uadd(r, bit, c);
+            if (!ult(x, sum))
+            {
+                x = usub(x, sum);
+                r = uadd(ushr(r, 1), bit, c);
+            }
+            else
+                r = ushr(r, 1);
+            bit = ushr(bit, 2);
+        }
+        out = wrapTo(r, t);
+        return true;
+    }
+    if (m == "ilog2" || m == "ilog10" || m == "ilog" || m == "checked_ilog2" || m == "checked_ilog10")
+    {
+        bool checked = m[0] == 'c';
+        bool positive = !(primSigned(t) && a.hi < 0) && !(a.lo == 0 && a.hi == 0);
+        if (!positive)
+        {
+            if (checked)
+            {
+                out = mkNone();
+                return true;
+            }
+            panicAt(n, "argument of integer logarithm must be positive");
+        }
+        uint64_t base = m.find("10") != std::string::npos ? 10 : m.find('2') != std::string::npos ? 2 : 0;
+        if (base == 0)
+        {
+            V b = other(0);
+            base = b.lo;
+            if (base < 2)
+                panicAt(n, "argument of integer logarithm must be positive");
+        }
+        U128 x = bitsOf(a), b128;
+        b128.lo = base;
+        int count = 0;
+        for (;;)
+        {
+            U128 q, r;
+            udivmod(x, b128, q, r);
+            if (uzero(q))
+                break;
+            x = q;
+            ++count;
+        }
+        V result = mkUint((uint64_t)count, PR_U32);
+        out = checked ? mkSome(result) : result;
+        return true;
+    }
+    if (m == "to_be_bytes" || m == "to_le_bytes" || m == "to_ne_bytes")
+    {
+        std::vector<V> bytes;
+        int count = bits / 8;
+        for (int i = 0; i < count; ++i)
+        {
+            int idx = m == "to_be_bytes" ? count - 1 - i : i;
+            uint64_t byte = idx >= 8 ? ((uint64_t)a.hi >> ((idx - 8) * 8)) & 0xFF : (a.lo >> (idx * 8)) & 0xFF;
+            bytes.push_back(mkUint(byte, PR_U8));
+        }
+        out = mkSeq(V_ARRAY, bytes);
+        return true;
+    }
+    if (m == "midpoint")
+    {
+        V b = other(0);
+        V sum = intWrapping(O_ADD, intConvert(a, PR_I128), intConvert(b, PR_I128));
+        V half;
+        bool dz = false;
+        exact(O_DIV, sum, mkInt(2, PR_I128), half, dz);
+        out = intConvert(half, t);
+        return true;
+    }
+    // bytes as ASCII characters
+    if (m.compare(0, 9, "is_ascii_") == 0 || m == "is_ascii" || m == "to_ascii_uppercase" ||
+        m == "to_ascii_lowercase" || m == "eq_ignore_ascii_case")
+    {
+        uint64_t c = a.lo;
+        bool ascii = a.hi == 0 && c < 128;
+        bool upper = ascii && c >= 'A' && c <= 'Z', lower = ascii && c >= 'a' && c <= 'z';
+        bool digit = ascii && c >= '0' && c <= '9';
+        if (m == "is_ascii") out = mkBool(ascii);
+        else if (m == "is_ascii_digit") out = mkBool(digit);
+        else if (m == "is_ascii_alphabetic") out = mkBool(upper || lower);
+        else if (m == "is_ascii_alphanumeric") out = mkBool(upper || lower || digit);
+        else if (m == "is_ascii_uppercase") out = mkBool(upper);
+        else if (m == "is_ascii_lowercase") out = mkBool(lower);
+        else if (m == "is_ascii_whitespace") out = mkBool(ascii && (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0C));
+        else if (m == "is_ascii_punctuation") out = mkBool(ascii && c > 32 && c < 127 && !upper && !lower && !digit);
+        else if (m == "is_ascii_hexdigit") out = mkBool(digit || (ascii && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))));
+        else if (m == "is_ascii_graphic") out = mkBool(ascii && c > 32 && c < 127);
+        else if (m == "is_ascii_control") out = mkBool(ascii && (c < 32 || c == 127));
+        else if (m == "to_ascii_uppercase") out = mkUint(lower ? c - 32 : c, t);
+        else if (m == "to_ascii_lowercase") out = mkUint(upper ? c + 32 : c, t);
+        else if (m == "eq_ignore_ascii_case")
+        {
+            V b = other(0);
+            uint64_t d = b.lo;
+            uint64_t x = (c >= 'A' && c <= 'Z') ? c + 32 : c, y = (d >= 'A' && d <= 'Z') ? d + 32 : d;
+            out = mkBool(x == y);
+        }
+        else
+            return false;
+        return true;
+    }
+    return false;
+}
+
+// ─── float methods ─────────────────────────────────────────────────────────
+
+bool floatMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    (void)sp;
+    (void)hint;
+    const std::string &m = n->s;
+    V a = fixFloat(sv);
+    uint8_t t = a.t;
+    double x = fval(a);
+    auto f = [&](double r) -> bool
+    {
+        out = mkFloat(r, t);
+        return true;
+    };
+    auto b = [&](bool r) -> bool
+    {
+        out = mkBool(r);
+        return true;
+    };
+    switch (m.size() > 0 ? m[0] : ' ')
+    {
+    case 'a':
+        if (m == "abs") return f(std::fabs(x));
+        if (m == "asin") return f(std::asin(x));
+        if (m == "acos") return f(std::acos(x));
+        if (m == "atan") return f(std::atan(x));
+        if (m == "atan2") return f(std::atan2(x, floatArg(args, 0, n)));
+        if (m == "asinh") return f(std::asinh(x));
+        if (m == "acosh") return f(std::acosh(x));
+        if (m == "atanh") return f(std::atanh(x));
+        break;
+    case 'c':
+        if (m == "ceil") return f(std::ceil(x));
+        if (m == "cos") return f(std::cos(x));
+        if (m == "cosh") return f(std::cosh(x));
+        if (m == "cbrt") return f(std::cbrt(x));
+        if (m == "copysign") return f(std::copysign(x, floatArg(args, 0, n)));
+        if (m == "clamp")
+        {
+            double lo = floatArg(args, 0, n), hi = floatArg(args, 1, n);
+            if (!(lo <= hi))
+                panicAt(n, "min > max, or either was NaN. min = " + floatToString(lo, t == PR_F32, true) +
+                               ", max = " + floatToString(hi, t == PR_F32, true));
+            return f(x < lo ? lo : x > hi ? hi : x);
+        }
+        break;
+    case 'd':
+        if (m == "div_euclid")
+        {
+            double y = floatArg(args, 0, n);
+            double q = std::trunc(x / y);
+            if (std::fmod(x, y) < 0)
+                q = y > 0 ? q - 1 : q + 1;
+            return f(q);
+        }
+        break;
+    case 'e':
+        if (m == "exp") return f(std::exp(x));
+        if (m == "exp2") return f(std::exp2(x));
+        if (m == "exp_m1") return f(std::expm1(x));
+        break;
+    case 'f':
+        if (m == "floor") return f(std::floor(x));
+        if (m == "fract") return f(x - std::trunc(x));
+        break;
+    case 'h':
+        if (m == "hypot") return f(std::hypot(x, floatArg(args, 0, n)));
+        break;
+    case 'i':
+        if (m == "is_nan") return b(x != x);
+        if (m == "is_infinite") return b(std::isinf(x));
+        if (m == "is_finite") return b(std::isfinite(x));
+        if (m == "is_normal") return b(std::isnormal(x));
+        if (m == "is_sign_negative") return b(std::signbit(x));
+        if (m == "is_sign_positive") return b(!std::signbit(x));
+        break;
+    case 'l':
+        if (m == "ln") return f(std::log(x));
+        if (m == "log10") return f(std::log10(x));
+        if (m == "log2") return f(std::log2(x));
+        if (m == "log") return f(std::log(x) / std::log(floatArg(args, 0, n)));
+        if (m == "ln_1p") return f(std::log1p(x));
+        break;
+    case 'm':
+        if (m == "max" || m == "min")
+        {
+            double y = floatArg(args, 0, n);
+            if (x != x) return f(y);
+            if (y != y) return f(x);
+            return f(m == "max" ? (x > y ? x : y) : (x < y ? x : y));
+        }
+        if (m == "mul_add") return f(x * floatArg(args, 0, n) + floatArg(args, 1, n));
+        break;
+    case 'p':
+        if (m == "powi")
+        {
+            V e = intArg(args, 0, n);
+            return f(std::pow(x, (double)(int64_t)e.lo));
+        }
+        if (m == "powf") return f(std::pow(x, floatArg(args, 0, n)));
+        break;
+    case 'r':
+        if (m == "round") return f(std::round(x));
+        if (m == "round_ties_even") return f(std::nearbyint(x));
+        if (m == "recip") return f(1.0 / x);
+        if (m == "rem_euclid")
+        {
+            double y = floatArg(args, 0, n);
+            double r = std::fmod(x, y);
+            return f(r < 0 ? r + std::fabs(y) : r);
+        }
+        break;
+    case 's':
+        if (m == "sqrt") return f(std::sqrt(x));
+        if (m == "sin") return f(std::sin(x));
+        if (m == "sinh") return f(std::sinh(x));
+        if (m == "signum") return f(x != x ? x : std::signbit(x) ? -1.0 : 1.0);
+        if (m == "sin_cos")
+        {
+            std::vector<V> pair;
+            pair.push_back(mkFloat(std::sin(x), t));
+            pair.push_back(mkFloat(std::cos(x), t));
+            out = mkTuple(pair);
+            return true;
+        }
+        break;
+    case 't':
+        if (m == "trunc") return f(std::trunc(x));
+        if (m == "tan") return f(std::tan(x));
+        if (m == "tanh") return f(std::tanh(x));
+        if (m == "to_degrees") return f(x * 180.0 / 3.14159265358979323846);
+        if (m == "to_radians") return f(x * 3.14159265358979323846 / 180.0);
+        if (m == "to_bits")
+        {
+            if (t == PR_F32)
+            {
+                float single = (float)x;
+                uint32_t bits32 = 0;
+                memcpy(&bits32, &single, 4);
+                out = mkUint(bits32, PR_U32);
+            }
+            else
+                out = mkUint(a.lo, PR_U64);
+            return true;
+        }
+        if (m == "total_cmp")
+        {
+            double y = floatArg(args, 0, n);
+            int c = x < y ? -1 : x > y ? 1 : 0;
+            if (c == 0 && (x != x || y != y || std::signbit(x) != std::signbit(y)))
+            {
+                // NaN sorts last (first when negative); -0 before +0
+                int rx = x != x ? (std::signbit(x) ? -2 : 2) : (std::signbit(x) && x == 0 ? -1 : 0);
+                int ry = y != y ? (std::signbit(y) ? -2 : 2) : (std::signbit(y) && y == 0 ? -1 : 0);
+                if (rx != ry)
+                    c = rx < ry ? -1 : 1;
+                else if (x == x && y != y)
+                    c = std::signbit(y) ? 1 : -1;
+                else if (x != x && y == y)
+                    c = std::signbit(x) ? -1 : 1;
+            }
+            out = mkOrdering(c);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+} // namespace rust

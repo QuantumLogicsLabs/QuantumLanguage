@@ -1,0 +1,1697 @@
+// quantum: cpp
+// Rust front-end: the parser, part 1: token handling, items, types, paths
+// and patterns. Lifetimes, bounds and where clauses are read and checked for
+// form, then left out of the tree: nothing at run time depends on them.
+#include "RustParse.h.sa"
+
+namespace rust
+{
+
+namespace
+{
+
+bool keyword(const std::string &s)
+{
+    static const char *const kws[] = {
+        "as",     "break",  "const",  "continue", "crate",  "else",     "enum",   "extern",  "false",
+        "fn",     "for",    "if",     "impl",     "in",     "let",      "loop",   "match",   "mod",
+        "move",   "mut",    "pub",    "ref",      "return", "self",     "Self",   "static",  "struct",
+        "super",  "trait",  "true",   "type",     "unsafe", "use",      "where",  "while",   "async",
+        "await",  "dyn",    "abstract", "become", "box",    "do",       "final",  "macro",   "override",
+        "priv",   "typeof", "unsized", "virtual", "yield",  "try"};
+    for (const char *k : kws)
+        if (s == k)
+            return true;
+    return false;
+}
+
+bool pathKeyword(const std::string &s) { return s == "self" || s == "Self" || s == "super" || s == "crate"; }
+
+} // namespace
+
+// ─── tokens ────────────────────────────────────────────────────────────────
+
+bool Parser::isIdent() const { return toks[p].k == T_IDENT && (toks[p].raw || !keyword(toks[p].s)); }
+
+bool Parser::isIdentAt(size_t n) const
+{
+    const Tok &t = peekTok(n);
+    return t.k == T_IDENT && (t.raw || !keyword(t.s));
+}
+
+bool Parser::eatP(const char *s)
+{
+    if (!isP(s))
+        return false;
+    ++p;
+    return true;
+}
+
+bool Parser::eatKw(const char *s)
+{
+    if (!isKw(s))
+        return false;
+    ++p;
+    return true;
+}
+
+std::string Parser::describe(const Tok &t) const
+{
+    switch (t.k)
+    {
+    case T_EOF:
+        return "`<eof>`";
+    case T_IDENT:
+        if (!t.raw && keyword(t.s))
+            return "keyword `" + t.s + "`";
+        return "`" + t.s + "`";
+    case T_STR:
+        return "`\"" + t.s + "\"`";
+    case T_CHAR:
+    case T_BYTE:
+        return "character literal";
+    case T_INT:
+    case T_FLOAT:
+        return "`" + t.s + t.suf + "`";
+    case T_LIFE:
+        return "`" + t.s + "`";
+    default:
+        return "`" + t.s + "`";
+    }
+}
+
+void Parser::fail(const std::string &msg, const Tok &at)
+{
+    CompileErr e;
+    e.message = msg;
+    e.line = at.line;
+    e.col = at.col;
+    e.width = at.len > 0 ? at.len : 1;
+    throw e;
+}
+
+void Parser::failExpected(const std::string &what) { fail("expected " + what + ", found " + describe(cur()), cur()); }
+
+void Parser::failAfterPrev(const std::string &what)
+{
+    const Tok &prev = prevTok();
+    CompileErr e;
+    e.message = "expected " + what + ", found " + describe(cur());
+    e.line = prev.line;
+    e.col = prev.col + (prev.len > 0 ? prev.len : 1);
+    e.width = 1;
+    throw e;
+}
+
+void Parser::expectP(const char *s)
+{
+    if (isP(s))
+    {
+        ++p;
+        return;
+    }
+    std::string what = std::string("`") + s + "`";
+    if (s[0] == ';' || s[0] == ',')
+        failAfterPrev(what);
+    failExpected(what);
+}
+
+void Parser::expectKw(const char *s)
+{
+    if (!eatKw(s))
+        failExpected(std::string("`") + s + "`");
+}
+
+std::string Parser::expectIdent(const char *what)
+{
+    if (!isIdent())
+        failExpected(what);
+    return toks[p++].s;
+}
+
+// A `>` that may be the first character of >>, >= or >>=
+bool Parser::eatGt()
+{
+    Tok &t = toks[p];
+    if (t.k != T_PUNCT || t.s.empty() || t.s[0] != '>')
+        return false;
+    if (t.s == ">")
+    {
+        ++p;
+        return true;
+    }
+    if (t.s == ">>" || t.s == ">=" || t.s == ">>=")
+    {
+        t.s = t.s.substr(1);
+        t.col += 1;
+        t.len -= 1;
+        return true;
+    }
+    return false;
+}
+
+void Parser::splitAmp()
+{
+    Tok &t = toks[p];
+    if (t.k == T_PUNCT && t.s == "&&")
+    {
+        Tok second = t;
+        t.s = "&";
+        t.len = 1;
+        second.s = "&";
+        second.len = 1;
+        second.col += 1;
+        second.spaceBefore = false;
+        toks.insert(toks.begin() + (std::ptrdiff_t)p + 1, second);
+    }
+}
+
+Node *Parser::mk(uint8_t k, const Tok &at) const
+{
+    Node *n = new Node();
+    n->k = k;
+    n->line = at.line;
+    n->col = at.col;
+    return n;
+}
+
+void Parser::skipBalanced()
+{
+    int depth = 0;
+    for (;;)
+    {
+        const Tok &t = cur();
+        if (t.k == T_EOF)
+            failHere("this file contains an unclosed delimiter");
+        if (t.k == T_PUNCT && (t.s == "(" || t.s == "[" || t.s == "{"))
+            ++depth;
+        else if (t.k == T_PUNCT && (t.s == ")" || t.s == "]" || t.s == "}"))
+            --depth;
+        ++p;
+        if (depth == 0)
+            return;
+    }
+}
+
+std::vector<Tok> Parser::takeGroup()
+{
+    if (!(isP("(") || isP("[") || isP("{")))
+        failExpected("one of `(`, `[`, or `{`");
+    size_t start = p;
+    skipBalanced();
+    return std::vector<Tok>(toks.begin() + (std::ptrdiff_t)start + 1, toks.begin() + (std::ptrdiff_t)p - 1);
+}
+
+// ─── attributes and visibility ─────────────────────────────────────────────
+
+// #[...] in front of an item. Returns its derives; `skipItem` for #[test]
+// and #[cfg(test)] (code only a test build has).
+unsigned Parser::parseAttributes(bool &skipItem, bool &isDefault)
+{
+    unsigned derives = 0;
+    attrSerde.clear();
+    attrRuntimeMain = false;
+    while (isP("#"))
+    {
+        ++p;
+        eatP("!");
+        if (!isP("["))
+            failExpected("`[`");
+        std::vector<Tok> inner = takeGroup();
+        if (inner.empty())
+            continue;
+        const std::string &name = inner[0].s;
+        bool pathAttr = inner.size() >= 3 && inner[1].k == T_PUNCT && inner[1].s == "::";
+        if (pathAttr && (name == "tokio" || name == "async_std") && inner[2].s == "main")
+            attrRuntimeMain = true;
+        else if (pathAttr && (name == "tokio" || name == "async_std") && inner[2].s == "test")
+            skipItem = true;
+        else if (name == "serde")
+        {
+            // serde(key = "value", flag, ...)
+            for (size_t k = 2; k < inner.size(); ++k)
+            {
+                if (inner[k].k != T_IDENT)
+                    continue;
+                std::string key = inner[k].s, value;
+                if (k + 2 < inner.size() && inner[k + 1].k == T_PUNCT && inner[k + 1].s == "=")
+                {
+                    value = inner[k + 2].s;
+                    k += 2;
+                }
+                else if (k + 1 < inner.size() && inner[k + 1].k == T_PUNCT && inner[k + 1].s == "(")
+                {
+                    // rename(serialize = "a", deserialize = "b"): the first value
+                    size_t j = k + 2;
+                    while (j < inner.size() && !(inner[j].k == T_PUNCT && inner[j].s == ")"))
+                    {
+                        if (inner[j].k == T_STR && value.empty())
+                            value = inner[j].s;
+                        ++j;
+                    }
+                    k = j;
+                }
+                attrSerde += key + (value.empty() ? "" : "=" + value) + ";";
+            }
+        }
+        else if (name == "derive")
+        {
+            for (size_t k = 1; k < inner.size(); ++k)
+            {
+                if (inner[k].k != T_IDENT)
+                    continue;
+                // std::fmt::Debug: the last segment counts
+                if (k + 1 < inner.size() && inner[k + 1].k == T_PUNCT && inner[k + 1].s == "::")
+                    continue;
+                const std::string &d = inner[k].s;
+                if (d == "Debug") derives |= D_DEBUG;
+                else if (d == "Clone") derives |= D_CLONE;
+                else if (d == "Copy") derives |= D_COPY;
+                else if (d == "PartialEq") derives |= D_PARTIALEQ;
+                else if (d == "Eq") derives |= D_EQ;
+                else if (d == "PartialOrd") derives |= D_PARTIALORD;
+                else if (d == "Ord") derives |= D_ORD;
+                else if (d == "Hash") derives |= D_HASH;
+                else if (d == "Default") derives |= D_DEFAULT;
+                else if (d == "Serialize") derives |= D_SERIALIZE;
+                else if (d == "Deserialize") derives |= D_DESERIALIZE;
+                else
+                {
+                    CompileErr e;
+                    e.message = "cannot find derive macro `" + d + "` in this scope";
+                    e.line = inner[k].line;
+                    e.col = inner[k].col;
+                    e.width = inner[k].len;
+                    throw e;
+                }
+            }
+        }
+        else if (name == "test")
+            skipItem = true;
+        else if (name == "cfg")
+        {
+            for (size_t k = 1; k < inner.size(); ++k)
+                if (inner[k].k == T_IDENT && inner[k].s == "test" &&
+                    !(k >= 2 && inner[k - 2].k == T_IDENT && inner[k - 2].s == "not"))
+                    skipItem = true;
+        }
+        else if (name == "default")
+            isDefault = true;
+    }
+    return derives;
+}
+
+// pub, pub(crate), pub(super), pub(in path)
+bool Parser::parseVisibility()
+{
+    if (!isKw("pub"))
+        return false;
+    ++p;
+    if (isP("(") && (isKwAt(1, "crate") || isKwAt(1, "super") || isKwAt(1, "self") || isKwAt(1, "in")))
+        skipBalanced();
+    return true;
+}
+
+// ─── items ─────────────────────────────────────────────────────────────────
+
+void Parser::addName(ModDef *m, const std::string &name, const Sym &sym, const Tok &at)
+{
+    auto it = m->names.find(name);
+    if (it != m->names.end() && it->second.k != S_BUILTIN)
+    {
+        CompileErr e;
+        e.code = "E0428";
+        e.message = "the name `" + name + "` is defined multiple times";
+        e.line = at.line;
+        e.col = at.col;
+        e.width = (int)name.size();
+        e.label = "`" + name + "` redefined here";
+        throw e;
+    }
+    Sym s = sym;
+    s.home = m;
+    m->names[name] = s;
+}
+
+bool Parser::atItemStart() const
+{
+    const Tok &t = cur();
+    if (t.k != T_IDENT || t.raw)
+        return false;
+    const std::string &s = t.s;
+    if (s == "fn" || s == "struct" || s == "enum" || s == "impl" || s == "trait" || s == "mod" || s == "use" ||
+        s == "type" || s == "pub" || s == "extern")
+        return true;
+    if (s == "const")
+        return !isPAt(1, "{"); // `const { ... }` is an expression
+    if (s == "static")
+        return isIdentAt(1) || isKwAt(1, "mut");
+    if (s == "unsafe")
+        return isKwAt(1, "fn") || isKwAt(1, "impl") || isKwAt(1, "trait") || isKwAt(1, "extern");
+    if (s == "async")
+        return isKwAt(1, "fn");
+    if (s == "macro_rules")
+        return isPAt(1, "!");
+    return false;
+}
+
+void Parser::parseItems(ModDef *m, bool untilBrace)
+{
+    for (;;)
+    {
+        if (cur().k == T_EOF)
+        {
+            if (untilBrace)
+                failHere("this file contains an unclosed delimiter");
+            return;
+        }
+        if (untilBrace && isP("}"))
+            return;
+        if (isP(";"))
+        {
+            ++p;
+            continue;
+        }
+        parseItem(m);
+    }
+}
+
+void Parser::parseItem(ModDef *m)
+{
+    bool skip = false, isDefault = false;
+    unsigned derives = parseAttributes(skip, isDefault);
+    itemSerde = attrSerde;
+    itemRuntimeMain = attrRuntimeMain;
+    if (cur().k == T_EOF || isP("}"))
+        return; // an inner attribute at the end
+    ModDef *target = m;
+    std::vector<ModDef *> *savedAll = all;
+    std::vector<ModDef *> dropped;
+    if (skip)
+    {
+        target = new ModDef(); // parsed for its syntax, then dropped
+        target->parent = m;
+        all = &dropped;
+    }
+    parseItemInto(m, target, isDefault, derives);
+    all = savedAll;
+}
+
+void Parser::parseItemInto(ModDef *m, ModDef *target, bool isDefault, unsigned derives)
+{
+    (void)m;
+    (void)isDefault;
+    Tok at = cur();
+    bool isPub = parseVisibility();
+    // qualifiers in front of fn
+    size_t save = p;
+    bool sawQualifier = false;
+    for (;;)
+    {
+        if (isKw("const") && (isKwAt(1, "fn") || isKwAt(1, "unsafe") || isKwAt(1, "async") || isKwAt(1, "extern")))
+            ++p;
+        else if (isKw("async") && (isKwAt(1, "fn") || isKwAt(1, "unsafe")))
+            ++p;
+        else if (isKw("unsafe") && (isKwAt(1, "fn") || isKwAt(1, "extern")))
+            ++p;
+        else if (isKw("extern") && peekTok(1).k == T_STR && isKwAt(2, "fn"))
+            p += 2;
+        else if (isKw("extern") && isKwAt(1, "fn"))
+            ++p;
+        else
+            break;
+        sawQualifier = true;
+    }
+    if (isKw("fn"))
+    {
+        Tok nameAt = peekTok(1);
+        bool runtimeMain = itemRuntimeMain;
+        FnDef *f = parseFn(isPub, false);
+        f->runtimeMain = runtimeMain;
+        f->mod = mod;
+        target->fns.push_back(f);
+        Sym s;
+        s.k = S_FN;
+        s.fn = f;
+        s.isPub = isPub;
+        addName(target, f->name, s, nameAt);
+        return;
+    }
+    if (sawQualifier)
+        p = save;
+    if (isKw("struct"))
+    {
+        parseStruct(target, isPub, derives);
+        return;
+    }
+    if (isKw("enum"))
+    {
+        parseEnum(target, isPub, derives);
+        return;
+    }
+    if (isKw("unsafe") && isKwAt(1, "trait"))
+        ++p;
+    if (isKw("trait"))
+    {
+        parseTrait(target, isPub);
+        return;
+    }
+    if (isKw("unsafe") && isKwAt(1, "impl"))
+        ++p;
+    if (isKw("impl"))
+    {
+        parseImpl(target);
+        return;
+    }
+    if (isKw("use"))
+    {
+        parseUse(target, isPub);
+        return;
+    }
+    if (isKw("mod"))
+    {
+        ++p;
+        Tok nameAt = cur();
+        std::string name = expectIdent("identifier");
+        std::string sep = modDir.empty() ? "" : "\\";
+        std::string childDir = modDir + sep + name;
+        ModDef *child = new ModDef();
+        child->name = name;
+        child->parent = target;
+        child->isPub = isPub;
+        child->line = nameAt.line;
+        child->col = nameAt.col;
+        all->push_back(child);
+        ModDef *saved = mod;
+        std::string savedDir = modDir;
+        mod = child;
+        modDir = childDir;
+        if (isP(";"))
+        {
+            // mod name; : the module is the file name.rs (or name/mod.rs)
+            std::string flat = savedDir + sep + name + ".rs", nested = childDir + "\\mod.rs";
+            std::string text;
+            int fileIdx = 0;
+            if (!loadModuleFile(flat, text, fileIdx) && !loadModuleFile(nested, text, fileIdx))
+            {
+                CompileErr e;
+                e.code = "E0583";
+                e.message = "file not found for module `" + name + "`";
+                e.line = at.line;
+                e.col = at.col;
+                e.width = cur().col + 1 - at.col;
+                e.help = "to create the module `" + name + "`, create file \"" + flat + "\" or \"" + nested + "\"";
+                throw e;
+            }
+            ++p; // ;
+            std::vector<Tok> savedToks = toks;
+            size_t savedP = p;
+            try
+            {
+                toks = lex(text);
+            }
+            catch (CompileErr &e)
+            {
+                CompileErr inFile = e;
+                inFile.line += fileIdx * kFileLine;
+                throw inFile;
+            }
+            for (Tok &t : toks)
+                t.line += fileIdx * kFileLine;
+            p = 0;
+            parseItems(child, false);
+            toks = savedToks;
+            p = savedP;
+            mod = saved;
+            modDir = savedDir;
+            target->mods.push_back(child);
+            Sym s;
+            s.k = S_MOD;
+            s.mod = child;
+            s.isPub = isPub;
+            addName(target, name, s, nameAt);
+            return;
+        }
+        expectP("{");
+        parseItems(child, true);
+        mod = saved;
+        modDir = savedDir;
+        expectP("}");
+        target->mods.push_back(child);
+        Sym s;
+        s.k = S_MOD;
+        s.mod = child;
+        s.isPub = isPub;
+        addName(target, name, s, nameAt);
+        return;
+    }
+    if (isKw("const") || isKw("static"))
+    {
+        bool isStatic = isKw("static");
+        Tok nameAt = peekTok(isKwAt(1, "mut") ? 2 : 1);
+        ConstDef *c = parseConst(isPub, isStatic);
+        c->mod = mod;
+        target->consts.push_back(c);
+        if (c->name != "_")
+        {
+            Sym s;
+            s.k = S_CONST;
+            s.cst = c;
+            s.isPub = isPub;
+            addName(target, c->name, s, nameAt);
+        }
+        return;
+    }
+    if (isKw("type"))
+    {
+        ++p;
+        Tok nameAt = cur();
+        std::string name = expectIdent("identifier");
+        std::vector<GenericParam> generics;
+        parseGenerics(generics);
+        expectP("=");
+        Ty *ty = parseType();
+        expectP(";");
+        for (const GenericParam &g : generics)
+            if (!g.isLifetime)
+                ty->params.push_back(g.name);
+        target->aliases.push_back(std::make_pair(name, ty));
+        Sym s;
+        s.k = S_ALIAS;
+        s.alias = ty;
+        s.isPub = isPub;
+        addName(target, name, s, nameAt);
+        return;
+    }
+    if (isKw("macro_rules") && isPAt(1, "!"))
+    {
+        parseMacroRules(target);
+        return;
+    }
+    if (isKw("extern"))
+    {
+        if (isKwAt(1, "crate"))
+        {
+            while (!isP(";") && cur().k != T_EOF)
+                ++p;
+            expectP(";");
+            return;
+        }
+        fail("`extern` blocks (functions of other languages) are not supported", at);
+    }
+    if (isIdent() && isPAt(1, "!") && (isPAt(2, "(") || isPAt(2, "[") || isPAt(2, "{")))
+    {
+        parseItemMacro(target);
+        return;
+    }
+    if (isPub)
+        failExpected("item");
+    fail("expected item, found " + describe(cur()), cur());
+}
+
+FnDef *Parser::parseFn(bool isPub, bool inTrait)
+{
+    // the qualifiers in front of `fn`: async?
+    bool isAsync = false;
+    for (size_t k = p; k-- > 0;)
+    {
+        const Tok &q = toks[k];
+        if (q.k == T_IDENT && !q.raw && q.s == "async")
+            isAsync = true;
+        else if (!(q.k == T_STR || (q.k == T_IDENT && !q.raw &&
+                                    (q.s == "const" || q.s == "unsafe" || q.s == "extern" || q.s == "default"))))
+            break;
+    }
+    expectKw("fn");
+    FnDef *f = new FnDef();
+    f->isPub = isPub;
+    f->isAsync = isAsync;
+    f->line = cur().line;
+    f->col = cur().col;
+    f->name = expectIdent("identifier");
+    parseGenerics(f->generics);
+    parseFnParams(f);
+    if (eatP("->"))
+        f->ret = parseType();
+    parseWhere(f->generics);
+    if (isP(";"))
+    {
+        if (!inTrait)
+            failHere("free function without a body");
+        ++p;
+    }
+    else
+    {
+        bool savedAsync = inAsync;
+        inAsync = isAsync;
+        f->body = parseBlock();
+        inAsync = savedAsync;
+    }
+    return f;
+}
+
+void Parser::parseFnParams(FnDef *f)
+{
+    expectP("(");
+    // the self parameter: self, mut self, &self, &mut self, &'a self, self: T
+    {
+        size_t k = 0;
+        bool amp = false, isMut = false;
+        if (isP("&"))
+        {
+            amp = true;
+            k = 1;
+            if (peekTok(k).k == T_LIFE)
+                ++k;
+        }
+        if (isKwAt(k, "mut"))
+        {
+            isMut = true;
+            ++k;
+        }
+        if (isKwAt(k, "self"))
+        {
+            p += k + 1;
+            f->selfKind = amp ? (isMut ? SK_MUT : SK_REF) : SK_VALUE;
+            f->selfMut = !amp && isMut;
+            if (!amp && eatP(":"))
+            {
+                Ty *t = parseType(); // self: &Self, self: &mut Self, self: Box<Self>
+                if (t->k == TY_REF)
+                    f->selfKind = t->mut ? SK_MUT : SK_REF;
+            }
+            if (!isP(")"))
+                expectP(",");
+        }
+    }
+    while (!isP(")"))
+    {
+        bool skip = false, isDefault = false;
+        parseAttributes(skip, isDefault);
+        Param prm;
+        prm.pat = parsePatNoOr();
+        expectP(":");
+        prm.ty = parseType();
+        f->params.push_back(prm);
+        if (!isP(")"))
+            expectP(",");
+    }
+    expectP(")");
+}
+
+void Parser::parseFields(std::vector<FieldDef> &out, bool tuple)
+{
+    const char *close = tuple ? ")" : "}";
+    ++p;
+    while (!isP(close))
+    {
+        bool skip = false, isDefault = false;
+        parseAttributes(skip, isDefault);
+        FieldDef fd;
+        fd.serde = attrSerde;
+        fd.isPub = parseVisibility();
+        if (tuple)
+            fd.name = std::to_string(out.size());
+        else
+        {
+            Tok nameAt = cur();
+            fd.name = expectIdent("identifier");
+            for (const FieldDef &other : out)
+                if (other.name == fd.name)
+                {
+                    CompileErr e;
+                    e.code = "E0124";
+                    e.message = "field `" + fd.name + "` is already declared";
+                    e.line = nameAt.line;
+                    e.col = nameAt.col;
+                    e.width = (int)fd.name.size();
+                    e.label = "field already declared";
+                    throw e;
+                }
+            expectP(":");
+        }
+        fd.ty = parseType();
+        out.push_back(fd);
+        if (!isP(close))
+            expectP(",");
+    }
+    ++p;
+}
+
+void Parser::parseStruct(ModDef *m, bool isPub, unsigned derives)
+{
+    expectKw("struct");
+    Tok nameAt = cur();
+    TypeDef *t = new TypeDef();
+    t->kind = TD_STRUCT;
+    t->isPub = isPub;
+    t->derives = derives;
+    t->serde = itemSerde;
+    t->mod = mod;
+    t->line = nameAt.line;
+    t->col = nameAt.col;
+    t->name = expectIdent("identifier");
+    parseGenerics(t->generics);
+    parseWhere(t->generics);
+    if (isP("{"))
+    {
+        t->form = FORM_NAMED;
+        parseFields(t->fields, false);
+    }
+    else if (isP("("))
+    {
+        t->form = FORM_TUPLE;
+        parseFields(t->fields, true);
+        parseWhere(t->generics);
+        expectP(";");
+    }
+    else
+    {
+        t->form = FORM_UNIT;
+        expectP(";");
+    }
+    for (size_t k = 0; k < t->fields.size(); ++k)
+        t->fieldIndex[t->fields[k].name] = (int)k;
+    m->types.push_back(t);
+    Sym s;
+    s.k = S_TYPE;
+    s.type = t;
+    s.isPub = isPub;
+    addName(m, t->name, s, nameAt);
+}
+
+void Parser::parseEnum(ModDef *m, bool isPub, unsigned derives)
+{
+    expectKw("enum");
+    Tok nameAt = cur();
+    TypeDef *t = new TypeDef();
+    t->kind = TD_ENUM;
+    t->isPub = isPub;
+    t->derives = derives;
+    t->serde = itemSerde;
+    t->mod = mod;
+    t->line = nameAt.line;
+    t->col = nameAt.col;
+    t->name = expectIdent("identifier");
+    parseGenerics(t->generics);
+    parseWhere(t->generics);
+    expectP("{");
+    while (!isP("}"))
+    {
+        bool skip = false, isDefault = false;
+        parseAttributes(skip, isDefault);
+        VariantDef v;
+        v.serde = attrSerde;
+        Tok vAt = cur();
+        v.name = expectIdent("identifier");
+        if (t->variantIndex.count(v.name))
+        {
+            CompileErr e;
+            e.code = "E0428";
+            e.message = "the name `" + v.name + "` is defined multiple times";
+            e.line = vAt.line;
+            e.col = vAt.col;
+            e.width = (int)v.name.size();
+            throw e;
+        }
+        if (isP("("))
+        {
+            v.form = FORM_TUPLE;
+            parseFields(v.fields, true);
+        }
+        else if (isP("{"))
+        {
+            v.form = FORM_NAMED;
+            parseFields(v.fields, false);
+        }
+        if (eatP("="))
+            v.disc = parseExpr();
+        if (isDefault)
+            t->defaultVariant = (int)t->variants.size();
+        t->variantIndex[v.name] = (int)t->variants.size();
+        t->variants.push_back(v);
+        if (!isP("}"))
+            expectP(",");
+    }
+    ++p;
+    m->types.push_back(t);
+    Sym s;
+    s.k = S_TYPE;
+    s.type = t;
+    s.isPub = isPub;
+    addName(m, t->name, s, nameAt);
+}
+
+void Parser::parseTrait(ModDef *m, bool isPub)
+{
+    expectKw("trait");
+    Tok nameAt = cur();
+    TraitDef *t = new TraitDef();
+    t->isPub = isPub;
+    t->mod = mod;
+    t->line = nameAt.line;
+    t->col = nameAt.col;
+    t->name = expectIdent("identifier");
+    parseGenerics(t->generics);
+    if (eatP(":"))
+    {
+        std::vector<Ty *> bounds;
+        parseBounds(bounds);
+        for (Ty *b : bounds)
+            if (b->path)
+                t->supers.push_back(b->path);
+    }
+    parseWhere(t->generics);
+    expectP("{");
+    while (!isP("}"))
+    {
+        bool skip = false, isDefault = false;
+        parseAttributes(skip, isDefault);
+        parseVisibility();
+        while ((isKw("const") || isKw("unsafe") || isKw("async")) && (isKwAt(1, "fn") || isKwAt(1, "unsafe")))
+            ++p;
+        if (isKw("fn"))
+        {
+            Tok fnAt = peekTok(1);
+            FnDef *f = parseFn(true, true);
+            f->trait = t;
+            f->mod = mod;
+            if (t->methods.count(f->name))
+                fail("the name `" + f->name + "` is defined multiple times", fnAt);
+            t->methods[f->name] = f;
+        }
+        else if (isKw("const"))
+        {
+            ConstDef *c = parseConst(true, false);
+            c->mod = mod;
+            t->consts[c->name] = c;
+        }
+        else if (isKw("type"))
+        {
+            ++p;
+            expectIdent("identifier");
+            std::vector<GenericParam> generics;
+            parseGenerics(generics);
+            if (eatP(":"))
+            {
+                std::vector<Ty *> bounds;
+                parseBounds(bounds);
+            }
+            if (eatP("="))
+                parseType();
+            expectP(";");
+        }
+        else
+            failExpected("one of `const`, `fn`, `type`, or `}`");
+    }
+    ++p;
+    m->traits.push_back(t);
+    Sym s;
+    s.k = S_TRAIT;
+    s.trait = t;
+    s.isPub = isPub;
+    addName(m, t->name, s, nameAt);
+}
+
+void Parser::parseImpl(ModDef *m)
+{
+    Tok at = cur();
+    expectKw("impl");
+    ImplDef *im = new ImplDef();
+    im->mod = mod;
+    im->line = at.line;
+    im->col = at.col;
+    if (isP("<"))
+        parseGenerics(im->generics);
+    eatP("!");
+    Ty *first = parseType();
+    if (eatKw("for"))
+    {
+        if (first->k != TY_PATH || !first->path)
+            fail("expected a trait, found type", at);
+        im->trait = first->path;
+        im->selfTy = parseType();
+    }
+    else
+        im->selfTy = first;
+    parseWhere(im->generics);
+    expectP("{");
+    while (!isP("}"))
+    {
+        bool skip = false, isDefault = false;
+        parseAttributes(skip, isDefault);
+        bool isPub = parseVisibility();
+        while ((isKw("const") || isKw("unsafe") || isKw("async") || isKw("default")) &&
+               (isKwAt(1, "fn") || isKwAt(1, "unsafe") || isKwAt(1, "async")))
+            ++p;
+        if (isKw("fn"))
+        {
+            FnDef *f = parseFn(isPub, false);
+            f->impl = im;
+            f->mod = mod;
+            if (!skip)
+                im->fns.push_back(f);
+        }
+        else if (isKw("const"))
+        {
+            ConstDef *c = parseConst(isPub, false);
+            c->mod = mod;
+            im->consts.push_back(c);
+        }
+        else if (isKw("type"))
+        {
+            ++p;
+            std::string name = expectIdent("identifier");
+            std::vector<GenericParam> generics;
+            parseGenerics(generics);
+            expectP("=");
+            Ty *ty = parseType();
+            expectP(";");
+            im->types.push_back(std::make_pair(name, ty));
+        }
+        else
+            failExpected("one of `const`, `fn`, `pub`, `type`, or `}`");
+    }
+    ++p;
+    m->impls.push_back(im);
+}
+
+void Parser::parseUse(ModDef *m, bool isPub)
+{
+    expectKw("use");
+    eatP("::");
+    parseUseTree(m, std::vector<std::string>(), isPub);
+    expectP(";");
+}
+
+void Parser::parseUseTree(ModDef *m, std::vector<std::string> prefix, bool isPub)
+{
+    for (;;)
+    {
+        Tok at = cur();
+        if (eatP("*"))
+        {
+            UseDecl u;
+            u.path = prefix;
+            u.glob = true;
+            u.isPub = isPub;
+            u.line = at.line;
+            u.col = at.col;
+            m->uses.push_back(u);
+            return;
+        }
+        if (eatP("{"))
+        {
+            while (!isP("}"))
+            {
+                parseUseTree(m, prefix, isPub);
+                if (!isP("}"))
+                    expectP(",");
+            }
+            ++p;
+            return;
+        }
+        if (cur().k != T_IDENT || (!cur().raw && keyword(cur().s) && !pathKeyword(cur().s)))
+            failExpected("identifier");
+        prefix.push_back(toks[p++].s);
+        if (eatP("::"))
+            continue;
+        UseDecl u;
+        u.isPub = isPub;
+        u.line = at.line;
+        u.col = at.col;
+        // `use a::b::{self}` brings in b
+        if (prefix.back() == "self" && prefix.size() > 1)
+            prefix.pop_back();
+        u.path = prefix;
+        u.alias = prefix.back();
+        if (eatKw("as"))
+        {
+            if (cur().k == T_IDENT && cur().s == "_")
+            {
+                ++p;
+                u.alias = "_";
+            }
+            else
+                u.alias = expectIdent("identifier");
+        }
+        m->uses.push_back(u);
+        return;
+    }
+}
+
+ConstDef *Parser::parseConst(bool isPub, bool isStatic)
+{
+    ++p; // const / static
+    ConstDef *c = new ConstDef();
+    c->isStatic = isStatic;
+    c->isPub = isPub;
+    if (isStatic && eatKw("mut"))
+        c->mut = true;
+    c->line = cur().line;
+    c->col = cur().col;
+    if (cur().k == T_IDENT && cur().s == "_")
+    {
+        ++p;
+        c->name = "_";
+    }
+    else
+        c->name = expectIdent("identifier");
+    if (!isP(":"))
+        failExpected("`:`"); // a constant needs its type
+    ++p;
+    c->ty = parseType();
+    if (eatP("="))
+        c->init = parseExpr();
+    expectP(";");
+    return c;
+}
+
+void Parser::parseMacroRules(ModDef *m)
+{
+    Tok at = cur();
+    p += 2; // macro_rules !
+    MacroDef *d = new MacroDef();
+    d->line = at.line;
+    d->col = at.col;
+    d->name = expectIdent("identifier");
+    bool brace = isP("{");
+    if (!(brace || isP("(") || isP("[")))
+        failExpected("one of `(`, `[`, or `{`");
+    std::vector<Tok> body = takeGroup();
+    if (!brace)
+        expectP(";");
+    // (matcher) => { body } ; ...
+    Tok eof;
+    eof.k = T_EOF;
+    body.push_back(eof);
+    Parser sub;
+    sub.toks = body;
+    sub.mod = mod;
+    sub.all = all;
+    sub.macros = macros;
+    while (sub.cur().k != T_EOF)
+    {
+        MacroRule r;
+        r.matcher = sub.takeGroup();
+        sub.expectP("=>");
+        r.body = sub.takeGroup();
+        d->rules.push_back(r);
+        if (!sub.eatP(";"))
+            break;
+    }
+    if (sub.cur().k != T_EOF)
+        sub.failExpected("`;`");
+    m->macros.push_back(d);
+    macros->push_back(d);
+}
+
+// <'a, T: Bound, const N: usize>
+void Parser::parseGenerics(std::vector<GenericParam> &out)
+{
+    if (!isP("<"))
+        return;
+    ++p;
+    for (;;)
+    {
+        if (eatGt())
+            return;
+        GenericParam g;
+        if (cur().k == T_LIFE)
+        {
+            g.name = toks[p++].s;
+            g.isLifetime = true;
+            if (eatP(":"))
+                while (cur().k == T_LIFE)
+                {
+                    ++p;
+                    if (!eatP("+"))
+                        break;
+                }
+        }
+        else if (eatKw("const"))
+        {
+            g.isConst = true;
+            g.name = expectIdent("identifier");
+            expectP(":");
+            parseType();
+            if (eatP("="))
+                parsePrimary(false);
+        }
+        else
+        {
+            g.name = expectIdent("identifier");
+            if (eatP(":"))
+                parseBounds(g.bounds);
+            if (eatP("="))
+                parseType();
+        }
+        out.push_back(g);
+        if (eatGt())
+            return;
+        expectP(",");
+    }
+}
+
+// Trait + 'a + ?Sized + for<'a> Fn(&'a T)
+void Parser::parseBounds(std::vector<Ty *> &out)
+{
+    for (;;)
+    {
+        if (cur().k == T_LIFE)
+            ++p;
+        else
+        {
+            eatP("?");
+            if (eatKw("for"))
+            {
+                std::vector<GenericParam> ignored;
+                parseGenerics(ignored);
+            }
+            bool paren = eatP("(");
+            Ty *t = new Ty();
+            t->k = TY_PATH;
+            t->line = cur().line;
+            t->col = cur().col;
+            t->path = parsePath(false);
+            if (paren)
+                expectP(")");
+            out.push_back(t);
+        }
+        if (!eatP("+"))
+            return;
+        if (isP("{") || isP(",") || isP(">") || isP("=") || isKw("where"))
+            return; // a trailing +
+    }
+}
+
+void Parser::parseWhere(std::vector<GenericParam> &generics)
+{
+    if (!eatKw("where"))
+        return;
+    while (!isP("{") && !isP(";") && !isP("=") && cur().k != T_EOF)
+    {
+        if (cur().k == T_LIFE)
+        {
+            ++p;
+            expectP(":");
+            while (cur().k == T_LIFE)
+            {
+                ++p;
+                if (!eatP("+"))
+                    break;
+            }
+        }
+        else
+        {
+            if (eatKw("for"))
+            {
+                std::vector<GenericParam> ignored;
+                parseGenerics(ignored);
+            }
+            Ty *subject = parseType();
+            expectP(":");
+            std::vector<Ty *> bounds;
+            parseBounds(bounds);
+            if (subject->k == TY_PATH && subject->path && subject->path->segs.size() == 1)
+                for (GenericParam &g : generics)
+                    if (g.name == subject->path->segs[0].name)
+                        for (Ty *b : bounds)
+                            g.bounds.push_back(b);
+        }
+        if (!eatP(","))
+            break;
+    }
+}
+
+// ─── types and paths ───────────────────────────────────────────────────────
+
+void Parser::parseGenericArgs(PathSeg &seg)
+{
+    ++p; // <
+    seg.hasArgs = true;
+    for (;;)
+    {
+        if (eatGt())
+            return;
+        if (cur().k == T_LIFE)
+            ++p;
+        else if (cur().k == T_INT || cur().k == T_STR || cur().k == T_CHAR || isKw("true") || isKw("false") ||
+                 isP("{") || (isP("-") && peekTok(1).k == T_INT))
+        {
+            // a const argument: Matrix<3, 3>
+            Ty *t = new Ty();
+            t->k = TY_INFER;
+            t->line = cur().line;
+            t->col = cur().col;
+            t->len = parseUnary(false);
+            seg.args.push_back(t);
+        }
+        else if (isIdent() && isPAt(1, "=") )
+        {
+            // an associated type: Iterator<Item = T>
+            p += 2;
+            parseType();
+        }
+        else
+            seg.args.push_back(parseType());
+        if (eatGt())
+            return;
+        expectP(",");
+    }
+}
+
+// a::b::<T>::c. In an expression, generic arguments need the `::` in front.
+Path *Parser::parsePath(bool exprMode)
+{
+    Path *path = new Path();
+    path->line = cur().line;
+    path->col = cur().col;
+    if (isP("<"))
+    {
+        ++p;
+        path->qself = parseType();
+        if (eatKw("as"))
+            path->qtrait = parsePath(false);
+        if (!eatGt())
+            failExpected("`>`");
+        expectP("::");
+    }
+    else
+        eatP("::");
+    for (;;)
+    {
+        const Tok &t = cur();
+        if (t.k != T_IDENT || (!t.raw && keyword(t.s) && !pathKeyword(t.s)))
+            failExpected("identifier");
+        PathSeg seg;
+        seg.name = t.s;
+        ++p;
+        if (isP("::") && isPAt(1, "<"))
+        {
+            ++p;
+            parseGenericArgs(seg);
+        }
+        else if (!exprMode && isP("<"))
+            parseGenericArgs(seg);
+        else if (!exprMode && isP("(") && (seg.name == "Fn" || seg.name == "FnMut" || seg.name == "FnOnce"))
+        {
+            ++p;
+            seg.hasArgs = true;
+            while (!isP(")"))
+            {
+                seg.args.push_back(parseType());
+                if (!isP(")"))
+                    expectP(",");
+            }
+            ++p;
+            if (eatP("->"))
+                seg.ret = parseType();
+        }
+        path->segs.push_back(seg);
+        if (isP("::") && peekTok(1).k == T_IDENT)
+        {
+            ++p;
+            continue;
+        }
+        return path;
+    }
+}
+
+Ty *Parser::parseType()
+{
+    Ty *t = new Ty();
+    t->line = cur().line;
+    t->col = cur().col;
+    if (isP("&&"))
+        splitAmp();
+    if (eatP("&"))
+    {
+        t->k = TY_REF;
+        if (cur().k == T_LIFE)
+            ++p;
+        t->mut = eatKw("mut");
+        t->elem = parseType();
+        return t;
+    }
+    if (isP("*") && (isKwAt(1, "const") || isKwAt(1, "mut")))
+    {
+        ++p;
+        t->k = TY_PTR;
+        t->mut = isKw("mut");
+        ++p;
+        t->elem = parseType();
+        return t;
+    }
+    if (eatP("("))
+    {
+        t->k = TY_TUPLE;
+        bool trailingComma = false;
+        while (!isP(")"))
+        {
+            t->items.push_back(parseType());
+            trailingComma = false;
+            if (!isP(")"))
+            {
+                expectP(",");
+                trailingComma = true;
+            }
+        }
+        ++p;
+        if (t->items.size() == 1 && !trailingComma)
+            return t->items[0]; // (T) is T
+        return t;
+    }
+    if (eatP("["))
+    {
+        t->elem = parseType();
+        if (eatP(";"))
+        {
+            t->k = TY_ARRAY;
+            t->len = parseExpr();
+        }
+        else
+            t->k = TY_SLICE;
+        expectP("]");
+        return t;
+    }
+    if (eatP("!"))
+    {
+        t->k = TY_NEVER;
+        return t;
+    }
+    if (cur().k == T_IDENT && cur().s == "_" && !cur().raw)
+    {
+        ++p;
+        t->k = TY_INFER;
+        return t;
+    }
+    if (isKw("unsafe") && (isKwAt(1, "fn") || isKwAt(1, "extern")))
+        ++p;
+    if (isKw("extern") && peekTok(1).k == T_STR && isKwAt(2, "fn"))
+        p += 2;
+    if (eatKw("for"))
+    {
+        std::vector<GenericParam> ignored;
+        parseGenerics(ignored);
+    }
+    if (eatKw("fn"))
+    {
+        t->k = TY_FN;
+        expectP("(");
+        while (!isP(")"))
+        {
+            // a parameter may be named: fn(x: i32) -> i32
+            if ((isIdent() || (cur().k == T_IDENT && cur().s == "_")) && isPAt(1, ":"))
+                p += 2;
+            t->items.push_back(parseType());
+            if (!isP(")"))
+                expectP(",");
+        }
+        ++p;
+        if (eatP("->"))
+            t->ret = parseType();
+        return t;
+    }
+    if (isKw("dyn") || isKw("impl"))
+    {
+        t->k = isKw("dyn") ? TY_DYN : TY_IMPL;
+        ++p;
+        std::vector<Ty *> bounds;
+        parseBounds(bounds);
+        if (!bounds.empty())
+            t->path = bounds[0]->path;
+        return t;
+    }
+    t->k = TY_PATH;
+    t->path = parsePath(false);
+    if (t->path->segs.size() == 1 && !t->path->qself)
+    {
+        t->prim = primOf(t->path->segs[0].name);
+        t->primKnown = t->prim != PR_NONE;
+    }
+    return t;
+}
+
+// ─── patterns ──────────────────────────────────────────────────────────────
+
+bool Parser::atPatLiteral() const
+{
+    const Tok &t = cur();
+    if (t.k == T_INT || t.k == T_FLOAT || t.k == T_STR || t.k == T_BSTR || t.k == T_CHAR || t.k == T_BYTE)
+        return true;
+    if (isKw("true") || isKw("false"))
+        return true;
+    return isP("-") && (peekTok(1).k == T_INT || peekTok(1).k == T_FLOAT);
+}
+
+Node *Parser::parsePatLiteral()
+{
+    bool neg = eatP("-");
+    Node *n = parsePrimary(true);
+    if (neg)
+    {
+        if (n->k != N_INT && n->k != N_FLOAT)
+            failExpected("a number");
+        n->flag = true; // negative
+    }
+    return n;
+}
+
+Pat *Parser::parsePattern()
+{
+    eatP("|");
+    Pat *first = parsePatNoOr();
+    if (!isP("|"))
+        return first;
+    Pat *alt = new Pat();
+    alt->k = P_OR;
+    alt->line = first->line;
+    alt->col = first->col;
+    alt->items.push_back(first);
+    while (eatP("|"))
+        alt->items.push_back(parsePatNoOr());
+    return alt;
+}
+
+Pat *Parser::parsePatNoOr()
+{
+    Pat *pt = new Pat();
+    pt->line = cur().line;
+    pt->col = cur().col;
+    if (isP("&&"))
+        splitAmp();
+    if (eatP("&"))
+    {
+        pt->k = P_REF;
+        pt->mut = eatKw("mut");
+        pt->sub = parsePatNoOr();
+        return pt;
+    }
+    if (eatP("("))
+    {
+        pt->k = P_TUPLE;
+        bool trailingComma = false;
+        while (!isP(")"))
+        {
+            pt->items.push_back(parsePattern());
+            trailingComma = false;
+            if (!isP(")"))
+            {
+                expectP(",");
+                trailingComma = true;
+            }
+        }
+        ++p;
+        if (pt->items.size() == 1 && !trailingComma && pt->items[0]->k != P_REST)
+            return pt->items[0]; // (p) is p
+        return pt;
+    }
+    if (eatP("["))
+    {
+        pt->k = P_SLICE;
+        while (!isP("]"))
+        {
+            pt->items.push_back(parsePattern());
+            if (!isP("]"))
+                expectP(",");
+        }
+        ++p;
+        return pt;
+    }
+    // ..  /  ..=hi
+    if (isP("..") || isP("..="))
+    {
+        bool inclusive = isP("..=");
+        ++p;
+        if (!inclusive && !atPatLiteral())
+        {
+            pt->k = P_REST;
+            return pt;
+        }
+        pt->k = P_RANGE;
+        pt->inclusive = inclusive;
+        pt->hi = parsePatLiteral();
+        return pt;
+    }
+    if (atPatLiteral())
+    {
+        pt->lo = parsePatLiteral();
+        if (isP("..=") || isP("..") || isP("..."))
+        {
+            pt->k = P_RANGE;
+            pt->inclusive = !isP("..");
+            ++p;
+            if (atPatLiteral())
+                pt->hi = parsePatLiteral();
+            else if (cur().k == T_IDENT && (isIdent() || pathKeyword(cur().s)))
+            {
+                Node *n = mk(N_PATH, cur());
+                n->path = parsePath(true);
+                pt->hi = n;
+            }
+            else if (pt->inclusive)
+                failExpected("the end of the range");
+            return pt;
+        }
+        pt->k = P_LIT;
+        return pt;
+    }
+    if (cur().k == T_IDENT && cur().s == "_" && !cur().raw)
+    {
+        ++p;
+        pt->k = P_WILD;
+        return pt;
+    }
+    if (isKw("ref") || isKw("mut") ||
+        (isIdent() && !isPAt(1, "::") && !isPAt(1, "(") && !isPAt(1, "{") && !isPAt(1, "!")))
+    {
+        pt->k = P_BIND;
+        pt->byRef = eatKw("ref");
+        pt->mut = eatKw("mut");
+        Tok nameAt = cur();
+        pt->name = expectIdent("identifier");
+        if (eatP("@"))
+            pt->sub = parsePatNoOr();
+        else if (!pt->byRef && !pt->mut && (isP("..=") || (isP("..") && atPatLiteral())))
+        {
+            // CONST..=hi
+            Node *lo = mk(N_PATH, nameAt);
+            lo->path = new Path();
+            PathSeg seg;
+            seg.name = pt->name;
+            lo->path->segs.push_back(seg);
+            pt->k = P_RANGE;
+            pt->inclusive = isP("..=");
+            ++p;
+            pt->lo = lo;
+            if (atPatLiteral())
+                pt->hi = parsePatLiteral();
+            else
+            {
+                Node *n = mk(N_PATH, cur());
+                n->path = parsePath(true);
+                pt->hi = n;
+            }
+        }
+        return pt;
+    }
+    if (cur().k == T_IDENT || isP("<") || isP("::"))
+    {
+        Tok at = cur();
+        pt->path = parsePath(true);
+        if (eatP("("))
+        {
+            pt->k = P_TSTRUCT;
+            while (!isP(")"))
+            {
+                pt->items.push_back(parsePattern());
+                if (!isP(")"))
+                    expectP(",");
+            }
+            ++p;
+            return pt;
+        }
+        if (eatP("{"))
+        {
+            pt->k = P_STRUCT;
+            while (!isP("}"))
+            {
+                if (eatP(".."))
+                {
+                    pt->hasRest = true;
+                    break;
+                }
+                bool skip = false, isDefault = false;
+                parseAttributes(skip, isDefault);
+                Tok fieldAt = cur();
+                bool byRef = eatKw("ref"), isMut = eatKw("mut");
+                std::string name;
+                if (cur().k == T_INT)
+                    name = toks[p++].s;
+                else
+                    name = expectIdent("identifier");
+                Pat *sub;
+                if (!byRef && !isMut && eatP(":"))
+                    sub = parsePattern();
+                else
+                {
+                    sub = new Pat();
+                    sub->k = P_BIND;
+                    sub->name = name;
+                    sub->byRef = byRef;
+                    sub->mut = isMut;
+                    sub->line = fieldAt.line;
+                    sub->col = fieldAt.col;
+                }
+                pt->fields.push_back(name);
+                pt->items.push_back(sub);
+                if (!isP("}"))
+                    expectP(",");
+            }
+            expectP("}");
+            return pt;
+        }
+        pt->k = P_PATH;
+        if (isP("..=") || (isP("..") && atPatLiteral()))
+        {
+            Node *lo = mk(N_PATH, at);
+            lo->path = pt->path;
+            pt->k = P_RANGE;
+            pt->inclusive = isP("..=");
+            ++p;
+            pt->lo = lo;
+            if (atPatLiteral())
+                pt->hi = parsePatLiteral();
+            else
+            {
+                Node *n = mk(N_PATH, cur());
+                n->path = parsePath(true);
+                pt->hi = n;
+            }
+        }
+        return pt;
+    }
+    failExpected("pattern");
+    return pt;
+}
+
+// ─── the file ──────────────────────────────────────────────────────────────
+
+ModDef *parseProgram(const std::string &source, std::vector<ModDef *> &all)
+{
+    Parser ps;
+    ps.toks = lex(source);
+    std::vector<MacroDef *> macros;
+    ps.macros = &macros;
+    ps.all = &all;
+    ModDef *root = new ModDef();
+    root->name = "crate";
+    all.push_back(root);
+    ps.mod = root;
+    ps.modDir = moduleRootDir();
+    ps.parseItems(root, false);
+    return root;
+}
+
+} // namespace rust

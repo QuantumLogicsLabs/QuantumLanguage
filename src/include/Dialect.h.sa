@@ -3,7 +3,7 @@
 // Dialect layer — the source-to-source front-end that lets Quantum accept
 // several languages' syntax before the ordinary lexer/parser/compiler run.
 //
-//   .rb/.py/.js/.c/.cpp/.java → strict, one language (strictSource): the
+//   .rb/.py/.js/.c/.cpp/.java/.rs → strict, one language (strictSource): the
 //                         file must be valid in the language its extension
 //                         names. That language's own front-end compiles it,
 //                         and a program it rejects is a compile error.
@@ -32,12 +32,12 @@ std::string applyDialect(std::string source, const std::string &path);
 // Lower-cased file extension including the leading dot (".rb", ".sa", ...).
 std::string fileExtLower(const std::string &path);
 
-// True for a file type this compiler runs natively: .sa .js .py .rb .c .cpp
+// True for a file type this compiler runs natively: .sa .js .py .rb .c .cpp .java .rs .html .css
 bool hasSupportedExt(const std::string &path);
 
 // Whether the file must be valid in the one language its extension names:
-// .c .cpp .py .js .rb .java. That language's front-end has the final word: a
-// program gcc / g++ / python / node / ruby / javac would reject is a compile
+// .c .cpp .py .js .rb .java .rs. That language's front-end has the final word:
+// a program gcc / g++ / python / node / ruby / javac / rustc would reject is a compile
 // error, reported their way, and nothing falls back to the mixed-syntax
 // pipeline. A .sa file is Quantum, where every syntax may be mixed: never
 // strict.

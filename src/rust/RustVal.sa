@@ -1,0 +1,1461 @@
+// quantum: cpp
+// Rust front-end: values. Making them, and what every value can do whatever
+// its type: be compared (PartialEq, PartialOrd), hashed, cloned, copied,
+// moved and dropped. A struct or enum does these by its derives, or by its
+// own impl when it has one. Also the map behind HashMap / BTreeMap and the
+// sets.
+#include "RustRt.h.sa"
+
+namespace rust
+{
+
+Interp G;
+
+// ─── making values ─────────────────────────────────────────────────────────
+
+V mkBool(bool b)
+{
+    V v;
+    v.k = V_BOOL;
+    v.lo = b ? 1 : 0;
+    return v;
+}
+
+V mkInt(int64_t x, uint8_t t)
+{
+    V v;
+    v.k = V_INT;
+    v.t = t;
+    v.lo = (uint64_t)x;
+    v.hi = x < 0 ? -1 : 0;
+    return v;
+}
+
+V mkUint(uint64_t x, uint8_t t)
+{
+    V v;
+    v.k = V_INT;
+    v.t = t;
+    v.lo = x;
+    return v;
+}
+
+V mkFloat(double d, uint8_t t)
+{
+    V v;
+    v.k = V_FLOAT;
+    v.t = t;
+    if (t == PR_F32)
+        d = (double)(float)d;
+    memcpy(&v.lo, &d, sizeof d);
+    return v;
+}
+
+V mkChar(uint32_t c)
+{
+    V v;
+    v.k = V_CHAR;
+    v.lo = c;
+    return v;
+}
+
+V mkStr(const std::string &s, bool owned)
+{
+    StrObj *o = new StrObj();
+    o->s = s;
+    V v;
+    v.k = V_STR;
+    v.x = owned ? 1 : 0;
+    v.p = o;
+    return v;
+}
+
+V mkTuple(const std::vector<V> &items)
+{
+    V v;
+    if (items.empty())
+        return v; // ()
+    Obj *o = new Obj();
+    o->items = items;
+    v.k = V_TUPLE;
+    v.p = o;
+    return v;
+}
+
+V mkSeq(uint8_t kind, const std::vector<V> &items)
+{
+    Obj *o = new Obj();
+    o->items = items;
+    V v;
+    v.k = kind;
+    v.p = o;
+    return v;
+}
+
+V mkSlice(Obj *seq, int64_t start, int64_t len, bool mut)
+{
+    V v;
+    v.k = V_SLICE;
+    v.x = mut ? 1 : 0;
+    v.p = seq;
+    v.hi = start;
+    v.lo = (uint64_t)len;
+    return v;
+}
+
+V mkStruct(TypeDef *def, const std::vector<V> &fields)
+{
+    StructObj *o = new StructObj();
+    o->def = def;
+    o->items = fields;
+    V v;
+    v.k = V_STRUCT;
+    v.p = o;
+    return v;
+}
+
+V mkVariant(TypeDef *def, int variant, const std::vector<V> &payload)
+{
+    EnumObj *o = new EnumObj();
+    o->def = def;
+    o->variant = variant;
+    o->items = payload;
+    V v;
+    v.k = V_ENUM;
+    v.p = o;
+    return v;
+}
+
+V mkSome(V x)
+{
+    std::vector<V> payload(1, x);
+    return mkVariant(G.optionDef, 1, payload);
+}
+
+V mkNone()
+{
+    static EnumObj *none = nullptr; // no parts: one object serves
+    if (!none)
+    {
+        none = new EnumObj();
+        none->def = G.optionDef;
+        none->variant = 0;
+    }
+    V v;
+    v.k = V_ENUM;
+    v.p = none;
+    return v;
+}
+
+V mkOption(bool some, V x) { return some ? mkSome(x) : mkNone(); }
+
+V mkOk(V x)
+{
+    std::vector<V> payload(1, x);
+    return mkVariant(G.resultDef, 0, payload);
+}
+
+V mkErr(V x)
+{
+    std::vector<V> payload(1, x);
+    return mkVariant(G.resultDef, 1, payload);
+}
+
+V mkOrdering(int c)
+{
+    static EnumObj *three[3] = {nullptr, nullptr, nullptr};
+    int idx = c < 0 ? 0 : c == 0 ? 1 : 2;
+    if (!three[idx])
+    {
+        three[idx] = new EnumObj();
+        three[idx]->def = G.orderingDef;
+        three[idx]->variant = idx;
+    }
+    V v;
+    v.k = V_ENUM;
+    v.p = three[idx];
+    return v;
+}
+
+V mkRef(Obj *o, int64_t i, bool mut)
+{
+    V v;
+    v.k = V_REF;
+    v.x = mut ? 1 : 0;
+    v.p = o;
+    v.hi = i;
+    return v;
+}
+
+Obj *newCell(V x)
+{
+    Obj *o = new Obj();
+    o->items.push_back(x);
+    return o;
+}
+
+V mkRefTo(V x, bool mut) { return mkRef(newCell(x), 0, mut); }
+
+V mkBox(V x)
+{
+    V v;
+    v.k = V_BOX;
+    v.p = newCell(x);
+    return v;
+}
+
+V mkRc(V x)
+{
+    RcObj *o = new RcObj();
+    o->items.push_back(x);
+    V v;
+    v.k = V_RC;
+    v.p = o;
+    return v;
+}
+
+V mkCell(V x, int kind)
+{
+    V v;
+    v.k = V_CELL;
+    v.n = kind;
+    v.p = newCell(x);
+    return v;
+}
+
+V mkMap(bool sorted, bool isSet)
+{
+    MapObj *m = new MapObj();
+    m->sorted = sorted;
+    m->isSet = isSet;
+    V v;
+    v.k = isSet ? V_SET : V_MAP;
+    v.p = m;
+    return v;
+}
+
+V mkRange(V lo, V hi, bool hasLo, bool hasHi, bool inclusive)
+{
+    RangeObj *r = new RangeObj();
+    r->items.push_back(lo);
+    r->items.push_back(hi);
+    r->hasLo = hasLo;
+    r->hasHi = hasHi;
+    r->inclusive = inclusive;
+    V v;
+    v.k = V_RANGE;
+    v.p = r;
+    return v;
+}
+
+V mkNative(const std::string &type, const std::string &text)
+{
+    NativeObj *o = new NativeObj();
+    o->type = type;
+    o->s = text;
+    V v;
+    v.k = V_NATIVE;
+    v.p = o;
+    return v;
+}
+
+V mkBuiltinFn(const std::string &name)
+{
+    FnObj *f = new FnObj();
+    f->name = name;
+    V v;
+    v.k = V_FN;
+    v.p = f;
+    return v;
+}
+
+// ─── looking at values ─────────────────────────────────────────────────────
+
+V &slotAt(Obj *o, int64_t i)
+{
+    if (!o || i < 0 || (size_t)i >= o->items.size())
+        errPos(0, 0, 1, "E0502",
+               "a reference outlived the element it points to (the collection was changed while it was borrowed)");
+    return o->items[(size_t)i];
+}
+
+V peel(V v)
+{
+    while (v.k == V_REF)
+        v = slotAt(v.p, v.hi);
+    return v;
+}
+
+V peelAll(V v)
+{
+    for (;;)
+    {
+        if (v.k == V_REF)
+            v = slotAt(v.p, v.hi);
+        else if (v.k == V_BOX || v.k == V_RC)
+            v = slotAt(v.p, 0);
+        else
+            return v;
+    }
+}
+
+bool isStr(V v) { return peelAll(v).k == V_STR; }
+
+std::string &strOf(V v)
+{
+    v = peelAll(v);
+    if (v.k != V_STR)
+        errPos(0, 0, 1, "E0308", "mismatched types: expected a string, found `" + typeName(v) + "`");
+    return static_cast<StrObj *>(v.p)->s;
+}
+
+bool isSomeV(V v)
+{
+    v = peel(v);
+    return v.k == V_ENUM && static_cast<EnumObj *>(v.p)->def == G.optionDef && static_cast<EnumObj *>(v.p)->variant == 1;
+}
+
+bool isNoneV(V v)
+{
+    v = peel(v);
+    return v.k == V_ENUM && static_cast<EnumObj *>(v.p)->def == G.optionDef && static_cast<EnumObj *>(v.p)->variant == 0;
+}
+
+bool isOkV(V v)
+{
+    v = peel(v);
+    return v.k == V_ENUM && static_cast<EnumObj *>(v.p)->def == G.resultDef && static_cast<EnumObj *>(v.p)->variant == 0;
+}
+
+bool isErrV(V v)
+{
+    v = peel(v);
+    return v.k == V_ENUM && static_cast<EnumObj *>(v.p)->def == G.resultDef && static_cast<EnumObj *>(v.p)->variant == 1;
+}
+
+bool seqOf(V v, Obj *&o, int64_t &start, int64_t &len)
+{
+    v = peelAll(v);
+    if (v.k == V_VEC || v.k == V_ARRAY || v.k == V_DEQUE || v.k == V_HEAP)
+    {
+        o = v.p;
+        start = 0;
+        len = (int64_t)v.p->items.size();
+        return true;
+    }
+    if (v.k == V_SLICE)
+    {
+        o = v.p;
+        start = v.hi;
+        len = (int64_t)v.lo;
+        if (start + len > (int64_t)o->items.size())
+            len = (int64_t)o->items.size() - start; // what it pointed at shrank
+        if (len < 0)
+            len = 0;
+        return true;
+    }
+    return false;
+}
+
+// Copy: numbers, bool, char, (), &T, fn, and tuples / arrays / derive(Copy)
+// types made of them
+bool isCopy(V v)
+{
+    switch (v.k)
+    {
+    case V_UNIT:
+    case V_BOOL:
+    case V_INT:
+    case V_FLOAT:
+    case V_CHAR:
+    case V_REF:
+    case V_SLICE:
+    case V_FN:
+    case V_RANGE:
+        return true;
+    case V_CLOSURE:
+    {
+        // a `move` closure that owns what is not Copy is not Copy itself: it moves, and
+        // what it owns is dropped once, with it
+        ClosureObj *c = static_cast<ClosureObj *>(v.p);
+        if (c->def->flag && G.trackDrops)
+            for (Obj *cell : c->caps)
+                if (cell && cell->items[0].k != V_MOVED && !isCopy(cell->items[0]))
+                    return false;
+        return true;
+    }
+    case V_NATIVE:
+    {
+        // what is counted when it is dropped moves: a channel's ends, a thread's handle, a permit
+        const std::string &t = static_cast<NativeObj *>(v.p)->type;
+        return !(t == "Sender" || t == "SyncSender" || t == "Receiver" || t == "JoinHandle" ||
+                 t == "SemaphorePermit" || t == "OwnedSemaphorePermit" || t == "TcpStream" || t == "TcpListener");
+    }
+    case V_STR:
+        return v.x == 0; // &str
+    case V_TUPLE:
+        for (const V &item : v.p->items)
+            if (!isCopy(item))
+                return false;
+        return true;
+    case V_ARRAY:
+        return v.p->items.empty() || isCopy(v.p->items[0]);
+    case V_STRUCT:
+        return (static_cast<StructObj *>(v.p)->def->derives & D_COPY) != 0;
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(v.p);
+        if (e->def == G.optionDef || e->def == G.resultDef)
+        {
+            for (const V &item : e->items)
+                if (!isCopy(item))
+                    return false;
+            return true;
+        }
+        return e->def == G.orderingDef || (e->def->derives & D_COPY) != 0;
+    }
+    }
+    return false;
+}
+
+V copyShell(V v)
+{
+    switch (v.k)
+    {
+    case V_TUPLE:
+    case V_ARRAY:
+    {
+        Obj *o = new Obj();
+        o->items.reserve(v.p->items.size());
+        for (const V &item : v.p->items)
+            o->items.push_back(copyShell(item));
+        v.p = o;
+        return v;
+    }
+    case V_STRUCT:
+    {
+        StructObj *from = static_cast<StructObj *>(v.p);
+        if (from->items.empty())
+            return v;
+        StructObj *o = new StructObj();
+        o->def = from->def;
+        o->items.reserve(from->items.size());
+        for (const V &item : from->items)
+            o->items.push_back(copyShell(item));
+        v.p = o;
+        return v;
+    }
+    case V_ENUM:
+    {
+        EnumObj *from = static_cast<EnumObj *>(v.p);
+        if (from->items.empty())
+            return v;
+        EnumObj *o = new EnumObj();
+        o->def = from->def;
+        o->variant = from->variant;
+        o->items.reserve(from->items.size());
+        for (const V &item : from->items)
+            o->items.push_back(copyShell(item));
+        v.p = o;
+        return v;
+    }
+    }
+    return v;
+}
+
+// ─── ownership ─────────────────────────────────────────────────────────────
+
+// A place read as a value: its own copy when the type is Copy, else the
+// value itself, and the place is left moved-from.
+V takeFrom(V &slot, const Node *at, const char *what)
+{
+    switch (slot.k)
+    {
+    case V_UNIT:
+    case V_BOOL:
+    case V_INT:
+    case V_FLOAT:
+    case V_CHAR:
+    case V_REF:
+    case V_SLICE:
+    case V_FN:
+        return slot;
+    case V_MOVED:
+        if (slot.n == 1)
+            errAt(at, "E0381", std::string("used binding `") + what + "` isn't initialized",
+                  std::string("`") + what + "` used here but it isn't initialized");
+        errAt(at, "E0382", std::string("use of moved value: `") + what + "`", "value used here after move");
+    }
+    if (isCopy(slot))
+        return copyShell(slot);
+    V out = slot;
+    slot.k = V_MOVED;
+    slot.n = 0;
+    return out;
+}
+
+void dropValue(V v, const Node *at)
+{
+    if (!G.trackDrops)
+        return;
+    switch (v.k)
+    {
+    case V_STRUCT:
+    {
+        StructObj *o = static_cast<StructObj *>(v.p);
+        if (o->dropped)
+            return;
+        o->dropped = true;
+        if (o->def->hasDrop)
+        {
+            FnDef *d = findMethod(o->def, "drop");
+            if (d)
+            {
+                std::vector<V> args(1, mkRefTo(v, true));
+                callFn(d, args, o->def, at, nullptr);
+            }
+        }
+        for (size_t k = 0; k < o->items.size(); ++k)
+            dropValue(o->items[k], at);
+        return;
+    }
+    case V_ENUM:
+    {
+        EnumObj *o = static_cast<EnumObj *>(v.p);
+        if (o->items.empty() || o->dropped)
+            return;
+        o->dropped = true;
+        if (o->def->hasDrop)
+        {
+            FnDef *d = findMethod(o->def, "drop");
+            if (d)
+            {
+                std::vector<V> args(1, mkRefTo(v, true));
+                callFn(d, args, o->def, at, nullptr);
+            }
+        }
+        for (size_t k = 0; k < o->items.size(); ++k)
+            dropValue(o->items[k], at);
+        return;
+    }
+    case V_TUPLE:
+    case V_ARRAY:
+    case V_VEC:
+    case V_DEQUE:
+    case V_HEAP:
+    case V_BOX:
+    case V_CELL:
+        if (v.p->dropped)
+            return;
+        v.p->dropped = true;
+        for (size_t k = 0; k < v.p->items.size(); ++k)
+            dropValue(v.p->items[k], at);
+        return;
+    case V_MAP:
+    {
+        MapObj *m = static_cast<MapObj *>(v.p);
+        if (m->dropped)
+            return;
+        m->dropped = true;
+        for (size_t k = 0; k < m->keys.size(); ++k)
+            if (m->keys[k].k != V_MOVED)
+            {
+                dropValue(m->keys[k], at);
+                dropValue(m->items[k], at);
+            }
+        return;
+    }
+    case V_RC:
+    {
+        RcObj *r = static_cast<RcObj *>(v.p);
+        if (r->strong > 0 && --r->strong == 0)
+            dropValue(r->items[0], at);
+        return;
+    }
+    case V_WEAK:
+    {
+        RcObj *r = static_cast<RcObj *>(v.p);
+        if (r->weak > 0)
+            --r->weak;
+        return;
+    }
+    case V_NATIVE:
+        taskDropped(static_cast<NativeObj *>(v.p));
+        return;
+    case V_CLOSURE:
+    {
+        // a closure made with `move` owns what it captured
+        ClosureObj *c = static_cast<ClosureObj *>(v.p);
+        if (c->dropped || !c->def->flag)
+            return;
+        c->dropped = true;
+        for (Obj *cell : c->caps)
+            if (cell && cell->items[0].k != V_MOVED)
+            {
+                dropValue(cell->items[0], at);
+                cell->items[0].k = V_MOVED;
+            }
+        return;
+    }
+    }
+}
+
+void dropSlot(V &slot, const Node *at)
+{
+    if (slot.k == V_MOVED)
+        return;
+    V v = slot;
+    slot.k = V_MOVED;
+    slot.n = 0;
+    dropValue(v, at);
+}
+
+// ─── Clone ─────────────────────────────────────────────────────────────────
+
+V cloneValue(V v, const Node *at)
+{
+    switch (v.k)
+    {
+    case V_STR:
+        return mkStr(static_cast<StrObj *>(v.p)->s, v.x != 0);
+    case V_TUPLE:
+    case V_ARRAY:
+    case V_VEC:
+    case V_DEQUE:
+    case V_HEAP:
+    {
+        Obj *o = new Obj();
+        o->items.reserve(v.p->items.size());
+        for (const V &item : v.p->items)
+            o->items.push_back(cloneValue(item, at));
+        v.p = o;
+        return v;
+    }
+    case V_STRUCT:
+    {
+        StructObj *from = static_cast<StructObj *>(v.p);
+        FnDef *own = findMethod(from->def, "clone");
+        if (own)
+        {
+            std::vector<V> args(1, mkRefTo(v, false));
+            return callFn(own, args, from->def, at, nullptr);
+        }
+        if (!(from->def->derives & D_CLONE))
+            errAt(at, "E0599",
+                  "no method named `clone` found for struct `" + from->def->name + "` in the current scope",
+                  "method not found in `" + from->def->name + "`");
+        StructObj *o = new StructObj();
+        o->def = from->def;
+        o->items.reserve(from->items.size());
+        for (const V &item : from->items)
+            o->items.push_back(cloneValue(item, at));
+        v.p = o;
+        return v;
+    }
+    case V_ENUM:
+    {
+        EnumObj *from = static_cast<EnumObj *>(v.p);
+        bool library = from->def == G.optionDef || from->def == G.resultDef || from->def == G.orderingDef;
+        if (!library)
+        {
+            FnDef *own = findMethod(from->def, "clone");
+            if (own)
+            {
+                std::vector<V> args(1, mkRefTo(v, false));
+                return callFn(own, args, from->def, at, nullptr);
+            }
+            if (!(from->def->derives & D_CLONE))
+                errAt(at, "E0599",
+                      "no method named `clone` found for enum `" + from->def->name + "` in the current scope",
+                      "method not found in `" + from->def->name + "`");
+        }
+        if (from->items.empty())
+            return v;
+        EnumObj *o = new EnumObj();
+        o->def = from->def;
+        o->variant = from->variant;
+        o->items.reserve(from->items.size());
+        for (const V &item : from->items)
+            o->items.push_back(cloneValue(item, at));
+        v.p = o;
+        return v;
+    }
+    case V_BOX:
+        return mkBox(cloneValue(v.p->items[0], at));
+    case V_CELL:
+        return mkCell(cloneValue(v.p->items[0], at), v.n);
+    case V_RC:
+        ++static_cast<RcObj *>(v.p)->strong;
+        return v;
+    case V_WEAK:
+        ++static_cast<RcObj *>(v.p)->weak;
+        return v;
+    case V_MAP:
+    case V_SET:
+    {
+        MapObj *from = static_cast<MapObj *>(v.p);
+        V out = mkMap(from->sorted, from->isSet);
+        MapObj *m = static_cast<MapObj *>(out.p);
+        for (size_t k = 0; k < from->keys.size(); ++k)
+        {
+            if (from->keys[k].k == V_MOVED)
+                continue;
+            V value;
+            if (!from->isSet)
+                value = cloneValue(from->items[k], at);
+            mapInsert(m, cloneValue(from->keys[k], at), value, at);
+        }
+        return out;
+    }
+    case V_RANGE:
+    {
+        RangeObj *from = static_cast<RangeObj *>(v.p);
+        return mkRange(from->items[0], from->items[1], from->hasLo, from->hasHi, from->inclusive);
+    }
+    case V_NATIVE:
+    {
+        NativeObj *o = new NativeObj();
+        *o = *static_cast<NativeObj *>(v.p);
+        v.p = o;
+        taskCloned(o);
+        return v;
+    }
+    case V_ITER:
+    {
+        // a copy of the iterator's own state; what it draws from is copied too
+        IterObj *from = static_cast<IterObj *>(v.p);
+        IterObj *o = new IterObj();
+        *o = *from;
+        if (from->src)
+        {
+            V s;
+            s.k = V_ITER;
+            s.p = from->src;
+            o->src = static_cast<IterObj *>(cloneValue(s, at).p);
+        }
+        if (from->src2)
+        {
+            V s;
+            s.k = V_ITER;
+            s.p = from->src2;
+            o->src2 = static_cast<IterObj *>(cloneValue(s, at).p);
+        }
+        v.p = o;
+        return v;
+    }
+    }
+    return v;
+}
+
+// ─── PartialEq / PartialOrd / Hash ─────────────────────────────────────────
+
+namespace
+{
+
+// the Ordering a user's cmp / partial_cmp returned, as -1 0 1 (2: None)
+int orderingOf(V r, const Node *at)
+{
+    r = peel(r);
+    if (r.k == V_ENUM)
+    {
+        EnumObj *e = static_cast<EnumObj *>(r.p);
+        if (e->def == G.orderingDef)
+            return e->variant - 1;
+        if (e->def == G.optionDef)
+            return e->variant == 0 ? 2 : orderingOf(e->items[0], at);
+    }
+    errAt(at, "E0308", "mismatched types: expected `Ordering`, found `" + typeName(r) + "`");
+}
+
+int cmpSeq(const std::vector<V> &a, size_t a0, size_t an, const std::vector<V> &b, size_t b0, size_t bn,
+           const Node *at)
+{
+    size_t n = an < bn ? an : bn;
+    for (size_t k = 0; k < n; ++k)
+    {
+        int c = valueCmp(a[a0 + k], b[b0 + k], at);
+        if (c != 0)
+            return c;
+    }
+    return an < bn ? -1 : an > bn ? 1 : 0;
+}
+
+[[noreturn]] void cannotCompare(V a, V b, const char *op, const Node *at)
+{
+    std::string ta = typeName(a), tb = typeName(b);
+    if (ta == tb)
+        errAt(at, "E0369", std::string("binary operation `") + op + "` cannot be applied to type `" + ta + "`",
+              "note: an implementation of `" + std::string(op[0] == '=' ? "PartialEq" : "PartialOrd") +
+                  "` might be missing for `" + ta + "`");
+    errAt(at, "E0308", "mismatched types: expected `" + ta + "`, found `" + tb + "`");
+}
+
+uint64_t mix(uint64_t h, uint64_t x)
+{
+    h ^= x + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+    h *= 0xFF51AFD7ED558CCDULL;
+    return h ^ (h >> 32);
+}
+
+} // namespace
+
+V settleLike(V other)
+{
+    switch (other.k)
+    {
+    case V_STR:
+        return mkStr("", other.x != 0);
+    case V_FLOAT:
+        return mkFloat(0, other.t);
+    case V_BOOL:
+        return mkBool(false);
+    case V_CHAR:
+        return mkChar(0);
+    case V_UNIT:
+        return other;
+    case V_VEC:
+    case V_ARRAY:
+    case V_DEQUE:
+    case V_HEAP:
+    case V_SLICE:
+        return mkSeq(other.k == V_SLICE || other.k == V_ARRAY ? (uint8_t)V_VEC : other.k, std::vector<V>());
+    case V_MAP:
+    case V_SET:
+        return mkMap(static_cast<MapObj *>(other.p)->sorted, other.k == V_SET);
+    case V_ENUM:
+        if (static_cast<EnumObj *>(other.p)->def == G.optionDef)
+            return mkNone();
+        break;
+    }
+    return openDefault();
+}
+
+bool valueEq(V a, V b, const Node *at)
+{
+    a = peelAll(a);
+    b = peelAll(b);
+    if (a.k != b.k)
+    {
+        bool same = false;
+        if (jsonEq(a, b, same))
+            return same;
+    }
+    if (isOpenDefault(a) && b.k != V_INT)
+        a = settleLike(b);
+    else if (isOpenDefault(b) && a.k != V_INT)
+        b = settleLike(a);
+    Obj *ao = nullptr, *bo = nullptr;
+    int64_t as = 0, an = 0, bs = 0, bn = 0;
+    if (seqOf(a, ao, as, an))
+    {
+        if (!seqOf(b, bo, bs, bn))
+            cannotCompare(a, b, "==", at);
+        if (an != bn)
+            return false;
+        for (int64_t k = 0; k < an; ++k)
+            if (!valueEq(ao->items[(size_t)(as + k)], bo->items[(size_t)(bs + k)], at))
+                return false;
+        return true;
+    }
+    if (a.k != b.k)
+        cannotCompare(a, b, "==", at);
+    switch (a.k)
+    {
+    case V_UNIT:
+        return true;
+    case V_BOOL:
+    case V_CHAR:
+        return a.lo == b.lo;
+    case V_INT:
+        if (a.t && b.t && a.t != b.t)
+            cannotCompare(a, b, "==", at);
+        return a.lo == b.lo && a.hi == b.hi;
+    case V_FLOAT:
+        return fval(a) == fval(b);
+    case V_STR:
+        return static_cast<StrObj *>(a.p)->s == static_cast<StrObj *>(b.p)->s;
+    case V_TUPLE:
+    {
+        if (a.p->items.size() != b.p->items.size())
+            cannotCompare(a, b, "==", at);
+        for (size_t k = 0; k < a.p->items.size(); ++k)
+            if (!valueEq(a.p->items[k], b.p->items[k], at))
+                return false;
+        return true;
+    }
+    case V_STRUCT:
+    {
+        StructObj *x = static_cast<StructObj *>(a.p), *y = static_cast<StructObj *>(b.p);
+        FnDef *own = findMethod(x->def, "eq");
+        if (own)
+        {
+            std::vector<V> args;
+            args.push_back(mkRefTo(a, false));
+            args.push_back(mkRefTo(b, false));
+            return callFn(own, args, x->def, at, nullptr).lo != 0;
+        }
+        if (x->def != y->def)
+            cannotCompare(a, b, "==", at);
+        if (!(x->def->derives & D_PARTIALEQ))
+            cannotCompare(a, b, "==", at);
+        for (size_t k = 0; k < x->items.size(); ++k)
+            if (!valueEq(x->items[k], y->items[k], at))
+                return false;
+        return true;
+    }
+    case V_ENUM:
+    {
+        EnumObj *x = static_cast<EnumObj *>(a.p), *y = static_cast<EnumObj *>(b.p);
+        bool library = x->def == G.optionDef || x->def == G.resultDef || x->def == G.orderingDef;
+        if (!library)
+        {
+            FnDef *own = findMethod(x->def, "eq");
+            if (own)
+            {
+                std::vector<V> args;
+                args.push_back(mkRefTo(a, false));
+                args.push_back(mkRefTo(b, false));
+                return callFn(own, args, x->def, at, nullptr).lo != 0;
+            }
+            if (x->def != y->def || !(x->def->derives & D_PARTIALEQ))
+                cannotCompare(a, b, "==", at);
+        }
+        else if (x->def != y->def)
+            cannotCompare(a, b, "==", at);
+        if (x->variant != y->variant)
+            return false;
+        for (size_t k = 0; k < x->items.size(); ++k)
+            if (!valueEq(x->items[k], y->items[k], at))
+                return false;
+        return true;
+    }
+    case V_MAP:
+    case V_SET:
+    {
+        MapObj *x = static_cast<MapObj *>(a.p), *y = static_cast<MapObj *>(b.p);
+        if (mapLive(x) != mapLive(y))
+            return false;
+        for (size_t k = 0; k < x->keys.size(); ++k)
+        {
+            if (x->keys[k].k == V_MOVED)
+                continue;
+            int found = mapFind(y, x->keys[k], at);
+            if (found < 0)
+                return false;
+            if (!x->isSet && !valueEq(x->items[k], y->items[(size_t)found], at))
+                return false;
+        }
+        return true;
+    }
+    case V_RANGE:
+    {
+        RangeObj *x = static_cast<RangeObj *>(a.p), *y = static_cast<RangeObj *>(b.p);
+        return x->inclusive == y->inclusive && x->hasLo == y->hasLo && x->hasHi == y->hasHi &&
+               (!x->hasLo || valueEq(x->items[0], y->items[0], at)) &&
+               (!x->hasHi || valueEq(x->items[1], y->items[1], at));
+    }
+    case V_CELL:
+        return valueEq(a.p->items[0], b.p->items[0], at);
+    case V_NATIVE:
+    {
+        NativeObj *x = static_cast<NativeObj *>(a.p), *y = static_cast<NativeObj *>(b.p);
+        return x->type == y->type && x->s == y->s && x->a == y->a && x->b == y->b && x->d == y->d;
+    }
+    case V_FN:
+    case V_CLOSURE:
+    case V_WEAK:
+    case V_ITER:
+        return a.p == b.p;
+    }
+    cannotCompare(a, b, "==", at);
+}
+
+int valueCmp(V a, V b, const Node *at)
+{
+    a = peelAll(a);
+    b = peelAll(b);
+    if (isOpenDefault(a) && b.k != V_INT)
+        a = settleLike(b);
+    else if (isOpenDefault(b) && a.k != V_INT)
+        b = settleLike(a);
+    Obj *ao = nullptr, *bo = nullptr;
+    int64_t as = 0, an = 0, bs = 0, bn = 0;
+    if (seqOf(a, ao, as, an))
+    {
+        if (!seqOf(b, bo, bs, bn))
+            cannotCompare(a, b, "<", at);
+        return cmpSeq(ao->items, (size_t)as, (size_t)an, bo->items, (size_t)bs, (size_t)bn, at);
+    }
+    if (a.k != b.k)
+        cannotCompare(a, b, "<", at);
+    switch (a.k)
+    {
+    case V_UNIT:
+        return 0;
+    case V_BOOL:
+    case V_CHAR:
+        return a.lo < b.lo ? -1 : a.lo > b.lo ? 1 : 0;
+    case V_INT:
+        if (a.t && b.t && a.t != b.t)
+            cannotCompare(a, b, "<", at);
+        return intCmp(a, b);
+    case V_FLOAT:
+    {
+        double x = fval(a), y = fval(b);
+        if (x != x || y != y)
+            return 2;
+        return x < y ? -1 : x > y ? 1 : 0;
+    }
+    case V_STR:
+    {
+        int c = static_cast<StrObj *>(a.p)->s.compare(static_cast<StrObj *>(b.p)->s);
+        return c < 0 ? -1 : c > 0 ? 1 : 0;
+    }
+    case V_TUPLE:
+        return cmpSeq(a.p->items, 0, a.p->items.size(), b.p->items, 0, b.p->items.size(), at);
+    case V_STRUCT:
+    {
+        StructObj *x = static_cast<StructObj *>(a.p), *y = static_cast<StructObj *>(b.p);
+        if (x->def == G.reverseDef && y->def == G.reverseDef)
+        {
+            int c = valueCmp(x->items[0], y->items[0], at);
+            return c == 2 ? 2 : -c;
+        }
+        FnDef *own = findMethod(x->def, "cmp");
+        if (!own)
+            own = findMethod(x->def, "partial_cmp");
+        if (own)
+        {
+            std::vector<V> args;
+            args.push_back(mkRefTo(a, false));
+            args.push_back(mkRefTo(b, false));
+            return orderingOf(callFn(own, args, x->def, at, nullptr), at);
+        }
+        if (x->def != y->def || !(x->def->derives & (D_PARTIALORD | D_ORD)))
+            cannotCompare(a, b, "<", at);
+        return cmpSeq(x->items, 0, x->items.size(), y->items, 0, y->items.size(), at);
+    }
+    case V_ENUM:
+    {
+        EnumObj *x = static_cast<EnumObj *>(a.p), *y = static_cast<EnumObj *>(b.p);
+        bool library = x->def == G.optionDef || x->def == G.resultDef || x->def == G.orderingDef;
+        if (!library)
+        {
+            FnDef *own = findMethod(x->def, "cmp");
+            if (!own)
+                own = findMethod(x->def, "partial_cmp");
+            if (own)
+            {
+                std::vector<V> args;
+                args.push_back(mkRefTo(a, false));
+                args.push_back(mkRefTo(b, false));
+                return orderingOf(callFn(own, args, x->def, at, nullptr), at);
+            }
+            if (x->def != y->def || !(x->def->derives & (D_PARTIALORD | D_ORD)))
+                cannotCompare(a, b, "<", at);
+        }
+        else if (x->def != y->def)
+            cannotCompare(a, b, "<", at);
+        if (x->variant != y->variant)
+            return x->variant < y->variant ? -1 : 1;
+        return cmpSeq(x->items, 0, x->items.size(), y->items, 0, y->items.size(), at);
+    }
+    case V_NATIVE:
+    {
+        NativeObj *x = static_cast<NativeObj *>(a.p), *y = static_cast<NativeObj *>(b.p);
+        if (x->a != y->a)
+            return x->a < y->a ? -1 : 1;
+        return x->b < y->b ? -1 : x->b > y->b ? 1 : 0;
+    }
+    }
+    cannotCompare(a, b, "<", at);
+}
+
+uint64_t valueHash(V v, const Node *at)
+{
+    v = peelAll(v);
+    Obj *o = nullptr;
+    int64_t start = 0, len = 0;
+    if (seqOf(v, o, start, len))
+    {
+        uint64_t h = 0x5EC0 + (uint64_t)len;
+        for (int64_t k = 0; k < len; ++k)
+            h = mix(h, valueHash(o->items[(size_t)(start + k)], at));
+        return h;
+    }
+    switch (v.k)
+    {
+    case V_UNIT:
+        return 0x11;
+    case V_BOOL:
+        return mix(0xB001, v.lo);
+    case V_CHAR:
+        return mix(0xC4A2, v.lo);
+    case V_INT:
+        return mix(mix(0x1A7, v.lo), (uint64_t)v.hi);
+    case V_STR:
+    {
+        uint64_t h = 1469598103934665603ULL;
+        for (unsigned char c : static_cast<StrObj *>(v.p)->s)
+        {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return mix(0x57A, h);
+    }
+    case V_TUPLE:
+    {
+        uint64_t h = 0x7091E;
+        for (const V &item : v.p->items)
+            h = mix(h, valueHash(item, at));
+        return h;
+    }
+    case V_STRUCT:
+    {
+        StructObj *s = static_cast<StructObj *>(v.p);
+        // its own PartialEq: equal values may differ in fields that do not
+        // count, so all of the type share a bucket and eq decides
+        if (findMethod(s->def, "eq"))
+            return mix(0x0E9, (uint64_t)s->def->id);
+        uint64_t h = mix(0x57C7, (uint64_t)s->def->id);
+        for (const V &item : s->items)
+            h = mix(h, valueHash(item, at));
+        return h;
+    }
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(v.p);
+        bool library = e->def == G.optionDef || e->def == G.resultDef || e->def == G.orderingDef;
+        if (!library && findMethod(e->def, "eq"))
+            return mix(0x0E9, (uint64_t)e->def->id);
+        uint64_t h = mix(mix(0xE7, (uint64_t)e->def->id), (uint64_t)e->variant);
+        for (const V &item : e->items)
+            h = mix(h, valueHash(item, at));
+        return h;
+    }
+    case V_NATIVE:
+    {
+        NativeObj *o = static_cast<NativeObj *>(v.p);
+        uint64_t h = 0x7A71;
+        for (unsigned char c : o->type + "\x01" + o->s)
+            h = mix(h, c);
+        return mix(mix(h, (uint64_t)o->a), (uint64_t)o->b);
+    }
+    case V_FLOAT:
+        errAt(at, "E0277", std::string("the trait bound `") + (v.t == PR_F32 ? "f32" : "f64") +
+                               ": Hash` is not satisfied",
+              "a float cannot be a key: it is not `Hash` or `Eq`");
+    }
+    errAt(at, "E0277", "the trait bound `" + typeName(v) + ": Hash` is not satisfied");
+}
+
+// ─── maps and sets ─────────────────────────────────────────────────────────
+
+int mapLive(MapObj *m) { return (int)m->keys.size() - m->holes; }
+
+void mapEntries(MapObj *m, std::vector<int> &out)
+{
+    out.reserve(m->keys.size());
+    for (size_t k = 0; k < m->keys.size(); ++k)
+        if (m->keys[k].k != V_MOVED)
+            out.push_back((int)k);
+}
+
+namespace
+{
+
+// in a sorted map: where `key` is, or would go (found: whether it is there)
+int sortedPos(MapObj *m, V key, bool &found, const Node *at)
+{
+    int lo = 0, hi = (int)m->keys.size();
+    while (lo < hi)
+    {
+        int mid = (lo + hi) / 2;
+        int c = valueCmp(m->keys[(size_t)mid], key, at);
+        if (c == 0)
+        {
+            found = true;
+            return mid;
+        }
+        if (c < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    found = false;
+    return lo;
+}
+
+} // namespace
+
+int mapFind(MapObj *m, V key, const Node *at)
+{
+    if (m->sorted)
+    {
+        bool found = false;
+        int pos = sortedPos(m, key, found, at);
+        return found ? pos : -1;
+    }
+    auto bucket = m->index.find(valueHash(key, at));
+    if (bucket == m->index.end())
+        return -1;
+    for (int idx : bucket->second)
+        if (m->keys[(size_t)idx].k != V_MOVED && valueEq(m->keys[(size_t)idx], key, at))
+            return idx;
+    return -1;
+}
+
+int mapInsert(MapObj *m, V key, V value, const Node *at)
+{
+    if (m->sorted)
+    {
+        bool found = false;
+        int pos = sortedPos(m, key, found, at);
+        if (found)
+        {
+            if (!m->isSet)
+                m->items[(size_t)pos] = value;
+            return pos;
+        }
+        m->keys.insert(m->keys.begin() + pos, key);
+        if (!m->isSet)
+            m->items.insert(m->items.begin() + pos, value);
+        return pos;
+    }
+    uint64_t h = valueHash(key, at);
+    std::vector<int> &bucket = m->index[h];
+    for (int idx : bucket)
+        if (m->keys[(size_t)idx].k != V_MOVED && valueEq(m->keys[(size_t)idx], key, at))
+        {
+            if (!m->isSet)
+                m->items[(size_t)idx] = value;
+            return idx;
+        }
+    int idx = (int)m->keys.size();
+    m->keys.push_back(key);
+    if (!m->isSet)
+        m->items.push_back(value);
+    bucket.push_back(idx);
+    return idx;
+}
+
+bool mapRemove(MapObj *m, V key, V *old, const Node *at)
+{
+    if (m->sorted)
+    {
+        bool found = false;
+        int pos = sortedPos(m, key, found, at);
+        if (!found)
+            return false;
+        if (old && !m->isSet)
+            *old = m->items[(size_t)pos];
+        if (old && m->isSet)
+            *old = m->keys[(size_t)pos];
+        m->keys.erase(m->keys.begin() + pos);
+        if (!m->isSet)
+            m->items.erase(m->items.begin() + pos);
+        return true;
+    }
+    uint64_t h = valueHash(key, at);
+    auto bucket = m->index.find(h);
+    if (bucket == m->index.end())
+        return false;
+    std::vector<int> &ids = bucket->second;
+    for (size_t k = 0; k < ids.size(); ++k)
+    {
+        int idx = ids[k];
+        if (m->keys[(size_t)idx].k == V_MOVED || !valueEq(m->keys[(size_t)idx], key, at))
+            continue;
+        if (old)
+            *old = m->isSet ? m->keys[(size_t)idx] : m->items[(size_t)idx];
+        m->keys[(size_t)idx] = V();
+        m->keys[(size_t)idx].k = V_MOVED;
+        if (!m->isSet)
+            m->items[(size_t)idx] = V();
+        ids.erase(ids.begin() + (std::ptrdiff_t)k);
+        ++m->holes;
+        if (m->holes > 32 && m->holes * 2 > (int)m->keys.size())
+            mapCompact(m, at);
+        return true;
+    }
+    return false;
+}
+
+void mapCompact(MapObj *m, const Node *at)
+{
+    if (m->sorted || m->holes == 0)
+        return;
+    std::vector<V> keys, items;
+    keys.reserve(m->keys.size());
+    for (size_t k = 0; k < m->keys.size(); ++k)
+    {
+        if (m->keys[k].k == V_MOVED)
+            continue;
+        keys.push_back(m->keys[k]);
+        if (!m->isSet)
+            items.push_back(m->items[k]);
+    }
+    m->keys = keys;
+    m->items = items;
+    m->holes = 0;
+    m->index.clear();
+    for (size_t k = 0; k < m->keys.size(); ++k)
+        m->index[valueHash(m->keys[k], at)].push_back((int)k);
+}
+
+// ─── names of types ────────────────────────────────────────────────────────
+
+std::string typeName(V v)
+{
+    switch (v.k)
+    {
+    case V_UNIT:
+        return "()";
+    case V_BOOL:
+        return "bool";
+    case V_INT:
+        return v.t ? primName(v.t) : "i32";
+    case V_FLOAT:
+        return v.t ? primName(v.t) : "f64";
+    case V_CHAR:
+        return "char";
+    case V_STR:
+        return v.x ? "String" : "&str";
+    case V_TUPLE:
+    {
+        std::string s = "(";
+        for (size_t k = 0; k < v.p->items.size(); ++k)
+            s += (k ? ", " : "") + typeName(v.p->items[k]);
+        return s + (v.p->items.size() == 1 ? ",)" : ")");
+    }
+    case V_ARRAY:
+        return "[" + (v.p->items.empty() ? std::string("_") : typeName(v.p->items[0])) + "; " +
+               std::to_string(v.p->items.size()) + "]";
+    case V_VEC:
+        return "Vec<" + (v.p->items.empty() ? std::string("_") : typeName(v.p->items[0])) + ">";
+    case V_DEQUE:
+        return "VecDeque<" + (v.p->items.empty() ? std::string("_") : typeName(v.p->items[0])) + ">";
+    case V_HEAP:
+        return "BinaryHeap<" + (v.p->items.empty() ? std::string("_") : typeName(v.p->items[0])) + ">";
+    case V_SLICE:
+        return std::string(v.x ? "&mut [" : "&[") +
+               (v.lo == 0 ? std::string("_") : typeName(v.p->items[(size_t)v.hi])) + "]";
+    case V_STRUCT:
+        return static_cast<StructObj *>(v.p)->def->name;
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(v.p);
+        if (e->def == G.optionDef)
+            return "Option<" + (e->items.empty() ? std::string("_") : typeName(e->items[0])) + ">";
+        if (e->def == G.resultDef)
+            return e->variant == 0 ? "Result<" + typeName(e->items[0]) + ", _>"
+                                   : "Result<_, " + typeName(e->items[0]) + ">";
+        return e->def->name;
+    }
+    case V_REF:
+        return std::string(v.x ? "&mut " : "&") + typeName(slotAt(v.p, v.hi));
+    case V_BOX:
+        return "Box<" + typeName(v.p->items[0]) + ">";
+    case V_RC:
+        return "Rc<" + typeName(v.p->items[0]) + ">";
+    case V_WEAK:
+        return "Weak<" + typeName(v.p->items[0]) + ">";
+    case V_CELL:
+        return std::string(v.n == 1 ? "Cell<" : v.n == 2 ? "Mutex<" : v.n == 3 ? "RwLock<" : "RefCell<") +
+               typeName(v.p->items[0]) + ">";
+    case V_FN:
+        return "fn";
+    case V_CLOSURE:
+        return "{closure}";
+    case V_MAP:
+    {
+        MapObj *m = static_cast<MapObj *>(v.p);
+        std::string kt = "_", vt = "_";
+        for (size_t k = 0; k < m->keys.size(); ++k)
+            if (m->keys[k].k != V_MOVED)
+            {
+                kt = typeName(m->keys[k]);
+                vt = typeName(m->items[k]);
+                break;
+            }
+        return std::string(m->sorted ? "BTreeMap<" : "HashMap<") + kt + ", " + vt + ">";
+    }
+    case V_SET:
+    {
+        MapObj *m = static_cast<MapObj *>(v.p);
+        std::string kt = "_";
+        for (size_t k = 0; k < m->keys.size(); ++k)
+            if (m->keys[k].k != V_MOVED)
+            {
+                kt = typeName(m->keys[k]);
+                break;
+            }
+        return std::string(m->sorted ? "BTreeSet<" : "HashSet<") + kt + ">";
+    }
+    case V_ITER:
+        return "impl Iterator";
+    case V_RANGE:
+        return "Range<" + typeName(v.p->items[0]) + ">";
+    case V_NATIVE:
+        return static_cast<NativeObj *>(v.p)->type;
+    case V_MOVED:
+        return "<moved>";
+    }
+    return "?";
+}
+
+std::string tyText(const Ty *t)
+{
+    if (!t)
+        return "_";
+    switch (t->k)
+    {
+    case TY_REF:
+        return std::string(t->mut ? "&mut " : "&") + tyText(t->elem);
+    case TY_PTR:
+        return std::string(t->mut ? "*mut " : "*const ") + tyText(t->elem);
+    case TY_TUPLE:
+    {
+        std::string s = "(";
+        for (size_t k = 0; k < t->items.size(); ++k)
+            s += (k ? ", " : "") + tyText(t->items[k]);
+        return s + ")";
+    }
+    case TY_ARRAY:
+        return "[" + tyText(t->elem) + "; _]";
+    case TY_SLICE:
+        return "[" + tyText(t->elem) + "]";
+    case TY_FN:
+    {
+        std::string s = "fn(";
+        for (size_t k = 0; k < t->items.size(); ++k)
+            s += (k ? ", " : "") + tyText(t->items[k]);
+        s += ")";
+        if (t->ret)
+            s += " -> " + tyText(t->ret);
+        return s;
+    }
+    case TY_NEVER:
+        return "!";
+    case TY_INFER:
+        return "_";
+    }
+    std::string s = t->k == TY_DYN ? "dyn " : t->k == TY_IMPL ? "impl " : "";
+    if (!t->path)
+        return s + "_";
+    for (size_t k = 0; k < t->path->segs.size(); ++k)
+    {
+        const PathSeg &seg = t->path->segs[k];
+        s += (k ? "::" : "") + seg.name;
+        if (!seg.args.empty())
+        {
+            s += "<";
+            for (size_t a = 0; a < seg.args.size(); ++a)
+                s += (a ? ", " : "") + tyText(seg.args[a]);
+            s += ">";
+        }
+    }
+    return s;
+}
+
+} // namespace rust

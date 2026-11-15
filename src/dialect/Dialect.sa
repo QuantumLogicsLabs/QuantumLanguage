@@ -2,6 +2,7 @@
 #include "../js/JsMain.h.sa"
 #include "../ruby/RubyMain.h.sa"
 #include "../python/PyMain.h.sa"
+#include "../rust/RustMain.h.sa"
 #include "../html/HtmlMain.h.sa"
 #include "../css/CssMain.h.sa"
 #include "Dialect.h.sa"
@@ -36,14 +37,14 @@ bool hasSupportedExt(const std::string &path)
 {
     std::string ext = fileExtLower(path);
     return ext == ".sa" || ext == ".js" || ext == ".py" || ext == ".rb" || ext == ".c" || ext == ".cpp" ||
-           ext == ".java" || ext == ".html" || ext == ".htm" || ext == ".css";
+           ext == ".java" || ext == ".rs" || ext == ".html" || ext == ".htm" || ext == ".css";
 }
 
 bool strictSource(const std::string &path)
 {
     std::string ext = fileExtLower(path);
     return ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".py" || ext == ".js" ||
-           ext == ".rb" || ext == ".java";
+           ext == ".rb" || ext == ".java" || ext == ".rs";
 }
 
 bool isMarkedCppSource(const std::string &source)
@@ -179,16 +180,17 @@ std::string applyDialect(std::string source, const std::string &path)
             std::cerr << "----- Java-style pass -----\n" << source << "----- end -----\n";
     }
 
-    // A .py / .js / .rb file is that language and nothing else (strictSource):
-    // a program its front-end cannot parse is a compile error, reported the
-    // way python / node / ruby report it, and never goes to the mixed-syntax
+    // A .py / .js / .rb / .rs file is that language and nothing else
+    // (strictSource): a program its front-end cannot parse is a compile
+    // error, reported the way python / node / ruby / rustc report it, and never goes to the mixed-syntax
     // pipeline below (mixed syntax belongs in a .sa file). Otherwise that
     // front-end runs it (src/python, src/js, src/ruby); the program travels
     // inside the chunk as a string.
-    if (ext == ".py" || ext == ".js" || ext == ".rb")
+    if (ext == ".py" || ext == ".js" || ext == ".rb" || ext == ".rs")
     {
         std::string report = ext == ".py"   ? py::syntaxReport(source, path)
                              : ext == ".js" ? js::syntaxReport(source, path)
+                             : ext == ".rs" ? rust::syntaxReport(source, path)
                                             : ruby::syntaxReport(source, path);
         if (!report.empty())
             throw CompileError(report);
@@ -197,6 +199,8 @@ std::string applyDialect(std::string source, const std::string &path)
             run = "__py_run__(";
         else if (ext == ".js")
             run = "__js_run__(";
+        else if (ext == ".rs")
+            run = "__rust_run__(";
         return run + quantumStringLiteral(source) + ", " + quantumStringLiteral(path) + ")\n";
     }
 

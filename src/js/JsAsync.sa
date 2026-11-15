@@ -25,6 +25,9 @@ void *CreateFiberEx(size_t commit, size_t reserve, unsigned long flags, void (*s
 void SwitchToFiber(void *fiber);
 } // namespace __dll_kernel32
 
+// the thread as a fiber, shared with the Rust front-end's threads (RustTask.sa)
+void *quantumThreadFiber();
+
 namespace js
 {
 
@@ -184,7 +187,7 @@ void coSwitchIn(Co *c, uint8_t mode, V val)
 {
     if (!g_mainFiber)
     {
-        g_mainFiber = __dll_kernel32::ConvertThreadToFiber(nullptr);
+        g_mainFiber = quantumThreadFiber();
         g_curFiber = g_mainFiber;
     }
     c->mode = mode;

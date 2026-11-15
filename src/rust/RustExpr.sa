@@ -1,0 +1,1588 @@
+// quantum: cpp
+// Rust front-end: the parser, part 2: blocks, statements, expressions, the
+// built-in macros and their format strings. A macro of the standard library
+// is parsed here into a node of its own (N_MACRO) with its arguments as
+// ordinary expressions; a format string is taken apart once, at parse time.
+#include "RustParse.h.sa"
+
+#include <cctype>
+#include <cstdlib>
+
+namespace rust
+{
+
+namespace
+{
+
+// precedence of a binary operator (0: not one)
+int binPrec(const std::string &s, uint8_t &op)
+{
+    switch (s.size())
+    {
+    case 1:
+        switch (s[0])
+        {
+        case '*': op = O_MUL; return 11;
+        case '/': op = O_DIV; return 11;
+        case '%': op = O_REM; return 11;
+        case '+': op = O_ADD; return 10;
+        case '-': op = O_SUB; return 10;
+        case '&': op = O_BITAND; return 8;
+        case '^': op = O_BITXOR; return 7;
+        case '|': op = O_BITOR; return 6;
+        case '<': op = O_LT; return 5;
+        case '>': op = O_GT; return 5;
+        }
+        return 0;
+    case 2:
+        if (s == "<<") { op = O_SHL; return 9; }
+        if (s == ">>") { op = O_SHR; return 9; }
+        if (s == "==") { op = O_EQ; return 5; }
+        if (s == "!=") { op = O_NE; return 5; }
+        if (s == "<=") { op = O_LE; return 5; }
+        if (s == ">=") { op = O_GE; return 5; }
+        if (s == "&&") { op = O_AND; return 4; }
+        if (s == "||") { op = O_OR; return 3; }
+        return 0;
+    }
+    return 0;
+}
+
+bool assignOp(const std::string &s, uint8_t &op)
+{
+    if (s.size() < 2 || s.back() != '=')
+        return false;
+    if (s == "+=") op = O_ADD;
+    else if (s == "-=") op = O_SUB;
+    else if (s == "*=") op = O_MUL;
+    else if (s == "/=") op = O_DIV;
+    else if (s == "%=") op = O_REM;
+    else if (s == "^=") op = O_BITXOR;
+    else if (s == "&=") op = O_BITAND;
+    else if (s == "|=") op = O_BITOR;
+    else if (s == "<<=") op = O_SHL;
+    else if (s == ">>=") op = O_SHR;
+    else
+        return false;
+    return true;
+}
+
+} // namespace
+
+bool Parser::blockLike(const Node *e)
+{
+    return e->k == N_IF || e->k == N_MATCH || e->k == N_LOOP || e->k == N_WHILE || e->k == N_FOR ||
+           e->k == N_BLOCK;
+}
+
+bool Parser::literalText(std::string &out)
+{
+    // the bracket the macro expander puts around an expression
+    if (isP("(") && cur().raw)
+    {
+        size_t save = p;
+        ++p;
+        std::string inner;
+        if (literalText(inner) && isP(")"))
+        {
+            ++p;
+            out = inner;
+            return true;
+        }
+        p = save;
+        return false;
+    }
+    const Tok &t = cur();
+    if (t.k == T_STR)
+    {
+        out = t.s;
+        ++p;
+        return true;
+    }
+    if (t.k == T_IDENT && (t.s == "concat" || t.s == "stringify") && isPAt(1, "!") &&
+        (isPAt(2, "(") || isPAt(2, "[") || isPAt(2, "{")))
+    {
+        bool isConcat = t.s == "concat";
+        p += 2;
+        std::vector<Tok> inner = takeGroup();
+        if (!isConcat)
+        {
+            std::string text;
+            for (size_t k = 0; k < inner.size(); ++k)
+            {
+                const Tok &x = inner[k];
+                if (x.k == T_PUNCT && x.raw)
+                    continue;
+                if (!text.empty() && x.spaceBefore)
+                    text += ' ';
+                if (x.k == T_STR)
+                    text += "\"" + x.s + "\"";
+                else
+                    text += x.s + x.suf;
+            }
+            out = text;
+            return true;
+        }
+        Tok eof;
+        eof.k = T_EOF;
+        Parser sub;
+        sub.toks = inner;
+        sub.toks.push_back(eof);
+        sub.mod = mod;
+        sub.all = all;
+        sub.macros = macros;
+        std::string text;
+        while (sub.cur().k != T_EOF)
+        {
+            std::string piece;
+            const Tok &x = sub.cur();
+            if (sub.literalText(piece))
+                text += piece;
+            else if (x.k == T_INT || x.k == T_FLOAT)
+            {
+                text += x.s;
+                ++sub.p;
+            }
+            else if (x.k == T_CHAR)
+            {
+                std::string c;
+                uint32_t cp = (uint32_t)x.lo;
+                if (cp < 0x80)
+                    c += (char)cp;
+                text += c;
+                ++sub.p;
+            }
+            else if (x.k == T_IDENT && (x.s == "true" || x.s == "false"))
+            {
+                text += x.s;
+                ++sub.p;
+            }
+            else
+                return false;
+            if (!sub.eatP(","))
+                break;
+        }
+        out = text;
+        return true;
+    }
+    return false;
+}
+
+bool Parser::exprStarts() const
+{
+    const Tok &t = cur();
+    if (t.k == T_EOF)
+        return false;
+    if (t.k == T_PUNCT)
+    {
+        const std::string &s = t.s;
+        return s == "(" || s == "[" || s == "{" || s == "-" || s == "!" || s == "*" || s == "&" || s == "&&" ||
+               s == "|" || s == "||" || s == "<" || s == "::" || s == ".." || s == "..=" || s == "#";
+    }
+    if (t.k == T_IDENT && !t.raw)
+        return !(t.s == "as" || t.s == "else" || t.s == "in" || t.s == "where");
+    return true;
+}
+
+// ─── blocks and statements ─────────────────────────────────────────────────
+
+Node *Parser::parseBlock()
+{
+    if (!isP("{"))
+        failExpected("`{`");
+    Tok open = cur();
+    ++p;
+    return parseBlockBody(open);
+}
+
+Node *Parser::parseBlockBody(const Tok &open)
+{
+    Node *b = mk(N_BLOCK, open);
+    // the items the block declares are a scope of their own
+    ModDef *scope = new ModDef();
+    scope->isBlock = true;
+    scope->parent = mod;
+    scope->line = open.line;
+    scope->col = open.col;
+    ModDef *saved = mod;
+    mod = scope;
+    size_t macroMark = macros->size();
+    for (;;)
+    {
+        if (cur().k == T_EOF)
+            fail("this file contains an unclosed delimiter", open);
+        if (isP("}"))
+            break;
+        parseStmt(b);
+    }
+    ++p;
+    mod = saved;
+    macros->resize(macroMark); // macro_rules! in a block ends with it
+    if (!scope->names.empty() || !scope->impls.empty() || !scope->uses.empty())
+    {
+        b->items = scope;
+        all->push_back(scope);
+    }
+    return b;
+}
+
+void Parser::parseStmt(Node *b)
+{
+    if (eatP(";"))
+        return;
+    b->flag = false;
+    if (isP("#"))
+    {
+        // attributes: of an item, or of a statement (then they say nothing here)
+        size_t start = p;
+        bool skip = false, isDefault = false;
+        parseAttributes(skip, isDefault);
+        bool item = atItemStart();
+        if (item)
+        {
+            p = start;
+            parseItem(mod);
+            return;
+        }
+    }
+    if (atItemStart())
+    {
+        parseItem(mod);
+        return;
+    }
+    // a macro_rules! macro as a statement: what it stands for joins this block
+    if (isIdent() && isPAt(1, "!") && (isPAt(2, "(") || isPAt(2, "[") || isPAt(2, "{")))
+    {
+        MacroDef *def = findMacro(cur().s);
+        if (def)
+        {
+            // only when the call is the whole statement
+            size_t close = p + 2;
+            int depth = 0;
+            for (; close < toks.size(); ++close)
+            {
+                const Tok &t = toks[close];
+                if (t.k == T_PUNCT && (t.s == "(" || t.s == "[" || t.s == "{"))
+                    ++depth;
+                else if (t.k == T_PUNCT && (t.s == ")" || t.s == "]" || t.s == "}") && --depth == 0)
+                    break;
+            }
+            const Tok &after = toks[close + 1 < toks.size() ? close + 1 : toks.size() - 1];
+            bool brace = isPAt(2, "{");
+            bool whole = brace || after.k == T_EOF || (after.k == T_PUNCT && (after.s == ";" || after.s == "}"));
+            if (whole)
+            {
+                Tok at = cur();
+                p += 2;
+                Node *e = parseUserMacro(def, at, 1);
+                for (Node *k : e->kids)
+                    b->kids.push_back(k);
+                if (eatP(";"))
+                    return;
+                if (isP("}") || cur().k == T_EOF)
+                    b->flag = e->flag;
+                return;
+            }
+        }
+    }
+    if (isKw("let"))
+    {
+        Tok at = cur();
+        ++p;
+        Node *n = mk(N_LET, at);
+        n->pat = parsePattern();
+        if (eatP(":"))
+            n->ty = parseType();
+        if (eatP("="))
+        {
+            n->a = parseExpr();
+            if (eatKw("else"))
+                n->b = parseBlock();
+        }
+        expectP(";");
+        b->kids.push_back(n);
+        return;
+    }
+    // An expression. One that starts with a block (if, match, a loop, { })
+    // is the whole statement, unless a method call or `?` follows.
+    bool startsBlock = isP("{") || isKw("if") || isKw("match") || isKw("loop") || isKw("while") || isKw("for") ||
+                       (isKw("unsafe") && isPAt(1, "{")) || (cur().k == T_LIFE && isPAt(1, ":"));
+    Node *e = nullptr;
+    bool complete = false;
+    if (startsBlock)
+    {
+        size_t start = p;
+        e = parsePrimary(false);
+        if (isP(".") || isP("?"))
+        {
+            p = start;
+            e = parseExpr();
+        }
+        else
+            complete = true;
+    }
+    else
+        e = parseExpr();
+    b->kids.push_back(e);
+    if (eatP(";"))
+        return;
+    if (isP("}") || cur().k == T_EOF)
+    {
+        b->flag = true; // the block's value
+        return;
+    }
+    if (complete || (e->k == N_MACRO && e->mut))
+        return; // no `;` needed after a block or a macro written with braces
+    failAfterPrev("`;`");
+}
+
+// ─── expressions ───────────────────────────────────────────────────────────
+
+Node *Parser::parseExpr(bool noStruct)
+{
+    Node *lhs = parseRange(noStruct);
+    const Tok &t = cur();
+    if (t.k != T_PUNCT)
+        return lhs;
+    if (t.s == "=")
+    {
+        Tok at = t;
+        ++p;
+        Node *n = mk(N_ASSIGN, at);
+        n->a = lhs;
+        n->b = parseExpr(noStruct);
+        return n;
+    }
+    uint8_t op = 0;
+    if (assignOp(t.s, op))
+    {
+        Tok at = t;
+        ++p;
+        Node *n = mk(N_OPASSIGN, at);
+        n->op = op;
+        n->a = lhs;
+        n->b = parseExpr(noStruct);
+        return n;
+    }
+    return lhs;
+}
+
+Node *Parser::parseRange(bool noStruct)
+{
+    if (isP("..") || isP("..="))
+    {
+        Tok at = cur();
+        ++p;
+        Node *n = mk(N_RANGE, at);
+        n->flag = at.s == "..=";
+        if (exprStarts() && !(noStruct && isP("{")))
+            n->b = parseBinary(1, noStruct);
+        return n;
+    }
+    Node *lhs = parseBinary(1, noStruct);
+    if (isP("..") || isP("..="))
+    {
+        Tok at = cur();
+        ++p;
+        Node *n = mk(N_RANGE, at);
+        n->line = lhs->line;
+        n->col = lhs->col;
+        n->flag = at.s == "..=";
+        n->a = lhs;
+        if (exprStarts() && !(noStruct && isP("{")))
+            n->b = parseBinary(1, noStruct);
+        else if (n->flag)
+            fail("inclusive range with no end", at);
+        return n;
+    }
+    return lhs;
+}
+
+Node *Parser::parseBinary(int minPrec, bool noStruct)
+{
+    Node *lhs = parseUnary(noStruct);
+    for (;;)
+    {
+        if (isKw("as"))
+        {
+            Tok at = cur();
+            ++p;
+            Node *n = mk(N_CAST, at);
+            n->a = lhs;
+            n->ty = parseType();
+            lhs = n;
+            continue;
+        }
+        const Tok &t = cur();
+        if (t.k != T_PUNCT)
+            break;
+        uint8_t op = 0;
+        int prec = binPrec(t.s, op);
+        if (prec == 0 || prec < minPrec)
+            break;
+        Tok at = t;
+        ++p;
+        Node *rhs = parseBinary(prec + 1, noStruct);
+        if (prec == 5)
+        {
+            uint8_t next = 0;
+            if (cur().k == T_PUNCT && binPrec(cur().s, next) == 5)
+                fail("comparison operators cannot be chained", cur());
+        }
+        Node *n = mk(N_BINARY, at);
+        n->op = op;
+        n->a = lhs;
+        n->b = rhs;
+        // where it is reported (an overflow panics there): the whole expression's start
+        n->line = lhs->line;
+        n->col = lhs->col;
+        lhs = n;
+    }
+    return lhs;
+}
+
+Node *Parser::parseUnary(bool noStruct)
+{
+    const Tok &t = cur();
+    if (t.k == T_PUNCT)
+    {
+        Tok at = t;
+        if (t.s == "-")
+        {
+            ++p;
+            Node *e = parseUnary(noStruct);
+            if ((e->k == N_INT || e->k == N_FLOAT) && !e->flag)
+            {
+                e->flag = true; // a negative literal
+                e->line = at.line;
+                e->col = at.col;
+                return e;
+            }
+            Node *n = mk(N_UNARY, at);
+            n->op = O_NEG;
+            n->a = e;
+            return n;
+        }
+        if (t.s == "!" || t.s == "*")
+        {
+            ++p;
+            Node *n = mk(N_UNARY, at);
+            n->op = at.s == "!" ? O_NOT : O_DEREF;
+            n->a = parseUnary(noStruct);
+            return n;
+        }
+        if (t.s == "&&")
+            splitAmp();
+        if (isP("&"))
+        {
+            at = cur();
+            ++p;
+            Node *n = mk(N_REF, at);
+            if (isKw("raw") && (isKwAt(1, "const") || isKwAt(1, "mut")))
+                ++p;
+            if (eatKw("mut"))
+                n->mut = true;
+            else
+                eatKw("const");
+            n->a = parseUnary(noStruct);
+            return n;
+        }
+    }
+    return parsePostfix(parsePrimary(noStruct), noStruct);
+}
+
+Node *Parser::parsePostfix(Node *e, bool noStruct)
+{
+    (void)noStruct;
+    for (;;)
+    {
+        Tok at = cur();
+        if (isP("?"))
+        {
+            ++p;
+            Node *n = mk(N_TRY, at);
+            n->a = e;
+            e = n;
+        }
+        else if (isP("."))
+        {
+            ++p;
+            const Tok &f = cur();
+            if (f.k == T_INT)
+            {
+                if (!f.suf.empty())
+                    fail("suffixes on a tuple index are invalid", f);
+                Node *n = mk(N_TFIELD, f);
+                n->a = e;
+                n->lo = f.lo;
+                ++p;
+                e = n;
+            }
+            else if (f.k == T_FLOAT && f.suf.empty() && f.s.find('.') != std::string::npos &&
+                     f.s.find('e') == std::string::npos)
+            {
+                // t.0.1: the lexer read 0.1 as a number
+                size_t dot = f.s.find('.');
+                Node *n1 = mk(N_TFIELD, f);
+                n1->a = e;
+                n1->lo = (uint64_t)std::strtoull(f.s.substr(0, dot).c_str(), nullptr, 10);
+                e = n1;
+                if (dot + 1 < f.s.size())
+                {
+                    Node *n2 = mk(N_TFIELD, f);
+                    n2->a = e;
+                    n2->lo = (uint64_t)std::strtoull(f.s.substr(dot + 1).c_str(), nullptr, 10);
+                    e = n2;
+                }
+                ++p;
+            }
+            else if (isKw("await"))
+            {
+                if (!inAsync)
+                {
+                    CompileErr err;
+                    err.code = "E0728";
+                    err.message = "`await` is only allowed inside `async` functions and blocks";
+                    err.line = f.line;
+                    err.col = f.col;
+                    err.width = 5;
+                    err.label = "only allowed inside `async` functions and blocks";
+                    throw err;
+                }
+                Node *n = mk(N_AWAIT, f);
+                n->a = e;
+                ++p;
+                e = n;
+            }
+            else
+            {
+                Tok nameAt = cur();
+                std::string name = expectIdent("identifier");
+                std::vector<Ty *> targs;
+                bool turbofish = false;
+                if (isP("::") && isPAt(1, "<"))
+                {
+                    ++p;
+                    PathSeg seg;
+                    parseGenericArgs(seg);
+                    targs = seg.args;
+                    turbofish = true;
+                }
+                if (isP("("))
+                {
+                    Node *n = mk(N_MCALL, nameAt);
+                    n->a = e;
+                    n->s = name;
+                    n->tys = targs;
+                    ++p;
+                    parseArgs(n->kids, ")");
+                    e = n;
+                }
+                else
+                {
+                    if (turbofish)
+                        failExpected("`(`");
+                    Node *n = mk(N_FIELD, nameAt);
+                    n->a = e;
+                    n->s = name;
+                    e = n;
+                }
+            }
+        }
+        else if (isP("("))
+        {
+            ++p;
+            Node *n = mk(N_CALL, at);
+            n->line = e->line;
+            n->col = e->col;
+            n->a = e;
+            parseArgs(n->kids, ")");
+            e = n;
+        }
+        else if (isP("["))
+        {
+            ++p;
+            Node *n = mk(N_INDEX, at);
+            n->line = e->line;
+            n->col = e->col;
+            n->hi = at.line; // where `[` is: a Vec's (Index trait) out-of-bounds panic points there
+            n->lo = (uint64_t)at.col;
+            n->a = e;
+            n->b = parseExpr();
+            expectP("]");
+            e = n;
+        }
+        else
+            return e;
+    }
+}
+
+void Parser::parseArgs(std::vector<Node *> &out, const char *close)
+{
+    while (!isP(close))
+    {
+        if (cur().k == T_EOF)
+            failExpected(std::string("`") + close + "`");
+        out.push_back(parseExpr());
+        if (!isP(close))
+            expectP(",");
+    }
+    ++p;
+}
+
+Node *Parser::parseIf()
+{
+    Tok at = cur();
+    ++p;
+    Node *n = mk(N_IF, at);
+    n->a = parseExpr(true);
+    if (!isP("{"))
+        failExpected("`{`");
+    n->b = parseBlock();
+    if (eatKw("else"))
+    {
+        if (isKw("if"))
+            n->c = parseIf();
+        else
+            n->c = parseBlock();
+    }
+    return n;
+}
+
+Node *Parser::parseMatch()
+{
+    Tok at = cur();
+    ++p;
+    Node *n = mk(N_MATCH, at);
+    n->a = parseExpr(true);
+    expectP("{");
+    while (!isP("}"))
+    {
+        bool skip = false, isDefault = false;
+        parseAttributes(skip, isDefault);
+        Arm arm;
+        arm.pat = parsePattern();
+        if (eatKw("if"))
+            arm.guard = parseExpr();
+        expectP("=>");
+        // a body that starts with a block ends with it, as a statement does
+        bool startsBlock = isP("{") || isKw("if") || isKw("match") || isKw("loop") || isKw("while") ||
+                           isKw("for") || (isKw("unsafe") && isPAt(1, "{")) ||
+                           (cur().k == T_LIFE && isPAt(1, ":"));
+        bool complete = false;
+        if (startsBlock)
+        {
+            size_t start = p;
+            arm.body = parsePrimary(false);
+            if (isP(".") || isP("?"))
+            {
+                p = start;
+                arm.body = parseExpr();
+            }
+            else
+                complete = true;
+        }
+        else
+            arm.body = parseExpr();
+        n->arms.push_back(arm);
+        if (isP("}"))
+            break;
+        if (complete)
+            eatP(",");
+        else
+            expectP(",");
+    }
+    expectP("}");
+    return n;
+}
+
+Node *Parser::parseClosure()
+{
+    Tok at = cur();
+    Node *n = mk(N_CLOSURE, at);
+    if (eatKw("move"))
+        n->flag = true;
+    if (!eatP("||"))
+    {
+        expectP("|");
+        while (!isP("|"))
+        {
+            Pat *pt = parsePatNoOr();
+            Ty *ty = nullptr;
+            if (eatP(":"))
+                ty = parseType();
+            n->pats.push_back(pt);
+            n->tys.push_back(ty);
+            if (!isP("|"))
+                expectP(",");
+        }
+        ++p;
+    }
+    // the body of `async |x| ...` may await; that of a plain closure may not
+    bool savedAsync = inAsync;
+    inAsync = asyncClosure;
+    asyncClosure = false;
+    if (eatP("->"))
+    {
+        n->ty = parseType();
+        n->a = parseBlock();
+    }
+    else
+        n->a = parseExpr();
+    inAsync = savedAsync;
+    return n;
+}
+
+Node *Parser::parseStructLit(Path *path, const Tok &at)
+{
+    Node *n = mk(N_STRUCT, at);
+    n->path = path;
+    ++p; // {
+    while (!isP("}"))
+    {
+        if (eatP(".."))
+        {
+            n->b = parseExpr();
+            break;
+        }
+        Tok fieldAt = cur();
+        std::string name;
+        if (cur().k == T_INT)
+            name = toks[p++].s;
+        else
+            name = expectIdent("identifier");
+        Node *value;
+        if (eatP(":"))
+            value = parseExpr();
+        else
+        {
+            value = mk(N_PATH, fieldAt); // x: the same as x: x
+            value->path = new Path();
+            value->path->line = fieldAt.line;
+            value->path->col = fieldAt.col;
+            PathSeg seg;
+            seg.name = name;
+            value->path->segs.push_back(seg);
+        }
+        for (const std::string &other : n->names)
+            if (other == name)
+            {
+                CompileErr e;
+                e.code = "E0062";
+                e.message = "field `" + name + "` specified more than once";
+                e.line = fieldAt.line;
+                e.col = fieldAt.col;
+                e.width = (int)name.size();
+                e.label = "used more than once";
+                throw e;
+            }
+        n->names.push_back(name);
+        n->kids.push_back(value);
+        if (!isP("}"))
+            expectP(",");
+    }
+    expectP("}");
+    return n;
+}
+
+Node *Parser::parsePrimary(bool noStruct)
+{
+    Tok at = cur();
+    switch (at.k)
+    {
+    case T_INT:
+    {
+        Node *n = mk(N_INT, at);
+        n->lo = at.lo;
+        n->hi = (int64_t)at.hi;
+        n->t = primOf(at.suf);
+        ++p;
+        return n;
+    }
+    case T_FLOAT:
+    {
+        Node *n = mk(N_FLOAT, at);
+        n->f = at.f;
+        n->t = primOf(at.suf);
+        ++p;
+        return n;
+    }
+    case T_STR:
+    case T_BSTR:
+    {
+        Node *n = mk(at.k == T_STR ? N_STR : N_BSTR, at);
+        n->s = at.s;
+        ++p;
+        return n;
+    }
+    case T_CHAR:
+    case T_BYTE:
+    {
+        Node *n = mk(at.k == T_CHAR ? N_CHAR : N_BYTE, at);
+        n->lo = at.lo;
+        ++p;
+        return n;
+    }
+    case T_LIFE:
+    {
+        // 'label: loop { }
+        if (!isPAt(1, ":"))
+            failExpected("expression");
+        p += 2;
+        if (!(isKw("loop") || isKw("while") || isKw("for") || isP("{")))
+            failExpected("`while`, `for`, `loop` or `{` after a label");
+        Node *e = parsePrimary(noStruct);
+        e->s = at.s;
+        return e;
+    }
+    case T_EOF:
+        failExpected("expression");
+    }
+    if (at.k == T_PUNCT)
+    {
+        if (at.s == "(")
+        {
+            ++p;
+            if (eatP(")"))
+                return mk(N_TUPLE, at);
+            Node *first = parseExpr();
+            if (eatP(")"))
+                return first;
+            Node *n = mk(N_TUPLE, at);
+            n->kids.push_back(first);
+            expectP(",");
+            while (!isP(")"))
+            {
+                n->kids.push_back(parseExpr());
+                if (!isP(")"))
+                    expectP(",");
+            }
+            ++p;
+            return n;
+        }
+        if (at.s == "[")
+        {
+            ++p;
+            if (eatP("]"))
+                return mk(N_ARRAY, at);
+            Node *first = parseExpr();
+            if (eatP(";"))
+            {
+                Node *n = mk(N_REPEAT, at);
+                n->a = first;
+                n->b = parseExpr();
+                expectP("]");
+                return n;
+            }
+            Node *n = mk(N_ARRAY, at);
+            n->kids.push_back(first);
+            while (!isP("]"))
+            {
+                expectP(",");
+                if (isP("]"))
+                    break;
+                n->kids.push_back(parseExpr());
+            }
+            ++p;
+            return n;
+        }
+        if (at.s == "{")
+            return parseBlock();
+        if (at.s == "|" || at.s == "||")
+            return parseClosure();
+        if (at.s == "#")
+        {
+            bool skip = false, isDefault = false;
+            parseAttributes(skip, isDefault);
+            return parsePrimary(noStruct);
+        }
+        if (!(at.s == "<" || at.s == "::"))
+            failExpected("expression");
+    }
+    if (at.k == T_IDENT && !at.raw)
+    {
+        const std::string &s = at.s;
+        if (s == "true" || s == "false")
+        {
+            Node *n = mk(N_BOOL, at);
+            n->lo = s == "true" ? 1 : 0;
+            ++p;
+            return n;
+        }
+        if (s == "if")
+            return parseIf();
+        if (s == "match")
+            return parseMatch();
+        if (s == "loop")
+        {
+            ++p;
+            Node *n = mk(N_LOOP, at);
+            n->b = parseBlock();
+            return n;
+        }
+        if (s == "while")
+        {
+            ++p;
+            Node *n = mk(N_WHILE, at);
+            n->a = parseExpr(true);
+            n->b = parseBlock();
+            return n;
+        }
+        if (s == "for")
+        {
+            ++p;
+            Node *n = mk(N_FOR, at);
+            n->pat = parsePattern();
+            expectKw("in");
+            n->a = parseExpr(true);
+            n->b = parseBlock();
+            return n;
+        }
+        if ((s == "unsafe" || s == "const") && isPAt(1, "{"))
+        {
+            ++p;
+            return parseBlock();
+        }
+        if (s == "return")
+        {
+            ++p;
+            Node *n = mk(N_RETURN, at);
+            if (exprStarts())
+                n->a = parseExpr(noStruct);
+            return n;
+        }
+        if (s == "break")
+        {
+            ++p;
+            Node *n = mk(N_BREAK, at);
+            if (cur().k == T_LIFE && !isPAt(1, ":"))
+                n->s = toks[p++].s;
+            if (exprStarts() && !(noStruct && isP("{")))
+                n->a = parseExpr(noStruct);
+            return n;
+        }
+        if (s == "continue")
+        {
+            ++p;
+            Node *n = mk(N_CONTINUE, at);
+            if (cur().k == T_LIFE)
+                n->s = toks[p++].s;
+            return n;
+        }
+        if (s == "move")
+            return parseClosure();
+        if (s == "let")
+        {
+            // `let pat = expr` as (part of) a condition
+            ++p;
+            Node *n = mk(N_LETCOND, at);
+            n->pat = parsePattern();
+            expectP("=");
+            n->a = parseBinary(5, true);
+            return n;
+        }
+        if (s == "async" && (isKwAt(1, "move") || isPAt(1, "{") || isPAt(1, "|") || isPAt(1, "||")))
+        {
+            // async [move] { ... }: a future; async [move] |x| ...: a closure that makes one
+            ++p;
+            bool isMove = false;
+            if (isKw("move") && isPAt(1, "{"))
+            {
+                isMove = true;
+                ++p;
+            }
+            if (isP("{"))
+            {
+                Node *n = mk(N_CLOSURE, at);
+                n->op = 1;
+                n->flag = isMove;
+                bool savedAsync = inAsync;
+                inAsync = true;
+                n->a = parseBlock();
+                inAsync = savedAsync;
+                return n;
+            }
+            if (isMove)
+                --p; // parseClosure reads the `move`
+            asyncClosure = true;
+            Node *n = parseClosure();
+            n->op = 2;
+            return n;
+        }
+        if (s == "async" || s == "await" || s == "yield")
+            fail("`" + s + "` is not supported", at);
+        if (!isIdent() && !(s == "self" || s == "Self" || s == "super" || s == "crate"))
+            failExpected("expression"); // some other keyword
+    }
+    // a path: a name, a macro call, or a struct literal
+    Path *path = parsePath(true);
+    if (isP("!") && !path->qself)
+        return parseMacro(path, at, false);
+    if (isP("{") && !noStruct)
+    {
+        const Tok &t1 = peekTok(1), &t2 = peekTok(2);
+        bool fieldName = (t1.k == T_IDENT && (t1.raw || t1.s != "_")) || t1.k == T_INT;
+        bool lit = (t1.k == T_PUNCT && (t1.s == "}" || t1.s == "..")) ||
+                   (fieldName && t2.k == T_PUNCT && (t2.s == ":" || t2.s == "," || t2.s == "}"));
+        if (lit)
+            return parseStructLit(path, at);
+    }
+    Node *n = mk(N_PATH, at);
+    n->path = path;
+    return n;
+}
+
+// ─── macros ────────────────────────────────────────────────────────────────
+
+// "..." [, arg | name = arg]* for the formatting macros. The format string
+// may be absent (`println!()`), unless `required`.
+void Parser::parseFormatArgs(Node *m, const char *close, bool required)
+{
+    size_t firstArg = m->kids.size();
+    if (isP(close))
+    {
+        if (required)
+            failExpected("a format string");
+        return;
+    }
+    Tok str = cur();
+    if (!literalText(str.s))
+        fail("format argument must be a string literal", cur());
+    std::vector<std::string> names(firstArg, std::string());
+    while (eatP(","))
+    {
+        if (isP(close))
+            break;
+        std::string name;
+        if (cur().k == T_IDENT && isPAt(1, "="))
+        {
+            name = cur().s;
+            p += 2;
+        }
+        else if (names.size() > firstArg && !names.back().empty())
+            fail("positional arguments cannot follow named arguments", cur());
+        m->kids.push_back(parseExpr());
+        names.push_back(name);
+    }
+    m->fmt = parseFormat(str, m, firstArg, names);
+}
+
+// The pieces of a format string. `names`: the name of each argument so far
+// ("" for a positional one); a {name} that is none of them is a variable of
+// the surrounding code and becomes one more argument.
+Fmt *Parser::parseFormat(const Tok &str, Node *m, size_t firstArg, std::vector<std::string> &names)
+{
+    const std::string &s = str.s;
+    Fmt *fmt = new Fmt();
+    size_t explicitCount = m->kids.size() - firstArg;
+    size_t positional = 0; // the explicit arguments without a name
+    for (size_t k = firstArg; k < names.size(); ++k)
+        if (names[k].empty())
+            ++positional;
+    std::vector<bool> used(m->kids.size(), false);
+    size_t next = 0; // the next implicit position
+    auto bad = [&](const std::string &msg)
+    {
+        CompileErr e;
+        e.message = msg;
+        e.line = str.line;
+        e.col = str.col;
+        e.width = 1;
+        throw e;
+    };
+    auto named = [&](const std::string &name) -> int
+    {
+        for (size_t k = firstArg; k < names.size(); ++k)
+            if (names[k] == name)
+            {
+                used[k] = true;
+                return (int)k;
+            }
+        // a variable in scope
+        Node *var = mk(N_PATH, str);
+        var->path = new Path();
+        var->path->line = str.line;
+        var->path->col = str.col;
+        PathSeg seg;
+        seg.name = name;
+        var->path->segs.push_back(seg);
+        m->kids.push_back(var);
+        names.push_back(name);
+        used.push_back(true);
+        return (int)m->kids.size() - 1;
+    };
+    auto positionalArg = [&](size_t index) -> int
+    {
+        if (index >= explicitCount)
+        {
+            size_t wanted = index + 1 > next ? index + 1 : next;
+            bad(std::to_string(wanted) + " positional argument" + (wanted == 1 ? "" : "s") +
+                " in format string, but " + (positional == 1 ? "there is 1 argument" : "there are " +
+                std::to_string(positional) + " arguments"));
+        }
+        used[firstArg + index] = true;
+        return (int)(firstArg + index);
+    };
+    std::string lit;
+    size_t i = 0, n = s.size();
+    while (i < n)
+    {
+        char c = s[i];
+        if (c == '}')
+        {
+            if (i + 1 < n && s[i + 1] == '}')
+            {
+                lit += '}';
+                i += 2;
+                continue;
+            }
+            bad("invalid format string: unmatched `}` found");
+        }
+        if (c != '{')
+        {
+            lit += c;
+            ++i;
+            continue;
+        }
+        if (i + 1 < n && s[i + 1] == '{')
+        {
+            lit += '{';
+            i += 2;
+            continue;
+        }
+        ++i;
+        FmtPiece piece;
+        piece.lit = lit;
+        lit.clear();
+        // the argument: nothing, a number or a name
+        size_t start = i;
+        while (i < n && s[i] != ':' && s[i] != '}')
+            ++i;
+        std::string argText = s.substr(start, i - start);
+        while (!argText.empty() && argText.back() == ' ')
+            argText.pop_back();
+        bool argGiven = !argText.empty();
+        if (argGiven)
+        {
+            bool digits = argText[0] >= '0' && argText[0] <= '9';
+            for (size_t c = 0; c < argText.size(); ++c)
+            {
+                char ch = argText[c];
+                bool ok = digits ? (ch >= '0' && ch <= '9')
+                                 : (std::isalpha((unsigned char)ch) || ch == '_' || (c > 0 && std::isdigit((unsigned char)ch)) ||
+                                    (unsigned char)ch >= 0x80);
+                if (!ok)
+                    bad(std::string("invalid format string: expected `}`, found `") + (ch == '\'' ? "\\'" : std::string(1, ch)) + "`");
+            }
+        }
+        int argIndex = -1;
+        if (argGiven)
+        {
+            if (argText[0] >= '0' && argText[0] <= '9')
+                argIndex = positionalArg((size_t)std::atoi(argText.c_str()));
+            else
+                argIndex = named(argText);
+        }
+        if (i < n && s[i] == ':')
+        {
+            ++i;
+            // [[fill]align]
+            auto isAlign = [](char ch) { return ch == '<' || ch == '>' || ch == '^'; };
+            if (i < n)
+            {
+                // the fill is one character (maybe several bytes)
+                size_t len = 1;
+                unsigned char lead = (unsigned char)s[i];
+                if (lead >= 0xF0) len = 4;
+                else if (lead >= 0xE0) len = 3;
+                else if (lead >= 0xC0) len = 2;
+                if (i + len < n && isAlign(s[i + len]))
+                {
+                    uint32_t cp = lead;
+                    if (len > 1)
+                    {
+                        cp = lead & (0x3F >> (len - 1));
+                        for (size_t b = 1; b < len; ++b)
+                            cp = (cp << 6) | ((unsigned char)s[i + b] & 0x3F);
+                    }
+                    piece.fill = cp;
+                    piece.align = s[i + len];
+                    i += len + 1;
+                }
+                else if (isAlign(s[i]))
+                    piece.align = s[i++];
+            }
+            if (i < n && (s[i] == '+' || s[i] == '-'))
+                piece.plus = s[i++] == '+';
+            if (i < n && s[i] == '#')
+            {
+                piece.alt = true;
+                ++i;
+            }
+            if (i < n && s[i] == '0' && !(i + 1 < n && s[i + 1] == '$'))
+            {
+                piece.zero = true;
+                ++i;
+            }
+            // width: 5, name$, 1$
+            auto count = [&](int &value, int &arg)
+            {
+                size_t from = i;
+                while (i < n && (std::isalnum((unsigned char)s[i]) || s[i] == '_'))
+                    ++i;
+                std::string text = s.substr(from, i - from);
+                if (text.empty())
+                    return;
+                if (i < n && s[i] == '$')
+                {
+                    ++i;
+                    if (text[0] >= '0' && text[0] <= '9')
+                        arg = positionalArg((size_t)std::atoi(text.c_str()));
+                    else
+                        arg = named(text);
+                }
+                else if (text[0] >= '0' && text[0] <= '9')
+                {
+                    // 8x: a width, then the type
+                    size_t digits = 0;
+                    while (digits < text.size() && text[digits] >= '0' && text[digits] <= '9')
+                        ++digits;
+                    value = std::atoi(text.substr(0, digits).c_str());
+                    i = from + digits;
+                }
+                else
+                    i = from; // the type letter
+            };
+            count(piece.width, piece.widthArg);
+            if (i < n && s[i] == '.')
+            {
+                ++i;
+                if (i < n && s[i] == '*')
+                {
+                    ++i;
+                    piece.precArg = positionalArg(next++); // .* takes the precision first
+                }
+                else
+                {
+                    count(piece.prec, piece.precArg);
+                    if (piece.prec < 0 && piece.precArg < 0)
+                        bad("invalid format string: missing precision after `.`");
+                }
+            }
+            if (i < n && s[i] != '}')
+            {
+                char ty = s[i];
+                if (ty == '?' || ty == 'x' || ty == 'X' || ty == 'o' || ty == 'b' || ty == 'e' || ty == 'E')
+                {
+                    piece.ty = ty;
+                    ++i;
+                    if ((ty == 'x' || ty == 'X') && i < n && s[i] == '?')
+                    {
+                        piece.ty = '?';
+                        ++i;
+                    }
+                }
+                else if (ty != ' ')
+                {
+                    size_t from = i;
+                    while (i < n && s[i] != '}')
+                        ++i;
+                    bad("unknown format trait `" + s.substr(from, i - from) + "`");
+                }
+                while (i < n && s[i] == ' ')
+                    ++i;
+            }
+        }
+        if (i >= n || s[i] != '}')
+            bad("invalid format string: expected `}` but string was terminated");
+        ++i;
+        if (!argGiven)
+            argIndex = positionalArg(next++);
+        piece.arg = argIndex;
+        fmt->pieces.push_back(piece);
+    }
+    if (!lit.empty())
+    {
+        FmtPiece tail;
+        tail.lit = lit;
+        fmt->pieces.push_back(tail);
+    }
+    for (size_t k = firstArg; k < firstArg + explicitCount; ++k)
+        if (!used[k])
+        {
+            Node *arg = m->kids[k];
+            CompileErr e;
+            e.message = names[k].empty() ? "argument never used" : "named argument never used";
+            e.line = arg->line;
+            e.col = arg->col;
+            e.width = 1;
+            e.label = "argument never used";
+            throw e;
+        }
+    return fmt;
+}
+
+// a value inside json!(...): null, {"key": value, ...}, [value, ...], or any expression
+Node *Parser::parseJsonValue()
+{
+    Tok at = cur();
+    Node *n = mk(N_MACRO, at);
+    n->s = "json";
+    if (isKw("null"))
+    {
+        ++p;
+        n->op = 0;
+        return n;
+    }
+    if (isP("{"))
+    {
+        n->op = 2;
+        ++p;
+        while (!isP("}"))
+        {
+            Node *key;
+            if (cur().k == T_STR || cur().k == T_IDENT)
+            {
+                key = parseBinary(0, true);
+            }
+            else if (isP("["))
+            {
+                ++p;
+                key = parseExpr();
+                expectP("]");
+            }
+            else
+                key = parseExpr(true);
+            n->kids.push_back(key);
+            expectP(":");
+            n->kids.push_back(parseJsonValue());
+            if (!isP("}"))
+                expectP(",");
+        }
+        ++p;
+        return n;
+    }
+    if (isP("["))
+    {
+        n->op = 3;
+        ++p;
+        while (!isP("]"))
+        {
+            n->kids.push_back(parseJsonValue());
+            if (!isP("]"))
+                expectP(",");
+        }
+        ++p;
+        return n;
+    }
+    n->op = 1;
+    n->a = parseExpr();
+    return n;
+}
+
+Node *Parser::parseMacro(Path *path, const Tok &at, bool stmt)
+{
+    ++p; // !
+    const std::string name = path->segs.back().name;
+    if (!(isP("(") || isP("[") || isP("{")))
+        failExpected("one of `(`, `[`, or `{`");
+    bool brace = isP("{");
+    const char *close = isP("(") ? ")" : isP("[") ? "]" : "}";
+    for (size_t k = macros->size(); k-- > 0;)
+        if ((*macros)[k]->name == name)
+            return parseUserMacro((*macros)[k], at, stmt ? 1 : 0);
+    Node *n = mk(N_MACRO, at);
+    n->s = name;
+    n->mut = brace;
+    if (name == "stringify")
+    {
+        // the tokens as text
+        std::vector<Tok> inner = takeGroup();
+        std::string text;
+        for (size_t k = 0; k < inner.size(); ++k)
+        {
+            const Tok &t = inner[k];
+            if (t.k == T_PUNCT && t.raw)
+                continue; // a bracket the macro expander put around an expression
+            if (!text.empty() && t.spaceBefore)
+                text += ' ';
+            if (t.k == T_STR)
+                text += "\"" + t.s + "\"";
+            else if (t.k == T_CHAR)
+            {
+                text += '\'';
+                text += (char)t.lo;
+                text += '\'';
+            }
+            else
+                text += t.s + t.suf;
+        }
+        n->names.push_back(text);
+        return n;
+    }
+    ++p; // the opening delimiter
+    if (name == "println" || name == "print" || name == "eprintln" || name == "eprint" || name == "format" ||
+        name == "panic" || name == "unreachable" || name == "todo" || name == "unimplemented" ||
+        name == "format_args")
+        parseFormatArgs(n, close, false);
+    else if (name == "write" || name == "writeln")
+    {
+        n->kids.push_back(parseExpr());
+        if (eatP(","))
+            parseFormatArgs(n, close, false);
+    }
+    else if (name == "assert" || name == "debug_assert")
+    {
+        n->kids.push_back(parseExpr());
+        if (eatP(","))
+            parseFormatArgs(n, close, false);
+    }
+    else if (name == "assert_eq" || name == "assert_ne" || name == "debug_assert_eq" || name == "debug_assert_ne")
+    {
+        n->kids.push_back(parseExpr());
+        expectP(",");
+        n->kids.push_back(parseExpr());
+        if (eatP(","))
+            parseFormatArgs(n, close, false);
+    }
+    else if (name == "vec")
+    {
+        if (!isP(close))
+        {
+            n->kids.push_back(parseExpr());
+            if (eatP(";"))
+            {
+                n->flag = true; // vec![value; count]
+                n->kids.push_back(parseExpr());
+            }
+            else
+                while (!isP(close))
+                {
+                    expectP(",");
+                    if (isP(close))
+                        break;
+                    n->kids.push_back(parseExpr());
+                }
+        }
+    }
+    else if (name == "matches")
+    {
+        n->a = parseExpr();
+        expectP(",");
+        n->pat = parsePattern();
+        if (eatKw("if"))
+            n->b = parseExpr();
+        eatP(",");
+    }
+    else if (name == "dbg" || name == "concat")
+    {
+        while (!isP(close))
+        {
+            n->kids.push_back(parseExpr());
+            if (!isP(close))
+                expectP(",");
+        }
+    }
+    else if (name == "line" || name == "column" || name == "file" || name == "module_path")
+    {
+    }
+    else if (name == "join" || name == "try_join" || name == "pin")
+    {
+        // tokio::join!(a, b, ...): futures run together
+        while (!isP(close))
+        {
+            n->kids.push_back(parseExpr());
+            if (!isP(close))
+                expectP(",");
+        }
+    }
+    else if (name == "select")
+    {
+        // tokio::select! { [biased;] pat = future [, if cond] => handler, ... [else => expr] }
+        if (isKw("biased") && isPAt(1, ";"))
+        {
+            n->flag = true;
+            p += 2;
+        }
+        while (!isP(close))
+        {
+            if (isKw("else") && isPAt(1, "=>"))
+            {
+                p += 2;
+                n->b = isP("{") ? parseBlock() : parseExpr();
+                eatP(",");
+                continue;
+            }
+            Arm arm;
+            arm.pat = parsePattern();
+            expectP("=");
+            n->kids.push_back(parseExpr());
+            if (eatP(","))
+            {
+                expectKw("if");
+                arm.guard = parseExpr();
+            }
+            expectP("=>");
+            if (isP("{"))
+            {
+                arm.body = parseBlock();
+                eatP(",");
+            }
+            else
+            {
+                arm.body = parseExpr();
+                if (!isP(close))
+                    expectP(",");
+            }
+            n->arms.push_back(arm);
+        }
+    }
+    else if (name == "json")
+        n->a = parseJsonValue();
+    else if (name == "env" || name == "option_env")
+    {
+        if (cur().k != T_STR)
+            fail(name + "! takes 1 or 2 arguments", cur());
+        n->names.push_back(cur().s);
+        ++p;
+        if (eatP(",") && cur().k == T_STR)
+        {
+            n->names.push_back(cur().s); // the message when it is not set
+            ++p;
+        }
+        eatP(",");
+    }
+    else if (name == "cfg")
+    {
+        // no configuration is set: cfg!(...) is false
+        int depth = 0;
+        while (!(depth == 0 && isP(close)) && cur().k != T_EOF)
+        {
+            if (isP("(") || isP("[") || isP("{"))
+                ++depth;
+            else if (isP(")") || isP("]") || isP("}"))
+                --depth;
+            ++p;
+        }
+    }
+    else if (name == "compile_error")
+    {
+        std::string msg = cur().k == T_STR ? cur().s : "compile_error!";
+        fail(msg, at);
+    }
+    else
+    {
+        CompileErr e;
+        e.message = "cannot find macro `" + name + "` in this scope";
+        e.line = at.line;
+        e.col = at.col;
+        e.width = (int)name.size();
+        throw e;
+    }
+    if (!isP(close))
+        failExpected(std::string("`") + close + "`");
+    ++p;
+    return n;
+}
+
+} // namespace rust
