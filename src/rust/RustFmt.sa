@@ -1,0 +1,936 @@
+// quantum: cpp
+// Rust front-end: formatting. What {} (Display), {:?} (Debug), {:#?}, {:x},
+// {:e} and the width / fill / sign / precision of a format spec produce for
+// each kind of value, and the Formatter a program's own `impl Display` or
+// `impl Debug` writes to. A type shows itself by its impl when it has one,
+// by its derive(Debug) otherwise; one with neither is error E0277, as in
+// rustc.
+#include "RustRt.h.sa"
+
+#include <cmath>
+
+namespace rust
+{
+
+void utf8Append(std::string &out, uint32_t cp)
+{
+    if (cp < 0x80)
+        out += (char)cp;
+    else if (cp < 0x800)
+    {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+    else if (cp < 0x10000)
+    {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+    else
+    {
+        out += (char)(0xF0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+size_t utf8Count(const std::string &s)
+{
+    size_t n = 0;
+    for (unsigned char c : s)
+        if ((c & 0xC0) != 0x80)
+            ++n;
+    return n;
+}
+
+namespace
+{
+
+const FmtPiece &plainSpec()
+{
+    static FmtPiece spec;
+    return spec;
+}
+
+// the first `count` characters of s
+std::string utf8Prefix(const std::string &s, size_t count)
+{
+    size_t i = 0, seen = 0;
+    while (i < s.size())
+    {
+        if (((unsigned char)s[i] & 0xC0) != 0x80)
+        {
+            if (seen == count)
+                break;
+            ++seen;
+        }
+        ++i;
+    }
+    return s.substr(0, i);
+}
+
+void padNumber(std::string &out, bool negative, const std::string &prefix, const std::string &digits,
+               const FmtPiece &spec, int width)
+{
+    std::string sign = negative ? "-" : spec.plus ? "+" : "";
+    if (spec.zero && width >= 0)
+    {
+        size_t len = sign.size() + prefix.size() + digits.size();
+        out += sign + prefix;
+        if ((size_t)width > len)
+            out.append((size_t)width - len, '0');
+        out += digits;
+        return;
+    }
+    padInto(out, sign + prefix + digits, spec, width, '>');
+}
+
+// the fmt of the trait `trait` among a type's fmt methods
+FnDef *traitFmt(TypeDef *td, const char *trait)
+{
+    for (FnDef *f = findMethod(td, "fmt"); f; f = f->overload)
+        if (f->impl && f->impl->traitName == trait)
+            return f;
+    return nullptr;
+}
+
+V formatterV(std::string *buf, const FmtPiece &spec, int width, int prec, bool pretty)
+{
+    V v = mkNative("Formatter", "");
+    NativeObj *f = static_cast<NativeObj *>(v.p);
+    f->buf = buf;
+    f->spec = &spec;
+    f->width = width;
+    f->prec = prec;
+    f->pretty = pretty;
+    return v;
+}
+
+// runs a type's own fmt into `out`
+void userFmt(std::string &out, FnDef *fn, TypeDef *td, V v, const FmtPiece &spec, int width, int prec,
+             const Node *at)
+{
+    std::string text;
+    V f = formatterV(&text, spec, width, prec, spec.alt);
+    std::vector<V> args;
+    args.push_back(mkRefTo(v, false));
+    args.push_back(mkRefTo(f, true));
+    V r = callFn(fn, args, td, at, nullptr);
+    if (isErrV(r))
+        panicAt(at, "a formatting trait implementation returned an error when the underlying stream did not");
+    out += text;
+}
+
+void quoteChar(std::string &out, uint32_t c, bool inString)
+{
+    switch (c)
+    {
+    case '\n': out += "\\n"; return;
+    case '\r': out += "\\r"; return;
+    case '\t': out += "\\t"; return;
+    case '\\': out += "\\\\"; return;
+    case '\0': out += "\\0"; return;
+    case '"':
+        out += inString ? "\\\"" : "\"";
+        return;
+    case '\'':
+        out += inString ? "'" : "\\'";
+        return;
+    }
+    if (c < 0x20 || c == 0x7F)
+    {
+        static const char *const hex = "0123456789abcdef";
+        out += "\\u{";
+        if (c >= 0x10)
+            out += hex[c >> 4];
+        out += hex[c & 15];
+        out += "}";
+        return;
+    }
+    utf8Append(out, c);
+}
+
+std::string quoteStr(const std::string &s)
+{
+    std::string out = "\"";
+    size_t i = 0;
+    while (i < s.size())
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80)
+        {
+            quoteChar(out, c, true);
+            ++i;
+            continue;
+        }
+        // a multi-byte character goes in as it is
+        size_t len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+        out += s.substr(i, len);
+        i += len;
+    }
+    return out + "\"";
+}
+
+// `text` as a part of an enclosing pretty-printed value: its later lines
+// move right by four
+void indented(std::string &out, const std::string &text)
+{
+    for (char c : text)
+    {
+        out += c;
+        if (c == '\n')
+            out += "    ";
+    }
+}
+
+void debugInto(std::string &out, V v, const FmtPiece &spec, int width, int prec, bool pretty, const Node *at);
+
+// name { a: 1, b: 2 } / name(1, 2) / [1, 2] / {k: v}: the parts, laid out
+struct Group
+{
+    std::string *out;
+    bool pretty;
+    bool any = false;
+    const char *open, *close;
+    Group(std::string &o, bool p, const char *op, const char *cl) : out(&o), pretty(p), open(op), close(cl) {}
+    void item(const std::string &text)
+    {
+        if (pretty)
+        {
+            if (!any)
+                *out += std::string(open) + "\n";
+            *out += "    ";
+            indented(*out, text);
+            *out += ",\n";
+        }
+        else
+        {
+            *out += any ? ", " : open;
+            *out += text;
+        }
+        any = true;
+    }
+    void finish(bool emptyShowsBrackets)
+    {
+        if (any)
+            *out += close;
+        else if (emptyShowsBrackets)
+            *out += std::string(open) + close;
+    }
+};
+
+std::string debugText(V v, const FmtPiece &spec, int width, int prec, bool pretty, const Node *at)
+{
+    std::string s;
+    debugInto(s, v, spec, width, prec, pretty, at);
+    return s;
+}
+
+void debugFields(std::string &out, const std::string &name, uint8_t form, const std::vector<FieldDef> &fields,
+                 const std::vector<V> &items, const FmtPiece &spec, int width, int prec, bool pretty,
+                 const Node *at)
+{
+    out += name;
+    if (form == FORM_UNIT || items.empty())
+        return;
+    if (form == FORM_TUPLE)
+    {
+        Group g(out, pretty, "(", ")");
+        for (const V &item : items)
+            g.item(debugText(item, spec, width, prec, pretty, at));
+        g.finish(false);
+        return;
+    }
+    Group g(out, pretty, pretty ? " {" : " { ", pretty ? "}" : " }");
+    for (size_t k = 0; k < items.size(); ++k)
+        g.item((k < fields.size() ? fields[k].name : std::to_string(k)) + ": " +
+               debugText(items[k], spec, width, prec, pretty, at));
+    g.finish(false);
+}
+
+std::string durationText(NativeObj *d)
+{
+    // a: whole seconds, b: nanoseconds
+    int64_t secs = d->a, nanos = d->b;
+    auto trimmed = [](int64_t whole, int64_t frac, int digits, const char *unit) -> std::string
+    {
+        std::string out = std::to_string(whole);
+        if (frac > 0)
+        {
+            std::string f = std::to_string(frac);
+            while ((int)f.size() < digits)
+                f = "0" + f;
+            while (!f.empty() && f.back() == '0')
+                f.pop_back();
+            out += "." + f;
+        }
+        return out + unit;
+    };
+    if (secs > 0)
+        return trimmed(secs, nanos, 9, "s");
+    if (nanos >= 1000000)
+        return trimmed(nanos / 1000000, nanos % 1000000, 6, "ms");
+    if (nanos >= 1000)
+        return trimmed(nanos / 1000, nanos % 1000, 3, "\xC2\xB5s");
+    return std::to_string(nanos) + "ns";
+}
+
+void debugInto(std::string &out, V v, const FmtPiece &spec, int width, int prec, bool pretty, const Node *at)
+{
+    switch (v.k)
+    {
+    case V_REF:
+        debugInto(out, slotAt(v.p, v.hi), spec, width, prec, pretty, at);
+        return;
+    case V_BOX:
+    case V_RC:
+        debugInto(out, v.p->items[0], spec, width, prec, pretty, at);
+        return;
+    case V_UNIT:
+        padInto(out, "()", spec, width, '<');
+        return;
+    case V_BOOL:
+        padInto(out, v.lo ? "true" : "false", spec, width, '<');
+        return;
+    case V_INT:
+        padNumber(out, v.t != PR_U128 && v.hi < 0, "", intToString(v).substr(v.t != PR_U128 && v.hi < 0 ? 1 : 0),
+                  spec, width);
+        return;
+    case V_FLOAT:
+    {
+        double d = fval(v);
+        std::string text = prec >= 0 ? floatFixed(std::fabs(d), prec) : floatToString(std::fabs(d), v.t == PR_F32, true);
+        if (d != d)
+            text = "NaN";
+        padNumber(out, std::signbit(d) && d == d, "", text, spec, width);
+        return;
+    }
+    case V_CHAR:
+    {
+        std::string text = "'";
+        quoteChar(text, (uint32_t)v.lo, false);
+        padInto(out, text + "'", spec, width, '<');
+        return;
+    }
+    case V_STR:
+        padInto(out, quoteStr(static_cast<StrObj *>(v.p)->s), spec, width, '<');
+        return;
+    case V_TUPLE:
+    {
+        Group g(out, pretty, "(", ")");
+        for (const V &item : v.p->items)
+            g.item(debugText(item, spec, width, prec, pretty, at));
+        if (!pretty && v.p->items.size() == 1)
+            out += ",";
+        g.finish(true);
+        return;
+    }
+    case V_ARRAY:
+    case V_VEC:
+    case V_DEQUE:
+    case V_HEAP:
+    case V_SLICE:
+    {
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        seqOf(v, o, start, len);
+        Group g(out, pretty, "[", "]");
+        for (int64_t k = 0; k < len; ++k)
+            g.item(debugText(o->items[(size_t)(start + k)], spec, width, prec, pretty, at));
+        g.finish(true);
+        return;
+    }
+    case V_STRUCT:
+    {
+        StructObj *s = static_cast<StructObj *>(v.p);
+        if (FnDef *own = traitFmt(s->def, "Debug"))
+        {
+            userFmt(out, own, s->def, v, spec, width, prec, at);
+            return;
+        }
+        if (!(s->def->derives & D_DEBUG))
+            errAt(at, "E0277", "`" + s->def->name + "` doesn't implement `Debug`",
+                  "`" + s->def->name + "` cannot be formatted using `{:?}`: add `#[derive(Debug)]` to `" +
+                      s->def->name + "` or manually `impl Debug for " + s->def->name + "`");
+        debugFields(out, s->def->name, s->def->form, s->def->fields, s->items, spec, width, prec, pretty, at);
+        return;
+    }
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(v.p);
+        if (e->def == G.jsonValueDef)
+        {
+            std::string own;
+            jsonDebug(v, pretty, at, own);
+            padInto(out, own, spec, width, '<');
+            return;
+        }
+        bool library = e->def == G.optionDef || e->def == G.resultDef || e->def == G.orderingDef ||
+                       e->def == G.tryRecvErrorDef || e->def == G.recvTimeoutErrorDef;
+        if (!library)
+        {
+            if (FnDef *own = traitFmt(e->def, "Debug"))
+            {
+                userFmt(out, own, e->def, v, spec, width, prec, at);
+                return;
+            }
+            if (!(e->def->derives & D_DEBUG))
+                errAt(at, "E0277", "`" + e->def->name + "` doesn't implement `Debug`",
+                      "`" + e->def->name + "` cannot be formatted using `{:?}`: add `#[derive(Debug)]` to `" +
+                          e->def->name + "` or manually `impl Debug for " + e->def->name + "`");
+        }
+        const VariantDef &var = e->def->variants[(size_t)e->variant];
+        debugFields(out, var.name, var.form, var.fields, e->items, spec, width, prec, pretty, at);
+        return;
+    }
+    case V_MAP:
+    case V_SET:
+    {
+        MapObj *m = static_cast<MapObj *>(v.p);
+        Group g(out, pretty, "{", "}");
+        for (size_t k = 0; k < m->keys.size(); ++k)
+        {
+            if (m->keys[k].k == V_MOVED)
+                continue;
+            std::string text = debugText(m->keys[k], spec, width, prec, pretty, at);
+            if (!m->isSet)
+                text += ": " + debugText(m->items[k], spec, width, prec, pretty, at);
+            g.item(text);
+        }
+        g.finish(true);
+        return;
+    }
+    case V_CELL:
+    {
+        if (v.n == 7) // an atomic shows its value
+        {
+            debugInto(out, v.p->items[0], spec, width, prec, pretty, at);
+            return;
+        }
+        if (v.n == 4)
+        {
+            V opt = v.p->items[0];
+            out += "OnceLock(";
+            if (isSomeV(opt))
+                debugInto(out, peel(opt).p->items[0], spec, width, prec, pretty, at);
+            else
+                out += "<uninit>";
+            out += ")";
+            return;
+        }
+        if (v.n >= 5)
+        {
+            Group g(out, pretty, pretty ? " {" : " { ", pretty ? "}" : " }");
+            out += v.n == 5 ? "Mutex" : "RwLock";
+            g.item("data: " + debugText(v.p->items[0], spec, width, prec, pretty, at));
+            g.finish(false);
+            return;
+        }
+        const char *name = v.n == 1 ? "Cell" : v.n == 2 ? "Mutex" : v.n == 3 ? "RwLock" : "RefCell";
+        Group g(out, pretty, pretty ? " {" : " { ", pretty ? "}" : " }");
+        out += name;
+        g.item(std::string(v.n >= 2 ? "data: " : "value: ") + debugText(v.p->items[0], spec, width, prec, pretty, at));
+        if (v.n >= 2)
+        {
+            g.item("poisoned: false");
+            g.item("..");
+        }
+        g.finish(false);
+        return;
+    }
+    case V_RANGE:
+    {
+        RangeObj *r = static_cast<RangeObj *>(v.p);
+        if (r->hasLo)
+            debugInto(out, r->items[0], spec, width, prec, pretty, at);
+        out += r->inclusive ? "..=" : "..";
+        if (r->hasHi)
+            debugInto(out, r->items[1], spec, width, prec, pretty, at);
+        return;
+    }
+    case V_WEAK:
+        out += "(Weak)";
+        return;
+    case V_NATIVE:
+    {
+        NativeObj *o = static_cast<NativeObj *>(v.p);
+        std::string own;
+        if (fsFormat(o, true, own) || taskFormat(o, true, own) || serdeFormat(o, true, own) || netFormat(o, true, own))
+        {
+            padInto(out, own, spec, width, '<');
+            return;
+        }
+        if (o->type == "ThreadId")
+        {
+            out += "ThreadId(" + std::to_string(o->b) + ")";
+            return;
+        }
+        if (o->type == "Thread")
+        {
+            out += "Thread { id: ThreadId(" + std::to_string(o->b) + "), name: " +
+                   (o->a ? "Some(" + quoteStr(o->s) + ")" : std::string("None")) + ", .. }";
+            return;
+        }
+        if (o->type == "Duration")
+            out += durationText(o);
+        else if (o->type == "ParseIntError" || o->type == "ParseFloatError" || o->type == "TryFromIntError" ||
+                 o->type == "ParseBoolError" || o->type == "ParseCharError" || o->type == "Utf8Error")
+            out += o->s.empty() ? o->type : o->s;
+        else if (o->type == "Error")
+            out += quoteStr(o->s); // a Box<dyn Error> made from text
+        else
+            out += o->type + " { .. }";
+        return;
+    }
+    case V_FN:
+        out += "fn";
+        return;
+    case V_ITER:
+        out += "Iter { .. }";
+        return;
+    case V_CLOSURE:
+        errAt(at, "E0277", "`{closure}` doesn't implement `Debug`");
+    case V_MOVED:
+        errAt(at, "E0382", "borrow of moved value");
+    }
+}
+
+[[noreturn]] void noDisplay(V v, const Node *at)
+{
+    std::string name = typeName(v);
+    errAt(at, "E0277", "`" + name + "` doesn't implement `std::fmt::Display`",
+          "`" + name + "` cannot be formatted with the default formatter: in format strings you may be able to "
+                       "use `{:?}` (or {:#?} for pretty-print) instead");
+}
+
+void displayInto(std::string &out, V v, const FmtPiece &spec, int width, int prec, const Node *at)
+{
+    switch (v.k)
+    {
+    case V_REF:
+        displayInto(out, slotAt(v.p, v.hi), spec, width, prec, at);
+        return;
+    case V_BOX:
+    case V_RC:
+        displayInto(out, v.p->items[0], spec, width, prec, at);
+        return;
+    case V_BOOL:
+        padInto(out, v.lo ? "true" : "false", spec, width, '<');
+        return;
+    case V_INT:
+    {
+        bool negative = v.t != PR_U128 && v.hi < 0;
+        padNumber(out, negative, "", intToString(v).substr(negative ? 1 : 0), spec, width);
+        return;
+    }
+    case V_FLOAT:
+    {
+        double d = fval(v);
+        if (d != d)
+        {
+            padInto(out, "NaN", spec, width, '>');
+            return;
+        }
+        std::string text = prec >= 0 ? floatFixed(std::fabs(d), prec) : floatToString(std::fabs(d), v.t == PR_F32, false);
+        padNumber(out, std::signbit(d), "", text, spec, width);
+        return;
+    }
+    case V_CHAR:
+    {
+        std::string text;
+        utf8Append(text, (uint32_t)v.lo);
+        padInto(out, text, spec, width, '<');
+        return;
+    }
+    case V_STR:
+    {
+        const std::string &s = static_cast<StrObj *>(v.p)->s;
+        if (prec >= 0)
+            padInto(out, utf8Prefix(s, (size_t)prec), spec, width, '<');
+        else if (width < 0)
+            out += s;
+        else
+            padInto(out, s, spec, width, '<');
+        return;
+    }
+    case V_STRUCT:
+    {
+        StructObj *s = static_cast<StructObj *>(v.p);
+        if (FnDef *own = traitFmt(s->def, "Display"))
+        {
+            userFmt(out, own, s->def, v, spec, width, prec, at);
+            return;
+        }
+        noDisplay(v, at);
+    }
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(v.p);
+        if (FnDef *own = traitFmt(e->def, "Display"))
+        {
+            userFmt(out, own, e->def, v, spec, width, prec, at);
+            return;
+        }
+        if (e->def == G.tryRecvErrorDef)
+        {
+            padInto(out, e->variant == 0 ? "receiving on an empty channel" : "receiving on a closed channel",
+                    spec, width, '<');
+            return;
+        }
+        if (e->def == G.recvTimeoutErrorDef)
+        {
+            padInto(out, e->variant == 0 ? "timed out waiting on channel" : "channel is empty and sending half is closed",
+                    spec, width, '<');
+            return;
+        }
+        if (e->def == G.jsonValueDef)
+        {
+            padInto(out, jsonText(v, spec.alt, at), spec, width, '<');
+            return;
+        }
+        noDisplay(v, at);
+    }
+    case V_NATIVE:
+    {
+        NativeObj *o = static_cast<NativeObj *>(v.p);
+        std::string own;
+        if (fsFormat(o, false, own) || taskFormat(o, false, own) || serdeFormat(o, false, own) ||
+            netFormat(o, false, own))
+        {
+            padInto(out, own, spec, width, '<');
+            return;
+        }
+        if (o->type == "ParseIntError")
+        {
+            const std::string &k = o->s;
+            const char *msg = k.find("Empty") != std::string::npos ? "cannot parse integer from empty string"
+                              : k.find("PosOverflow") != std::string::npos ? "number too large to fit in target type"
+                              : k.find("NegOverflow") != std::string::npos ? "number too small to fit in target type"
+                              : "invalid digit found in string";
+            padInto(out, msg, spec, width, '<');
+            return;
+        }
+        if (o->type == "ParseFloatError")
+        {
+            padInto(out, o->s.find("Empty") != std::string::npos ? "cannot parse float from empty string"
+                                                                 : "invalid float literal",
+                    spec, width, '<');
+            return;
+        }
+        if (o->type == "TryFromIntError")
+        {
+            padInto(out, "out of range integral type conversion attempted", spec, width, '<');
+            return;
+        }
+        if (o->type == "ParseBoolError")
+        {
+            padInto(out, "provided string was not `true` or `false`", spec, width, '<');
+            return;
+        }
+        if (o->type == "ParseCharError")
+        {
+            padInto(out, "too many characters in string", spec, width, '<');
+            return;
+        }
+        if (o->type == "Error" || o->type == "IoError" || o->type == "Utf8Error")
+        {
+            padInto(out, o->s, spec, width, '<');
+            return;
+        }
+        noDisplay(v, at);
+    }
+    }
+    noDisplay(v, at);
+}
+
+} // namespace
+
+void padInto(std::string &out, const std::string &text, const FmtPiece &spec, int width, char defaultAlign)
+{
+    size_t len = width < 0 ? 0 : utf8Count(text);
+    if (width < 0 || (size_t)width <= len)
+    {
+        out += text;
+        return;
+    }
+    size_t pad = (size_t)width - len;
+    char align = spec.align ? spec.align : defaultAlign;
+    size_t left = align == '>' ? pad : align == '^' ? pad / 2 : 0;
+    std::string fill;
+    utf8Append(fill, spec.fill);
+    for (size_t k = 0; k < left; ++k)
+        out += fill;
+    out += text;
+    for (size_t k = left; k < pad; ++k)
+        out += fill;
+}
+
+bool hasTrait(V v, const char *trait)
+{
+    v = peelAll(v);
+    bool debug = trait[1] == 'e'; // Debug
+    switch (v.k)
+    {
+    case V_STRUCT:
+    {
+        TypeDef *td = static_cast<StructObj *>(v.p)->def;
+        return traitFmt(td, trait) != nullptr || (debug && (td->derives & D_DEBUG));
+    }
+    case V_ENUM:
+    {
+        TypeDef *td = static_cast<EnumObj *>(v.p)->def;
+        if (td == G.optionDef || td == G.resultDef || td == G.orderingDef)
+            return debug;
+        if (td == G.jsonValueDef || td == G.tryRecvErrorDef || td == G.recvTimeoutErrorDef)
+            return true;
+        return traitFmt(td, trait) != nullptr || (debug && (td->derives & D_DEBUG));
+    }
+    case V_BOOL:
+    case V_INT:
+    case V_FLOAT:
+    case V_CHAR:
+    case V_STR:
+        return true;
+    case V_CLOSURE:
+        return false;
+    }
+    return debug;
+}
+
+std::string displayStr(V v, const Node *at)
+{
+    std::string out;
+    displayInto(out, v, plainSpec(), -1, -1, at);
+    return out;
+}
+
+std::string debugStr(V v, bool pretty, const Node *at)
+{
+    std::string out;
+    debugInto(out, v, plainSpec(), -1, -1, pretty, at);
+    return out;
+}
+
+void fmtValue(std::string &out, V v, const FmtPiece &spec, int width, int prec, const Node *at)
+{
+    switch (spec.ty)
+    {
+    case 0:
+        displayInto(out, v, spec, width, prec, at);
+        return;
+    case '?':
+        debugInto(out, v, spec, width, prec, spec.alt, at);
+        return;
+    case 'x':
+    case 'X':
+    case 'o':
+    case 'b':
+    {
+        V x = peelAll(v);
+        if (x.k != V_INT)
+        {
+            // its own impl of LowerHex, Binary ...
+            const char *trait = spec.ty == 'x' ? "LowerHex" : spec.ty == 'X' ? "UpperHex" : spec.ty == 'o' ? "Octal" : "Binary";
+            TypeDef *td = typeDefOf(x);
+            FnDef *own = td ? traitFmt(td, trait) : nullptr;
+            if (own)
+            {
+                userFmt(out, own, td, x, spec, width, prec, at);
+                return;
+            }
+            errAt(at, "E0277", "the trait bound `" + typeName(x) + ": " + trait + "` is not satisfied");
+        }
+        x = fixInt(x);
+        int base = spec.ty == 'b' ? 2 : spec.ty == 'o' ? 8 : 16;
+        const char *prefix = !spec.alt ? "" : spec.ty == 'b' ? "0b" : spec.ty == 'o' ? "0o" : "0x";
+        padNumber(out, false, prefix, intToRadix(x, base, spec.ty == 'X'), spec, width);
+        return;
+    }
+    case 'e':
+    case 'E':
+    {
+        V x = peelAll(v);
+        double d = 0;
+        bool f32 = false;
+        if (x.k == V_FLOAT)
+        {
+            d = fval(x);
+            f32 = x.t == PR_F32;
+        }
+        else if (x.k == V_INT)
+            d = (double)(int64_t)x.lo;
+        else
+            errAt(at, "E0277", "the trait bound `" + typeName(x) + ": LowerExp` is not satisfied");
+        std::string text = floatExp(std::fabs(d), f32, prec, spec.ty == 'E');
+        padNumber(out, std::signbit(d) && d == d, "", text, spec, width);
+        return;
+    }
+    }
+    displayInto(out, v, spec, width, prec, at);
+}
+
+std::string formatArgs(const Node *n, size_t firstArg, const std::vector<V> &args)
+{
+    (void)firstArg;
+    std::string out;
+    if (!n->fmt)
+        return out;
+    for (const FmtPiece &piece : n->fmt->pieces)
+    {
+        out += piece.lit;
+        if (piece.arg < 0)
+            continue;
+        int width = piece.width, prec = piece.prec;
+        if (piece.widthArg >= 0)
+            width = (int)toIndex(args[(size_t)piece.widthArg], n);
+        if (piece.precArg >= 0)
+            prec = (int)toIndex(args[(size_t)piece.precArg], n);
+        fmtValue(out, args[(size_t)piece.arg], piece, width, prec, n);
+    }
+    return out;
+}
+
+// ─── the Formatter and its builders ────────────────────────────────────────
+
+bool formatterMethod(NativeObj *f, const Node *n, std::vector<V> &args, V &out)
+{
+    const std::string &m = n->s;
+    if (f->type == "Formatter")
+    {
+        if (m == "write_str")
+        {
+            *f->buf += strOf(argAt(args, 0, n));
+            out = mkOk(V());
+            return true;
+        }
+        if (m == "write_char")
+        {
+            utf8Append(*f->buf, (uint32_t)peel(argAt(args, 0, n)).lo);
+            out = mkOk(V());
+            return true;
+        }
+        if (m == "pad")
+        {
+            const std::string &s = strOf(argAt(args, 0, n));
+            padInto(*f->buf, f->prec >= 0 ? utf8Prefix(s, (size_t)f->prec) : s, *f->spec, f->width, '<');
+            out = mkOk(V());
+            return true;
+        }
+        if (m == "width" || m == "precision")
+        {
+            int value = m == "width" ? f->width : f->prec;
+            out = value >= 0 ? mkSome(mkUint((uint64_t)value, PR_USIZE)) : mkNone();
+            return true;
+        }
+        if (m == "alternate")
+        {
+            out = mkBool(f->spec->alt);
+            return true;
+        }
+        if (m == "sign_plus")
+        {
+            out = mkBool(f->spec->plus);
+            return true;
+        }
+        if (m == "sign_aware_zero_pad")
+        {
+            out = mkBool(f->spec->zero);
+            return true;
+        }
+        if (m == "fill")
+        {
+            out = mkChar(f->spec->fill);
+            return true;
+        }
+        if (m == "debug_struct" || m == "debug_tuple" || m == "debug_list" || m == "debug_set" || m == "debug_map")
+        {
+            out = mkNative(m == "debug_struct" ? "DebugStruct" : m == "debug_tuple" ? "DebugTuple"
+                           : m == "debug_list" ? "DebugList" : m == "debug_set" ? "DebugSet" : "DebugMap",
+                           "");
+            NativeObj *b = static_cast<NativeObj *>(out.p);
+            b->buf = f->buf;
+            b->spec = f->spec;
+            b->pretty = f->pretty;
+            b->first = true;
+            if (!args.empty())
+                *f->buf += strOf(args[0]);
+            return true;
+        }
+        return false;
+    }
+    bool isStruct = f->type == "DebugStruct", isTuple = f->type == "DebugTuple", isList = f->type == "DebugList",
+         isSet = f->type == "DebugSet", isMap = f->type == "DebugMap";
+    if (!(isStruct || isTuple || isList || isSet || isMap))
+        return false;
+    const char *open = isStruct ? (f->pretty ? " {" : " { ") : isTuple ? "(" : isList ? "[" : "{";
+    const char *close = isStruct ? (f->pretty ? "}" : " }") : isTuple ? ")" : isList ? "]" : "}";
+    auto add = [&](const std::string &text)
+    {
+        if (f->pretty)
+        {
+            if (f->first)
+                *f->buf += std::string(open) + "\n";
+            *f->buf += "    ";
+            indented(*f->buf, text);
+            *f->buf += ",\n";
+        }
+        else
+        {
+            *f->buf += f->first ? open : ", ";
+            *f->buf += text;
+        }
+        f->first = false;
+    };
+    V self;
+    self.k = V_NATIVE;
+    self.p = f;
+    if (m == "field")
+    {
+        if (isStruct)
+            add(strOf(argAt(args, 0, n)) + ": " + debugStr(argAt(args, 1, n), f->pretty, n));
+        else
+            add(debugStr(argAt(args, 0, n), f->pretty, n));
+        out = self;
+        return true;
+    }
+    if (m == "entry")
+    {
+        if (isMap)
+            add(debugStr(argAt(args, 0, n), f->pretty, n) + ": " + debugStr(argAt(args, 1, n), f->pretty, n));
+        else
+            add(debugStr(argAt(args, 0, n), f->pretty, n));
+        out = self;
+        return true;
+    }
+    if (m == "entries")
+    {
+        V it = toIter(argAt(args, 0, n), n);
+        V item;
+        while (iterNext(static_cast<IterObj *>(it.p), item, n))
+        {
+            V x = peel(item);
+            if (isMap && x.k == V_TUPLE && x.p->items.size() == 2)
+                add(debugStr(x.p->items[0], f->pretty, n) + ": " + debugStr(x.p->items[1], f->pretty, n));
+            else
+                add(debugStr(item, f->pretty, n));
+        }
+        out = self;
+        return true;
+    }
+    if (m == "finish" || m == "finish_non_exhaustive")
+    {
+        if (m == "finish_non_exhaustive")
+            add("..");
+        if (!f->first)
+            *f->buf += close;
+        else if (isList || isSet || isMap)
+            *f->buf += std::string(open) + close;
+        out = mkOk(V());
+        return true;
+    }
+    return false;
+}
+
+} // namespace rust

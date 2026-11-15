@@ -61,6 +61,7 @@ The extension decides what a file may contain:
 | `.c` | C | C only (C++ is an error) |
 | `.cpp` | C++ | C++ only |
 | `.java` | Java | Java only |
+| `.rs` | Rust | Rust only (the 2021 edition) |
 
 Every extension other than `.sa` is strictly its own language. The file is compiled by that
 language's own front-end, and code the real compiler or interpreter would reject is an error,
@@ -421,6 +422,75 @@ Not there: `import`/`export` modules, networking (`http`, `net`, `fetch`), `chil
 real worker threads, resizable `ArrayBuffer`s, and time-zone history (a date's local time uses the
 machine's current offset). `Intl` knows English and German names and common number punctuation.
 There is no garbage collector: memory goes back when the program ends.
+
+---
+
+## Rust
+
+A `.rs` file runs on the Rust front-end in `src/rust` (`qrun main.rs`, or `quantum main.rs` for a
+standalone `.exe`). Its output is what the same program built by `rustc` prints, panics included:
+`thread 'main' panicked at main.rs:4:5:` and exit status 101. A program `rustc` rejects is an error
+reported the way rustc reports it: syntax, unknown names (`E0425`), private items (`E0603`), wrong
+argument counts (`E0061`), missing struct fields (`E0063`), assigning to a variable that is not
+`mut` (`E0384`), and so on.
+
+What works: structs, enums, `impl` blocks, traits (default methods, associated types and constants,
+trait objects, `impl Trait`, generics with bounds and `where` clauses, const generics), closures
+(`move`, `Fn`/`FnMut`/`FnOnce`), pattern matching (guards, `@` bindings, slice and nested patterns,
+`let ... else`, `matches!`), operator overloading (`Add`, `Index`, `AddAssign` ...), ownership
+(a moved value cannot be used again: `E0382`), `Drop`, `Box`/`Rc`/`Weak`/`RefCell`/`Cell`/`Arc`/
+`Mutex`/`RwLock`/atomics, `macro_rules!`, integer types to `i128`/`u128` with overflow panics and
+the `checked_`/`wrapping_`/`saturating_` methods, `f32`/`f64`, the formatting macros with every
+format spec, iterators and their adapters, `String`/`&str`/`char`, `Vec`, `VecDeque`,
+`BinaryHeap`, `HashMap`/`HashSet`/`BTreeMap`/`BTreeSet`, `Option`/`Result` and `?`, `std::fs`,
+`File`, `BufReader`/`BufWriter`, `Path`/`PathBuf`, `std::env::args`, `std::process::exit`,
+`Instant`/`Duration`/`SystemTime`, and `env!` (with `CARGO_PKG_*` read from the nearest `Cargo.toml`).
+
+**Modules in other files.** `mod geometry;` reads `geometry.rs` (or `geometry/mod.rs`) next to the
+file that declares it, the way rustc does; errors and panics name the file they are in. A missing
+file is rustc's `E0583`. A `lib.rs` without `main` is a library crate: it is compiled and checked,
+and there is nothing to run. `quantum --test` treats a crate as cargo does: a `.rs` file that another
+file declares with `mod name;` is checked as part of that crate, not run as a program of its own.
+
+**Threads.** `thread::spawn`, `thread::Builder`, `thread::scope`, `join`, `park`/`unpark`,
+`mpsc::channel`/`sync_channel` (a channel closes when its last `Sender` is dropped, so `for msg in rx`
+ends), `Condvar`, `Barrier`, atomics. Threads take turns on one OS thread: each runs until it waits
+(a channel, a join, a sleep, a barrier), then the next one runs. A spawned thread starts when its
+parent waits, as it mostly does in a real run. `thread::sleep` costs nothing: it moves a virtual clock
+that `Instant` and `SystemTime` see, so the order things happen in is the order a real run shows,
+the same every time. If every thread waits for another, the program reports a deadlock and exits
+with 101 instead of hanging.
+
+**async / await.** `async fn`, `async` blocks and closures, `.await`, and async methods in traits.
+A future is lazy: calling an async fn runs nothing until it is awaited. `#[tokio::main]` runs `main`
+on a built-in tokio: `tokio::spawn` and `spawn_blocking`, `JoinHandle` (`await`, `abort`),
+`JoinSet`, `join!`, `try_join!`, `select!` (with `biased;`, `else` and preconditions),
+`time::sleep`/`sleep_until`/`timeout`/`interval`, `sync::mpsc` (bounded and unbounded), `oneshot`,
+`Mutex`, `RwLock`, `Notify`, `Semaphore`, `Barrier`, `task::yield_now`, `Runtime::block_on`; and
+`futures::future::join_all` and `futures::executor::block_on`. Tasks share the virtual clock, so
+`join!` of three 50 ms sleeps takes 50 ms.
+
+**serde.** `#[derive(Serialize, Deserialize)]` with `serde_json::to_string`/`to_string_pretty`/
+`to_vec`/`to_writer`/`to_value` and `from_str`/`from_slice`/`from_reader`/`from_value`, written
+and read as serde's derive does (field order, externally/internally/adjacently tagged and untagged
+enums, `Option` as `null`); the attributes `rename`, `rename_all`, `skip`, `skip_serializing_if`,
+`default`, `alias`, `flatten`, `transparent`, `deny_unknown_fields`; `serde_json::Value` (match on its
+variants, index it with `v["key"]` and `v[0]`, `as_str`/`as_i64`/`get`/`pointer` ...) and `json!`.
+The text is byte for byte serde_json's, floats included, and errors carry serde_json's message,
+line and column (`missing field `id` at line 1 column 13`).
+
+**Networking.** `TcpListener` (`bind`, `incoming`, `accept`) and `TcpStream` (`connect`, `read`,
+`read_exact`, `read_line`, `lines`, `write_all`, timeouts) are real sockets, and so are tokio's
+(`tokio::net`, with `AsyncReadExt`/`AsyncWriteExt`: their reads and writes are futures, so
+`timeout(d, stream.read(&mut buf))` works). A thread or task waiting for a connection or for data lets
+the others run, so a server and its clients can be one program. While `quantum --test` runs, no client
+connects: `incoming()` ends at once, so a server program finishes.
+
+How it differs from rustc: types are checked as the program runs, so a type error is reported
+when the code that has it runs, not before. A `HashMap` keeps insertion order (Rust promises no
+order at all). A `Mutex` is never contended (threads take turns), so holding a lock while waiting
+does not block the others. Not supported: crates other than the standard library, tokio, futures
+and serde/serde_json; UDP; and `unsafe` pointer tricks.
 
 ---
 

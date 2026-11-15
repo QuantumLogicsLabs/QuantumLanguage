@@ -303,6 +303,70 @@ static TestResult testFile(const std::string &path, const fs::path &workDir)
 // directory that would have been visited afterward in the same lazy walk.
 // Gathering this level's subdirectories up front and recursing into each
 // independently means a failure in one subtree only loses that subtree.
+// Whether Rust source declares `mod name;` (a module in another file)
+static bool declaresRustMod(const std::string &text, const std::string &name)
+{
+    auto identChar = [](char c)
+    { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+    size_t at = 0;
+    while ((at = text.find("mod", at)) != std::string::npos)
+    {
+        size_t k = at + 3;
+        bool starts = at == 0 || !identChar(text[at - 1]);
+        at = k;
+        if (!starts || k >= text.size() || (text[k] != ' ' && text[k] != '\t'))
+            continue;
+        while (k < text.size() && (text[k] == ' ' || text[k] == '\t'))
+            ++k;
+        if (text.compare(k, name.size(), name) != 0)
+            continue;
+        k += name.size();
+        while (k < text.size() && (text[k] == ' ' || text[k] == '\t'))
+            ++k;
+        if (k < text.size() && text[k] == ';')
+            return true;
+    }
+    return false;
+}
+
+// A .rs file that another file declares with `mod name;` is a module of that file's crate, not a
+// program: cargo compiles it with its crate root (lib.rs, main.rs), and so does the runner.
+static bool isRustModuleFile(const fs::path &file)
+{
+    if (file.extension().string() != ".rs")
+        return false;
+    std::string stem = file.stem().string();
+    if (stem == "main" || stem == "lib")
+        return false;
+    fs::path dir = file.parent_path();
+    // name.rs is declared next to it or one folder up; name/mod.rs one or two folders up
+    std::string name = stem == "mod" ? dir.filename().string() : stem;
+    std::vector<fs::path> folders;
+    folders.push_back(stem == "mod" ? dir.parent_path() : dir);
+    folders.push_back(stem == "mod" ? dir.parent_path().parent_path() : dir.parent_path());
+    for (const fs::path &folder : folders)
+    {
+        try
+        {
+            for (auto &e : fs::directory_iterator(folder, fs::directory_options::skip_permission_denied))
+            {
+                if (!e.is_regular_file() || e.path().extension().string() != ".rs" ||
+                    e.path().string() == file.string())
+                    continue;
+                std::ifstream in(e.path(), std::ios::binary);
+                std::stringstream text;
+                text << in.rdbuf();
+                if (declaresRustMod(text.str(), name))
+                    return true;
+            }
+        }
+        catch (const fs::filesystem_error &)
+        {
+        }
+    }
+    return false;
+}
+
 static void collectTestFilesRecursive(const fs::path &dir, std::vector<fs::path> &out)
 {
     std::vector<fs::path> subdirs;
@@ -321,7 +385,7 @@ static void collectTestFilesRecursive(const fs::path &dir, std::vector<fs::path>
                     continue;
                 subdirs.push_back(e.path());
             }
-            else if (e.is_regular_file() && hasSupportedExt(e.path().string()))
+            else if (e.is_regular_file() && hasSupportedExt(e.path().string()) && !isRustModuleFile(e.path()))
                 out.push_back(e.path());
         }
     }
@@ -336,7 +400,7 @@ static void collectTestFilesRecursive(const fs::path &dir, std::vector<fs::path>
 static void collectTestFiles(const fs::path &dir, std::vector<fs::path> &out)
 {
     // Any file type the compiler runs natively is testable:
-    // .sa .js .py .rb .c .cpp .java .html .css — whatever hasSupportedExt() accepts.
+    // .sa .js .py .rb .c .cpp .java .rs .html .css — whatever hasSupportedExt() accepts.
     if (!fs::exists(dir) || !fs::is_directory(dir))
         return;
     collectTestFilesRecursive(dir, out);
@@ -477,7 +541,7 @@ int runTestExamples(const std::string &dir)
     collectTestFiles(d, files);
     if (files.empty())
     {
-        std::cout << "No testable files found (.sa .js .py .rb .c .cpp .java .html .css).\n";
+        std::cout << "No testable files found (.sa .js .py .rb .c .cpp .java .rs .html .css).\n";
         return 0;
     }
     std::sort(files.begin(), files.end());

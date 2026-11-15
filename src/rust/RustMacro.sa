@@ -1,0 +1,538 @@
+// quantum: cpp
+// Rust front-end: macro_rules!. A call is matched against each rule's
+// matcher in turn; the first that takes all of the call's tokens gives the
+// body to write out, with its $variables and $( ... )* repetitions filled
+// in. The result is a token list, parsed where the call stands: as an
+// expression, as statements, or as items. Fragments are measured with the
+// parser itself (`$x:expr` takes what parseExpr takes). There is no hygiene:
+// a name the body introduces is a name of the place it is used in.
+#include "RustParse.h.sa"
+
+#include <map>
+
+namespace rust
+{
+
+namespace
+{
+
+struct MItem
+{
+    int kind = 0; // 0 a token, 1 $name[:frag], 2 $( ... ) sep rep
+    Tok tok;
+    std::string name, frag;
+    std::vector<MItem *> sub;
+    bool hasSep = false;
+    Tok sep;
+    char rep = '*';
+};
+
+// What a $name matched: tokens, or one match per repetition around it
+struct Binding
+{
+    bool leaf = true;
+    std::string frag;
+    std::vector<Tok> toks;
+    std::vector<Binding *> reps;
+};
+
+typedef std::map<std::string, Binding *> Bindings;
+
+const size_t NOMATCH = (size_t)-1;
+
+bool isOpen(const Tok &t) { return t.k == T_PUNCT && (t.s == "(" || t.s == "[" || t.s == "{"); }
+bool isClose(const Tok &t) { return t.k == T_PUNCT && (t.s == ")" || t.s == "]" || t.s == "}"); }
+
+// index just past the group that opens at `at`, or NOMATCH
+size_t groupEnd(const std::vector<Tok> &toks, size_t at, size_t end)
+{
+    int depth = 0;
+    for (size_t k = at; k < end; ++k)
+    {
+        if (isOpen(toks[k]))
+            ++depth;
+        else if (isClose(toks[k]) && --depth == 0)
+            return k + 1;
+    }
+    return NOMATCH;
+}
+
+[[noreturn]] void macroError(const std::string &msg, const Tok &at)
+{
+    CompileErr e;
+    e.message = msg;
+    e.line = at.line;
+    e.col = at.col;
+    e.width = at.len > 0 ? at.len : 1;
+    throw e;
+}
+
+void parseMItems(const std::vector<Tok> &toks, size_t from, size_t to, bool matcher, std::vector<MItem *> &out)
+{
+    size_t i = from;
+    while (i < to)
+    {
+        const Tok &t = toks[i];
+        if (t.k == T_PUNCT && t.s == "$" && i + 1 < to)
+        {
+            const Tok &next = toks[i + 1];
+            if (next.k == T_PUNCT && next.s == "(")
+            {
+                size_t close = groupEnd(toks, i + 1, to);
+                if (close == NOMATCH)
+                    macroError("unbalanced `$(` in macro", t);
+                MItem *rep = new MItem();
+                rep->kind = 2;
+                rep->tok = t;
+                parseMItems(toks, i + 2, close - 1, matcher, rep->sub);
+                i = close;
+                auto isRep = [](const Tok &x) { return x.k == T_PUNCT && (x.s == "*" || x.s == "+" || x.s == "?"); };
+                if (i < to && !isRep(toks[i]))
+                {
+                    rep->hasSep = true;
+                    rep->sep = toks[i++];
+                }
+                if (i >= to || !isRep(toks[i]))
+                    macroError("expected one of: `*`, `+`, or `?`", i < to ? toks[i] : t);
+                rep->rep = toks[i++].s[0];
+                out.push_back(rep);
+                continue;
+            }
+            if (next.k == T_IDENT)
+            {
+                MItem *var = new MItem();
+                var->kind = 1;
+                var->tok = next;
+                var->name = next.s;
+                i += 2;
+                if (matcher)
+                {
+                    if (i + 1 >= to || !(toks[i].k == T_PUNCT && toks[i].s == ":") || toks[i + 1].k != T_IDENT)
+                        macroError("missing fragment specifier", next);
+                    var->frag = toks[i + 1].s;
+                    i += 2;
+                }
+                out.push_back(var);
+                continue;
+            }
+        }
+        MItem *lit = new MItem();
+        lit->tok = t;
+        out.push_back(lit);
+        ++i;
+    }
+}
+
+void collectNames(const std::vector<MItem *> &items, std::vector<std::string> &names)
+{
+    for (const MItem *it : items)
+    {
+        if (it->kind == 1)
+            names.push_back(it->name);
+        else if (it->kind == 2)
+            collectNames(it->sub, names);
+    }
+}
+
+bool sameToken(const Tok &a, const Tok &b) { return a.k == b.k && a.s == b.s && a.suf == b.suf && a.lo == b.lo; }
+
+// How many tokens of `in` at `pos` make a fragment of kind `frag`
+size_t fragLen(const std::string &frag, const std::vector<Tok> &in, size_t pos, Parser &host)
+{
+    if (frag == "vis")
+    {
+        if (pos < in.size() && in[pos].k == T_IDENT && in[pos].s == "pub")
+        {
+            if (pos + 1 < in.size() && in[pos + 1].k == T_PUNCT && in[pos + 1].s == "(")
+            {
+                size_t close = groupEnd(in, pos + 1, in.size());
+                return close == NOMATCH ? NOMATCH : close - pos;
+            }
+            return 1;
+        }
+        return 0;
+    }
+    if (pos >= in.size())
+        return NOMATCH;
+    const Tok &t = in[pos];
+    if (frag == "tt" || frag == "block")
+    {
+        if (isOpen(t))
+        {
+            if (frag == "block" && t.s != "{")
+                return NOMATCH;
+            size_t close = groupEnd(in, pos, in.size());
+            return close == NOMATCH ? NOMATCH : close - pos;
+        }
+        if (frag == "block" || isClose(t))
+            return NOMATCH;
+        return 1;
+    }
+    if (frag == "lifetime")
+        return t.k == T_LIFE ? 1 : NOMATCH;
+    if (frag == "literal")
+    {
+        if (t.k == T_PUNCT && t.s == "-" && pos + 1 < in.size() && (in[pos + 1].k == T_INT || in[pos + 1].k == T_FLOAT))
+            return 2;
+        if (t.k == T_INT || t.k == T_FLOAT || t.k == T_STR || t.k == T_BSTR || t.k == T_CHAR || t.k == T_BYTE)
+            return 1;
+        if (t.k == T_IDENT && !t.raw && (t.s == "true" || t.s == "false"))
+            return 1;
+        return NOMATCH;
+    }
+    // the rest is measured by parsing it
+    Parser sub;
+    sub.toks.assign(in.begin() + (std::ptrdiff_t)pos, in.end());
+    Tok eof;
+    eof.k = T_EOF;
+    eof.line = t.line;
+    eof.col = t.col;
+    sub.toks.push_back(eof);
+    std::vector<ModDef *> scratchAll;
+    std::vector<MacroDef *> scratchMacros = *host.macros;
+    ModDef scratchMod;
+    sub.all = &scratchAll;
+    sub.macros = &scratchMacros;
+    sub.mod = &scratchMod;
+    sub.expandDepth = host.expandDepth;
+    try
+    {
+        if (frag == "ident")
+        {
+            if (!sub.isIdent())
+                return NOMATCH;
+            return 1;
+        }
+        if (frag == "expr")
+            sub.parseExpr();
+        else if (frag == "ty")
+            sub.parseType();
+        else if (frag == "pat")
+            sub.parsePattern();
+        else if (frag == "pat_param")
+            sub.parsePatNoOr();
+        else if (frag == "path")
+            sub.parsePath(false);
+        else if (frag == "stmt")
+        {
+            if (sub.eatKw("let"))
+            {
+                sub.parsePattern();
+                if (sub.eatP(":"))
+                    sub.parseType();
+                if (sub.eatP("="))
+                    sub.parseExpr();
+            }
+            else
+                sub.parseExpr();
+        }
+        else if (frag == "item")
+            sub.parseItem(&scratchMod);
+        else if (frag == "meta")
+        {
+            sub.parsePath(false);
+            if (sub.isP("(") || sub.isP("[") || sub.isP("{"))
+                sub.skipBalanced();
+            else if (sub.eatP("="))
+                sub.parsePrimary(false);
+        }
+        else
+            macroError("invalid fragment specifier `" + frag + "`", t);
+    }
+    catch (CompileErr &)
+    {
+        if (frag != "expr" && frag != "ty" && frag != "pat" && frag != "pat_param" && frag != "path" &&
+            frag != "stmt" && frag != "item" && frag != "meta")
+            throw;
+        return NOMATCH;
+    }
+    return sub.p == 0 ? NOMATCH : sub.p;
+}
+
+bool matchSeq(const std::vector<MItem *> &items, const std::vector<Tok> &in, size_t &pos, Bindings &b, Parser &host)
+{
+    for (const MItem *it : items)
+    {
+        if (it->kind == 0)
+        {
+            if (pos >= in.size() || !sameToken(in[pos], it->tok))
+                return false;
+            ++pos;
+        }
+        else if (it->kind == 1)
+        {
+            size_t n = fragLen(it->frag, in, pos, host);
+            if (n == NOMATCH)
+                return false;
+            Binding *bd = new Binding();
+            bd->frag = it->frag;
+            bd->toks.assign(in.begin() + (std::ptrdiff_t)pos, in.begin() + (std::ptrdiff_t)(pos + n));
+            b[it->name] = bd;
+            pos += n;
+        }
+        else
+        {
+            std::vector<Bindings> rounds;
+            for (;;)
+            {
+                size_t save = pos;
+                if (!rounds.empty() && it->hasSep)
+                {
+                    if (pos < in.size() && sameToken(in[pos], it->sep))
+                        ++pos;
+                    else
+                        break;
+                }
+                Bindings round;
+                size_t before = pos;
+                if (pos >= in.size() || !matchSeq(it->sub, in, pos, round, host) || pos == before)
+                {
+                    pos = save;
+                    break;
+                }
+                rounds.push_back(round);
+                if (it->rep == '?')
+                    break;
+            }
+            if (it->rep == '+' && rounds.empty())
+                return false;
+            std::vector<std::string> names;
+            collectNames(it->sub, names);
+            for (const std::string &name : names)
+            {
+                Binding *bd = new Binding();
+                bd->leaf = false;
+                for (Bindings &round : rounds)
+                {
+                    auto found = round.find(name);
+                    if (found != round.end())
+                        bd->reps.push_back(found->second);
+                }
+                b[name] = bd;
+            }
+        }
+    }
+    return true;
+}
+
+void transcribe(const std::vector<MItem *> &items, Bindings &b, std::vector<Tok> &out, const Tok &at)
+{
+    for (const MItem *it : items)
+    {
+        if (it->kind == 0)
+            out.push_back(it->tok);
+        else if (it->kind == 1)
+        {
+            if (it->name == "crate")
+            {
+                Tok t = it->tok;
+                t.s = "crate";
+                out.push_back(t);
+                continue;
+            }
+            auto found = b.find(it->name);
+            if (found == b.end())
+            {
+                // not a macro variable: `$` and the name stay as they are
+                Tok dollar = it->tok;
+                dollar.k = T_PUNCT;
+                dollar.s = "$";
+                out.push_back(dollar);
+                out.push_back(it->tok);
+                continue;
+            }
+            Binding *bd = found->second;
+            if (!bd->leaf)
+                macroError("variable `" + it->name + "` is still repeating at this depth", it->tok);
+            // an expression goes in as one operand
+            bool wrap = bd->frag == "expr" && bd->toks.size() > 1;
+            if (wrap)
+            {
+                Tok open = bd->toks[0];
+                open.k = T_PUNCT;
+                open.s = "(";
+                open.raw = true; // not written by anyone: stringify! leaves it out
+                open.suf.clear();
+                out.push_back(open);
+            }
+            for (const Tok &t : bd->toks)
+                out.push_back(t);
+            if (wrap)
+            {
+                Tok close = bd->toks.back();
+                close.k = T_PUNCT;
+                close.s = ")";
+                close.raw = true;
+                close.suf.clear();
+                out.push_back(close);
+            }
+        }
+        else
+        {
+            std::vector<std::string> names;
+            collectNames(it->sub, names);
+            size_t count = 0;
+            bool any = false;
+            for (const std::string &name : names)
+            {
+                auto found = b.find(name);
+                if (found == b.end() || found->second->leaf)
+                    continue;
+                if (any && found->second->reps.size() != count)
+                    macroError("meta-variable `" + name + "` repeats a different number of times than the others",
+                               it->tok);
+                count = found->second->reps.size();
+                any = true;
+            }
+            if (!any)
+                macroError("attempted to repeat an expression containing no syntax variables matched as "
+                           "repeating at this depth",
+                           it->tok);
+            for (size_t round = 0; round < count; ++round)
+            {
+                Bindings inner = b;
+                for (const std::string &name : names)
+                {
+                    auto found = b.find(name);
+                    if (found != b.end() && !found->second->leaf)
+                        inner[name] = found->second->reps[round];
+                }
+                if (round > 0 && it->hasSep)
+                    out.push_back(it->sep);
+                transcribe(it->sub, inner, out, at);
+            }
+        }
+    }
+}
+
+// The tokens a call of `def` with the tokens `input` stands for
+std::vector<Tok> expand(MacroDef *def, const std::vector<Tok> &input, const Tok &at, Parser &host)
+{
+    if (host.expandDepth > 100)
+        macroError("recursion limit reached while expanding `" + def->name + "!`", at);
+    for (const MacroRule &rule : def->rules)
+    {
+        std::vector<MItem *> matcher;
+        parseMItems(rule.matcher, 0, rule.matcher.size(), true, matcher);
+        Bindings b;
+        size_t pos = 0;
+        if (!matchSeq(matcher, input, pos, b, host) || pos != input.size())
+            continue;
+        std::vector<MItem *> body;
+        parseMItems(rule.body, 0, rule.body.size(), false, body);
+        std::vector<Tok> out;
+        transcribe(body, b, out, at);
+        return out;
+    }
+    macroError("no rules expected this token in macro call", input.empty() ? at : input[0]);
+    return std::vector<Tok>();
+}
+
+} // namespace
+
+MacroDef *Parser::findMacro(const std::string &name) const
+{
+    for (size_t k = macros->size(); k-- > 0;)
+        if ((*macros)[k]->name == name)
+            return (*macros)[k];
+    return nullptr;
+}
+
+// `context`: 0 an expression is wanted, 1 statements (the result is a block
+// marked `mut`: its statements belong to the block the call is in).
+Node *Parser::parseUserMacro(MacroDef *def, const Tok &at, int context)
+{
+    std::vector<Tok> input = takeGroup();
+    std::vector<Tok> out = expand(def, input, at, *this);
+    // statements or one expression? A `;` or a `let` outside brackets decides.
+    bool statements = !out.empty() && out[0].k == T_IDENT && !out[0].raw && out[0].s == "let";
+    int depth = 0;
+    for (const Tok &t : out)
+    {
+        if (isOpen(t))
+            ++depth;
+        else if (isClose(t))
+            --depth;
+        else if (depth == 0 && t.k == T_PUNCT && t.s == ";")
+            statements = true;
+    }
+    Tok eof;
+    eof.k = T_EOF;
+    eof.line = at.line;
+    eof.col = at.col;
+    Parser sub;
+    sub.mod = mod;
+    sub.all = all;
+    sub.macros = macros;
+    sub.expandDepth = expandDepth + 1;
+    if (context == 1)
+    {
+        sub.toks = out;
+        sub.toks.push_back(eof);
+        Node *blk = mk(N_BLOCK, at);
+        blk->mut = true;
+        while (sub.cur().k != T_EOF)
+            sub.parseStmt(blk);
+        return blk;
+    }
+    if (out.empty())
+        return mk(N_TUPLE, at); // nothing: ()
+    if (statements)
+    {
+        Tok open = at, close = at;
+        open.k = close.k = T_PUNCT;
+        open.s = "{";
+        close.s = "}";
+        sub.toks.push_back(open);
+        for (const Tok &t : out)
+            sub.toks.push_back(t);
+        sub.toks.push_back(close);
+        sub.toks.push_back(eof);
+        Node *blk = sub.parseBlock();
+        if (sub.cur().k != T_EOF)
+            sub.failExpected("the end of the macro's result");
+        return blk;
+    }
+    sub.toks = out;
+    sub.toks.push_back(eof);
+    Node *e = sub.parseExpr();
+    if (sub.cur().k != T_EOF)
+        sub.fail("macro expansion ignores " + sub.describe(sub.cur()) + " and any tokens following", sub.cur());
+    return e;
+}
+
+// name!( ... ); where items are expected: the result is items of `m`
+void Parser::parseItemMacro(ModDef *m)
+{
+    Tok at = cur();
+    MacroDef *def = findMacro(at.s);
+    if (!def)
+    {
+        CompileErr e;
+        e.message = "cannot find macro `" + at.s + "` in this scope";
+        e.line = at.line;
+        e.col = at.col;
+        e.width = (int)at.s.size();
+        throw e;
+    }
+    p += 2; // name !
+    bool brace = isP("{");
+    std::vector<Tok> input = takeGroup();
+    if (!brace)
+        expectP(";");
+    std::vector<Tok> out = expand(def, input, at, *this);
+    Tok eof;
+    eof.k = T_EOF;
+    eof.line = at.line;
+    eof.col = at.col;
+    Parser sub;
+    sub.toks = out;
+    sub.toks.push_back(eof);
+    sub.mod = mod;
+    sub.all = all;
+    sub.macros = macros;
+    sub.expandDepth = expandDepth + 1;
+    sub.parseItems(m, false);
+}
+
+} // namespace rust

@@ -1,0 +1,1206 @@
+// quantum: cpp
+// Rust front-end: strings and characters. A string is UTF-8 bytes; lengths
+// and indexes are in bytes, `chars()` gives the code points. A method that
+// changes the string needs a `String` (an owned one); the others work on
+// `&str` and `String` alike. Patterns (for split, find, trim_matches ...)
+// are a string, a character, a set of characters or a closure on a
+// character.
+#include "RustRt.h.sa"
+
+#include <cmath>
+
+namespace rust
+{
+
+namespace
+{
+
+uint32_t decodeAt(const std::string &s, size_t i, size_t &len)
+{
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x80)
+    {
+        len = 1;
+        return c;
+    }
+    size_t extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
+    uint32_t cp = c & (0x3F >> extra);
+    len = 1;
+    for (size_t k = 0; k < extra && i + len < s.size(); ++k, ++len)
+        cp = (cp << 6) | ((unsigned char)s[i + len] & 0x3F);
+    return cp;
+}
+
+// the start of the character before byte i
+size_t prevChar(const std::string &s, size_t i)
+{
+    --i;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80)
+        --i;
+    return i;
+}
+
+bool isSpace(uint32_t c)
+{
+    return c == ' ' || (c >= 9 && c <= 13) || c == 0x85 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+           c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+bool isUpper(uint32_t c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 0xC0 && c <= 0xDE && c != 0xD7) || (c >= 0x391 && c <= 0x3A9) ||
+           (c >= 0x410 && c <= 0x42F) || (c >= 0x400 && c <= 0x40F);
+}
+
+bool isLower(uint32_t c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 0xDF && c <= 0xFF && c != 0xF7) || (c >= 0x3B1 && c <= 0x3C9) ||
+           (c >= 0x430 && c <= 0x45F);
+}
+
+bool isAlpha(uint32_t c)
+{
+    if (c < 0x80)
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    if (c == 0xAA || c == 0xB5 || c == 0xBA)
+        return true;
+    if (c < 0xC0)
+        return false;
+    if (c == 0xD7 || c == 0xF7)
+        return false;
+    if (c >= 0x2000 && c <= 0x2BFF)
+        return false; // punctuation, symbols, arrows
+    if (c >= 0x3000 && c <= 0x303F)
+        return false;
+    if (c >= 0xFE00 && c <= 0xFE0F)
+        return false;
+    if (c >= 0x1F000 && c <= 0x1FAFF)
+        return false; // emoji
+    return true;
+}
+
+bool isDigit(uint32_t c) { return c >= '0' && c <= '9'; }
+
+uint32_t toUpper(uint32_t c)
+{
+    if (c >= 'a' && c <= 'z')
+        return c - 32;
+    if ((c >= 0xE0 && c <= 0xFE && c != 0xF7) || (c >= 0x3B1 && c <= 0x3C9 && c != 0x3C2) || (c >= 0x430 && c <= 0x44F))
+        return c - 32;
+    if (c >= 0x450 && c <= 0x45F)
+        return c - 80;
+    if (c == 0xFF)
+        return 0x178;
+    return c;
+}
+
+uint32_t toLower(uint32_t c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c + 32;
+    if ((c >= 0xC0 && c <= 0xDE && c != 0xD7) || (c >= 0x391 && c <= 0x3A9) || (c >= 0x410 && c <= 0x42F))
+        return c + 32;
+    if (c >= 0x400 && c <= 0x40F)
+        return c + 80;
+    return c;
+}
+
+std::string mapCase(const std::string &s, bool upper)
+{
+    std::string out;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        size_t len = 1;
+        uint32_t c = decodeAt(s, i, len);
+        if (upper && c == 0xDF)
+            out += "SS";
+        else
+            utf8Append(out, upper ? toUpper(c) : toLower(c));
+        i += len;
+    }
+    return out;
+}
+
+// What a pattern argument is, and where it next matches
+struct Pattern
+{
+    int kind = 0; // 0 a string, 1 a character, 2 a set of characters, 3 a closure
+    std::string text;
+    uint32_t ch = 0;
+    std::vector<uint32_t> set;
+    V fn;
+    const Node *at = nullptr;
+
+    bool testChar(uint32_t c) const
+    {
+        if (kind == 1)
+            return c == ch;
+        if (kind == 2)
+        {
+            for (uint32_t x : set)
+                if (x == c)
+                    return true;
+            return false;
+        }
+        return isTrue(call1(fn, mkChar(c), at), at);
+    }
+
+    // a match at exactly byte i: its length, or -1
+    int64_t matchAt(const std::string &s, size_t i) const
+    {
+        if (kind == 0)
+            return s.compare(i, text.size(), text) == 0 ? (int64_t)text.size() : -1;
+        if (i >= s.size())
+            return -1;
+        size_t len = 1;
+        uint32_t c = decodeAt(s, i, len);
+        return testChar(c) ? (int64_t)len : -1;
+    }
+
+    // the first match at or after `from`
+    bool find(const std::string &s, size_t from, size_t &pos, size_t &len) const
+    {
+        if (kind == 0)
+        {
+            size_t at0 = s.find(text, from);
+            if (at0 == std::string::npos)
+                return false;
+            pos = at0;
+            len = text.size();
+            return true;
+        }
+        size_t i = from;
+        while (i < s.size())
+        {
+            size_t clen = 1;
+            uint32_t c = decodeAt(s, i, clen);
+            if (testChar(c))
+            {
+                pos = i;
+                len = clen;
+                return true;
+            }
+            i += clen;
+        }
+        return false;
+    }
+
+    // the last match that ends at or before `to`
+    bool rfind(const std::string &s, size_t to, size_t &pos, size_t &len) const
+    {
+        if (kind == 0)
+        {
+            if (text.size() > to)
+                return false;
+            size_t at0 = s.rfind(text, to - text.size());
+            if (at0 == std::string::npos)
+                return false;
+            pos = at0;
+            len = text.size();
+            return true;
+        }
+        size_t i = to;
+        while (i > 0)
+        {
+            size_t start = prevChar(s, i);
+            size_t clen = 1;
+            uint32_t c = decodeAt(s, start, clen);
+            if (testChar(c))
+            {
+                pos = start;
+                len = clen;
+                return true;
+            }
+            i = start;
+        }
+        return false;
+    }
+};
+
+Pattern patternOf(V v, const Node *at)
+{
+    Pattern p;
+    p.at = at;
+    V x = peelAll(v);
+    Obj *o = nullptr;
+    int64_t start = 0, len = 0;
+    if (x.k == V_STR)
+        p.text = static_cast<StrObj *>(x.p)->s;
+    else if (x.k == V_CHAR)
+    {
+        p.kind = 1;
+        p.ch = (uint32_t)x.lo;
+    }
+    else if (x.k == V_CLOSURE || x.k == V_FN)
+    {
+        p.kind = 3;
+        p.fn = x;
+    }
+    else if (seqOf(x, o, start, len))
+    {
+        p.kind = 2;
+        for (int64_t k = 0; k < len; ++k)
+            p.set.push_back((uint32_t)peel(o->items[(size_t)(start + k)]).lo);
+    }
+    else
+        errAt(at, "E0277", "the trait bound `" + typeName(x) + ": Pattern` is not satisfied",
+              "a pattern is a `&str`, a `char`, a slice of `char`s or a closure taking a `char`");
+    return p;
+}
+
+V strV(const std::string &s) { return mkStr(s, false); }
+
+IterObj *strIter(const std::vector<std::string> &parts)
+{
+    IterObj *it = newIter(IT_VALUES);
+    it->items.reserve(parts.size());
+    for (const std::string &part : parts)
+        it->items.push_back(strV(part));
+    it->end = (int64_t)parts.size();
+    return it;
+}
+
+void splitBy(const std::string &s, const Pattern &p, int64_t limit, std::vector<std::string> &out, bool keepSep)
+{
+    size_t from = 0, scan = 0;
+    while (limit < 0 || (int64_t)out.size() + 1 < limit)
+    {
+        size_t pos = 0, len = 0;
+        if (scan > s.size() || !p.find(s, scan, pos, len))
+            break;
+        if (len == 0)
+        {
+            // an empty pattern matches between characters
+            if (pos >= s.size())
+            {
+                out.push_back(s.substr(from, pos - from));
+                from = pos;
+                scan = pos + 1;
+                continue;
+            }
+            size_t clen = 1;
+            decodeAt(s, pos, clen);
+            out.push_back(s.substr(from, pos - from));
+            from = pos;
+            scan = pos + clen;
+            continue;
+        }
+        out.push_back(s.substr(from, pos - from + (keepSep ? len : 0)));
+        from = pos + len;
+        scan = from;
+    }
+    out.push_back(s.substr(from));
+}
+
+[[noreturn]] void needOwned(const Node *n, const std::string &m)
+{
+    errAt(n, "E0599", "no method named `" + m + "` found for reference `&str` in the current scope",
+          "method not found in `&str`: `" + m + "` changes the string, so it needs a `String`");
+}
+
+// byte index arguments have to fall between characters
+void checkBoundary(const std::string &s, int64_t i, const Node *n, const char *what)
+{
+    if (i > (int64_t)s.size())
+        panicAt(n, std::string(what) + ": index " + std::to_string(i) + " is out of bounds of a string of length " +
+                       std::to_string(s.size()));
+    if (i < (int64_t)s.size() && ((unsigned char)s[(size_t)i] & 0xC0) == 0x80)
+        panicAt(n, std::string("assertion failed: self.is_char_boundary(") + (what[0] == 'i' ? "idx" : "new_len") + ")");
+}
+
+V parseAs(const std::string &s, Ty *target, const Node *n)
+{
+    Ty *t = tyResolve(target);
+    uint8_t prim = t ? tyPrim(t) : (uint8_t)PR_NONE;
+    if (isIntPrim(prim))
+    {
+        V v;
+        std::string kind;
+        if (parseInt(s, 10, prim, v, kind))
+            return mkOk(v);
+        return mkErr(mkNative("ParseIntError", "ParseIntError { kind: " + kind + " }"));
+    }
+    if (isFloatPrim(prim))
+    {
+        V v;
+        if (parseFloat(s, prim, v))
+            return mkOk(v);
+        return mkErr(mkNative("ParseFloatError", std::string("ParseFloatError { kind: ") + (s.empty() ? "Empty" : "Invalid") + " }"));
+    }
+    if (prim == PR_BOOL)
+    {
+        if (s == "true" || s == "false")
+            return mkOk(mkBool(s == "true"));
+        return mkErr(mkNative("ParseBoolError", "ParseBoolError"));
+    }
+    if (prim == PR_CHAR)
+    {
+        size_t len = 1;
+        if (!s.empty())
+        {
+            uint32_t c = decodeAt(s, 0, len);
+            if (len == s.size())
+                return mkOk(mkChar(c));
+        }
+        return mkErr(mkNative("ParseCharError", s.empty() ? "EmptyString" : "TooManyChars"));
+    }
+    if (t)
+    {
+        if (tyHead(t) == "String")
+            return mkOk(mkStr(s, true));
+        // the type's own FromStr
+        TypeDef *td = tyDef(t);
+        if (!td)
+        {
+            auto bt = G.builtinTypes.find(tyHead(t));
+            if (bt != G.builtinTypes.end())
+                td = bt->second;
+        }
+        if (td)
+            if (FnDef *f = findMethod(td, "from_str"))
+            {
+                std::vector<V> args(1, strV(s));
+                return callFn(f, args, td, n, nullptr);
+            }
+        if (t->k == TY_INFER || tyHead(t).empty())
+            t = nullptr;
+        else
+            errAt(n, "E0277", "the trait bound `" + tyText(t) + ": FromStr` is not satisfied",
+                  "the trait `FromStr` is not implemented for `" + tyText(t) + "`");
+    }
+    // nothing says what is wanted: a number of open type, by what the text looks like
+    V v;
+    std::string kind;
+    if (parseInt(s, 10, PR_I128, v, kind))
+    {
+        v.t = 0;
+        v.n = 1;
+        return mkOk(v);
+    }
+    if (parseFloat(s, 0, v) && s.find_first_of("0123456789") != std::string::npos)
+        return mkOk(v);
+    return mkErr(mkNative("ParseIntError", "ParseIntError { kind: " + kind + " }"));
+}
+
+} // namespace
+
+bool charMethod(V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    (void)hint;
+    const std::string &m = n->s;
+    uint32_t c = (uint32_t)sv.lo;
+    bool ascii = c < 128;
+    auto b = [&](bool r) -> bool
+    {
+        out = mkBool(r);
+        return true;
+    };
+    if (m.compare(0, 3, "is_") == 0)
+    {
+        if (m == "is_alphabetic") return b(isAlpha(c));
+        if (m == "is_numeric") return b(isDigit(c) || (c >= 0xB2 && c <= 0xB3) || c == 0xB9 || (c >= 0xBC && c <= 0xBE) || (c >= 0x660 && c <= 0x669));
+        if (m == "is_alphanumeric") return b(isAlpha(c) || isDigit(c));
+        if (m == "is_whitespace") return b(isSpace(c));
+        if (m == "is_uppercase") return b(isUpper(c));
+        if (m == "is_lowercase") return b(isLower(c));
+        if (m == "is_control") return b(c < 32 || (c >= 127 && c < 160));
+        if (m == "is_ascii") return b(ascii);
+        if (m == "is_ascii_digit") return b(isDigit(c));
+        if (m == "is_ascii_alphabetic") return b(ascii && isAlpha(c));
+        if (m == "is_ascii_alphanumeric") return b(ascii && (isAlpha(c) || isDigit(c)));
+        if (m == "is_ascii_uppercase") return b(c >= 'A' && c <= 'Z');
+        if (m == "is_ascii_lowercase") return b(c >= 'a' && c <= 'z');
+        if (m == "is_ascii_whitespace") return b(c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0C);
+        if (m == "is_ascii_punctuation") return b(ascii && c > 32 && c < 127 && !isAlpha(c) && !isDigit(c));
+        if (m == "is_ascii_hexdigit") return b(isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+        if (m == "is_ascii_graphic") return b(c > 32 && c < 127);
+        if (m == "is_ascii_control") return b(c < 32 || c == 127);
+        if (m == "is_digit")
+        {
+            int64_t radix = toIndex(argAt(args, 0, n), n);
+            int d = isDigit(c) ? (int)(c - '0') : c >= 'a' && c <= 'z' ? (int)(c - 'a') + 10 : c >= 'A' && c <= 'Z' ? (int)(c - 'A') + 10 : 99;
+            return b(d < radix);
+        }
+        return false;
+    }
+    if (m == "to_digit")
+    {
+        int64_t radix = toIndex(argAt(args, 0, n), n);
+        if (radix < 2 || radix > 36)
+            panicAt(n, "to_digit: invalid radix -- radix must be in the range 2 to 36 inclusive");
+        int d = isDigit(c) ? (int)(c - '0') : c >= 'a' && c <= 'z' ? (int)(c - 'a') + 10 : c >= 'A' && c <= 'Z' ? (int)(c - 'A') + 10 : 99;
+        out = d < radix ? mkSome(mkUint((uint64_t)d, PR_U32)) : mkNone();
+        return true;
+    }
+    if (m == "to_ascii_uppercase" || m == "to_ascii_lowercase")
+    {
+        out = mkChar(m == "to_ascii_uppercase" ? (c >= 'a' && c <= 'z' ? c - 32 : c) : (c >= 'A' && c <= 'Z' ? c + 32 : c));
+        return true;
+    }
+    if (m == "to_uppercase" || m == "to_lowercase")
+    {
+        // an iterator over the characters of the result
+        IterObj *it = newIter(IT_VALUES);
+        if (m == "to_uppercase" && c == 0xDF)
+        {
+            it->items.push_back(mkChar('S'));
+            it->items.push_back(mkChar('S'));
+        }
+        else
+            it->items.push_back(mkChar(m == "to_uppercase" ? toUpper(c) : toLower(c)));
+        it->end = (int64_t)it->items.size();
+        it->mode = 9; // shows as its text
+        out = iterV(it);
+        return true;
+    }
+    if (m == "len_utf8")
+    {
+        out = mkUint(c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4, PR_USIZE);
+        return true;
+    }
+    if (m == "len_utf16")
+    {
+        out = mkUint(c < 0x10000 ? 1 : 2, PR_USIZE);
+        return true;
+    }
+    if (m == "eq_ignore_ascii_case")
+    {
+        uint32_t d = (uint32_t)peel(argAt(args, 0, n)).lo;
+        uint32_t x = c >= 'A' && c <= 'Z' ? c + 32 : c, y = d >= 'A' && d <= 'Z' ? d + 32 : d;
+        return b(x == y);
+    }
+    if (m == "encode_utf8")
+    {
+        out = strV(charString(c));
+        return true;
+    }
+    return false;
+}
+
+bool strMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    StrObj *so = static_cast<StrObj *>(sv.p);
+    std::string &s = so->s;
+    bool owned = sv.x != 0;
+    auto b = [&](bool r) -> bool
+    {
+        out = mkBool(r);
+        return true;
+    };
+    auto str = [&](const std::string &r) -> bool
+    {
+        out = strV(r);
+        return true;
+    };
+    auto string = [&](const std::string &r) -> bool
+    {
+        out = mkStr(r, true);
+        return true;
+    };
+    auto num = [&](uint64_t r) -> bool
+    {
+        out = mkUint(r, PR_USIZE);
+        return true;
+    };
+    if (m == "to_str")
+    {
+        out = mkSome(mkStr(s, false));
+        return true;
+    }
+    if (m == "to_string_lossy" || m == "display" || m == "as_os_str" || m == "borrow")
+    {
+        out = mkStr(s, false);
+        return true;
+    }
+    if (m == "into_owned" || m == "into_string" || m == "to_os_string")
+    {
+        out = m == "into_string" ? mkOk(mkStr(s, true)) : mkStr(s, true);
+        return true;
+    }
+    char key = m[0];
+    if (m == "rfind")
+        key = 'f';
+    else if (m == "rmatches")
+        key = 'm';
+    else if (m == "into")
+        key = 't';
+    switch (key)
+    {
+    case 'a':
+        if (m == "as_str" || m == "as_ref" || m == "as_mut_str" || m == "as_mut")
+        {
+            out = mkRef(sp.o, sp.i, m[3] == 'm');
+            return true;
+        }
+        if (m == "as_bytes")
+        {
+            std::vector<V> bytes;
+            bytes.reserve(s.size());
+            for (unsigned char c : s)
+                bytes.push_back(mkUint(c, PR_U8));
+            Obj *o = mkSeq(V_ARRAY, bytes).p;
+            out = mkSlice(o, 0, (int64_t)bytes.size(), false);
+            return true;
+        }
+        break;
+    case 'b':
+        if (m == "bytes")
+        {
+            IterObj *it = newIter(IT_VALUES);
+            it->items.reserve(s.size());
+            for (unsigned char c : s)
+                it->items.push_back(mkUint(c, PR_U8));
+            it->end = (int64_t)s.size();
+            out = iterV(it);
+            return true;
+        }
+        break;
+    case 'c':
+        if (m == "chars")
+        {
+            IterObj *it = newIter(IT_VALUES);
+            size_t i = 0;
+            while (i < s.size())
+            {
+                size_t len = 1;
+                it->items.push_back(mkChar(decodeAt(s, i, len)));
+                i += len;
+            }
+            it->end = (int64_t)it->items.size();
+            out = iterV(it);
+            return true;
+        }
+        if (m == "char_indices")
+        {
+            IterObj *it = newIter(IT_VALUES);
+            size_t i = 0;
+            while (i < s.size())
+            {
+                size_t len = 1;
+                std::vector<V> pair;
+                pair.push_back(mkUint(i, PR_USIZE));
+                pair.push_back(mkChar(decodeAt(s, i, len)));
+                it->items.push_back(mkTuple(pair));
+                i += len;
+            }
+            it->end = (int64_t)it->items.size();
+            out = iterV(it);
+            return true;
+        }
+        if (m == "contains")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            size_t pos = 0, len = 0;
+            return b(p.find(s, 0, pos, len));
+        }
+        if (m == "capacity")
+            return num(s.size() > 0 ? s.capacity() : 0);
+        if (m == "clear")
+        {
+            if (!owned)
+                needOwned(n, m);
+            s.clear();
+            out = V();
+            return true;
+        }
+        break;
+    case 'd':
+        if (m == "drain")
+        {
+            if (!owned)
+                needOwned(n, m);
+            V r = peel(argAt(args, 0, n));
+            if (r.k != V_RANGE)
+                errAt(n, "E0277", "`drain` takes a range of byte positions");
+            RangeObj *range = static_cast<RangeObj *>(r.p);
+            int64_t lo = range->hasLo ? toIndex(range->items[0], n) : 0;
+            int64_t hi = range->hasHi ? toIndex(range->items[1], n) + (range->inclusive ? 1 : 0) : (int64_t)s.size();
+            if (lo > hi || hi > (int64_t)s.size())
+                panicAt(n, "range end index " + std::to_string(hi) + " out of range for slice of length " + std::to_string(s.size()));
+            std::string taken = s.substr((size_t)lo, (size_t)(hi - lo));
+            s.erase((size_t)lo, (size_t)(hi - lo));
+            IterObj *it = newIter(IT_VALUES);
+            size_t i = 0;
+            while (i < taken.size())
+            {
+                size_t len = 1;
+                it->items.push_back(mkChar(decodeAt(taken, i, len)));
+                i += len;
+            }
+            it->end = (int64_t)it->items.size();
+            out = iterV(it);
+            return true;
+        }
+        break;
+    case 'e':
+        if (m == "ends_with")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            if (p.kind == 0)
+                return b(s.size() >= p.text.size() && s.compare(s.size() - p.text.size(), p.text.size(), p.text) == 0);
+            if (s.empty())
+                return b(false);
+            size_t start = prevChar(s, s.size()), len = 1;
+            return b(p.testChar(decodeAt(s, start, len)));
+        }
+        if (m == "eq_ignore_ascii_case")
+        {
+            const std::string &o = strOf(argAt(args, 0, n));
+            if (o.size() != s.size())
+                return b(false);
+            for (size_t k = 0; k < s.size(); ++k)
+            {
+                unsigned char x = (unsigned char)s[k], y = (unsigned char)o[k];
+                if (x >= 'A' && x <= 'Z') x += 32;
+                if (y >= 'A' && y <= 'Z') y += 32;
+                if (x != y)
+                    return b(false);
+            }
+            return b(true);
+        }
+        if (m == "extend")
+        {
+            if (!owned)
+                needOwned(n, m);
+            V it = toIter(argAt(args, 0, n), n);
+            V x;
+            while (iterNext(static_cast<IterObj *>(it.p), x, n))
+            {
+                V v = peelAll(x);
+                if (v.k == V_CHAR)
+                    utf8Append(s, (uint32_t)v.lo);
+                else
+                    s += strOf(v);
+            }
+            out = V();
+            return true;
+        }
+        break;
+    case 'f':
+        if (m == "find" || m == "rfind")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            size_t pos = 0, len = 0;
+            bool found = m == "find" ? p.find(s, 0, pos, len) : p.rfind(s, s.size(), pos, len);
+            out = found ? mkSome(mkUint(pos, PR_USIZE)) : mkNone();
+            return true;
+        }
+        break;
+    case 'g':
+        if (m == "get")
+        {
+            V r = peel(argAt(args, 0, n));
+            if (r.k != V_RANGE)
+                errAt(n, "E0277", "the type `str` cannot be indexed by `" + typeName(r) + "`");
+            RangeObj *range = static_cast<RangeObj *>(r.p);
+            int64_t lo = range->hasLo ? toIndex(range->items[0], n) : 0;
+            int64_t hi = range->hasHi ? toIndex(range->items[1], n) + (range->inclusive ? 1 : 0) : (int64_t)s.size();
+            auto boundary = [&](int64_t i) { return i == (int64_t)s.size() || ((unsigned char)s[(size_t)i] & 0xC0) != 0x80; };
+            if (lo > hi || hi > (int64_t)s.size() || !boundary(lo) || !boundary(hi))
+                out = mkNone();
+            else
+                out = mkSome(strV(s.substr((size_t)lo, (size_t)(hi - lo))));
+            return true;
+        }
+        break;
+    case 'i':
+        if (m == "is_empty")
+            return b(s.empty());
+        if (m == "into_bytes")
+        {
+            std::vector<V> bytes;
+            bytes.reserve(s.size());
+            for (unsigned char c : s)
+                bytes.push_back(mkUint(c, PR_U8));
+            out = mkSeq(V_VEC, bytes);
+            return true;
+        }
+        if (m == "into_boxed_str" || m == "into_string")
+            return string(s);
+        if (m == "insert" || m == "insert_str")
+        {
+            if (!owned)
+                needOwned(n, m);
+            int64_t at0 = toIndex(argAt(args, 0, n), n);
+            checkBoundary(s, at0, n, "idx");
+            V what = peel(argAt(args, 1, n));
+            s.insert((size_t)at0, what.k == V_CHAR ? charString((uint32_t)what.lo) : strOf(what));
+            out = V();
+            return true;
+        }
+        if (m == "is_char_boundary")
+        {
+            int64_t i = toIndex(argAt(args, 0, n), n);
+            return b(i == (int64_t)s.size() || (i < (int64_t)s.size() && ((unsigned char)s[(size_t)i] & 0xC0) != 0x80));
+        }
+        if (m == "is_ascii")
+        {
+            for (unsigned char c : s)
+                if (c >= 128)
+                    return b(false);
+            return b(true);
+        }
+        break;
+    case 'l':
+        if (m == "len")
+            return num(s.size());
+        if (m == "lines")
+        {
+            std::vector<std::string> parts;
+            size_t from = 0;
+            while (from < s.size())
+            {
+                size_t nl = s.find('\n', from);
+                size_t end = nl == std::string::npos ? s.size() : nl;
+                size_t stop = end > from && s[end - 1] == '\r' ? end - 1 : end;
+                parts.push_back(s.substr(from, stop - from));
+                from = nl == std::string::npos ? s.size() : nl + 1;
+            }
+            out = iterV(strIter(parts));
+            return true;
+        }
+        break;
+    case 'm':
+        if (m == "matches" || m == "match_indices" || m == "rmatches")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            IterObj *it = newIter(IT_VALUES);
+            size_t from = 0, pos = 0, len = 0;
+            while (from <= s.size() && p.find(s, from, pos, len))
+            {
+                V piece = strV(s.substr(pos, len));
+                if (m == "match_indices")
+                {
+                    std::vector<V> pair;
+                    pair.push_back(mkUint(pos, PR_USIZE));
+                    pair.push_back(piece);
+                    it->items.push_back(mkTuple(pair));
+                }
+                else
+                    it->items.push_back(piece);
+                from = pos + (len ? len : 1);
+            }
+            if (m == "rmatches")
+                for (size_t a = 0, z = it->items.size(); a + 1 < z; ++a, --z)
+                {
+                    V t = it->items[a];
+                    it->items[a] = it->items[z - 1];
+                    it->items[z - 1] = t;
+                }
+            it->end = (int64_t)it->items.size();
+            out = iterV(it);
+            return true;
+        }
+        if (m == "make_ascii_uppercase" || m == "make_ascii_lowercase")
+        {
+            for (char &c : s)
+            {
+                if (m == "make_ascii_uppercase" && c >= 'a' && c <= 'z')
+                    c = (char)(c - 32);
+                else if (m == "make_ascii_lowercase" && c >= 'A' && c <= 'Z')
+                    c = (char)(c + 32);
+            }
+            out = V();
+            return true;
+        }
+        break;
+    case 'p':
+        if (m == "push")
+        {
+            if (!owned)
+                needOwned(n, m);
+            V c = peel(argAt(args, 0, n));
+            if (c.k != V_CHAR)
+                errAt(n, "E0308", "mismatched types: expected `char`, found `" + typeName(c) + "`",
+                      c.k == V_STR ? "expected `char`, found `&str`: a string is added with `.push_str(..)`" : "expected `char`");
+            utf8Append(s, (uint32_t)c.lo);
+            out = V();
+            return true;
+        }
+        if (m == "push_str")
+        {
+            if (!owned)
+                needOwned(n, m);
+            V x = peel(argAt(args, 0, n));
+            if (x.k != V_STR)
+                errAt(n, "E0308", "mismatched types: expected `&str`, found `" + typeName(x) + "`",
+                      x.k == V_CHAR ? "expected `&str`, found `char`: a character is added with `.push(..)`" : "expected `&str`");
+            if (args[0].k == V_STR && args[0].x)
+                errAt(n, "E0308", "mismatched types: expected `&str`, found `String`",
+                      "expected `&str`, found `String`: consider borrowing here with `&`");
+            s += static_cast<StrObj *>(x.p)->s;
+            out = V();
+            return true;
+        }
+        if (m == "pop")
+        {
+            if (!owned)
+                needOwned(n, m);
+            if (s.empty())
+            {
+                out = mkNone();
+                return true;
+            }
+            size_t start = prevChar(s, s.size()), len = 1;
+            uint32_t c = decodeAt(s, start, len);
+            s.erase(start);
+            out = mkSome(mkChar(c));
+            return true;
+        }
+        if (m == "parse")
+        {
+            Ty *target = !n->tys.empty() ? n->tys[0] : nullptr;
+            if (!target && hint)
+            {
+                Ty *h = tyResolve(hint);
+                if (tyHead(h) == "Result")
+                    target = tyArg(h, 0);
+            }
+            out = parseAs(s, target, n);
+            return true;
+        }
+        break;
+    case 'r':
+        if (m == "replace" || m == "replacen")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            const std::string &to = strOf(argAt(args, 1, n));
+            int64_t limit = m == "replacen" ? toIndex(argAt(args, 2, n), n) : -1;
+            std::string r;
+            size_t from = 0, pos = 0, len = 0;
+            while (limit != 0 && from <= s.size() && p.find(s, from, pos, len))
+            {
+                r += s.substr(from, pos - from) + to;
+                if (len == 0)
+                {
+                    if (pos >= s.size())
+                    {
+                        from = s.size() + 1;
+                        break;
+                    }
+                    size_t clen = 1;
+                    decodeAt(s, pos, clen);
+                    r += s.substr(pos, clen);
+                    from = pos + clen;
+                }
+                else
+                    from = pos + len;
+                if (limit > 0)
+                    --limit;
+            }
+            if (from <= s.size())
+                r += s.substr(from);
+            return string(r);
+        }
+        if (m == "repeat")
+        {
+            int64_t count = toIndex(argAt(args, 0, n), n);
+            std::string r;
+            r.reserve(s.size() * (size_t)count);
+            for (int64_t k = 0; k < count; ++k)
+                r += s;
+            return string(r);
+        }
+        if (m == "remove")
+        {
+            if (!owned)
+                needOwned(n, m);
+            int64_t at0 = toIndex(argAt(args, 0, n), n);
+            if (at0 >= (int64_t)s.size())
+                panicAt(n, "cannot remove a char from the end of a string");
+            checkBoundary(s, at0, n, "idx");
+            size_t len = 1;
+            uint32_t c = decodeAt(s, (size_t)at0, len);
+            s.erase((size_t)at0, len);
+            out = mkChar(c);
+            return true;
+        }
+        if (m == "retain")
+        {
+            if (!owned)
+                needOwned(n, m);
+            V f = argAt(args, 0, n);
+            std::string r;
+            size_t i = 0;
+            while (i < s.size())
+            {
+                size_t len = 1;
+                uint32_t c = decodeAt(s, i, len);
+                if (isTrue(call1(f, mkChar(c), n), n))
+                    r += s.substr(i, len);
+                i += len;
+            }
+            s = r;
+            out = V();
+            return true;
+        }
+        if (m == "rsplit" || m == "rsplitn" || m == "rsplit_once" || m == "rsplit_terminator")
+        {
+            bool limited = m == "rsplitn";
+            Pattern p = patternOf(argAt(args, limited ? 1 : 0, n), n);
+            if (m == "rsplit_once")
+            {
+                size_t pos = 0, len = 0;
+                if (!p.rfind(s, s.size(), pos, len))
+                {
+                    out = mkNone();
+                    return true;
+                }
+                std::vector<V> pair;
+                pair.push_back(strV(s.substr(0, pos)));
+                pair.push_back(strV(s.substr(pos + len)));
+                out = mkSome(mkTuple(pair));
+                return true;
+            }
+            int64_t limit = limited ? toIndex(argAt(args, 0, n), n) : -1;
+            std::vector<std::string> parts;
+            size_t end = s.size();
+            while (limit < 0 || (int64_t)parts.size() + 1 < limit)
+            {
+                size_t pos = 0, len = 0;
+                if (!p.rfind(s, end, pos, len) || len == 0)
+                    break;
+                parts.push_back(s.substr(pos + len, end - pos - len));
+                end = pos;
+            }
+            if (limit != 0)
+                parts.push_back(s.substr(0, end));
+            out = iterV(strIter(parts));
+            return true;
+        }
+        if (m == "reserve" || m == "reserve_exact")
+        {
+            out = V();
+            return true;
+        }
+        if (m == "replace_range")
+        {
+            if (!owned)
+                needOwned(n, m);
+            V r = peel(argAt(args, 0, n));
+            RangeObj *range = static_cast<RangeObj *>(r.p);
+            int64_t lo = range->hasLo ? toIndex(range->items[0], n) : 0;
+            int64_t hi = range->hasHi ? toIndex(range->items[1], n) + (range->inclusive ? 1 : 0) : (int64_t)s.size();
+            checkBoundary(s, lo, n, "idx");
+            checkBoundary(s, hi, n, "idx");
+            s.replace((size_t)lo, (size_t)(hi - lo), strOf(argAt(args, 1, n)));
+            out = V();
+            return true;
+        }
+        break;
+    case 's':
+        if (m == "split" || m == "splitn" || m == "split_terminator" || m == "split_inclusive")
+        {
+            bool limited = m == "splitn";
+            Pattern p = patternOf(argAt(args, limited ? 1 : 0, n), n);
+            int64_t limit = limited ? toIndex(argAt(args, 0, n), n) : -1;
+            std::vector<std::string> parts;
+            if (limit != 0)
+                splitBy(s, p, limit, parts, m == "split_inclusive");
+            if ((m == "split_terminator" || m == "split_inclusive") && !parts.empty() && parts.back().empty())
+                parts.pop_back();
+            out = iterV(strIter(parts));
+            return true;
+        }
+        if (m == "split_whitespace" || m == "split_ascii_whitespace")
+        {
+            std::vector<std::string> parts;
+            size_t i = 0;
+            std::string cur;
+            bool in = false;
+            while (i < s.size())
+            {
+                size_t len = 1;
+                uint32_t c = decodeAt(s, i, len);
+                if (isSpace(c))
+                {
+                    if (in)
+                        parts.push_back(cur);
+                    cur.clear();
+                    in = false;
+                }
+                else
+                {
+                    cur += s.substr(i, len);
+                    in = true;
+                }
+                i += len;
+            }
+            if (in)
+                parts.push_back(cur);
+            out = iterV(strIter(parts));
+            return true;
+        }
+        if (m == "split_once")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            size_t pos = 0, len = 0;
+            if (!p.find(s, 0, pos, len))
+            {
+                out = mkNone();
+                return true;
+            }
+            std::vector<V> pair;
+            pair.push_back(strV(s.substr(0, pos)));
+            pair.push_back(strV(s.substr(pos + len)));
+            out = mkSome(mkTuple(pair));
+            return true;
+        }
+        if (m == "split_at")
+        {
+            int64_t mid = toIndex(argAt(args, 0, n), n);
+            if (mid > (int64_t)s.size() || (mid < (int64_t)s.size() && ((unsigned char)s[(size_t)mid] & 0xC0) == 0x80))
+                panicAt(n, "byte index " + std::to_string(mid) + " is not a char boundary; it is inside a character or past the end of `" + s + "`");
+            std::vector<V> pair;
+            pair.push_back(strV(s.substr(0, (size_t)mid)));
+            pair.push_back(strV(s.substr((size_t)mid)));
+            out = mkTuple(pair);
+            return true;
+        }
+        if (m == "split_off")
+        {
+            if (!owned)
+                needOwned(n, m);
+            int64_t at0 = toIndex(argAt(args, 0, n), n);
+            checkBoundary(s, at0, n, "idx");
+            std::string tail = s.substr((size_t)at0);
+            s.erase((size_t)at0);
+            return string(tail);
+        }
+        if (m == "starts_with")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            return b(p.matchAt(s, 0) >= 0);
+        }
+        if (m == "strip_prefix" || m == "strip_suffix")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            if (m == "strip_prefix")
+            {
+                int64_t len = p.matchAt(s, 0);
+                out = len >= 0 ? mkSome(strV(s.substr((size_t)len))) : mkNone();
+                return true;
+            }
+            if (p.kind == 0)
+            {
+                bool ok = s.size() >= p.text.size() && s.compare(s.size() - p.text.size(), p.text.size(), p.text) == 0;
+                out = ok ? mkSome(strV(s.substr(0, s.size() - p.text.size()))) : mkNone();
+                return true;
+            }
+            if (s.empty())
+            {
+                out = mkNone();
+                return true;
+            }
+            size_t start = prevChar(s, s.size()), len = 1;
+            out = p.testChar(decodeAt(s, start, len)) ? mkSome(strV(s.substr(0, start))) : mkNone();
+            return true;
+        }
+        if (m == "shrink_to_fit" || m == "shrink_to")
+        {
+            out = V();
+            return true;
+        }
+        break;
+    case 't':
+        if (m == "to_string" || m == "to_owned" || m == "into" || m == "to_lowercase" || m == "to_uppercase" ||
+            m == "to_ascii_uppercase" || m == "to_ascii_lowercase")
+        {
+            if (m == "into")
+            {
+                out = convertInto(sv, hint, n, false);
+                if (out.k == V_STR)
+                    out = mkStr(s, true);
+                return true;
+            }
+            if (m == "to_lowercase" || m == "to_uppercase")
+                return string(mapCase(s, m == "to_uppercase"));
+            if (m == "to_ascii_uppercase" || m == "to_ascii_lowercase")
+            {
+                std::string r = s;
+                for (char &c : r)
+                {
+                    if (m == "to_ascii_uppercase" && c >= 'a' && c <= 'z')
+                        c = (char)(c - 32);
+                    else if (m == "to_ascii_lowercase" && c >= 'A' && c <= 'Z')
+                        c = (char)(c + 32);
+                }
+                return string(r);
+            }
+            return string(s);
+        }
+        if (m == "trim" || m == "trim_start" || m == "trim_end" || m == "trim_left" || m == "trim_right")
+        {
+            size_t a = 0, z = s.size();
+            if (m != "trim_end" && m != "trim_right")
+                while (a < z)
+                {
+                    size_t len = 1;
+                    if (!isSpace(decodeAt(s, a, len)))
+                        break;
+                    a += len;
+                }
+            if (m != "trim_start" && m != "trim_left")
+                while (z > a)
+                {
+                    size_t start = prevChar(s, z), len = 1;
+                    if (!isSpace(decodeAt(s, start, len)))
+                        break;
+                    z = start;
+                }
+            return str(s.substr(a, z - a));
+        }
+        if (m == "trim_matches" || m == "trim_start_matches" || m == "trim_end_matches")
+        {
+            Pattern p = patternOf(argAt(args, 0, n), n);
+            size_t a = 0, z = s.size();
+            if (m != "trim_end_matches")
+                for (;;)
+                {
+                    int64_t len = a < z ? p.matchAt(s, a) : -1;
+                    if (len <= 0 || a + (size_t)len > z)
+                        break;
+                    a += (size_t)len;
+                }
+            if (m != "trim_start_matches")
+                for (;;)
+                {
+                    if (z <= a)
+                        break;
+                    if (p.kind == 0)
+                    {
+                        if (p.text.empty() || z - a < p.text.size() || s.compare(z - p.text.size(), p.text.size(), p.text) != 0)
+                            break;
+                        z -= p.text.size();
+                    }
+                    else
+                    {
+                        size_t start = prevChar(s, z), len = 1;
+                        if (!p.testChar(decodeAt(s, start, len)))
+                            break;
+                        z = start;
+                    }
+                }
+            return str(s.substr(a, z - a));
+        }
+        if (m == "truncate")
+        {
+            if (!owned)
+                needOwned(n, m);
+            int64_t len = toIndex(argAt(args, 0, n), n);
+            if (len < (int64_t)s.size())
+            {
+                checkBoundary(s, len, n, "new_len");
+                s.erase((size_t)len);
+            }
+            out = V();
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+} // namespace rust

@@ -1,0 +1,609 @@
+// quantum: cpp
+#pragma once
+// Rust front-end: the runtime. A tree-walking evaluator with Rust's value
+// model made explicit:
+//
+//   V        a value: numbers, bool, char and unit are held in it; everything
+//            else points at a heap object. Objects are never freed (the
+//            programs this runs are short).
+//   Obj      every object has `items`, its slots: a struct's fields, a
+//            tuple's or Vec's elements, the one value of a Box, an Rc, a
+//            RefCell or a variable. A place is (object, slot index), and a
+//            reference is a V holding one: nothing ever points at raw
+//            storage, so a stale reference is an error, not a crash.
+//   moves    reading a variable whose type is not Copy takes the value out
+//            and leaves V_MOVED behind: using it again is error E0382, as it
+//            is in rustc, found here when the code runs. A Copy value
+//            (numbers, &T, tuples and derive(Copy) types of them) is copied.
+//   drops    a scope's variables still holding a value when it ends are
+//            dropped in reverse order: `impl Drop` runs and Rc counts fall.
+//   integers 128 bits wide with their type beside them; arithmetic checks
+//            the type's range and panics on overflow, as a debug build does.
+//            A literal without a suffix has no type yet (t == 0): it takes
+//            the type of what it meets (an annotation, the other operand)
+//            and is an i32 when nothing says otherwise.
+//   types    are not inferred ahead of time. What an expression is wanted
+//            as (`hint`: the annotation, parameter or return type it flows
+//            into) is passed down to where Rust needs it: number literals,
+//            parse(), collect(), into(), Default::default().
+#include "RustAst.h.sa"
+
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace rust
+{
+
+enum VK : uint8_t
+{
+    V_UNIT,
+    V_BOOL,
+    V_INT,
+    V_FLOAT,
+    V_CHAR,
+    V_STR,     // String (x == 1) or &str
+    V_TUPLE,
+    V_ARRAY,   // [T; N]
+    V_VEC,
+    V_SLICE,   // &[T] into a Vec or array: p, hi = start, lo = length
+    V_STRUCT,
+    V_ENUM,    // Option and Result too
+    V_REF,     // &T / &mut T: the slot hi of p
+    V_BOX,
+    V_RC,      // Rc and Arc
+    V_WEAK,
+    V_CELL,    // RefCell, Cell, Mutex, RwLock (n says which)
+    V_FN,      // a function item or a built-in function
+    V_CLOSURE,
+    V_MAP,     // HashMap, BTreeMap
+    V_SET,     // HashSet, BTreeSet
+    V_DEQUE,
+    V_HEAP,    // BinaryHeap
+    V_ITER,
+    V_RANGE,
+    V_NATIVE,  // a library type with no parts a program can reach
+    V_MOVED    // a variable's value was moved out (n == 1: never set)
+};
+
+struct Obj;
+
+struct V
+{
+    uint8_t k = V_UNIT;
+    uint8_t t = 0;   // V_INT / V_FLOAT: the type (Prim); 0: an unsuffixed literal
+    uint16_t x = 0;  // V_STR: 1 = String; V_REF, V_SLICE: 1 = mutable
+    int32_t n = 0;
+    uint64_t lo = 0; // integer low half, bool, char, the bits of a float
+    int64_t hi = 0;  // integer high half
+    Obj *p = nullptr;
+};
+
+struct Obj
+{
+    std::vector<V> items;
+    bool dropped = false; // its destructor has run
+};
+
+struct StrObj : Obj
+{
+    std::string s;
+};
+
+struct StructObj : Obj
+{
+    TypeDef *def = nullptr;
+};
+
+struct EnumObj : Obj
+{
+    TypeDef *def = nullptr;
+    int variant = 0;
+};
+
+struct RcObj : Obj
+{
+    int strong = 1, weak = 0;
+};
+
+// HashMap (insertion order) / BTreeMap (sorted): keys beside the values
+// (`items`). A set has no values. A removed entry of a hash map stays as a
+// hole (key.k == V_MOVED) until there are too many.
+struct MapObj : Obj
+{
+    std::vector<V> keys;
+    bool sorted = false, isSet = false;
+    int holes = 0;
+    Ty *valTy = nullptr; // the value type, when the map was made where it is known (or_default)
+    std::unordered_map<uint64_t, std::vector<int>> index; // hash -> entries
+};
+
+struct RangeObj : Obj // items: start, end
+{
+    bool hasLo = false, hasHi = false, inclusive = false;
+};
+
+struct GenBind
+{
+    std::string name;
+    Ty *ty = nullptr;
+    V val;          // a const generic
+    bool isConst = false;
+};
+
+struct FnObj : Obj
+{
+    FnDef *fn = nullptr;
+    TypeDef *self = nullptr; // Self for the call
+    int builtin = 0;         // a built-in function (its id) ...
+    std::string name;        // ... or a method called as a function: str::len
+    TypeDef *ctor = nullptr; // a tuple struct or variant used as a function
+    int variant = -1;
+};
+
+struct ClosureObj : Obj
+{
+    Node *def = nullptr;
+    std::vector<Obj *> caps; // the cells of the captured variables
+    // of the function it was made in
+    TypeDef *self = nullptr;
+    ModDef *mod = nullptr;
+    std::vector<GenBind> gen;
+};
+
+enum IterK : uint8_t
+{
+    IT_RANGE,      // a: next, b: end; flag: inclusive
+    IT_SEQ,        // seq[i..end): mode 0 values, 1 references, 2 mutable ones
+    IT_VALUES,     // items[i..]
+    IT_MAP,
+    IT_FILTER,
+    IT_FILTER_MAP,
+    IT_ENUMERATE,
+    IT_ZIP,
+    IT_CHAIN,
+    IT_TAKE,
+    IT_SKIP,
+    IT_TAKE_WHILE,
+    IT_SKIP_WHILE,
+    IT_MAP_WHILE,
+    IT_STEP_BY,
+    IT_REV,
+    IT_PEEKABLE,   // a: the peeked item (flag: there is one; done: it was the end)
+    IT_CLONED,
+    IT_FLAT_MAP,
+    IT_FLATTEN,
+    IT_INSPECT,
+    IT_SCAN,       // a: the state's cell
+    IT_CYCLE,
+    IT_REPEAT,     // a: the value; n: how many more (-1: for ever)
+    IT_FROM_FN,
+    IT_SUCCESSORS, // a: the next item (flag: there is one)
+    IT_USER,       // a: a value with a next() method
+    IT_STDIN_LINES,
+    IT_RECV,       // a: a channel's Receiver; mode 1: try_iter (stops when it is empty)
+    IT_NET         // a: a TcpListener (mode 0: incoming()) or a TcpStream (mode 1: lines())
+};
+
+struct IterObj : Obj
+{
+    uint8_t ik = IT_VALUES;
+    uint8_t mode = 0;
+    bool flag = false, done = false;
+    IterObj *src = nullptr, *src2 = nullptr;
+    V f;
+    V a, b;
+    int64_t i = 0, end = 0, n = 0;
+    Obj *seq = nullptr;
+};
+
+struct NativeObj : Obj
+{
+    std::string type; // "Instant", "ParseIntError", "Formatter", "Path", "File" ...
+    std::string s;
+    std::string data; // a file's text once read; an error's kind; a directory entry's name
+    int64_t pos = 0;  // where reading a file has got to
+    int64_t a = 0, b = 0;
+    double d = 0;
+    // a Formatter: where it writes and how
+    std::string *buf = nullptr;
+    const FmtPiece *spec = nullptr;
+    int width = -1, prec = -1;
+    int depth = 0;
+    bool pretty = false;
+    bool first = true;
+    void *ext = nullptr; // a JoinHandle's task, a channel end's channel, a future's state (RustTask.sa)
+};
+
+// A place: slot i of o. `ref`: reached through a reference (or an Rc): what
+// is there can be looked at but not moved out.
+struct Place
+{
+    Obj *o = nullptr;
+    int64_t i = 0;
+    bool ref = false;
+};
+
+struct Frame
+{
+    std::vector<Obj *> slots; // one cell per local
+    FnDef *fn = nullptr;
+    TypeDef *self = nullptr;  // Self
+    ModDef *mod = nullptr;
+    Ty *ret = nullptr;        // what the function returns (hint for `return` and `?`)
+    std::vector<GenBind> gen; // what its generic parameters are for this call
+};
+
+enum Flow
+{
+    FL_NONE,
+    FL_BREAK,
+    FL_CONTINUE,
+    FL_RETURN
+};
+
+// panic!: unwinds to the top (or to a thread's join)
+struct Panic
+{
+    std::string msg;
+    int line = 0, col = 0;
+};
+
+// std::process::exit
+struct ExitEx
+{
+    int code = 0;
+};
+
+// every thread waits for another: the program would never finish
+struct Deadlock
+{
+    int unused = 0;
+};
+
+// a task's future was dropped (select! took another branch, abort(), a timeout):
+// it unwinds from where it waits
+struct TaskCancel
+{
+    int unused = 0;
+};
+
+struct Interp
+{
+    std::string path, fileName, source;
+    ModDef *root = nullptr;
+    std::vector<ModDef *> mods;
+    Frame *fr = nullptr;
+    int flow = FL_NONE;
+    V flowVal;
+    const std::string *flowLabel = nullptr;
+    int depth = 0;
+    bool trackDrops = false; // the program has Drop impls or counts Rc references
+    TypeDef *optionDef = nullptr, *resultDef = nullptr, *orderingDef = nullptr, *reverseDef = nullptr;
+    TypeDef *tryRecvErrorDef = nullptr, *recvTimeoutErrorDef = nullptr; // mpsc's errors
+    TypeDef *jsonValueDef = nullptr;                                     // serde_json::Value
+    std::unordered_map<std::string, TypeDef *> builtinTypes; // i32, String, Vec ... with user impls
+    std::vector<ImplDef *> blanketImpls;                     // impl<T> Trait for T
+    std::vector<std::string> args;                           // the command line
+    std::vector<std::string> files, sources;                 // the program's files: [0] the root, then its modules
+    int nextTypeId = 1;
+    const Node *cur = nullptr; // the call being made: where an error without a place of its own is
+};
+
+extern Interp G;
+
+// What a path in an expression names (Node::cacheKind, set by the resolver)
+enum CacheKind
+{
+    CK_NONE,
+    CK_FN,       // cache: FnDef
+    CK_CONST,    // cache: ConstDef
+    CK_UNIT,     // a unit struct: cache: TypeDef
+    CK_CTOR,     // a tuple struct as a function: cache: TypeDef
+    CK_VARIANT,  // cache: TypeDef, cacheIdx: which
+    CK_METHOD,   // Type::method: cache: FnDef, cache2: TypeDef
+    CK_TYPEFN,   // Type::name of the library for a user type (default, from ...): cache: TypeDef, s
+    CK_BUILTIN,  // s: the library item's key (mem::swap, String::new, i32::MAX)
+    CK_GENERIC,  // T::name: names[0]: T, s: name
+    CK_SELF,     // Self::name where Self is only known when it runs: s
+    CK_TRAIT,    // Trait::name: cache: TraitDef, s
+    CK_QSELF,    // <T as Trait>::name: s
+    CK_DISCARD   // _
+};
+
+// ─── errors ────────────────────────────────────────────────────────────────
+
+[[noreturn]] void panicAt(const Node *at, const std::string &msg);
+std::string srcPos(int line, int col); // file:line:col of a position (its file may be a module's)
+// an error rustc reports when compiling, found at this operation
+[[noreturn]] void errAt(const Node *at, const char *code, const std::string &msg, const std::string &label = "");
+[[noreturn]] void errPos(int line, int col, int width, const char *code, const std::string &msg,
+                         const std::string &label = "");
+
+// ─── values (RustVal.sa) ───────────────────────────────────────────────────
+
+V mkBool(bool b);
+V mkInt(int64_t v, uint8_t t);
+V mkUint(uint64_t v, uint8_t t);
+V mkFloat(double d, uint8_t t);
+V mkChar(uint32_t c);
+V mkStr(const std::string &s, bool owned);
+V mkTuple(const std::vector<V> &items);
+V mkSeq(uint8_t kind, const std::vector<V> &items); // V_VEC, V_ARRAY, V_DEQUE, V_HEAP
+V mkSlice(Obj *seq, int64_t start, int64_t len, bool mut);
+V mkStruct(TypeDef *def, const std::vector<V> &fields);
+V mkVariant(TypeDef *def, int variant, const std::vector<V> &payload);
+V mkSome(V v);
+V mkNone();
+V mkOk(V v);
+V mkErr(V v);
+V mkOption(bool some, V v);
+V mkOrdering(int c); // -1, 0, 1
+V mkRef(Obj *o, int64_t i, bool mut);
+V mkRefTo(V v, bool mut); // a reference to a temporary holding v
+V mkBox(V v);
+V mkRc(V v);
+V mkCell(V v, int kind);
+V mkMap(bool sorted, bool isSet);
+V mkRange(V lo, V hi, bool hasLo, bool hasHi, bool inclusive);
+V mkNative(const std::string &type, const std::string &text);
+V mkBuiltinFn(const std::string &name);
+Obj *newCell(V v);
+
+inline double nanValue()
+{
+    double zero = 0.0;
+    return zero / zero;
+}
+
+inline double fval(const V &v)
+{
+    double d;
+    const uint64_t bits = v.lo;
+    memcpy(&d, &bits, sizeof d);
+    return d;
+}
+
+V &slotAt(Obj *o, int64_t i);          // checked
+inline V &at(const Place &pl) { return slotAt(pl.o, pl.i); }
+V peel(V v);                           // the value behind any references
+V peelAll(V v);                        // ... and behind Box and Rc
+std::string &strOf(V v);               // the text of a string (references followed)
+bool isStr(V v);                       // a string, maybe behind references
+bool isSomeV(V v);
+bool isNoneV(V v);
+bool isOkV(V v);
+bool isErrV(V v);
+bool isCopy(V v);
+V copyShell(V v);                      // a Copy value's own copy
+V cloneValue(V v, const Node *at);     // Clone::clone
+bool valueEq(V a, V b, const Node *at);
+int valueCmp(V a, V b, const Node *at); // -1 0 1; 2: unordered (NaN)
+uint64_t valueHash(V v, const Node *at);
+std::string typeName(V v);             // for messages: i32, String, Vec<i32> ...
+std::string tyText(const Ty *t);       // a type as written
+// the sequence a Vec / array / slice / deque value is: object, first, length
+bool seqOf(V v, Obj *&o, int64_t &start, int64_t &len);
+
+// map / set entries
+int mapFind(MapObj *m, V key, const Node *at);              // entry index or -1
+int mapInsert(MapObj *m, V key, V value, const Node *at);   // the entry (replaced or new)
+bool mapRemove(MapObj *m, V key, V *old, const Node *at);
+void mapCompact(MapObj *m, const Node *at);
+int mapLive(MapObj *m);
+void mapEntries(MapObj *m, std::vector<int> &out);          // live entries in order
+
+// ownership
+V takeFrom(V &slot, const Node *at, const char *what); // a by-value read: copy or move out
+void dropValue(V v, const Node *at);                   // run destructors
+void dropSlot(V &slot, const Node *at);
+
+// ─── numbers (RustNum.sa) ──────────────────────────────────────────────────
+
+bool isIntPrim(uint8_t p);
+bool isFloatPrim(uint8_t p);
+int primBits(uint8_t p);
+bool primSigned(uint8_t p);
+bool intFits(const V &v, uint8_t prim);
+V intConvert(V v, uint8_t prim);                          // wraps as `as` does
+V intBinary(uint8_t op, V a, V b, const Node *at);        // checked: + - * / % & | ^ << >>
+V intWrapping(uint8_t op, V a, V b);                      // two's complement result
+bool intChecked(uint8_t op, V a, V b, V &out);            // false: overflow
+V intNeg(V a, const Node *at);
+V intNot(V a);
+int intCmp(const V &a, const V &b);
+V floatBinary(uint8_t op, V a, V b, const Node *at);
+V numCast(V v, Ty *to, const Node *at);
+V intLimit(uint8_t prim, bool max);
+std::string intToString(const V &v);
+std::string intToRadix(const V &v, int base, bool upper); // two's complement for negatives
+std::string floatToString(double d, bool f32, bool debug);
+std::string floatFixed(double d, int prec);
+std::string floatExp(double d, bool f32, int prec, bool upper);
+bool parseInt(const std::string &s, int radix, uint8_t prim, V &out, std::string &kind);
+bool parseFloat(const std::string &s, uint8_t prim, V &out);
+int64_t asI64(const V &v);
+uint64_t asU64(const V &v);
+int64_t toIndex(const V &v, const Node *at); // a usize operand
+// unifies the types of two integer (or float) operands; an error if they differ
+void unifyNum(V &a, V &b, const Node *at, const char *what);
+V fixInt(V v);   // an untyped integer is an i32
+V fixFloat(V v); // an untyped float is an f64
+bool numMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool floatMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+
+// ─── formatting (RustFmt.sa) ───────────────────────────────────────────────
+
+std::string displayStr(V v, const Node *at);
+std::string debugStr(V v, bool pretty, const Node *at);
+void fmtValue(std::string &out, V v, const FmtPiece &spec, int width, int prec, const Node *at);
+std::string formatArgs(const Node *n, size_t firstArg, const std::vector<V> &args);
+void padInto(std::string &out, const std::string &text, const FmtPiece &spec, int width, char defaultAlign);
+bool formatterMethod(NativeObj *f, const Node *n, std::vector<V> &args, V &out);
+bool hasTrait(V v, const char *trait); // Display / Debug by impl or derive
+
+// ─── the evaluator (RustEval.sa) ───────────────────────────────────────────
+
+enum MatchMode
+{
+    M_MOVE, // names take what they match
+    M_REF,  // names bind references into what is matched
+    M_PEEK  // names see what they match; nothing is moved (a guard may still say no)
+};
+
+V eval(Node *n, Ty *hint);
+V evalBorrow(Node *n, Ty *hint);        // as an operand that is only looked at
+V evalBlock(Node *b, Ty *hint);
+bool evalCond(Node *c);
+bool placeOf(Node *n, Place &out);      // false: not a place expression
+void autoDeref(Place &pl, const Node *at); // through references, Box and Rc to the value
+bool matchPat(Pat *p, Place pl, int mode, const Node *at);
+void scopeExit(std::vector<int> &slots, const Node *at);
+V evalCall(Node *n, Ty *hint);          // N_CALL
+V evalMethodCall(Node *n, Ty *hint);    // N_MCALL
+V evalMacro(Node *n, Ty *hint);         // N_MACRO
+V evalPathValue(Node *n, Ty *hint);     // a path that is not a local
+V evalClosure(Node *n);
+V constValue(ConstDef *c, const Node *at);
+Obj *constCell(ConstDef *c, const Node *at);
+V binaryOp(uint8_t op, V a, V b, const Node *at); // arithmetic on evaluated operands
+Ty *tyOfValue(V v);
+V callFn(FnDef *f, std::vector<V> &args, TypeDef *self, const Node *at, Ty *hint,
+         const std::vector<Ty *> *targs = nullptr);
+V callValue(V f, std::vector<V> &args, const Node *at);
+V callMethodOn(V recv, const std::string &name, std::vector<V> &args, const Node *at, Ty *hint = nullptr);
+FnDef *findMethod(TypeDef *td, const std::string &name);
+FnDef *findMethodFor(V v, const std::string &name);
+TypeDef *typeDefOf(V v);                // the type whose impls apply
+V coerce(V v, Ty *ty, const Node *at);  // a value entering a place of declared type
+uint8_t tyPrim(Ty *t);                  // the primitive a type names (aliases and generics followed)
+Ty *tyResolve(Ty *t);                   // aliases, Self and generic parameters followed
+std::string tyHead(Ty *t);              // Vec, Option, String ...: the last name of its path
+Ty *tyArg(Ty *t, size_t index);         // its generic argument, or null
+TypeDef *tyDef(Ty *t);                  // the struct / enum it names, or null
+V defaultFor(Ty *ty, const Node *at);   // Default::default() of a type
+void writeOut(const std::string &s);
+void writeErr(const std::string &s);
+void flushOut();
+
+// ─── the library (RustStr / RustColl / RustIter / RustLib) ─────────────────
+
+bool strMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool charMethod(V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool seqMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool mapMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool optionMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool resultMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool entryMethod(NativeObj *e, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool iterMethod(V it, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool miscMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+// a method of any value: clone, to_string, eq, cmp, into ...
+bool commonMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+// String::new, Vec::with_capacity, mem::swap ...: `name` is the path's last two names
+bool builtinCall(const std::string &name, std::vector<V> &args, const Node *n, Ty *hint,
+                 const std::vector<Ty *> *targs, V &out);
+bool builtinConst(const std::string &name, V &out);
+bool knownBuiltinFn(const std::string &name);
+V convertInto(V v, Ty *to, const Node *at, bool tryForm); // From / Into / TryFrom
+
+// files and paths (RustFs.sa)
+std::string pathText(V v, const Node *n);
+bool fsCall(const std::string &name, std::vector<V> &args, const Node *n, Ty *hint, V &out);
+bool fsConst(const std::string &name, V &out);
+bool fsMethod(NativeObj *o, V self, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool fsWrite(NativeObj *o, const std::string &text, V &out);
+bool fsFormat(NativeObj *o, bool debug, std::string &out);
+V openDefault(); // Default::default() of a type not known yet: it becomes what it is first used as
+inline bool isOpenDefault(const V &v) { return v.k == V_INT && v.t == 0 && v.n == 2; }
+V settleLike(V other);                  // an open default, as the empty value of other's kind
+
+IterObj *newIter(uint8_t kind);
+V iterV(IterObj *it);
+V toIter(V v, const Node *at);                 // IntoIterator::into_iter
+bool iterNext(IterObj *it, V &out, const Node *at);
+bool iterNextBack(IterObj *it, V &out, const Node *at);
+void iterDrain(IterObj *it, std::vector<V> &out, const Node *at);
+V collectInto(std::vector<V> &items, Ty *hint, const Node *at); // collect()
+
+void utf8Append(std::string &out, uint32_t cp);
+size_t utf8Count(const std::string &s);
+V &argAt(std::vector<V> &args, size_t k, const Node *at); // the k-th argument, or error E0061
+V call0(V f, const Node *at);
+V call1(V f, V a, const Node *at);
+V call2(V f, V a, V b, const Node *at);
+bool isTrue(V v, const Node *at);                         // a bool result
+void sortValues(std::vector<V> &items, size_t from, size_t to, V *cmpFn, V *keyFn, const Node *at); // stable
+Ty *resultHint(Ty *inner);                                // Result<inner, _>: what x in x.unwrap() is wanted as
+bool takeSelf(Place sp, V sv);                            // a by-value method: the receiver is moved out
+std::string charString(uint32_t c);
+void setTestMode(bool on);
+bool testMode();
+
+// ─── threads and async tasks (RustTask.sa) ─────────────────────────────────
+
+void tasksBegin();                    // a run starts: main is the only thread
+void tasksEnd();
+int64_t virtualNanos();               // how far sleeping has moved the clock
+void currentThreadInfo(std::string &name, bool &named, int64_t &id);
+V spawnThread(V f, const std::string &name, bool named, const Node *n); // a JoinHandle
+void sleepNanos(int64_t ns);
+bool takeAsyncEntry();                // callFn / callClosure: run an async body now (it is being awaited)
+void enterAsync();                    // the next call runs an async fn's body
+V asyncFnFuture(FnDef *f, std::vector<V> &args, TypeDef *self, const Node *at, Ty *hint,
+                const std::vector<Ty *> *targs);
+V asyncClosureFuture(V closure, std::vector<V> &args);
+V asyncBlockFuture(V closure, bool owned);
+V readyFuture(V v);
+V awaitValue(V v, const Node *at, Ty *hint);       // .await
+bool taskMacro(Node *n, Ty *hint, V &out);         // join!, try_join!, select!, pin!
+bool taskCall(const std::string &name, std::vector<V> &args, const Node *n, Ty *hint,
+              const std::vector<Ty *> *targs, V &out);
+bool taskMethod(NativeObj *o, V self, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+bool taskFormat(NativeObj *o, bool debug, std::string &out);
+bool taskKnown(const std::string &name);
+void taskDropped(NativeObj *o);       // a channel end, a permit ...
+void taskCloned(NativeObj *o);
+bool recvIterNext(IterObj *it, V &out, const Node *at);
+bool atomicMethod(V sv, const Node *n, std::vector<V> &args, V &out); // AtomicUsize ... (a cell of kind 7)
+// the running thread waits until socket s can be read (or written); false: timeoutNs (>= 0) passed first
+bool waitSocket(uint64_t s, bool write, int64_t timeoutNs);
+
+// ─── std::net (RustNet.sa) ─────────────────────────────────────────────────
+
+bool netCall(const std::string &name, std::vector<V> &args, const Node *n, V &out);
+bool netMethod(NativeObj *o, V self, const Node *n, std::vector<V> &args, V &out);
+bool netMethodNow(NativeObj *o, V self, const Node *n, std::vector<V> &args, V &out); // tokio's, when awaited
+V deferredCall(V self, const Node *n, std::vector<V> &args); // a future that runs the method when awaited
+bool netFormat(NativeObj *o, bool debug, std::string &out);
+bool netNext(IterObj *it, V &out, const Node *at);
+void netDropped(NativeObj *o);
+void netPoll(const std::vector<uint64_t> &socks, const std::vector<int> &writes, int64_t timeoutNs,
+             std::vector<int> &ready);
+
+// ─── serde and serde_json (RustSerde.sa) ───────────────────────────────────
+
+std::string jsonText(V v, bool pretty, const Node *at); // a value as JSON text
+V toJsonValue(V v, const Node *at);                     // serde_json::to_value(v).unwrap()
+V jsonMacro(Node *j, const Node *at);                   // json!(...)
+bool serdeKnown(const std::string &name);
+bool serdeCall(const std::string &name, std::vector<V> &args, const Node *n, Ty *hint, const std::vector<Ty *> *targs,
+               V &out);
+bool serdeFormat(NativeObj *o, bool debug, std::string &out);
+bool jsonDebug(V v, bool pretty, const Node *at, std::string &out);
+bool jsonEq(V a, V b, bool &result);                    // a Value and a str / number / bool
+bool jsonIndex(V bv, Place base, V idx, bool write, Place &out, const Node *n);
+bool jsonMethod(V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out);
+// env!("CARGO_PKG_VERSION"): the environment, and what Cargo would set from Cargo.toml (RustFs.sa)
+bool compileEnv(const std::string &name, std::string &value);
+
+// ─── names (RustResolve.sa) ────────────────────────────────────────────────
+
+void initBuiltins();
+void resolveProgram(ModDef *root, std::vector<ModDef *> &all);
+Sym *lookupName(ModDef *m, const std::string &name);   // through enclosing blocks
+std::string builtinKey(const std::string &full);       // std::mem::swap -> mem::swap
+TypeDef *builtinType(const std::string &name);         // the TypeDef user impls for it hang on
+
+} // namespace rust

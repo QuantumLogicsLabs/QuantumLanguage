@@ -1,0 +1,1182 @@
+// quantum: cpp
+// Rust front-end: files and paths. std::fs (read, write, directories,
+// metadata), File with BufReader / BufWriter / OpenOptions, Path and PathBuf
+// with Windows' rules (both / and \ separate; join and push add \), and
+// io::Error with the messages and kinds Windows gives (os error 2: "The
+// system cannot find the file specified.").
+//
+// A path, a file, a directory entry, metadata and an error are NativeObj
+// values; their `type` says which. A file keeps its path: a write goes
+// straight to the file, and reading loads the file on first use.
+#include "RustRt.h.sa"
+
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+#include <cstdlib>
+
+namespace fsys = std::filesystem;
+
+namespace rust
+{
+
+namespace
+{
+
+bool isSep(char c) { return c == '/' || c == '\\'; }
+
+NativeObj *nat(V v) { return static_cast<NativeObj *>(v.p); }
+
+V pathV(const std::string &text)
+{
+    V v = mkNative("Path", text);
+    return v;
+}
+
+// io::Error from the OS: its code, kind and message
+V osError(int code)
+{
+    V v = mkNative("IoError", "");
+    NativeObj *e = nat(v);
+    e->a = code;
+    switch (code)
+    {
+    case 2:
+        e->s = "The system cannot find the file specified.";
+        e->data = "NotFound";
+        break;
+    case 3:
+        e->s = "The system cannot find the path specified.";
+        e->data = "NotFound";
+        break;
+    case 5:
+        e->s = "Access is denied.";
+        e->data = "PermissionDenied";
+        break;
+    case 80:
+        e->s = "The file exists.";
+        e->data = "AlreadyExists";
+        break;
+    case 145:
+        e->s = "The directory is not empty.";
+        e->data = "DirectoryNotEmpty";
+        break;
+    case 183:
+        e->s = "Cannot create a file when that file already exists.";
+        e->data = "AlreadyExists";
+        break;
+    case 267:
+        e->s = "The directory name is invalid.";
+        e->data = "NotADirectory";
+        break;
+    default:
+        e->s = "An unexpected error occurred.";
+        e->data = "Other";
+    }
+    return mkErr(v);
+}
+
+// a path that names nothing: the file is missing (2) or a folder on the way (3)
+V missing(const std::string &path)
+{
+    fsys::path p(path);
+    fsys::path parent = p.parent_path();
+    std::error_code ec;
+    if (!parent.empty() && !fsys::is_directory(parent))
+        return osError(3);
+    (void)ec;
+    return osError(2);
+}
+
+V customError(const std::string &kind, const std::string &message)
+{
+    V v = mkNative("IoError", message);
+    nat(v)->data = kind;
+    nat(v)->a = 0;
+    return v;
+}
+
+const char *kindText(const std::string &k)
+{
+    if (k == "NotFound") return "entity not found";
+    if (k == "PermissionDenied") return "permission denied";
+    if (k == "AlreadyExists") return "entity already exists";
+    if (k == "InvalidInput") return "invalid input parameter";
+    if (k == "InvalidData") return "invalid data";
+    if (k == "UnexpectedEof") return "unexpected end of file";
+    if (k == "WriteZero") return "write zero";
+    if (k == "Interrupted") return "operation interrupted";
+    if (k == "Unsupported") return "unsupported";
+    if (k == "OutOfMemory") return "out of memory";
+    if (k == "TimedOut") return "timed out";
+    if (k == "DirectoryNotEmpty") return "directory not empty";
+    if (k == "NotADirectory") return "not a directory";
+    if (k == "IsADirectory") return "is a directory";
+    return "other error";
+}
+
+bool readWhole(const std::string &path, std::string &out)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return false;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+// what a value given as file contents is: text or bytes
+std::string contentsOf(V v, const Node *n)
+{
+    V x = peelAll(v);
+    if (x.k == V_STR)
+        return static_cast<StrObj *>(x.p)->s;
+    Obj *o = nullptr;
+    int64_t start = 0, len = 0;
+    if (seqOf(x, o, start, len))
+    {
+        std::string s;
+        s.reserve((size_t)len);
+        for (int64_t k = 0; k < len; ++k)
+            s += (char)o->items[(size_t)(start + k)].lo;
+        return s;
+    }
+    errAt(n, "E0277", "the trait bound `" + typeName(x) + ": AsRef<[u8]>` is not satisfied");
+}
+
+V bytesV(const std::string &s)
+{
+    std::vector<V> bytes;
+    bytes.reserve(s.size());
+    for (unsigned char c : s)
+        bytes.push_back(mkUint(c, PR_U8));
+    return mkSeq(V_VEC, bytes);
+}
+
+// ─── Windows paths ─────────────────────────────────────────────────────────
+
+// the end of the prefix that is not a component: a drive (C: or C:\), the
+// verbatim prefix, or a leading separator
+size_t rootLen(const std::string &p)
+{
+    if (p.size() >= 2 && std::isalpha((unsigned char)p[0]) && p[1] == ':')
+        return p.size() >= 3 && isSep(p[2]) ? 3 : 2;
+    if (p.size() >= 4 && p.compare(0, 4, "\\\\?\\") == 0)
+        return 4;
+    if (!p.empty() && isSep(p[0]))
+        return 1;
+    return 0;
+}
+
+bool absolutePath(const std::string &p)
+{
+    if (p.size() >= 3 && std::isalpha((unsigned char)p[0]) && p[1] == ':' && isSep(p[2]))
+        return true;
+    return p.size() >= 2 && isSep(p[0]) && isSep(p[1]);
+}
+
+// the last component and where it starts; empty when the last one is not a name
+bool lastName(const std::string &p, std::string &name, size_t &start, size_t &end)
+{
+    size_t root = rootLen(p);
+    end = p.size();
+    while (end > root && isSep(p[end - 1]))
+        --end;
+    // `.` components at the end do not count
+    for (;;)
+    {
+        if (end == root)
+            return false;
+        start = end;
+        while (start > root && !isSep(p[start - 1]))
+            --start;
+        name = p.substr(start, end - start);
+        if (name == ".")
+        {
+            end = start;
+            while (end > root && isSep(p[end - 1]))
+                --end;
+            continue;
+        }
+        return name != "..";
+    }
+}
+
+bool parentOf(const std::string &p, std::string &out)
+{
+    size_t root = rootLen(p);
+    size_t end = p.size();
+    while (end > root && isSep(p[end - 1]))
+        --end;
+    if (end == root)
+        return false; // a root or empty path has no parent
+    size_t start = end;
+    while (start > root && !isSep(p[start - 1]))
+        --start;
+    size_t cut = start;
+    while (cut > root && isSep(p[cut - 1]))
+        --cut;
+    out = p.substr(0, cut);
+    return true;
+}
+
+bool stemAndExt(const std::string &p, std::string &stem, std::string &ext, bool &hasExt)
+{
+    std::string name;
+    size_t start = 0, end = 0;
+    if (!lastName(p, name, start, end))
+        return false;
+    size_t dot = name.rfind('.');
+    if (dot == std::string::npos || dot == 0)
+    {
+        stem = name;
+        hasExt = false;
+        return true;
+    }
+    stem = name.substr(0, dot);
+    ext = name.substr(dot + 1);
+    hasExt = true;
+    return true;
+}
+
+std::string joinPath(const std::string &base, const std::string &more)
+{
+    if (absolutePath(more) || (!more.empty() && isSep(more[0])))
+        return more;
+    if (base.empty())
+        return more;
+    if (isSep(base.back()))
+        return base + more;
+    return base + "\\" + more;
+}
+
+void setExtension(std::string &p, const std::string &ext, bool &ok)
+{
+    std::string name;
+    size_t start = 0, end = 0;
+    if (!lastName(p, name, start, end))
+    {
+        ok = false;
+        return;
+    }
+    size_t dot = name.rfind('.');
+    std::string stem = dot == std::string::npos || dot == 0 ? name : name.substr(0, dot);
+    std::string fresh = ext.empty() ? stem : stem + "." + ext;
+    p = p.substr(0, start) + fresh + p.substr(end);
+    ok = true;
+}
+
+V metadataOf(const std::string &path)
+{
+    if (!fsys::exists(fsys::path(path)))
+        return missing(path);
+    V v = mkNative("Metadata", path);
+    bool dir = fsys::is_directory(fsys::path(path));
+    nat(v)->b = dir ? 1 : 2;
+    nat(v)->a = dir ? 0 : (int64_t)fsys::file_size(fsys::path(path));
+    return mkOk(v);
+}
+
+V fileV(const std::string &path, bool canWrite, bool canRead)
+{
+    V v = mkNative("File", path);
+    nat(v)->a = canWrite ? 1 : 0;
+    nat(v)->b = canRead ? 1 : 0;
+    return v;
+}
+
+// the file's text, loaded on first read
+std::string &fileText(NativeObj *f)
+{
+    if (!f->d)
+    {
+        readWhole(f->s, f->data);
+        f->d = 1;
+        f->pos = 0;
+    }
+    return f->data;
+}
+
+bool appendTo(const std::string &path, const std::string &text)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out)
+        return false;
+    out << text;
+    return (bool)out;
+}
+
+// the next line of a file being read, with its "\n"
+bool nextLine(NativeObj *f, std::string &line)
+{
+    std::string &text = fileText(f);
+    if ((size_t)f->pos >= text.size())
+        return false;
+    size_t nl = text.find('\n', (size_t)f->pos);
+    size_t end = nl == std::string::npos ? text.size() : nl + 1;
+    line = text.substr((size_t)f->pos, end - (size_t)f->pos);
+    f->pos = (int64_t)end;
+    return true;
+}
+
+std::string upperName(const std::string &s)
+{
+    std::string out = s;
+    for (char &c : out)
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 32);
+    return out;
+}
+
+} // namespace
+
+// what a path argument says: &str, String, &Path, PathBuf, DirEntry::path()
+std::string pathText(V v, const Node *n)
+{
+    V x = peelAll(v);
+    if (x.k == V_STR)
+        return static_cast<StrObj *>(x.p)->s;
+    if (x.k == V_NATIVE && (nat(x)->type == "Path" || nat(x)->type == "DirEntry"))
+        return nat(x)->s;
+    errAt(n, "E0277", "the trait bound `" + typeName(x) + ": AsRef<Path>` is not satisfied",
+          "a path is a `&str`, a `String`, a `&Path` or a `PathBuf`");
+}
+
+bool fsConst(const std::string &name, V &out)
+{
+    if (name.compare(0, 11, "ErrorKind::") == 0)
+    {
+        out = mkNative("ErrorKind", name.substr(11));
+        return true;
+    }
+    return false;
+}
+
+bool fsCall(const std::string &name, std::vector<V> &args, const Node *n, Ty *hint, V &out)
+{
+    (void)hint;
+    size_t sep = name.rfind("::");
+    if (sep == std::string::npos)
+        return false;
+    std::string head = name.substr(0, sep), tail = name.substr(sep + 2);
+    auto arg = [&](size_t k) -> V & { return argAt(args, k, n); };
+    if (head == "fs")
+    {
+        if (tail == "read_to_string" || tail == "read")
+        {
+            std::string path = pathText(arg(0), n), text;
+            if (fsys::is_directory(fsys::path(path)))
+            {
+                out = osError(5);
+                return true;
+            }
+            if (!readWhole(path, text))
+            {
+                out = missing(path);
+                return true;
+            }
+            out = mkOk(tail == "read" ? bytesV(text) : mkStr(text, true));
+            return true;
+        }
+        if (tail == "write")
+        {
+            std::string path = pathText(arg(0), n);
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            if (!f)
+            {
+                out = missing(path);
+                return true;
+            }
+            f << contentsOf(arg(1), n);
+            out = mkOk(V());
+            return true;
+        }
+        if (tail == "remove_file")
+        {
+            std::string path = pathText(arg(0), n);
+            fsys::path p(path);
+            if (!fsys::exists(p))
+                out = missing(path);
+            else if (fsys::is_directory(p))
+                out = osError(5);
+            else
+            {
+                std::error_code ec;
+                fsys::remove(p, ec);
+                out = ec ? osError(5) : mkOk(V());
+            }
+            return true;
+        }
+        if (tail == "remove_dir" || tail == "remove_dir_all")
+        {
+            std::string path = pathText(arg(0), n);
+            fsys::path p(path);
+            if (!fsys::exists(p))
+                out = missing(path);
+            else if (!fsys::is_directory(p))
+                out = osError(267);
+            else
+            {
+                std::error_code ec;
+                if (tail == "remove_dir")
+                {
+                    if (!fsys::is_empty(p))
+                    {
+                        out = osError(145);
+                        return true;
+                    }
+                    fsys::remove(p, ec);
+                }
+                else
+                    fsys::remove_all(p, ec);
+                out = ec ? osError(5) : mkOk(V());
+            }
+            return true;
+        }
+        if (tail == "create_dir" || tail == "create_dir_all")
+        {
+            std::string path = pathText(arg(0), n);
+            fsys::path p(path);
+            std::error_code ec;
+            if (tail == "create_dir")
+            {
+                if (fsys::exists(p))
+                {
+                    out = osError(183);
+                    return true;
+                }
+                if (!p.parent_path().empty() && !fsys::is_directory(p.parent_path()))
+                {
+                    out = osError(3);
+                    return true;
+                }
+                fsys::create_directory(p, ec);
+            }
+            else
+                fsys::create_directories(p, ec);
+            out = ec && !fsys::is_directory(p) ? osError(5) : mkOk(V());
+            return true;
+        }
+        if (tail == "rename")
+        {
+            std::string from = pathText(arg(0), n), to = pathText(arg(1), n);
+            if (!fsys::exists(fsys::path(from)))
+            {
+                out = missing(from);
+                return true;
+            }
+            fsys::rename(fsys::path(from), fsys::path(to));
+            out = fsys::exists(fsys::path(to)) ? mkOk(V()) : osError(5);
+            return true;
+        }
+        if (tail == "copy")
+        {
+            std::string from = pathText(arg(0), n), to = pathText(arg(1), n), text;
+            if (!readWhole(from, text))
+            {
+                out = missing(from);
+                return true;
+            }
+            std::ofstream f(to, std::ios::binary | std::ios::trunc);
+            if (!f)
+            {
+                out = missing(to);
+                return true;
+            }
+            f << text;
+            out = mkOk(mkUint(text.size(), PR_U64));
+            return true;
+        }
+        if (tail == "metadata" || tail == "symlink_metadata")
+        {
+            out = metadataOf(pathText(arg(0), n));
+            return true;
+        }
+        if (tail == "exists")
+        {
+            out = mkOk(mkBool(fsys::exists(fsys::path(pathText(arg(0), n)))));
+            return true;
+        }
+        if (tail == "read_dir")
+        {
+            std::string path = pathText(arg(0), n);
+            fsys::path p(path);
+            if (!fsys::exists(p))
+            {
+                out = missing(path);
+                return true;
+            }
+            if (!fsys::is_directory(p))
+            {
+                out = osError(267);
+                return true;
+            }
+            std::error_code ec;
+            std::vector<std::string> names;
+            for (fsys::directory_iterator it(p, ec), end; !ec && it != end; ++it)
+                names.push_back(it->path().filename().string());
+            // NTFS lists a folder by name, ignoring case
+            for (size_t i = 1; i < names.size(); ++i)
+                for (size_t j = i; j > 0 && upperName(names[j]) < upperName(names[j - 1]); --j)
+                {
+                    std::string t = names[j];
+                    names[j] = names[j - 1];
+                    names[j - 1] = t;
+                }
+            IterObj *it = newIter(IT_VALUES);
+            for (const std::string &entry : names)
+            {
+                V e = mkNative("DirEntry", joinPath(path, entry));
+                nat(e)->data = entry;
+                it->items.push_back(mkOk(e));
+            }
+            it->end = (int64_t)it->items.size();
+            out = mkOk(iterV(it));
+            return true;
+        }
+        if (tail == "canonicalize")
+        {
+            std::string path = pathText(arg(0), n);
+            if (!fsys::exists(fsys::path(path)))
+            {
+                out = missing(path);
+                return true;
+            }
+            std::string full = fsys::canonical(fsys::path(path)).string();
+            for (char &c : full)
+                if (c == '/')
+                    c = '\\';
+            out = mkOk(pathV("\\\\?\\" + full));
+            return true;
+        }
+        return false;
+    }
+    if (head == "File")
+    {
+        std::string path = pathText(arg(0), n);
+        if (tail == "open")
+        {
+            fsys::path p(path);
+            if (!fsys::exists(p))
+                out = missing(path);
+            else
+                out = mkOk(fileV(path, false, true));
+            return true;
+        }
+        if (tail == "create" || tail == "create_new")
+        {
+            fsys::path p(path);
+            if (tail == "create_new" && fsys::exists(p))
+            {
+                out = osError(80);
+                return true;
+            }
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            out = f ? mkOk(fileV(path, true, false)) : missing(path);
+            return true;
+        }
+        return false;
+    }
+    if (name == "OpenOptions::new")
+    {
+        out = mkNative("OpenOptions", "");
+        return true;
+    }
+    if (head == "BufReader" || head == "BufWriter" || head == "LineWriter")
+    {
+        if (tail == "new")
+        {
+            out = arg(0);
+            return true;
+        }
+        if (tail == "with_capacity")
+        {
+            out = arg(1);
+            return true;
+        }
+        return false;
+    }
+    if (head == "Path" || head == "PathBuf")
+    {
+        if (tail == "new" || tail == "from")
+        {
+            out = pathV(pathText(arg(0), n));
+            return true;
+        }
+        return false;
+    }
+    if (name == "Error::new" || name == "io::Error::new")
+    {
+        V kind = peel(arg(0));
+        std::string k = kind.k == V_NATIVE ? nat(kind)->s : "Other";
+        out = customError(k, displayStr(arg(1), n));
+        return true;
+    }
+    if (name == "Error::other")
+    {
+        out = customError("Other", displayStr(arg(0), n));
+        return true;
+    }
+    return false;
+}
+
+// write! / writeln! to a file
+bool fsWrite(NativeObj *o, const std::string &text, V &out)
+{
+    if (o->type != "File")
+        return false;
+    if (!o->a)
+        out = mkErr(customError("PermissionDenied", "Access is denied. (os error 5)"));
+    else
+        out = appendTo(o->s, text) ? mkOk(V()) : osError(5);
+    return true;
+}
+
+bool fsFormat(NativeObj *o, bool debug, std::string &out)
+{
+    const std::string &t = o->type;
+    if (t == "Path")
+    {
+        if (!debug)
+        {
+            out = o->s;
+            return true;
+        }
+        out = debugStr(mkStr(o->s, false), false, nullptr);
+        return true;
+    }
+    if (t == "IoError")
+    {
+        if (o->a)
+        {
+            if (debug)
+                out = "Os { code: " + std::to_string(o->a) + ", kind: " + o->data + ", message: " +
+                      debugStr(mkStr(o->s, false), false, nullptr) + " }";
+            else
+                out = o->s + " (os error " + std::to_string(o->a) + ")";
+        }
+        else if (debug)
+            out = "Custom { kind: " + o->data + ", error: " + debugStr(mkStr(o->s, false), false, nullptr) + " }";
+        else
+            out = o->s;
+        return true;
+    }
+    if (t == "ErrorKind")
+    {
+        out = debug ? o->s : std::string(kindText(o->s));
+        return true;
+    }
+    if (t == "File")
+    {
+        out = "File { path: " + debugStr(mkStr(o->s, false), false, nullptr) + " }";
+        return debug;
+    }
+    if (t == "DirEntry")
+    {
+        out = "DirEntry(" + debugStr(mkStr(o->s, false), false, nullptr) + ")";
+        return debug;
+    }
+    if (t == "Metadata")
+    {
+        out = std::string("Metadata { file_type: FileType { is_file: ") + (o->b == 2 ? "true" : "false") +
+              ", is_dir: " + (o->b == 1 ? "true" : "false") + " }, len: " + std::to_string(o->a) + " }";
+        return debug;
+    }
+    return false;
+}
+
+bool fsMethod(NativeObj *o, V self, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    (void)hint;
+    const std::string &m = n->s;
+    const std::string &t = o->type;
+    auto arg = [&](size_t k) -> V & { return argAt(args, k, n); };
+    if (t == "Path")
+    {
+        std::string &p = o->s;
+        if (m == "file_name")
+        {
+            std::string name;
+            size_t start = 0, end = 0;
+            out = lastName(p, name, start, end) ? mkSome(mkStr(name, false)) : mkNone();
+            return true;
+        }
+        if (m == "file_stem" || m == "extension")
+        {
+            std::string stem, ext;
+            bool hasExt = false;
+            if (!stemAndExt(p, stem, ext, hasExt) || (m == "extension" && !hasExt))
+                out = mkNone();
+            else
+                out = mkSome(mkStr(m == "extension" ? ext : stem, false));
+            return true;
+        }
+        if (m == "parent")
+        {
+            std::string parent;
+            out = parentOf(p, parent) ? mkSome(pathV(parent)) : mkNone();
+            return true;
+        }
+        if (m == "join")
+        {
+            out = pathV(joinPath(p, pathText(arg(0), n)));
+            return true;
+        }
+        if (m == "push")
+        {
+            p = joinPath(p, pathText(arg(0), n));
+            out = V();
+            return true;
+        }
+        if (m == "pop")
+        {
+            std::string parent;
+            bool ok = parentOf(p, parent);
+            if (ok)
+                p = parent;
+            out = mkBool(ok);
+            return true;
+        }
+        if (m == "set_extension" || m == "with_extension")
+        {
+            std::string copy = p;
+            bool ok = false;
+            setExtension(copy, pathText(arg(0), n), ok);
+            if (m == "set_extension")
+            {
+                p = copy;
+                out = mkBool(ok);
+            }
+            else
+                out = pathV(copy);
+            return true;
+        }
+        if (m == "set_file_name" || m == "with_file_name")
+        {
+            std::string parent, fresh = pathText(arg(0), n);
+            std::string next = parentOf(p, parent) ? joinPath(parent, fresh) : fresh;
+            if (m == "set_file_name")
+            {
+                p = next;
+                out = V();
+            }
+            else
+                out = pathV(next);
+            return true;
+        }
+        if (m == "is_absolute" || m == "is_relative" || m == "has_root")
+        {
+            bool abs = absolutePath(p);
+            out = mkBool(m == "is_absolute" ? abs : m == "is_relative" ? !abs : rootLen(p) > 0);
+            return true;
+        }
+        if (m == "exists" || m == "is_file" || m == "is_dir" || m == "is_symlink")
+        {
+            fsys::path fp(p);
+            bool r = m == "exists" ? fsys::exists(fp) : m == "is_file" ? fsys::is_regular_file(fp)
+                     : m == "is_dir" ? fsys::is_directory(fp) : false;
+            out = mkBool(r);
+            return true;
+        }
+        if (m == "display" || m == "to_string_lossy" || m == "as_os_str")
+        {
+            out = mkStr(p, false);
+            return true;
+        }
+        if (m == "to_str")
+        {
+            out = mkSome(mkStr(p, false));
+            return true;
+        }
+        if (m == "to_path_buf" || m == "as_path" || m == "to_owned" || m == "into_path_buf" || m == "as_ref")
+        {
+            out = pathV(p);
+            return true;
+        }
+        if (m == "into_os_string" || m == "into_string")
+        {
+            out = m == "into_string" ? mkOk(mkStr(p, true)) : mkStr(p, true);
+            return true;
+        }
+        if (m == "metadata")
+        {
+            out = metadataOf(p);
+            return true;
+        }
+        if (m == "canonicalize" || m == "read_dir")
+        {
+            std::vector<V> one(1, self);
+            return fsCall("fs::" + m, one, n, nullptr, out);
+        }
+        if (m == "starts_with" || m == "ends_with")
+        {
+            std::string other = pathText(arg(0), n);
+            bool ok;
+            if (m == "starts_with")
+                ok = p.compare(0, other.size(), other) == 0 &&
+                     (p.size() == other.size() || other.empty() || isSep(p[other.size()]) || isSep(other.back()));
+            else
+                ok = p.size() >= other.size() && p.compare(p.size() - other.size(), other.size(), other) == 0 &&
+                     (p.size() == other.size() || isSep(p[p.size() - other.size() - 1]));
+            out = mkBool(ok);
+            return true;
+        }
+        if (m == "strip_prefix")
+        {
+            std::string base = pathText(arg(0), n);
+            bool ok = p.compare(0, base.size(), base) == 0 &&
+                      (p.size() == base.size() || base.empty() || isSep(p[base.size()]) || isSep(base.back()));
+            if (!ok)
+            {
+                out = mkErr(mkNative("StripPrefixError", "StripPrefixError(())"));
+                return true;
+            }
+            size_t at0 = base.size();
+            while (at0 < p.size() && isSep(p[at0]))
+                ++at0;
+            out = mkOk(pathV(p.substr(at0)));
+            return true;
+        }
+        if (m == "components" || m == "iter")
+        {
+            IterObj *it = newIter(IT_VALUES);
+            size_t root = rootLen(p);
+            if (root)
+                it->items.push_back(mkStr(p.substr(0, root), false));
+            size_t i = root;
+            while (i < p.size())
+            {
+                while (i < p.size() && isSep(p[i]))
+                    ++i;
+                size_t start = i;
+                while (i < p.size() && !isSep(p[i]))
+                    ++i;
+                if (i > start && p.substr(start, i - start) != ".")
+                    it->items.push_back(mkStr(p.substr(start, i - start), false));
+            }
+            it->end = (int64_t)it->items.size();
+            out = iterV(it);
+            return true;
+        }
+        return false;
+    }
+    if (t == "DirEntry")
+    {
+        if (m == "path")
+        {
+            out = pathV(o->s);
+            return true;
+        }
+        if (m == "file_name")
+        {
+            out = mkStr(o->data, true);
+            return true;
+        }
+        if (m == "metadata")
+        {
+            out = metadataOf(o->s);
+            return true;
+        }
+        if (m == "file_type")
+        {
+            V meta = metadataOf(o->s);
+            out = isOkV(meta) ? mkOk(peel(meta).p->items[0]) : meta;
+            return true;
+        }
+        return false;
+    }
+    if (t == "Metadata")
+    {
+        if (m == "len")
+        {
+            out = mkUint((uint64_t)o->a, PR_U64);
+            return true;
+        }
+        if (m == "is_dir" || m == "is_file" || m == "is_symlink")
+        {
+            out = mkBool(m == "is_dir" ? o->b == 1 : m == "is_file" ? o->b == 2 : false);
+            return true;
+        }
+        if (m == "file_type")
+        {
+            out = self;
+            return true;
+        }
+        return false;
+    }
+    if (t == "IoError")
+    {
+        if (m == "kind")
+        {
+            out = mkNative("ErrorKind", o->data);
+            return true;
+        }
+        if (m == "raw_os_error")
+        {
+            out = o->a ? mkSome(mkInt(o->a, PR_I32)) : mkNone();
+            return true;
+        }
+        if (m == "to_string")
+        {
+            std::string text;
+            fsFormat(o, false, text);
+            out = mkStr(text, true);
+            return true;
+        }
+        return false;
+    }
+    if (t == "OpenOptions")
+    {
+        static const char *const flags[] = {"read", "write", "append", "create", "truncate", "create_new"};
+        for (int k = 0; k < 6; ++k)
+            if (m == flags[k])
+            {
+                if (isTrue(arg(0), n))
+                    o->a |= (int64_t)1 << k;
+                else
+                    o->a &= ~((int64_t)1 << k);
+                out = self;
+                return true;
+            }
+        if (m == "open")
+        {
+            std::string path = pathText(arg(0), n);
+            fsys::path p(path);
+            bool read = o->a & 1, write = (o->a & 2) || (o->a & 4), append = o->a & 4, create = o->a & 8,
+                 truncate = o->a & 16, createNew = o->a & 32;
+            bool exists = fsys::exists(p);
+            if (createNew && exists)
+            {
+                out = osError(80);
+                return true;
+            }
+            if (!exists && !(create || createNew))
+            {
+                out = missing(path);
+                return true;
+            }
+            if (!exists || (truncate && !append))
+            {
+                std::ofstream f(path, std::ios::binary | std::ios::trunc);
+                if (!f)
+                {
+                    out = missing(path);
+                    return true;
+                }
+            }
+            out = mkOk(fileV(path, write, read || !write));
+            return true;
+        }
+        return false;
+    }
+    if (t == "File")
+    {
+        if (m == "write_all" || m == "write" || m == "write_str" || m == "write_fmt")
+        {
+            std::string text = contentsOf(arg(0), n);
+            V r;
+            fsWrite(o, text, r);
+            out = m == "write" && isOkV(r) ? mkOk(mkUint(text.size(), PR_USIZE)) : r;
+            return true;
+        }
+        if (m == "flush" || m == "sync_all" || m == "sync_data")
+        {
+            out = mkOk(V());
+            return true;
+        }
+        if (m == "read_to_string")
+        {
+            std::string &text = fileText(o);
+            std::string rest = text.substr((size_t)o->pos);
+            o->pos = (int64_t)text.size();
+            strOf(arg(0)) += rest;
+            out = mkOk(mkUint(rest.size(), PR_USIZE));
+            return true;
+        }
+        if (m == "read_to_end")
+        {
+            std::string &text = fileText(o);
+            std::string rest = text.substr((size_t)o->pos);
+            o->pos = (int64_t)text.size();
+            V dest = peelAll(arg(0));
+            for (unsigned char c : rest)
+                dest.p->items.push_back(mkUint(c, PR_U8));
+            out = mkOk(mkUint(rest.size(), PR_USIZE));
+            return true;
+        }
+        if (m == "read_line")
+        {
+            std::string line;
+            bool any = nextLine(o, line);
+            if (any)
+                strOf(arg(0)) += line;
+            out = mkOk(mkUint(any ? line.size() : 0, PR_USIZE));
+            return true;
+        }
+        if (m == "lines")
+        {
+            IterObj *it = newIter(IT_VALUES);
+            std::string line;
+            while (nextLine(o, line))
+            {
+                if (!line.empty() && line.back() == '\n')
+                    line.pop_back();
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                it->items.push_back(mkOk(mkStr(line, true)));
+            }
+            it->end = (int64_t)it->items.size();
+            out = iterV(it);
+            return true;
+        }
+        if (m == "metadata")
+        {
+            out = metadataOf(o->s);
+            return true;
+        }
+        if (m == "by_ref" || m == "get_ref" || m == "get_mut" || m == "into_inner")
+        {
+            out = m == "into_inner" && false ? mkOk(self) : self;
+            return true;
+        }
+        return false;
+    }
+    if (t == "ErrorKind" && m == "to_string")
+    {
+        out = mkStr(kindText(o->s), true);
+        return true;
+    }
+    return false;
+}
+
+// env!("NAME") at "compile time": the environment, else what Cargo sets from
+// the Cargo.toml above the program (CARGO_PKG_NAME, CARGO_PKG_VERSION ...)
+bool compileEnv(const std::string &name, std::string &value)
+{
+    if (const char *e = std::getenv(name.c_str()))
+    {
+        value = e;
+        return true;
+    }
+    if (name.compare(0, 6, "CARGO_") != 0)
+        return false;
+    // the nearest Cargo.toml
+    std::error_code ec;
+    fsys::path dir = fsys::absolute(fsys::path(G.path), ec).parent_path();
+    std::string text;
+    fsys::path manifest;
+    for (int up = 0; up < 8 && !dir.empty(); ++up)
+    {
+        fsys::path cand = dir / "Cargo.toml";
+        if (readWhole(cand.string(), text))
+        {
+            manifest = cand;
+            break;
+        }
+        fsys::path parent = dir.parent_path();
+        if (parent == dir)
+            break;
+        dir = parent;
+    }
+    if (manifest.empty())
+        return false;
+    if (name == "CARGO_MANIFEST_DIR")
+    {
+        value = manifest.parent_path().string();
+        return true;
+    }
+    // the [package] table's `key = "value"` lines
+    std::istringstream in(text);
+    std::string line, section;
+    std::unordered_map<std::string, std::string> pkg;
+    while (std::getline(in, line))
+    {
+        size_t a = line.find_first_not_of(" \t\r");
+        if (a == std::string::npos || line[a] == '#')
+            continue;
+        line = line.substr(a);
+        if (line[0] == '[')
+        {
+            section = line.substr(0, line.find(']') + 1);
+            continue;
+        }
+        if (section != "[package]")
+            continue;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos)
+            continue;
+        std::string key = line.substr(0, eq);
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t'))
+            key.pop_back();
+        std::string rest = line.substr(eq + 1);
+        size_t q1 = rest.find('"'), q2 = q1 == std::string::npos ? q1 : rest.find('"', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos)
+            pkg[key] = rest.substr(q1 + 1, q2 - q1 - 1);
+        else if (rest.find('[') != std::string::npos)
+        {
+            // authors = ["a", "b"]: joined with ':'
+            std::string joined;
+            size_t at0 = 0;
+            while ((q1 = rest.find('"', at0)) != std::string::npos && (q2 = rest.find('"', q1 + 1)) != std::string::npos)
+            {
+                joined += (joined.empty() ? "" : ":") + rest.substr(q1 + 1, q2 - q1 - 1);
+                at0 = q2 + 1;
+            }
+            pkg[key] = joined;
+        }
+    }
+    std::string version = pkg.count("version") ? pkg["version"] : "";
+    if (name == "CARGO_PKG_NAME" || name == "CARGO_CRATE_NAME")
+    {
+        if (!pkg.count("name"))
+            return false;
+        value = pkg["name"];
+        if (name == "CARGO_CRATE_NAME")
+            for (char &c : value)
+                if (c == '-')
+                    c = '_';
+        return true;
+    }
+    if (name == "CARGO_PKG_VERSION")
+    {
+        value = version;
+        return pkg.count("version") != 0;
+    }
+    if (name == "CARGO_PKG_VERSION_MAJOR" || name == "CARGO_PKG_VERSION_MINOR" || name == "CARGO_PKG_VERSION_PATCH" ||
+        name == "CARGO_PKG_VERSION_PRE")
+    {
+        std::string core = version.substr(0, version.find('-'));
+        std::string parts[3];
+        int k = 0;
+        for (char c : core)
+        {
+            if (c == '.')
+                ++k;
+            else if (k < 3)
+                parts[k] += c;
+        }
+        value = name.back() == 'R' ? parts[0] : name.back() == 'E' ? (version.find('-') == std::string::npos ? std::string() : version.substr(version.find('-') + 1))
+                : name.back() == 'H' ? parts[2] : parts[1];
+        if (name == "CARGO_PKG_VERSION_MAJOR")
+            value = parts[0];
+        else if (name == "CARGO_PKG_VERSION_MINOR")
+            value = parts[1];
+        else if (name == "CARGO_PKG_VERSION_PATCH")
+            value = parts[2];
+        return true;
+    }
+    const char *keys[][2] = {{"CARGO_PKG_AUTHORS", "authors"},       {"CARGO_PKG_DESCRIPTION", "description"},
+                             {"CARGO_PKG_HOMEPAGE", "homepage"},     {"CARGO_PKG_REPOSITORY", "repository"},
+                             {"CARGO_PKG_LICENSE", "license"},       {"CARGO_PKG_RUST_VERSION", "rust-version"}};
+    for (auto &k : keys)
+        if (name == k[0])
+        {
+            value = pkg.count(k[1]) ? pkg[k[1]] : "";
+            return true;
+        }
+    return false;
+}
+
+} // namespace rust

@@ -1,0 +1,2095 @@
+// quantum: cpp
+// Rust front-end: serde and serde_json, built in. #[derive(Serialize,
+// Deserialize)] types are written and read the way serde's derive does it
+// (field order, externally tagged enums, Option as null, the #[serde(...)]
+// attributes rename, rename_all, skip, default, skip_serializing_if, tag,
+// content, untagged, flatten, transparent), and serde_json's text comes out
+// byte for byte the same: compact or pretty (two spaces), floats the way
+// ryu prints them, errors with their line and column.
+//
+// serde_json::Value is an enum of the library (Null, Bool, Number, String,
+// Array, Object) a program can match on; its Number is a library object and
+// an Object is a map sorted by key, as serde_json's Map is by default.
+#include "RustRt.h.sa"
+
+#include <cmath>
+#include <cstdlib>
+#include <unordered_map>
+
+namespace rust
+{
+
+namespace
+{
+
+// a serde_json::Error: message, and where (line 0: no place)
+struct JsonErr
+{
+    std::string msg;
+    int line = 0, col = 0;
+    char kind = 'd'; // d: data, s: syntax, e: eof, i: io
+};
+
+// ─── #[serde(...)] ─────────────────────────────────────────────────────────
+
+bool serdeAttr(const std::string &attrs, const char *key, std::string *value)
+{
+    std::string k = key;
+    size_t at0 = 0;
+    while (at0 < attrs.size())
+    {
+        size_t semi = attrs.find(';', at0);
+        if (semi == std::string::npos)
+            semi = attrs.size();
+        std::string item = attrs.substr(at0, semi - at0);
+        at0 = semi + 1;
+        size_t eq = item.find('=');
+        std::string name = eq == std::string::npos ? item : item.substr(0, eq);
+        if (name == k)
+        {
+            if (value)
+                *value = eq == std::string::npos ? std::string() : item.substr(eq + 1);
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<std::string> wordsOf(const std::string &name)
+{
+    // snake_case and PascalCase both split into lower-case words
+    std::vector<std::string> words;
+    std::string cur;
+    for (size_t k = 0; k < name.size(); ++k)
+    {
+        char c = name[k];
+        if (c == '_')
+        {
+            if (!cur.empty())
+                words.push_back(cur);
+            cur.clear();
+            continue;
+        }
+        if (c >= 'A' && c <= 'Z')
+        {
+            if (!cur.empty())
+                words.push_back(cur);
+            cur.clear();
+            cur += (char)(c - 'A' + 'a');
+            continue;
+        }
+        cur += c;
+    }
+    if (!cur.empty())
+        words.push_back(cur);
+    return words;
+}
+
+std::string upper(std::string s)
+{
+    for (char &c : s)
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+    return s;
+}
+
+std::string lower(std::string s)
+{
+    for (char &c : s)
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+    return s;
+}
+
+// rename_all = "camelCase" ... of a field (snake_case in Rust) or a variant (PascalCase)
+std::string renameCase(const std::string &name, const std::string &rule, bool variant)
+{
+    if (rule.empty())
+        return name;
+    if (rule == "lowercase")
+        return variant ? lower(name) : name;
+    if (rule == "UPPERCASE")
+        return upper(name);
+    std::vector<std::string> w = wordsOf(name);
+    std::string out;
+    if (rule == "PascalCase" || rule == "camelCase")
+    {
+        for (size_t k = 0; k < w.size(); ++k)
+        {
+            std::string part = w[k];
+            if (!part.empty() && (k > 0 || rule == "PascalCase"))
+                part[0] = (char)(part[0] >= 'a' && part[0] <= 'z' ? part[0] - 'a' + 'A' : part[0]);
+            out += part;
+        }
+        return out;
+    }
+    const char *sep = rule == "kebab-case" || rule == "SCREAMING-KEBAB-CASE" ? "-" : "_";
+    for (size_t k = 0; k < w.size(); ++k)
+        out += (k ? sep : "") + w[k];
+    if (rule == "SCREAMING_SNAKE_CASE" || rule == "SCREAMING-KEBAB-CASE")
+        out = upper(out);
+    return out;
+}
+
+std::string fieldKey(const std::string &containerAttrs, const FieldDef &f)
+{
+    std::string r;
+    if (serdeAttr(f.serde, "rename", &r))
+        return r;
+    std::string rule;
+    serdeAttr(containerAttrs, "rename_all", &rule);
+    return renameCase(f.name, rule, false);
+}
+
+std::string variantKey(TypeDef *td, const VariantDef &v)
+{
+    std::string r;
+    if (serdeAttr(v.serde, "rename", &r))
+        return r;
+    std::string rule;
+    serdeAttr(td->serde, "rename_all", &rule);
+    return renameCase(v.name, rule, true);
+}
+
+// ─── writing ───────────────────────────────────────────────────────────────
+
+struct Writer
+{
+    std::string out;
+    bool pretty = false;
+    int depth = 0;
+};
+
+void newline(Writer &w)
+{
+    if (!w.pretty)
+        return;
+    w.out += '\n';
+    w.out.append((size_t)(2 * w.depth), ' ');
+}
+
+void writeStr(std::string &out, const std::string &s)
+{
+    static const char *hex = "0123456789abcdef";
+    out += '"';
+    for (unsigned char c : s)
+    {
+        switch (c)
+        {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        case 8: out += "\\b"; break;
+        case 12: out += "\\f"; break;
+        default:
+            if (c < 0x20)
+            {
+                out += "\\u00";
+                out += hex[c >> 4];
+                out += hex[c & 15];
+            }
+            else
+                out += (char)c;
+        }
+    }
+    out += '"';
+}
+
+// a float as ryu writes it: 1.0, 0.1, 1e16, 1.5e-7
+std::string jsonFloat(double d)
+{
+    std::string sci = floatExp(d, false, -1, false); // shortest digits: 1.5e-7
+    bool neg = !sci.empty() && sci[0] == '-';
+    if (neg)
+        sci = sci.substr(1);
+    size_t e = sci.find('e');
+    std::string mant = sci.substr(0, e);
+    int x = std::atoi(sci.c_str() + e + 1);
+    std::string digits;
+    for (char c : mant)
+        if (c != '.')
+            digits += c;
+    int length = (int)digits.size();
+    int kk = x + 1;         // where the decimal point goes, from the first digit
+    int k = kk - length;    // the power of ten of the last digit
+    std::string out = neg ? "-" : "";
+    if (0 <= k && kk <= 16)
+        out += digits + std::string((size_t)k, '0') + ".0";
+    else if (0 < kk && kk <= 16)
+        out += digits.substr(0, (size_t)kk) + "." + digits.substr((size_t)kk);
+    else if (-5 < kk && kk <= 0)
+        out += "0." + std::string((size_t)-kk, '0') + digits;
+    else if (length == 1)
+        out += digits + "e" + std::to_string(kk - 1);
+    else
+        out += digits.substr(0, 1) + "." + digits.substr(1) + "e" + std::to_string(kk - 1);
+    return out;
+}
+
+void ser(Writer &w, V v, const Node *at);
+
+// [a, b] with the pretty layout
+void serSeq(Writer &w, const std::vector<V> &items, size_t from, size_t count, const Node *at)
+{
+    if (count == 0)
+    {
+        w.out += "[]";
+        return;
+    }
+    w.out += '[';
+    ++w.depth;
+    for (size_t k = 0; k < count; ++k)
+    {
+        if (k)
+            w.out += ',';
+        newline(w);
+        ser(w, items[from + k], at);
+    }
+    --w.depth;
+    newline(w);
+    w.out += ']';
+}
+
+struct ObjWriter
+{
+    Writer *w;
+    bool any = false;
+    void key(const std::string &k)
+    {
+        w->out += any ? "," : "{";
+        any = true;
+        ++w->depth;
+        newline(*w);
+        --w->depth;
+        writeStr(w->out, k);
+        w->out += w->pretty ? ": " : ":";
+    }
+    void finish()
+    {
+        if (!any)
+        {
+            w->out += "{}";
+            return;
+        }
+        newline(*w);
+        w->out += '}';
+    }
+};
+
+void serValueIn(ObjWriter &ow, const std::string &k, V v, const Node *at)
+{
+    ow.key(k);
+    ++ow.w->depth;
+    ser(*ow.w, v, at);
+    --ow.w->depth;
+}
+
+std::string mapKeyText(V k, const Node *at)
+{
+    V x = peelAll(k);
+    switch (x.k)
+    {
+    case V_STR:
+        return static_cast<StrObj *>(x.p)->s;
+    case V_INT:
+        return intToString(x);
+    case V_CHAR:
+        return charString((uint32_t)x.lo);
+    case V_BOOL:
+        return x.lo ? "true" : "false";
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(x.p);
+        if (e->items.empty() && e->def != G.optionDef)
+            return variantKey(e->def, e->def->variants[(size_t)e->variant]);
+        if (e->def == G.jsonValueDef && e->variant == 3)
+            return strOf(e->items[0]);
+        break;
+    }
+    }
+    JsonErr err;
+    err.msg = "key must be a string";
+    (void)at;
+    throw err;
+}
+
+bool skipField(const FieldDef &f, V value, const Node *at)
+{
+    if (serdeAttr(f.serde, "skip", nullptr) || serdeAttr(f.serde, "skip_serializing", nullptr))
+        return true;
+    std::string pred;
+    if (!serdeAttr(f.serde, "skip_serializing_if", &pred))
+        return false;
+    V x = peelAll(value);
+    if (pred == "Option::is_none")
+        return isNoneV(x);
+    if (pred == "Option::is_some")
+        return isSomeV(x);
+    if (pred.size() > 10 && pred.compare(pred.size() - 10, 10, "::is_empty") == 0)
+    {
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        if (x.k == V_STR)
+            return static_cast<StrObj *>(x.p)->s.empty();
+        if (x.k == V_MAP || x.k == V_SET)
+            return mapLive(static_cast<MapObj *>(x.p)) == 0;
+        if (seqOf(x, o, start, len))
+            return len == 0;
+    }
+    // a function of the program: fn(&T) -> bool
+    std::string fname = pred.substr(pred.rfind(':') == std::string::npos ? 0 : pred.rfind(':') + 1);
+    if (Sym *s = lookupName(G.root, fname))
+        if (s->k == S_FN)
+        {
+            std::vector<V> args(1, mkRefTo(value, false));
+            return isTrue(callFn(s->fn, args, nullptr, at, nullptr), at);
+        }
+    return false;
+}
+
+void serFields(Writer &w, ObjWriter &ow, const std::string &attrs, const std::vector<FieldDef> &fields,
+               const std::vector<V> &items, const Node *at)
+{
+    for (size_t k = 0; k < fields.size() && k < items.size(); ++k)
+    {
+        if (skipField(fields[k], items[k], at))
+            continue;
+        if (serdeAttr(fields[k].serde, "flatten", nullptr))
+        {
+            // the inner struct's (or map's) fields join this object
+            Writer inner;
+            inner.pretty = false;
+            ser(inner, items[k], at);
+            V x = peelAll(items[k]);
+            if (x.k == V_STRUCT)
+            {
+                StructObj *s = static_cast<StructObj *>(x.p);
+                serFields(w, ow, s->def->serde, s->def->fields, s->items, at);
+                continue;
+            }
+            if (x.k == V_MAP)
+            {
+                MapObj *m = static_cast<MapObj *>(x.p);
+                std::vector<int> entries;
+                mapEntries(m, entries);
+                for (int e : entries)
+                    serValueIn(ow, mapKeyText(m->keys[(size_t)e], at), m->items[(size_t)e], at);
+                continue;
+            }
+            if (isNoneV(x))
+                continue;
+        }
+        serValueIn(ow, fieldKey(attrs, fields[k]), items[k], at);
+    }
+    (void)w;
+}
+
+void requireSerialize(TypeDef *td, const Node *at)
+{
+    if (td->kind == TD_BUILTIN || (td->derives & D_SERIALIZE) || td == G.reverseDef)
+        return;
+    for (const std::string &t : td->traitNames)
+        if (t == "Serialize")
+            return;
+    errAt(at, "E0277", "the trait bound `" + td->name + ": Serialize` is not satisfied",
+          "the trait `Serialize` is not implemented for `" + td->name + "`: add `#[derive(Serialize)]` to it");
+}
+
+void serJsonValue(Writer &w, EnumObj *e, const Node *at)
+{
+    switch (e->variant)
+    {
+    case 0:
+        w.out += "null";
+        return;
+    case 1:
+        w.out += e->items[0].lo ? "true" : "false";
+        return;
+    case 2:
+        w.out += static_cast<NativeObj *>(peelAll(e->items[0]).p)->s;
+        return;
+    case 3:
+        writeStr(w.out, strOf(e->items[0]));
+        return;
+    case 4:
+    {
+        V arr = peelAll(e->items[0]);
+        serSeq(w, arr.p->items, 0, arr.p->items.size(), at);
+        return;
+    }
+    case 5:
+    {
+        MapObj *m = static_cast<MapObj *>(peelAll(e->items[0]).p);
+        std::vector<int> entries;
+        mapEntries(m, entries);
+        ObjWriter ow;
+        ow.w = &w;
+        for (int k : entries)
+            serValueIn(ow, mapKeyText(m->keys[(size_t)k], at), m->items[(size_t)k], at);
+        ow.finish();
+        return;
+    }
+    }
+}
+
+void ser(Writer &w, V v, const Node *at)
+{
+    V x = peelAll(v);
+    switch (x.k)
+    {
+    case V_UNIT:
+        w.out += "null";
+        return;
+    case V_BOOL:
+        w.out += x.lo ? "true" : "false";
+        return;
+    case V_INT:
+        w.out += intToString(fixInt(x));
+        return;
+    case V_FLOAT:
+    {
+        double d = fval(x);
+        if (std::isnan(d) || std::isinf(d))
+            w.out += "null";
+        else if (x.t == PR_F32)
+            w.out += jsonFloat((double)std::strtod(floatToString(d, true, true).c_str(), nullptr));
+        else
+            w.out += jsonFloat(d);
+        return;
+    }
+    case V_CHAR:
+        writeStr(w.out, charString((uint32_t)x.lo));
+        return;
+    case V_STR:
+        writeStr(w.out, static_cast<StrObj *>(x.p)->s);
+        return;
+    case V_TUPLE:
+    case V_VEC:
+    case V_ARRAY:
+    case V_DEQUE:
+    case V_HEAP:
+    case V_SLICE:
+    {
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        if (x.k == V_TUPLE)
+        {
+            serSeq(w, x.p->items, 0, x.p->items.size(), at);
+            return;
+        }
+        if (seqOf(x, o, start, len))
+            serSeq(w, o->items, (size_t)start, (size_t)len, at);
+        return;
+    }
+    case V_SET:
+    {
+        MapObj *m = static_cast<MapObj *>(x.p);
+        std::vector<int> entries;
+        mapEntries(m, entries);
+        std::vector<V> keys;
+        for (int e : entries)
+            keys.push_back(m->keys[(size_t)e]);
+        serSeq(w, keys, 0, keys.size(), at);
+        return;
+    }
+    case V_MAP:
+    {
+        MapObj *m = static_cast<MapObj *>(x.p);
+        std::vector<int> entries;
+        mapEntries(m, entries);
+        ObjWriter ow;
+        ow.w = &w;
+        for (int e : entries)
+            serValueIn(ow, mapKeyText(m->keys[(size_t)e], at), m->items[(size_t)e], at);
+        ow.finish();
+        return;
+    }
+    case V_CELL:
+        ser(w, x.p->items[0], at);
+        return;
+    case V_STRUCT:
+    {
+        StructObj *s = static_cast<StructObj *>(x.p);
+        TypeDef *td = s->def;
+        if (td == G.reverseDef)
+        {
+            ser(w, s->items[0], at);
+            return;
+        }
+        requireSerialize(td, at);
+        if (td->form == FORM_UNIT)
+        {
+            w.out += "null";
+            return;
+        }
+        if (td->form == FORM_TUPLE || serdeAttr(td->serde, "transparent", nullptr))
+        {
+            if (s->items.size() == 1)
+                ser(w, s->items[0], at); // a newtype is what it holds
+            else
+                serSeq(w, s->items, 0, s->items.size(), at);
+            return;
+        }
+        ObjWriter ow;
+        ow.w = &w;
+        serFields(w, ow, td->serde, td->fields, s->items, at);
+        ow.finish();
+        return;
+    }
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(x.p);
+        TypeDef *td = e->def;
+        if (td == G.optionDef)
+        {
+            if (e->variant == 0)
+                w.out += "null";
+            else
+                ser(w, e->items[0], at);
+            return;
+        }
+        if (td == G.jsonValueDef)
+        {
+            serJsonValue(w, e, at);
+            return;
+        }
+        if (td != G.resultDef)
+            requireSerialize(td, at);
+        const VariantDef &var = td->variants[(size_t)e->variant];
+        std::string name = td == G.resultDef ? var.name : variantKey(td, var);
+        std::string tag, content;
+        bool untagged = serdeAttr(td->serde, "untagged", nullptr) || serdeAttr(var.serde, "untagged", nullptr);
+        bool internal = serdeAttr(td->serde, "tag", &tag);
+        bool adjacent = internal && serdeAttr(td->serde, "content", &content);
+        std::string fieldRule, fieldAttrs;
+        if (serdeAttr(var.serde, "rename_all", &fieldRule) || serdeAttr(td->serde, "rename_all_fields", &fieldRule))
+            fieldAttrs = "rename_all=" + fieldRule + ";";
+        auto content_ = [&](Writer &cw)
+        {
+            if (var.form == FORM_UNIT)
+                cw.out += "null";
+            else if (var.form == FORM_TUPLE)
+            {
+                if (e->items.size() == 1)
+                    ser(cw, e->items[0], at);
+                else
+                    serSeq(cw, e->items, 0, e->items.size(), at);
+            }
+            else
+            {
+                ObjWriter ow;
+                ow.w = &cw;
+                serFields(cw, ow, fieldAttrs, var.fields, e->items, at);
+                ow.finish();
+            }
+        };
+        if (untagged)
+        {
+            content_(w);
+            return;
+        }
+        if (adjacent)
+        {
+            ObjWriter ow;
+            ow.w = &w;
+            ow.key(tag);
+            writeStr(w.out, name);
+            if (var.form != FORM_UNIT)
+            {
+                ow.key(content);
+                ++w.depth;
+                content_(w);
+                --w.depth;
+            }
+            ow.finish();
+            return;
+        }
+        if (internal)
+        {
+            ObjWriter ow;
+            ow.w = &w;
+            ow.key(tag);
+            writeStr(w.out, name);
+            if (var.form == FORM_NAMED)
+                serFields(w, ow, fieldAttrs, var.fields, e->items, at);
+            else if (var.form == FORM_TUPLE && e->items.size() == 1)
+            {
+                V inner = peelAll(e->items[0]);
+                if (inner.k == V_STRUCT)
+                {
+                    StructObj *s = static_cast<StructObj *>(inner.p);
+                    serFields(w, ow, s->def->serde, s->def->fields, s->items, at);
+                }
+            }
+            ow.finish();
+            return;
+        }
+        if (var.form == FORM_UNIT)
+        {
+            writeStr(w.out, name);
+            return;
+        }
+        ObjWriter ow;
+        ow.w = &w;
+        ow.key(name);
+        ++w.depth;
+        content_(w);
+        --w.depth;
+        ow.finish();
+        return;
+    }
+    case V_NATIVE:
+    {
+        NativeObj *o = static_cast<NativeObj *>(x.p);
+        if (o->type == "Number")
+        {
+            w.out += o->s;
+            return;
+        }
+        if (o->type == "Duration")
+        {
+            ObjWriter ow;
+            ow.w = &w;
+            serValueIn(ow, "secs", mkUint((uint64_t)o->a, PR_U64), at);
+            serValueIn(ow, "nanos", mkUint((uint64_t)o->b, PR_U32), at);
+            ow.finish();
+            return;
+        }
+        if (o->type == "Path" || o->type == "PathBuf")
+        {
+            writeStr(w.out, displayStr(x, at));
+            return;
+        }
+        break;
+    }
+    }
+    errAt(at, "E0277", "the trait bound `" + typeName(x) + ": Serialize` is not satisfied",
+          "the trait `Serialize` is not implemented for `" + typeName(x) + "`");
+}
+
+// ─── reading JSON text ─────────────────────────────────────────────────────
+
+std::unordered_map<Obj *, std::pair<int, int>> *g_pos = nullptr; // where each parsed value ends
+
+V jNull()
+{
+    std::vector<V> none;
+    return mkVariant(G.jsonValueDef, 0, none);
+}
+
+V jWrap(int variant, V payload)
+{
+    std::vector<V> one(1, payload);
+    return mkVariant(G.jsonValueDef, variant, one);
+}
+
+V numberV(const std::string &text, int64_t i, int kind, double d)
+{
+    V n = mkNative("Number", text);
+    NativeObj *o = static_cast<NativeObj *>(n.p);
+    o->a = i;
+    o->b = kind; // 0: an unsigned integer, 1: a negative one, 2: a float
+    o->d = d;
+    return n;
+}
+
+struct JParser
+{
+    const std::string *s = nullptr;
+    size_t i = 0;
+    int line = 1;
+    size_t lineStart = 0;
+
+    int col() const { return (int)(i - lineStart); }
+
+    [[noreturn]] void fail(const std::string &msg, char kind)
+    {
+        JsonErr e;
+        e.msg = msg;
+        e.line = line;
+        e.col = kind == 'e' ? col() : col() + 1;
+        e.kind = kind;
+        throw e;
+    }
+
+    bool atEnd() const { return i >= s->size(); }
+    char peekc() const { return atEnd() ? '\0' : (*s)[i]; }
+
+    void advance()
+    {
+        if ((*s)[i] == '\n')
+        {
+            ++line;
+            lineStart = i + 1;
+        }
+        ++i;
+    }
+
+    void skipWs()
+    {
+        while (!atEnd())
+        {
+            char c = (*s)[i];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+                advance();
+            else
+                break;
+        }
+    }
+
+    void mark(V v)
+    {
+        if (v.p)
+            (*g_pos)[v.p] = std::make_pair(line, col());
+    }
+
+    V value()
+    {
+        skipWs();
+        if (atEnd())
+            fail("EOF while parsing a value", 'e');
+        char c = peekc();
+        V out;
+        if (c == '{')
+            out = object();
+        else if (c == '[')
+            out = array();
+        else if (c == '"')
+            out = jWrap(3, mkStr(str(), true));
+        else if (c == 't' || c == 'f' || c == 'n')
+        {
+            const char *word = c == 't' ? "true" : c == 'f' ? "false" : "null";
+            for (const char *w = word; *w; ++w)
+            {
+                if (atEnd())
+                    fail("EOF while parsing a value", 'e');
+                if ((*s)[i] != *w)
+                    fail("expected ident", 's');
+                advance();
+            }
+            out = c == 'n' ? jNull() : jWrap(1, mkBool(c == 't'));
+        }
+        else if (c == '-' || (c >= '0' && c <= '9'))
+            out = jWrap(2, number());
+        else
+            fail("expected value", 's');
+        mark(out);
+        return out;
+    }
+
+    V number()
+    {
+        size_t start = i;
+        bool neg = false, isFloat = false;
+        if (peekc() == '-')
+        {
+            neg = true;
+            advance();
+        }
+        if (!(peekc() >= '0' && peekc() <= '9'))
+            fail("invalid number", 's');
+        if (peekc() == '0')
+        {
+            advance();
+            if (peekc() >= '0' && peekc() <= '9')
+                fail("invalid number", 's');
+        }
+        while (peekc() >= '0' && peekc() <= '9')
+            advance();
+        if (peekc() == '.')
+        {
+            isFloat = true;
+            advance();
+            if (!(peekc() >= '0' && peekc() <= '9'))
+                fail(atEnd() ? "EOF while parsing a value" : "invalid number", atEnd() ? 'e' : 's');
+            while (peekc() >= '0' && peekc() <= '9')
+                advance();
+        }
+        if (peekc() == 'e' || peekc() == 'E')
+        {
+            isFloat = true;
+            advance();
+            if (peekc() == '+' || peekc() == '-')
+                advance();
+            if (!(peekc() >= '0' && peekc() <= '9'))
+                fail("invalid number", 's');
+            while (peekc() >= '0' && peekc() <= '9')
+                advance();
+        }
+        std::string text = s->substr(start, i - start);
+        if (!isFloat)
+        {
+            // an integer that fits u64 (or i64 when negative)
+            std::string digits = neg ? text.substr(1) : text;
+            bool fits = digits.size() < 20 || (digits.size() == 20 && digits <= "18446744073709551615");
+            if (fits)
+            {
+                uint64_t u = std::strtoull(digits.c_str(), nullptr, 10);
+                if (!neg)
+                    return numberV(text, (int64_t)u, 0, (double)u);
+                if (u <= (uint64_t)9223372036854775807ULL + 1)
+                    return numberV(text, (int64_t)(0 - u), 1, -(double)u);
+            }
+        }
+        double d = std::strtod(text.c_str(), nullptr);
+        if (std::isinf(d))
+            fail("number out of range", 's');
+        return numberV(jsonFloat(d), 0, 2, d);
+    }
+
+    uint32_t hex4()
+    {
+        uint32_t v = 0;
+        for (int k = 0; k < 4; ++k)
+        {
+            if (atEnd())
+                fail("EOF while parsing a string", 'e');
+            char c = (*s)[i];
+            int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0)
+                fail("invalid escape", 's');
+            v = v * 16 + (uint32_t)d;
+            advance();
+        }
+        return v;
+    }
+
+    std::string str()
+    {
+        advance(); // "
+        std::string out;
+        for (;;)
+        {
+            if (atEnd())
+                fail("EOF while parsing a string", 'e');
+            char c = (*s)[i];
+            if (c == '"')
+            {
+                advance();
+                return out;
+            }
+            if ((unsigned char)c < 0x20)
+                fail("control character (\\u0000-\\u001F) found while parsing a string", 's');
+            if (c != '\\')
+            {
+                out += c;
+                advance();
+                continue;
+            }
+            advance();
+            if (atEnd())
+                fail("EOF while parsing a string", 'e');
+            char e = (*s)[i];
+            advance();
+            switch (e)
+            {
+            case '"': out += '"'; break;
+            case '\\': out += '\\'; break;
+            case '/': out += '/'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'n': out += '\n'; break;
+            case 'r': out += '\r'; break;
+            case 't': out += '\t'; break;
+            case 'u':
+            {
+                uint32_t cp = hex4();
+                if (cp >= 0xD800 && cp < 0xDC00)
+                {
+                    if (peekc() != '\\')
+                        fail("lone leading surrogate in hex escape", 's');
+                    advance();
+                    if (peekc() != 'u')
+                        fail("unexpected end of hex escape", 's');
+                    advance();
+                    uint32_t lo = hex4();
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                }
+                utf8Append(out, cp);
+                break;
+            }
+            default:
+                fail("invalid escape", 's');
+            }
+        }
+    }
+
+    V array()
+    {
+        advance(); // [
+        std::vector<V> items;
+        skipWs();
+        if (peekc() == ']')
+        {
+            advance();
+            return jWrap(4, mkSeq(V_VEC, items));
+        }
+        for (;;)
+        {
+            items.push_back(value());
+            skipWs();
+            if (atEnd())
+                fail("EOF while parsing a list", 'e');
+            if (peekc() == ',')
+            {
+                advance();
+                skipWs();
+                if (peekc() == ']')
+                    fail("trailing comma", 's');
+                continue;
+            }
+            if (peekc() == ']')
+            {
+                advance();
+                return jWrap(4, mkSeq(V_VEC, items));
+            }
+            fail("expected `,` or `]`", 's');
+        }
+    }
+
+    V object()
+    {
+        advance(); // {
+        V m = mkMap(true, false);
+        MapObj *mo = static_cast<MapObj *>(m.p);
+        skipWs();
+        if (peekc() == '}')
+        {
+            advance();
+            return jWrap(5, m);
+        }
+        for (;;)
+        {
+            skipWs();
+            if (atEnd())
+                fail("EOF while parsing an object", 'e');
+            if (peekc() != '"')
+                fail("key must be a string", 's');
+            std::string key = str();
+            skipWs();
+            if (atEnd())
+                fail("EOF while parsing an object", 'e');
+            if (peekc() != ':')
+                fail("expected `:`", 's');
+            advance();
+            V v = value();
+            mapInsert(mo, mkStr(key, true), v, nullptr);
+            skipWs();
+            if (atEnd())
+                fail("EOF while parsing an object", 'e');
+            if (peekc() == ',')
+            {
+                advance();
+                skipWs();
+                if (peekc() == '}')
+                    fail("trailing comma", 's');
+                continue;
+            }
+            if (peekc() == '}')
+            {
+                advance();
+                return jWrap(5, m);
+            }
+            fail("expected `,` or `}`", 's');
+        }
+    }
+};
+
+V parseJson(const std::string &text)
+{
+    if (!g_pos)
+        g_pos = new std::unordered_map<Obj *, std::pair<int, int>>();
+    g_pos->clear();
+    JParser p;
+    p.s = &text;
+    V v = p.value();
+    p.skipWs();
+    if (!p.atEnd())
+        p.fail("trailing characters", 's');
+    return v;
+}
+
+// ─── from a Value to a typed value ─────────────────────────────────────────
+
+[[noreturn]] void dataErr(const std::string &msg, V at)
+{
+    JsonErr e;
+    e.msg = msg;
+    if (g_pos && at.p)
+    {
+        auto it = g_pos->find(at.p);
+        if (it != g_pos->end())
+        {
+            e.line = it->second.first;
+            e.col = it->second.second;
+        }
+    }
+    throw e;
+}
+
+std::string unexpected(V jv)
+{
+    EnumObj *e = static_cast<EnumObj *>(jv.p);
+    switch (e->variant)
+    {
+    case 0:
+        return "null";
+    case 1:
+        return std::string("boolean `") + (e->items[0].lo ? "true" : "false") + "`";
+    case 2:
+    {
+        NativeObj *n = static_cast<NativeObj *>(e->items[0].p);
+        return n->b == 2 ? "floating point `" + n->s + "`" : "integer `" + n->s + "`";
+    }
+    case 3:
+    {
+        std::string q;
+        writeStr(q, strOf(e->items[0]));
+        return "string " + q;
+    }
+    case 4:
+        return "sequence";
+    }
+    return "map";
+}
+
+Ty *substGen(Ty *t, const std::vector<std::string> &params, const std::vector<Ty *> &args)
+{
+    if (!t || params.empty())
+        return t;
+    if (t->k == TY_PATH && t->path && !t->path->qself && t->path->segs.size() == 1 && t->path->segs[0].args.empty())
+        for (size_t k = 0; k < params.size() && k < args.size(); ++k)
+            if (t->path->segs[0].name == params[k])
+                return args[k];
+    Ty *c = new Ty();
+    *c = *t;
+    c->elem = substGen(t->elem, params, args);
+    c->ret = substGen(t->ret, params, args);
+    for (size_t k = 0; k < c->items.size(); ++k)
+        c->items[k] = substGen(t->items[k], params, args);
+    if (t->path)
+    {
+        Path *p = new Path();
+        *p = *t->path;
+        for (PathSeg &seg : p->segs)
+            for (size_t k = 0; k < seg.args.size(); ++k)
+                seg.args[k] = substGen(seg.args[k], params, args);
+        c->path = p;
+    }
+    return c;
+}
+
+V fromJson(V jv, Ty *ty, const Node *at);
+
+std::string oneOf(const std::vector<std::string> &names)
+{
+    if (names.empty())
+        return "there are no variants";
+    if (names.size() == 1)
+        return "expected `" + names[0] + "`";
+    if (names.size() == 2)
+        return "expected `" + names[0] + "` or `" + names[1] + "`";
+    std::string out = "expected one of ";
+    for (size_t k = 0; k < names.size(); ++k)
+        out += (k ? ", `" : "`") + names[k] + "`";
+    return out;
+}
+
+V fieldsFromJson(V jv, const std::string &attrs, const std::vector<FieldDef> &fields, const std::vector<std::string> &params,
+                 const std::vector<Ty *> &args, const std::string &what, const Node *at, std::vector<V> &out)
+{
+    EnumObj *e = static_cast<EnumObj *>(jv.p);
+    if (e->variant != 5)
+    {
+        if (e->variant == 4)
+        {
+            // a struct may come as a sequence of its fields
+            V arr = e->items[0];
+            if (arr.p->items.size() != fields.size())
+                dataErr("invalid length " + std::to_string(arr.p->items.size()) + ", expected " + what + " with " +
+                            std::to_string(fields.size()) + " elements",
+                        jv);
+            for (size_t k = 0; k < fields.size(); ++k)
+                out.push_back(fromJson(arr.p->items[k], substGen(fields[k].ty, params, args), at));
+            return jv;
+        }
+        dataErr("invalid type: " + unexpected(jv) + ", expected " + what, jv);
+    }
+    MapObj *m = static_cast<MapObj *>(e->items[0].p);
+    bool containerDefault = serdeAttr(attrs, "default", nullptr);
+    for (size_t k = 0; k < fields.size(); ++k)
+    {
+        const FieldDef &f = fields[k];
+        Ty *fty = substGen(f.ty, params, args);
+        if (serdeAttr(f.serde, "skip", nullptr) || serdeAttr(f.serde, "skip_deserializing", nullptr))
+        {
+            out.push_back(defaultFor(fty, at));
+            continue;
+        }
+        if (serdeAttr(f.serde, "flatten", nullptr))
+        {
+            out.push_back(fromJson(jv, fty, at));
+            continue;
+        }
+        std::string key = fieldKey(attrs, f);
+        int found = mapFind(m, mkStr(key, false), at);
+        if (found < 0)
+        {
+            std::string alias;
+            if (serdeAttr(f.serde, "alias", &alias))
+                found = mapFind(m, mkStr(alias, false), at);
+        }
+        if (found >= 0)
+        {
+            out.push_back(fromJson(m->items[(size_t)found], fty, at));
+            continue;
+        }
+        std::string dflt;
+        if (serdeAttr(f.serde, "default", &dflt))
+        {
+            if (!dflt.empty())
+            {
+                std::string fname = dflt.substr(dflt.rfind(':') == std::string::npos ? 0 : dflt.rfind(':') + 1);
+                if (Sym *s = lookupName(G.root, fname))
+                    if (s->k == S_FN)
+                    {
+                        std::vector<V> none;
+                        out.push_back(callFn(s->fn, none, nullptr, at, fty));
+                        continue;
+                    }
+            }
+            out.push_back(defaultFor(fty, at));
+            continue;
+        }
+        if (containerDefault)
+        {
+            out.push_back(defaultFor(fty, at));
+            continue;
+        }
+        Ty *r = tyResolve(fty);
+        if (r && tyHead(r) == "Option")
+        {
+            out.push_back(mkNone());
+            continue;
+        }
+        dataErr("missing field `" + key + "`", jv);
+    }
+    if (serdeAttr(attrs, "deny_unknown_fields", nullptr))
+    {
+        std::vector<int> entries;
+        mapEntries(m, entries);
+        std::vector<std::string> names;
+        for (const FieldDef &f : fields)
+            names.push_back(fieldKey(attrs, f));
+        for (int k : entries)
+        {
+            std::string key = strOf(m->keys[(size_t)k]);
+            bool known = false;
+            for (const std::string &nm : names)
+                if (nm == key)
+                    known = true;
+            if (!known)
+                dataErr("unknown field `" + key + "`, " + oneOf(names), jv);
+        }
+    }
+    return jv;
+}
+
+V enumFromJson(V jv, TypeDef *td, const std::vector<std::string> &params, const std::vector<Ty *> &args, const Node *at)
+{
+    EnumObj *e = static_cast<EnumObj *>(jv.p);
+    std::vector<std::string> names;
+    for (const VariantDef &v : td->variants)
+        names.push_back(variantKey(td, v));
+    std::string tag, content;
+    bool internal = serdeAttr(td->serde, "tag", &tag);
+    bool adjacent = internal && serdeAttr(td->serde, "content", &content);
+    auto build = [&](int k, V payload, bool fromMap) -> V
+    {
+        const VariantDef &var = td->variants[(size_t)k];
+        std::vector<V> items;
+        if (var.form == FORM_UNIT)
+            return mkVariant(td, k, items);
+        if (var.form == FORM_TUPLE)
+        {
+            if (var.fields.size() == 1 && !fromMap)
+                items.push_back(fromJson(payload, substGen(var.fields[0].ty, params, args), at));
+            else if (var.fields.size() == 1)
+                items.push_back(fromJson(payload, substGen(var.fields[0].ty, params, args), at));
+            else
+            {
+                EnumObj *pe = static_cast<EnumObj *>(payload.p);
+                if (pe->variant != 4 || pe->items[0].p->items.size() != var.fields.size())
+                    dataErr("invalid type: " + unexpected(payload) + ", expected tuple variant " + td->name + "::" + var.name,
+                            payload);
+                for (size_t f = 0; f < var.fields.size(); ++f)
+                    items.push_back(fromJson(pe->items[0].p->items[f], substGen(var.fields[f].ty, params, args), at));
+            }
+            return mkVariant(td, k, items);
+        }
+        std::string fieldRule, fieldAttrs;
+        if (serdeAttr(var.serde, "rename_all", &fieldRule) || serdeAttr(td->serde, "rename_all_fields", &fieldRule))
+            fieldAttrs = "rename_all=" + fieldRule + ";";
+        fieldsFromJson(payload, fieldAttrs, var.fields, params, args, "struct variant " + td->name + "::" + var.name, at,
+                       items);
+        return mkVariant(td, k, items);
+    };
+    auto find = [&](const std::string &name, V where) -> int
+    {
+        for (size_t k = 0; k < names.size(); ++k)
+            if (names[k] == name)
+                return (int)k;
+        for (size_t k = 0; k < td->variants.size(); ++k)
+        {
+            std::string alias;
+            if (serdeAttr(td->variants[k].serde, "alias", &alias) && alias == name)
+                return (int)k;
+        }
+        dataErr("unknown variant `" + name + "`, " + oneOf(names), where);
+    };
+    if (serdeAttr(td->serde, "untagged", nullptr))
+    {
+        for (size_t k = 0; k < td->variants.size(); ++k)
+        {
+            try
+            {
+                if (td->variants[k].form == FORM_UNIT)
+                {
+                    if (e->variant == 0)
+                        return build((int)k, jv, false);
+                    continue;
+                }
+                return build((int)k, jv, false);
+            }
+            catch (JsonErr &)
+            {
+            }
+        }
+        dataErr("data did not match any variant of untagged enum " + td->name, jv);
+    }
+    if (internal)
+    {
+        if (e->variant != 5)
+            dataErr("invalid type: " + unexpected(jv) + ", expected internally tagged enum " + td->name, jv);
+        MapObj *m = static_cast<MapObj *>(e->items[0].p);
+        int t = mapFind(m, mkStr(tag, false), at);
+        if (t < 0)
+            dataErr("missing field `" + tag + "`", jv);
+        int k = find(strOf(static_cast<EnumObj *>(m->items[(size_t)t].p)->items[0]), m->items[(size_t)t]);
+        if (adjacent)
+        {
+            int c = mapFind(m, mkStr(content, false), at);
+            if (td->variants[(size_t)k].form == FORM_UNIT)
+                return build(k, jv, true);
+            if (c < 0)
+                dataErr("missing field `" + content + "`", jv);
+            return build(k, m->items[(size_t)c], true);
+        }
+        const VariantDef &var = td->variants[(size_t)k];
+        if (var.form == FORM_TUPLE && var.fields.size() == 1)
+            return build(k, jv, true);
+        return build(k, jv, true);
+    }
+    // externally tagged: "Unit" or {"Variant": content}
+    if (e->variant == 3)
+    {
+        int k = find(strOf(e->items[0]), jv);
+        if (td->variants[(size_t)k].form != FORM_UNIT)
+            dataErr("invalid type: unit variant, expected " +
+                        std::string(td->variants[(size_t)k].form == FORM_TUPLE ? "tuple variant" : "struct variant"),
+                    jv);
+        return build(k, jv, false);
+    }
+    if (e->variant == 5)
+    {
+        MapObj *m = static_cast<MapObj *>(e->items[0].p);
+        std::vector<int> entries;
+        mapEntries(m, entries);
+        if (entries.size() != 1)
+            dataErr("invalid type: map, expected map with a single key", jv);
+        int k = find(strOf(m->keys[(size_t)entries[0]]), jv);
+        return build(k, m->items[(size_t)entries[0]], true);
+    }
+    dataErr("invalid type: " + unexpected(jv) + ", expected enum " + td->name, jv);
+}
+
+V intFromJson(V jv, uint8_t prim)
+{
+    EnumObj *e = static_cast<EnumObj *>(jv.p);
+    if (e->variant != 2)
+        dataErr("invalid type: " + unexpected(jv) + ", expected " + primName(prim), jv);
+    NativeObj *n = static_cast<NativeObj *>(e->items[0].p);
+    if (n->b == 2)
+        dataErr("invalid type: floating point `" + n->s + "`, expected " + primName(prim), jv);
+    V v = n->b == 0 ? mkUint((uint64_t)n->a, PR_U64) : mkInt(n->a, PR_I64);
+    if (!intFits(v, prim))
+        dataErr("invalid value: integer `" + n->s + "`, expected " + primName(prim), jv);
+    return intConvert(v, prim);
+}
+
+V fromJson(V jv, Ty *ty, const Node *at)
+{
+    Ty *t = tyResolve(ty);
+    if (!t || t->k == TY_INFER || t->k == TY_IMPL || t->k == TY_DYN)
+        return jv;
+    EnumObj *e = static_cast<EnumObj *>(jv.p);
+    if (t->k == TY_REF)
+        return fromJson(jv, t->elem, at);
+    if (t->k == TY_TUPLE)
+    {
+        if (t->items.empty())
+        {
+            if (e->variant != 0)
+                dataErr("invalid type: " + unexpected(jv) + ", expected unit", jv);
+            return V();
+        }
+        if (e->variant != 4 || e->items[0].p->items.size() != t->items.size())
+            dataErr(e->variant == 4 ? "invalid length " + std::to_string(e->items[0].p->items.size()) +
+                                          ", expected a tuple of size " + std::to_string(t->items.size())
+                                    : "invalid type: " + unexpected(jv) + ", expected a tuple of size " +
+                                          std::to_string(t->items.size()),
+                    jv);
+        std::vector<V> items;
+        for (size_t k = 0; k < t->items.size(); ++k)
+            items.push_back(fromJson(e->items[0].p->items[k], t->items[k], at));
+        return mkTuple(items);
+    }
+    if (t->k == TY_ARRAY || t->k == TY_SLICE)
+    {
+        if (e->variant != 4)
+            dataErr("invalid type: " + unexpected(jv) + ", expected an array", jv);
+        std::vector<V> items;
+        for (V &item : e->items[0].p->items)
+            items.push_back(fromJson(item, t->elem, at));
+        return mkSeq(t->k == TY_ARRAY ? V_ARRAY : V_VEC, items);
+    }
+    if (t->k != TY_PATH)
+        return jv;
+    uint8_t prim = tyPrim(t);
+    if (prim != PR_NONE)
+    {
+        if (isIntPrim(prim))
+            return intFromJson(jv, prim);
+        if (isFloatPrim(prim))
+        {
+            if (e->variant != 2)
+                dataErr("invalid type: " + unexpected(jv) + ", expected " + primName(prim), jv);
+            return mkFloat(static_cast<NativeObj *>(e->items[0].p)->d, prim);
+        }
+        if (prim == PR_BOOL)
+        {
+            if (e->variant != 1)
+                dataErr("invalid type: " + unexpected(jv) + ", expected a boolean", jv);
+            return mkBool(e->items[0].lo != 0);
+        }
+        if (prim == PR_CHAR)
+        {
+            if (e->variant != 3 || utf8Count(strOf(e->items[0])) != 1)
+                dataErr("invalid type: " + unexpected(jv) + ", expected a character", jv);
+            const std::string &s = strOf(e->items[0]);
+            uint32_t cp = (unsigned char)s[0];
+            if (cp >= 0x80)
+            {
+                int extra = cp >= 0xF0 ? 3 : cp >= 0xE0 ? 2 : 1;
+                cp &= extra == 3 ? 0x07 : extra == 2 ? 0x0F : 0x1F;
+                for (int k = 1; k <= extra; ++k)
+                    cp = (cp << 6) | ((unsigned char)s[(size_t)k] & 0x3F);
+            }
+            return mkChar(cp);
+        }
+        if (prim == PR_STR)
+        {
+            if (e->variant != 3)
+                dataErr("invalid type: " + unexpected(jv) + ", expected a borrowed string", jv);
+            return mkStr(strOf(e->items[0]), false);
+        }
+    }
+    std::string head = tyHead(t);
+    if (head == "Value")
+        return jv;
+    if (head == "String" || head == "PathBuf")
+    {
+        if (e->variant != 3)
+            dataErr("invalid type: " + unexpected(jv) + ", expected a string", jv);
+        return mkStr(strOf(e->items[0]), true);
+    }
+    if (head == "Option")
+    {
+        if (e->variant == 0)
+            return mkNone();
+        return mkSome(fromJson(jv, tyArg(t, 0), at));
+    }
+    if (head == "Box" || head == "Rc" || head == "Arc" || head == "Cell" || head == "RefCell" || head == "Mutex" ||
+        head == "RwLock")
+    {
+        V inner = fromJson(jv, tyArg(t, 0), at);
+        if (head == "Box")
+            return mkBox(inner);
+        if (head == "Rc" || head == "Arc")
+            return mkRc(inner);
+        return mkCell(inner, head == "Cell" ? 1 : head == "Mutex" ? 2 : head == "RwLock" ? 3 : 0);
+    }
+    if (head == "Vec" || head == "VecDeque" || head == "LinkedList" || head == "BinaryHeap" || head == "HashSet" ||
+        head == "BTreeSet")
+    {
+        if (e->variant != 4)
+            dataErr("invalid type: " + unexpected(jv) + ", expected a sequence", jv);
+        std::vector<V> items;
+        for (V &item : e->items[0].p->items)
+            items.push_back(fromJson(item, tyArg(t, 0), at));
+        if (head == "HashSet" || head == "BTreeSet")
+        {
+            V set = mkMap(head == "BTreeSet", true);
+            for (V &item : items)
+                mapInsert(static_cast<MapObj *>(set.p), item, V(), at);
+            return set;
+        }
+        if (head == "BinaryHeap")
+            sortValues(items, 0, items.size(), nullptr, nullptr, at);
+        return mkSeq(head == "VecDeque" || head == "LinkedList" ? V_DEQUE : head == "BinaryHeap" ? V_HEAP : V_VEC, items);
+    }
+    if (head == "HashMap" || head == "BTreeMap" || head == "Map" || head == "IndexMap")
+    {
+        if (e->variant != 5)
+            dataErr("invalid type: " + unexpected(jv) + ", expected a map", jv);
+        MapObj *src = static_cast<MapObj *>(e->items[0].p);
+        V out = mkMap(head != "HashMap" && head != "IndexMap", false);
+        MapObj *m = static_cast<MapObj *>(out.p);
+        m->valTy = tyArg(t, 1);
+        Ty *kty = tyResolve(tyArg(t, 0));
+        uint8_t kp = kty ? tyPrim(kty) : PR_NONE;
+        std::vector<int> entries;
+        mapEntries(src, entries);
+        for (int k : entries)
+        {
+            std::string ks = strOf(src->keys[(size_t)k]);
+            V key = mkStr(ks, true);
+            if (kp != PR_NONE && isIntPrim(kp))
+            {
+                std::string kind;
+                if (!parseInt(ks, 10, kp, key, kind))
+                    dataErr("invalid type: string \"" + ks + "\", expected " + primName(kp), src->items[(size_t)k]);
+            }
+            else if (kty && tyDef(kty) && tyDef(kty)->kind == TD_ENUM)
+                key = fromJson(jWrap(3, mkStr(ks, true)), kty, at);
+            mapInsert(m, key, fromJson(src->items[(size_t)k], tyArg(t, 1), at), at);
+        }
+        return out;
+    }
+    if (head == "Result")
+    {
+        if (e->variant == 5)
+        {
+            MapObj *m = static_cast<MapObj *>(e->items[0].p);
+            int ok = mapFind(m, mkStr("Ok", false), at), er = mapFind(m, mkStr("Err", false), at);
+            if (ok >= 0)
+                return mkOk(fromJson(m->items[(size_t)ok], tyArg(t, 0), at));
+            if (er >= 0)
+                return mkErr(fromJson(m->items[(size_t)er], tyArg(t, 1), at));
+        }
+        dataErr("invalid type: " + unexpected(jv) + ", expected enum Result", jv);
+    }
+    if (head == "Duration")
+    {
+        std::vector<FieldDef> fields(2);
+        fields[0].name = "secs";
+        fields[1].name = "nanos";
+        if (e->variant != 5)
+            dataErr("invalid type: " + unexpected(jv) + ", expected struct Duration", jv);
+        MapObj *m = static_cast<MapObj *>(e->items[0].p);
+        int s = mapFind(m, mkStr("secs", false), at), ns = mapFind(m, mkStr("nanos", false), at);
+        if (s < 0)
+            dataErr("missing field `secs`", jv);
+        if (ns < 0)
+            dataErr("missing field `nanos`", jv);
+        V d = mkNative("Duration", "");
+        static_cast<NativeObj *>(d.p)->a = (int64_t)intFromJson(m->items[(size_t)s], PR_U64).lo;
+        static_cast<NativeObj *>(d.p)->b = (int64_t)intFromJson(m->items[(size_t)ns], PR_U32).lo;
+        return d;
+    }
+    TypeDef *td = tyDef(t);
+    if (!td)
+        return jv;
+    if (!(td->derives & D_DESERIALIZE))
+        errAt(at, "E0277", "the trait bound `" + td->name + ": Deserialize<'_>` is not satisfied",
+              "the trait `Deserialize<'_>` is not implemented for `" + td->name +
+                  "`: add `#[derive(Deserialize)]` to it");
+    std::vector<std::string> params;
+    std::vector<Ty *> args;
+    for (const GenericParam &g : td->generics)
+        if (!g.isLifetime && !g.isConst)
+        {
+            params.push_back(g.name);
+            args.push_back(tyArg(t, args.size()));
+        }
+    if (td->kind == TD_ENUM)
+        return enumFromJson(jv, td, params, args, at);
+    std::vector<V> items;
+    if (td->form == FORM_UNIT)
+    {
+        if (e->variant != 0)
+            dataErr("invalid type: " + unexpected(jv) + ", expected unit struct " + td->name, jv);
+        return mkStruct(td, items);
+    }
+    if (td->form == FORM_TUPLE || serdeAttr(td->serde, "transparent", nullptr))
+    {
+        if (td->fields.size() == 1)
+        {
+            items.push_back(fromJson(jv, substGen(td->fields[0].ty, params, args), at));
+            return mkStruct(td, items);
+        }
+        if (e->variant != 4 || e->items[0].p->items.size() != td->fields.size())
+            dataErr("invalid type: " + unexpected(jv) + ", expected tuple struct " + td->name, jv);
+        for (size_t k = 0; k < td->fields.size(); ++k)
+            items.push_back(fromJson(e->items[0].p->items[k], substGen(td->fields[k].ty, params, args), at));
+        return mkStruct(td, items);
+    }
+    fieldsFromJson(jv, td->serde, td->fields, params, args, "struct " + td->name, at, items);
+    return mkStruct(td, items);
+}
+
+V jsonError(const JsonErr &e)
+{
+    V v = mkNative("JsonError", e.msg);
+    NativeObj *o = static_cast<NativeObj *>(v.p);
+    o->a = e.line;
+    o->b = e.col;
+    o->data = std::string(1, e.kind);
+    return v;
+}
+
+std::string serText(V v, bool pretty, const Node *at)
+{
+    Writer w;
+    w.pretty = pretty;
+    ser(w, v, at);
+    return w.out;
+}
+
+// what serde_json::from_* reads into: the turbofish, else the Result the call is wanted as
+Ty *targetOf(Ty *hint, const std::vector<Ty *> *targs)
+{
+    if (targs && !targs->empty())
+        return (*targs)[0];
+    Ty *h = tyResolve(hint);
+    if (h && h->k == TY_PATH && tyHead(h) == "Result")
+        return tyArg(h, 0);
+    return nullptr;
+}
+
+std::vector<V> bytesOf(const std::string &s)
+{
+    std::vector<V> items;
+    items.reserve(s.size());
+    for (unsigned char c : s)
+        items.push_back(mkUint(c, PR_U8));
+    return items;
+}
+
+std::string textOfBytes(V v, const Node *at)
+{
+    V x = peelAll(v);
+    if (x.k == V_STR)
+        return static_cast<StrObj *>(x.p)->s;
+    Obj *o = nullptr;
+    int64_t start = 0, len = 0;
+    if (!seqOf(x, o, start, len))
+        errAt(at, "E0308", "mismatched types: expected `&[u8]`, found `" + typeName(x) + "`");
+    std::string s;
+    for (int64_t k = 0; k < len; ++k)
+        s += (char)o->items[(size_t)(start + k)].lo;
+    return s;
+}
+
+V jsonOfValue(V v, const Node *at)
+{
+    std::string text = serText(v, false, at);
+    return parseJson(text);
+}
+
+} // namespace
+
+// ─── what the rest of the front-end calls ──────────────────────────────────
+
+std::string jsonText(V v, bool pretty, const Node *at) { return serText(v, pretty, at); }
+
+V toJsonValue(V v, const Node *at)
+{
+    try
+    {
+        return jsonOfValue(v, at);
+    }
+    catch (JsonErr &e)
+    {
+        panicAt(at, "called `Result::unwrap()` on an `Err` value: Error(\"" + e.msg + "\", line: 0, column: 0)");
+    }
+}
+
+V jsonMacro(Node *j, const Node *at)
+{
+    switch (j->op)
+    {
+    case 0:
+        return jNull();
+    case 1:
+    {
+        V v = eval(j->a, nullptr);
+        if (G.flow)
+            return V();
+        V x = peelAll(v);
+        if (x.k == V_ENUM && static_cast<EnumObj *>(x.p)->def == G.jsonValueDef)
+            return x.k == v.k ? v : cloneValue(x, at);
+        return toJsonValue(v, at);
+    }
+    case 2:
+    {
+        V m = mkMap(true, false);
+        for (size_t k = 0; k + 1 < j->kids.size(); k += 2)
+        {
+            V key = eval(j->kids[k], nullptr);
+            if (G.flow)
+                return V();
+            V val = jsonMacro(j->kids[k + 1], at);
+            if (G.flow)
+                return V();
+            V kx = peelAll(key);
+            std::string ks = kx.k == V_STR ? static_cast<StrObj *>(kx.p)->s : displayStr(kx, at);
+            mapInsert(static_cast<MapObj *>(m.p), mkStr(ks, true), val, at);
+        }
+        return jWrap(5, m);
+    }
+    case 3:
+    {
+        std::vector<V> items;
+        for (Node *kid : j->kids)
+        {
+            items.push_back(jsonMacro(kid, at));
+            if (G.flow)
+                return V();
+        }
+        return jWrap(4, mkSeq(V_VEC, items));
+    }
+    }
+    return jNull();
+}
+
+bool serdeKnown(const std::string &name)
+{
+    return name.compare(0, 12, "serde_json::") == 0 || name.compare(0, 7, "serde::") == 0;
+}
+
+bool serdeCall(const std::string &name, std::vector<V> &args, const Node *n, Ty *hint, const std::vector<Ty *> *targs,
+               V &out)
+{
+    if (name.compare(0, 12, "serde_json::") != 0)
+        return false;
+    std::string key = name.substr(12);
+    auto need = [&](size_t count)
+    {
+        if (args.size() != count)
+            errAt(n, "E0061", "this function takes " + std::to_string(count) + " argument" + (count == 1 ? "" : "s") +
+                                  " but " + std::to_string(args.size()) + " argument" +
+                                  (args.size() == 1 ? " was" : "s were") + " supplied");
+    };
+    try
+    {
+        if (key == "to_string" || key == "to_string_pretty" || key == "to_vec" || key == "to_vec_pretty")
+        {
+            need(1);
+            std::string text = serText(args[0], key.find("pretty") != std::string::npos, n);
+            out = mkOk(key[3] == 's' ? mkStr(text, true) : mkSeq(V_VEC, bytesOf(text)));
+            return true;
+        }
+        if (key == "to_writer" || key == "to_writer_pretty")
+        {
+            need(2);
+            std::string text = serText(args[1], key == "to_writer_pretty", n);
+            V w = args[0];
+            V x = peel(w);
+            if (x.k == V_VEC)
+            {
+                std::vector<V> bytes = bytesOf(text);
+                for (V &b : bytes)
+                    x.p->items.push_back(b);
+                out = mkOk(V());
+                return true;
+            }
+            std::vector<V> wargs(1, mkRefTo(mkSeq(V_VEC, bytesOf(text)), false));
+            V r = callMethodOn(w, "write_all", wargs, n);
+            out = isErrV(r) ? r : mkOk(V());
+            return true;
+        }
+        if (key == "to_value")
+        {
+            need(1);
+            out = mkOk(jsonOfValue(args[0], n));
+            return true;
+        }
+        if (key == "from_str" || key == "from_slice" || key == "from_reader" || key == "from_value")
+        {
+            need(1);
+            Ty *target = targetOf(hint, targs);
+            V jv;
+            if (key == "from_value")
+            {
+                if (g_pos)
+                    g_pos->clear();
+                jv = peelAll(args[0]);
+            }
+            else
+            {
+                std::string text;
+                if (key == "from_reader")
+                {
+                    V buf = mkStr("", true);
+                    Obj *cell = newCell(buf);
+                    std::vector<V> rargs(1, mkRef(cell, 0, true));
+                    V r = callMethodOn(args[0], "read_to_string", rargs, n);
+                    if (isErrV(r))
+                    {
+                        JsonErr e;
+                        e.msg = displayStr(peel(r).p->items[0], n);
+                        e.kind = 'i';
+                        throw e;
+                    }
+                    text = strOf(cell->items[0]);
+                }
+                else
+                    text = textOfBytes(args[0], n);
+                jv = parseJson(text);
+            }
+            out = mkOk(fromJson(jv, target, n));
+            return true;
+        }
+        if (key == "Map::new" || key == "Map::with_capacity")
+        {
+            out = mkMap(true, false);
+            return true;
+        }
+        if (key == "Value::from")
+        {
+            need(1);
+            out = jsonOfValue(args[0], n);
+            return true;
+        }
+        if (key == "Number::from")
+        {
+            need(1);
+            out = static_cast<EnumObj *>(jsonOfValue(args[0], n).p)->items[0];
+            return true;
+        }
+        if (key == "Number::from_f64")
+        {
+            need(1);
+            double d = fval(peel(args[0]));
+            out = std::isfinite(d) ? mkSome(numberV(jsonFloat(d), 0, 2, d)) : mkNone();
+            return true;
+        }
+    }
+    catch (JsonErr &e)
+    {
+        out = mkErr(jsonError(e));
+        return true;
+    }
+    return false;
+}
+
+bool serdeFormat(NativeObj *o, bool debug, std::string &out)
+{
+    if (o->type == "Number")
+    {
+        out = debug ? "Number(" + o->s + ")" : o->s;
+        return true;
+    }
+    if (o->type == "JsonError")
+    {
+        if (debug)
+        {
+            std::string q;
+            writeStr(q, o->s);
+            out = "Error(" + q + ", line: " + std::to_string(o->a) + ", column: " + std::to_string(o->b) + ")";
+        }
+        else
+            out = o->a ? o->s + " at line " + std::to_string(o->a) + " column " + std::to_string(o->b) : o->s;
+        return true;
+    }
+    return false;
+}
+
+// Debug of a Value: Object {"a": Number(1)}, Array [..], String("x") ...
+bool jsonDebug(V v, bool pretty, const Node *at, std::string &out)
+{
+    V x = peelAll(v);
+    if (x.k != V_ENUM || static_cast<EnumObj *>(x.p)->def != G.jsonValueDef)
+        return false;
+    EnumObj *e = static_cast<EnumObj *>(x.p);
+    switch (e->variant)
+    {
+    case 0:
+        out += "Null";
+        return true;
+    case 1:
+        out += e->items[0].lo ? "Bool(true)" : "Bool(false)";
+        return true;
+    case 2:
+        out += "Number(" + static_cast<NativeObj *>(e->items[0].p)->s + ")";
+        return true;
+    case 3:
+    {
+        std::string q = debugStr(e->items[0], false, at);
+        out += "String(" + q + ")";
+        return true;
+    }
+    case 4:
+        out += "Array " + debugStr(e->items[0], pretty, at);
+        return true;
+    case 5:
+        out += "Object " + debugStr(e->items[0], pretty, at);
+        return true;
+    }
+    return false;
+}
+
+bool jsonEq(V a, V b, bool &result)
+{
+    bool ja = a.k == V_ENUM && static_cast<EnumObj *>(a.p)->def == G.jsonValueDef;
+    bool jb = b.k == V_ENUM && static_cast<EnumObj *>(b.p)->def == G.jsonValueDef;
+    if (ja == jb)
+        return false;
+    V j = ja ? a : b, o = ja ? b : a;
+    EnumObj *e = static_cast<EnumObj *>(j.p);
+    switch (o.k)
+    {
+    case V_STR:
+        result = e->variant == 3 && strOf(e->items[0]) == static_cast<StrObj *>(o.p)->s;
+        return true;
+    case V_BOOL:
+        result = e->variant == 1 && e->items[0].lo == o.lo;
+        return true;
+    case V_INT:
+    {
+        if (e->variant != 2)
+        {
+            result = false;
+            return true;
+        }
+        NativeObj *n = static_cast<NativeObj *>(e->items[0].p);
+        result = n->b != 2 && intToString(o) == n->s;
+        return true;
+    }
+    case V_FLOAT:
+        result = e->variant == 2 && static_cast<NativeObj *>(e->items[0].p)->d == fval(o);
+        return true;
+    }
+    return false;
+}
+
+// value["key"], value[0]: Null when there is nothing there; for writing, an
+// object gets the key (Null becomes an object first)
+bool jsonIndex(V bv, Place base, V idx, bool write, Place &out, const Node *n)
+{
+    if (bv.k != V_ENUM || static_cast<EnumObj *>(bv.p)->def != G.jsonValueDef)
+        return false;
+    EnumObj *e = static_cast<EnumObj *>(bv.p);
+    V ix = peelAll(idx);
+    static Obj *nullCell = nullptr;
+    if (ix.k == V_STR)
+    {
+        if (write && e->variant == 0)
+        {
+            V obj = jWrap(5, mkMap(true, false));
+            slotAt(base.o, base.i) = obj;
+            e = static_cast<EnumObj *>(obj.p);
+        }
+        if (e->variant == 5)
+        {
+            MapObj *m = static_cast<MapObj *>(e->items[0].p);
+            int k = mapFind(m, ix, n);
+            if (k < 0 && write)
+                k = mapInsert(m, mkStr(static_cast<StrObj *>(ix.p)->s, true), jNull(), n);
+            if (k >= 0)
+            {
+                out.o = m;
+                out.i = k;
+                out.ref = true;
+                return true;
+            }
+        }
+        else if (write)
+            panicAt(n, "cannot access key " + debugStr(ix, false, n) + " in JSON " +
+                           std::string(e->variant == 4 ? "array" : e->variant == 3 ? "string" : e->variant == 2 ? "number" : "boolean"));
+    }
+    else if (ix.k == V_INT && e->variant == 4)
+    {
+        Obj *arr = e->items[0].p;
+        int64_t i = (int64_t)ix.lo;
+        if (i >= 0 && i < (int64_t)arr->items.size())
+        {
+            out.o = arr;
+            out.i = i;
+            out.ref = true;
+            return true;
+        }
+        if (write)
+            panicAt(n, "cannot access index " + std::to_string(i) + " of JSON array of length " +
+                           std::to_string(arr->items.size()));
+    }
+    else if (write)
+        panicAt(n, "cannot access index " + displayStr(ix, n) + " of JSON " + (e->variant == 0 ? "null" : "value"));
+    if (!nullCell)
+        nullCell = newCell(V());
+    nullCell->items[0] = jNull();
+    out.o = nullCell;
+    out.i = 0;
+    out.ref = true;
+    return true;
+}
+
+bool jsonMethod(V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    (void)hint;
+    V x = peelAll(sv);
+    const std::string &m = n->s;
+    if (x.k == V_NATIVE)
+    {
+        NativeObj *o = static_cast<NativeObj *>(x.p);
+        if (o->type == "Number")
+        {
+            if (m == "as_i64")
+                out = o->b == 1 || (o->b == 0 && o->a >= 0) ? mkSome(mkInt(o->a, PR_I64)) : mkNone();
+            else if (m == "as_u64")
+                out = o->b == 0 ? mkSome(mkUint((uint64_t)o->a, PR_U64)) : mkNone();
+            else if (m == "as_f64")
+                out = mkSome(mkFloat(o->d, PR_F64));
+            else if (m == "is_i64")
+                out = mkBool(o->b == 1 || (o->b == 0 && o->a >= 0));
+            else if (m == "is_u64")
+                out = mkBool(o->b == 0);
+            else if (m == "is_f64")
+                out = mkBool(o->b == 2);
+            else
+                return false;
+            return true;
+        }
+        if (o->type == "JsonError")
+        {
+            if (m == "line")
+                out = mkUint((uint64_t)o->a, PR_USIZE);
+            else if (m == "column")
+                out = mkUint((uint64_t)o->b, PR_USIZE);
+            else if (m == "is_eof")
+                out = mkBool(o->data == "e");
+            else if (m == "is_syntax")
+                out = mkBool(o->data == "s");
+            else if (m == "is_data")
+                out = mkBool(o->data == "d");
+            else if (m == "is_io")
+                out = mkBool(o->data == "i");
+            else
+                return false;
+            return true;
+        }
+        return false;
+    }
+    if (x.k != V_ENUM || static_cast<EnumObj *>(x.p)->def != G.jsonValueDef)
+        return false;
+    EnumObj *e = static_cast<EnumObj *>(x.p);
+    int k = e->variant;
+    NativeObj *num = k == 2 ? static_cast<NativeObj *>(e->items[0].p) : nullptr;
+    if (m == "is_null") out = mkBool(k == 0);
+    else if (m == "is_boolean") out = mkBool(k == 1);
+    else if (m == "is_number") out = mkBool(k == 2);
+    else if (m == "is_string") out = mkBool(k == 3);
+    else if (m == "is_array") out = mkBool(k == 4);
+    else if (m == "is_object") out = mkBool(k == 5);
+    else if (m == "is_i64") out = mkBool(num && (num->b == 1 || (num->b == 0 && num->a >= 0)));
+    else if (m == "is_u64") out = mkBool(num && num->b == 0);
+    else if (m == "is_f64") out = mkBool(num && num->b == 2);
+    else if (m == "as_null") out = k == 0 ? mkSome(V()) : mkNone();
+    else if (m == "as_bool") out = k == 1 ? mkSome(e->items[0]) : mkNone();
+    else if (m == "as_str") out = k == 3 ? mkSome(mkStr(strOf(e->items[0]), false)) : mkNone();
+    else if (m == "as_i64") out = num && (num->b == 1 || (num->b == 0 && num->a >= 0)) ? mkSome(mkInt(num->a, PR_I64)) : mkNone();
+    else if (m == "as_u64") out = num && num->b == 0 ? mkSome(mkUint((uint64_t)num->a, PR_U64)) : mkNone();
+    else if (m == "as_f64") out = num ? mkSome(mkFloat(num->d, PR_F64)) : mkNone();
+    else if (m == "as_number") out = num ? mkSome(mkRef(e, 0, false)) : mkNone();
+    else if (m == "as_array" || m == "as_array_mut") out = k == 4 ? mkSome(mkRef(e, 0, m.size() > 8)) : mkNone();
+    else if (m == "as_object" || m == "as_object_mut") out = k == 5 ? mkSome(mkRef(e, 0, m.size() > 9)) : mkNone();
+    else if (m == "get" || m == "get_mut")
+    {
+        V ix = peelAll(argAt(args, 0, n));
+        out = mkNone();
+        if (ix.k == V_STR && k == 5)
+        {
+            MapObj *mo = static_cast<MapObj *>(e->items[0].p);
+            int f = mapFind(mo, ix, n);
+            if (f >= 0)
+                out = mkSome(mkRef(mo, f, m == "get_mut"));
+        }
+        else if (ix.k == V_INT && k == 4)
+        {
+            Obj *arr = e->items[0].p;
+            if ((int64_t)ix.lo < (int64_t)arr->items.size())
+                out = mkSome(mkRef(arr, (int64_t)ix.lo, m == "get_mut"));
+        }
+    }
+    else if (m == "pointer" || m == "pointer_mut")
+    {
+        std::string ptr = strOf(argAt(args, 0, n));
+        if (!ptr.empty() && ptr[0] != '/')
+        {
+            out = mkNone();
+            return true;
+        }
+        Obj *o = nullptr;
+        int64_t i = 0;
+        V cur = x;
+        size_t at0 = 1;
+        while (!ptr.empty() && at0 <= ptr.size())
+        {
+            size_t slash = ptr.find('/', at0);
+            if (slash == std::string::npos)
+                slash = ptr.size();
+            std::string tok = ptr.substr(at0, slash - at0);
+            at0 = slash + 1;
+            EnumObj *ce = static_cast<EnumObj *>(cur.p);
+            if (ce->variant == 5)
+            {
+                MapObj *mo = static_cast<MapObj *>(ce->items[0].p);
+                int f = mapFind(mo, mkStr(tok, false), n);
+                if (f < 0)
+                {
+                    out = mkNone();
+                    return true;
+                }
+                o = mo;
+                i = f;
+            }
+            else if (ce->variant == 4 && !tok.empty() && tok.find_first_not_of("0123456789") == std::string::npos &&
+                     std::strtoull(tok.c_str(), nullptr, 10) < ce->items[0].p->items.size())
+            {
+                o = ce->items[0].p;
+                i = (int64_t)std::strtoull(tok.c_str(), nullptr, 10);
+            }
+            else
+            {
+                out = mkNone();
+                return true;
+            }
+            cur = peelAll(o->items[(size_t)i]);
+        }
+        out = o ? mkSome(mkRef(o, i, m == "pointer_mut")) : mkSome(sv);
+    }
+    else if (m == "take")
+    {
+        out = x;
+        if (sv.k == V_REF)
+            slotAt(sv.p, sv.hi) = jNull();
+    }
+    else
+        return false;
+    return true;
+}
+
+} // namespace rust

@@ -1,0 +1,1918 @@
+// quantum: cpp
+// Rust front-end: the library. The functions and constants a path names
+// (String::new, HashMap::new, mem::swap, i32::MAX ...), the methods of the
+// smart pointers and cells (Box, Rc, Weak, RefCell, Cell, Mutex), the
+// methods every value has (clone, to_string, cmp, into ...), and running a
+// program: main is called; a panic or an error ends it the way a program
+// built by rustc ends.
+#include "RustMain.h.sa"
+#include "RustRt.h.sa"
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+
+namespace rust
+{
+
+namespace
+{
+
+bool g_testMode = false;
+
+V threadV()
+{
+    std::string name;
+    bool named = false;
+    int64_t id = 0;
+    currentThreadInfo(name, named, id);
+    V v = mkNative("Thread", name);
+    static_cast<NativeObj *>(v.p)->a = named ? 1 : 0;
+    static_cast<NativeObj *>(v.p)->b = id;
+    return v;
+}
+
+V pairOf(V a, V b)
+{
+    std::vector<V> pair;
+    pair.push_back(a);
+    pair.push_back(b);
+    return mkTuple(pair);
+}
+
+Ty *primTy(uint8_t prim)
+{
+    if (isFloatPrim(prim))
+        return tyOfValue(mkFloat(0, prim));
+    if (prim == PR_BOOL)
+        return tyOfValue(mkBool(false));
+    if (prim == PR_CHAR)
+        return tyOfValue(mkChar(0));
+    if (prim == PR_STR)
+        return tyOfValue(mkStr("", false));
+    return tyOfValue(mkInt(0, prim));
+}
+
+V durationV(int64_t secs, int64_t nanos)
+{
+    V v = mkNative("Duration", "");
+    NativeObj *d = static_cast<NativeObj *>(v.p);
+    d->a = secs + nanos / 1000000000;
+    d->b = nanos % 1000000000;
+    return v;
+}
+
+// the real clock, plus the time threads have slept (RustTask.sa)
+int64_t nowNanos()
+{
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+               .count() +
+           virtualNanos();
+}
+
+V seqFrom(uint8_t kind, V src, const Node *n)
+{
+    V x = peelAll(src);
+    std::vector<V> items;
+    if (x.k == V_STR)
+    {
+        for (unsigned char c : static_cast<StrObj *>(x.p)->s)
+            items.push_back(mkUint(c, PR_U8));
+        return mkSeq(kind, items);
+    }
+    Obj *o = nullptr;
+    int64_t start = 0, len = 0;
+    if (seqOf(x, o, start, len))
+    {
+        bool owned = src.k != V_REF && x.k != V_SLICE;
+        for (int64_t k = 0; k < len; ++k)
+            items.push_back(owned ? o->items[(size_t)(start + k)] : cloneValue(o->items[(size_t)(start + k)], n));
+    }
+    else
+    {
+        V it = toIter(src, n);
+        iterDrain(static_cast<IterObj *>(it.p), items, n);
+    }
+    if (kind == V_HEAP)
+        sortValues(items, 0, items.size(), nullptr, nullptr, n);
+    return mkSeq(kind, items);
+}
+
+V mapFrom(bool sorted, bool isSet, std::vector<V> &args, Ty *hint, const Node *n)
+{
+    V out = mkMap(sorted, isSet);
+    MapObj *m = static_cast<MapObj *>(out.p);
+    Ty *h = tyResolve(hint);
+    if (h && !isSet)
+        m->valTy = tyArg(h, 1);
+    if (args.empty())
+        return out;
+    V it = toIter(args[0], n);
+    V x;
+    while (iterNext(static_cast<IterObj *>(it.p), x, n))
+    {
+        if (isSet)
+        {
+            mapInsert(m, x.k == V_REF ? cloneValue(peel(x), n) : x, V(), n);
+            continue;
+        }
+        V pair = peel(x);
+        if (pair.k != V_TUPLE || pair.p->items.size() != 2)
+            errAt(n, "E0277", "a map is built from `(key, value)` pairs, found `" + typeName(pair) + "`");
+        mapInsert(m, pair.p->items[0], pair.p->items[1], n);
+    }
+    return out;
+}
+
+// what mem::take leaves behind
+V emptyLike(V v, const Node *n)
+{
+    switch (v.k)
+    {
+    case V_INT: return mkInt(0, v.t);
+    case V_FLOAT: return mkFloat(0, v.t);
+    case V_BOOL: return mkBool(false);
+    case V_CHAR: return mkChar(0);
+    case V_STR: return mkStr("", v.x != 0);
+    case V_VEC:
+    case V_DEQUE:
+    case V_HEAP: return mkSeq(v.k, std::vector<V>());
+    case V_MAP:
+    case V_SET: return mkMap(static_cast<MapObj *>(v.p)->sorted, v.k == V_SET);
+    case V_ENUM:
+        if (static_cast<EnumObj *>(v.p)->def == G.optionDef)
+            return mkNone();
+        break;
+    case V_UNIT: return v;
+    }
+    Ty *t = tyOfValue(v);
+    if (t)
+        return defaultFor(t, n);
+    errAt(n, "E0277", "the trait bound `" + typeName(v) + ": Default` is not satisfied");
+}
+
+std::string rustcReport(const CompileErr &e, const std::string &rootFile, const std::string &rootSource)
+{
+    std::string out = "error";
+    if (!e.code.empty())
+        out += "[" + e.code + "]";
+    out += ": " + e.message + "\n";
+    // the file it is in: the root, or a module's
+    int fileIdx = e.line > 0 ? srcFile(e.line) : 0;
+    bool known = fileIdx > 0 && (size_t)fileIdx < G.files.size();
+    const std::string &file = known ? G.files[(size_t)fileIdx] : rootFile;
+    const std::string &source = known ? G.sources[(size_t)fileIdx] : rootSource;
+    int line = e.line > 0 ? srcLine(e.line) : e.line;
+    if (line > 0)
+    {
+        std::string num = std::to_string(line), pad(num.size(), ' ');
+        out += pad + "--> " + file + ":" + num + ":" + std::to_string(e.col > 0 ? e.col : 1) + "\n";
+        // the line of the source
+        size_t at0 = 0;
+        for (int l = 1; l < line && at0 != std::string::npos; ++l)
+        {
+            at0 = source.find('\n', at0);
+            if (at0 != std::string::npos)
+                ++at0;
+        }
+        if (at0 != std::string::npos && at0 <= source.size())
+        {
+            size_t end = source.find('\n', at0);
+            std::string text = source.substr(at0, end == std::string::npos ? std::string::npos : end - at0);
+            if (!text.empty() && text.back() == '\r')
+                text.pop_back();
+            out += pad + " |\n" + num + " | " + text + "\n" + pad + " | ";
+            for (int c = 1; c < e.col && (size_t)c <= text.size(); ++c)
+                out += text[(size_t)c - 1] == '\t' ? '\t' : ' ';
+            out += std::string((size_t)(e.width > 0 ? e.width : 1), '^');
+            if (!e.label.empty())
+                out += " " + e.label;
+            out += "\n";
+        }
+    }
+    else if (!e.label.empty())
+        out += "  = note: " + e.label + "\n";
+    if (!e.help.empty())
+        out += "  = help: " + e.help + "\n";
+    return out + "\nerror: aborting due to 1 previous error\n";
+}
+
+std::string baseName(const std::string &path)
+{
+    size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+void resetRun(const std::string &path, const std::string &source)
+{
+    G.path = path;
+    G.fileName = path;
+    G.source = source;
+    G.files.clear();
+    G.sources.clear();
+    G.files.push_back(path);
+    G.sources.push_back(source);
+    G.fr = nullptr;
+    G.flow = FL_NONE;
+    G.flowVal = V();
+    G.flowLabel = nullptr;
+    G.depth = 0;
+    G.trackDrops = false;
+    G.builtinTypes.clear();
+    G.blanketImpls.clear();
+    G.cur = nullptr;
+    initBuiltins();
+}
+
+bool readLine(std::string &line)
+{
+    flushOut();
+    line.clear();
+    int c;
+    bool any = false;
+    while ((c = fgetc(stdin)) != EOF)
+    {
+        any = true;
+        line += (char)c;
+        if (c == '\n')
+            break;
+    }
+    return any;
+}
+
+} // namespace
+
+void setTestMode(bool on) { g_testMode = on; }
+
+std::string srcPos(int line, int col)
+{
+    int f = srcFile(line);
+    const std::string &file = f > 0 && (size_t)f < G.files.size() ? G.files[(size_t)f] : G.fileName;
+    return file + ":" + std::to_string(srcLine(line)) + ":" + std::to_string(col);
+}
+
+bool loadModuleFile(const std::string &path, std::string &text, int &fileIdx)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return false;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    text = ss.str();
+    fileIdx = (int)G.files.size();
+    G.files.push_back(path);
+    G.sources.push_back(text);
+    return true;
+}
+
+std::string moduleRootDir()
+{
+    size_t slash = G.path.find_last_of("/\\");
+    return slash == std::string::npos ? std::string() : G.path.substr(0, slash);
+}
+bool testMode() { return g_testMode; }
+void setArgs(const std::vector<std::string> &args) { G.args = args; }
+
+// ─── methods of pointers, cells and library objects ────────────────────────
+
+bool miscMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    switch (sv.k)
+    {
+    case V_BOOL:
+        if (m == "then")
+        {
+            out = sv.lo ? mkSome(call0(argAt(args, 0, n), n)) : mkNone();
+            return true;
+        }
+        if (m == "then_some")
+        {
+            out = sv.lo ? mkSome(argAt(args, 0, n)) : mkNone();
+            return true;
+        }
+        break;
+    case V_BOX:
+    case V_RC:
+        if (m == "as_ref" || m == "as_mut" || m == "deref" || m == "deref_mut")
+        {
+            out = mkRef(sv.p, 0, m == "as_mut" || m == "deref_mut");
+            return true;
+        }
+        break;
+    case V_WEAK:
+        if (m == "upgrade")
+        {
+            RcObj *r = static_cast<RcObj *>(sv.p);
+            if (r->strong <= 0)
+            {
+                out = mkNone();
+                return true;
+            }
+            ++r->strong;
+            V rc;
+            rc.k = V_RC;
+            rc.p = r;
+            out = mkSome(rc);
+            return true;
+        }
+        break;
+    case V_CELL:
+    {
+        V &inner = sv.p->items[0];
+        if (sv.n == 7 && atomicMethod(sv, n, args, out))
+            return true;
+        if (sv.n == 4) // OnceLock / OnceCell: an Option inside
+        {
+            EnumObj *opt = static_cast<EnumObj *>(inner.p);
+            bool set = opt->variant == 1;
+            if (m == "get")
+            {
+                out = set ? mkSome(mkRef(opt, 0, false)) : mkNone();
+                return true;
+            }
+            if (m == "get_or_init")
+            {
+                if (!set)
+                {
+                    inner = mkSome(call0(argAt(args, 0, n), n));
+                    opt = static_cast<EnumObj *>(inner.p);
+                }
+                out = mkRef(opt, 0, false);
+                return true;
+            }
+            if (m == "set")
+            {
+                if (set)
+                    out = mkErr(argAt(args, 0, n));
+                else
+                {
+                    inner = mkSome(argAt(args, 0, n));
+                    out = mkOk(V());
+                }
+                return true;
+            }
+            if (m == "into_inner" || m == "take")
+            {
+                out = inner;
+                if (m == "take")
+                    inner = mkNone();
+                return true;
+            }
+        }
+        if (sv.n == 1) // Cell
+        {
+            if (m == "get")
+            {
+                out = isCopy(inner) ? copyShell(inner) : inner;
+                return true;
+            }
+            if (m == "set")
+            {
+                inner = argAt(args, 0, n);
+                out = V();
+                return true;
+            }
+            if (m == "update")
+            {
+                inner = call1(argAt(args, 0, n), inner, n);
+                out = inner;
+                return true;
+            }
+        }
+        if (sv.n >= 5) // tokio's Mutex / RwLock: lock().await is the guard
+        {
+            if (m == "lock" || m == "read" || m == "write")
+            {
+                out = readyFuture(mkRef(sv.p, 0, m != "read"));
+                return true;
+            }
+            if (m == "blocking_lock" || m == "blocking_read" || m == "blocking_write" || m == "get_mut")
+            {
+                out = mkRef(sv.p, 0, m != "blocking_read");
+                return true;
+            }
+            if (m == "try_lock" || m == "try_read" || m == "try_write")
+            {
+                out = mkOk(mkRef(sv.p, 0, m != "try_read"));
+                return true;
+            }
+            if (m == "into_inner")
+            {
+                out = inner;
+                return true;
+            }
+        }
+        if (m == "borrow" || m == "read" || m == "try_borrow")
+        {
+            V r = mkRef(sv.p, 0, false);
+            out = m == "borrow" ? r : mkOk(r);
+            return true;
+        }
+        if (m == "borrow_mut" || m == "lock" || m == "write" || m == "try_borrow_mut" || m == "try_lock" || m == "get_mut")
+        {
+            V r = mkRef(sv.p, 0, true);
+            out = m == "borrow_mut" || (m == "get_mut" && sv.n < 2) ? r : mkOk(r);
+            return true;
+        }
+        if (m == "into_inner")
+        {
+            out = sv.n >= 2 ? mkOk(inner) : inner;
+            return true;
+        }
+        if (m == "replace")
+        {
+            out = inner;
+            inner = argAt(args, 0, n);
+            return true;
+        }
+        if (m == "take")
+        {
+            out = inner;
+            inner = emptyLike(inner, n);
+            return true;
+        }
+        if (m == "swap")
+        {
+            V other = peelAll(argAt(args, 0, n));
+            if (other.k != V_CELL)
+                errAt(n, "E0308", "mismatched types: expected a cell, found `" + typeName(other) + "`");
+            V t = inner;
+            inner = other.p->items[0];
+            other.p->items[0] = t;
+            out = V();
+            return true;
+        }
+        if (m == "is_poisoned")
+        {
+            out = mkBool(false);
+            return true;
+        }
+        break;
+    }
+    case V_NATIVE:
+    {
+        NativeObj *o = static_cast<NativeObj *>(sv.p);
+        const std::string &t = o->type;
+        if (o->buf && formatterMethod(o, n, args, out))
+            return true;
+        if (fsMethod(o, sv, n, args, hint, out))
+            return true;
+        if (taskMethod(o, sv, n, args, hint, out))
+            return true;
+        if (netMethod(o, sv, n, args, out))
+            return true;
+        if (t == "Thread")
+        {
+            if (m == "name")
+            {
+                out = o->a ? mkSome(mkStr(o->s, false)) : mkNone();
+                return true;
+            }
+            if (m == "id")
+            {
+                out = mkNative("ThreadId", "");
+                static_cast<NativeObj *>(out.p)->b = o->b;
+                return true;
+            }
+        }
+        if (t == "ThreadBuilder")
+        {
+            if (m == "name")
+            {
+                o->s = strOf(argAt(args, 0, n));
+                o->a = 1;
+                out = sv;
+                return true;
+            }
+            if (m == "stack_size")
+            {
+                out = sv;
+                return true;
+            }
+            if (m == "spawn")
+            {
+                out = mkOk(spawnThread(argAt(args, 0, n), o->s, o->a != 0, n));
+                return true;
+            }
+        }
+        if (t == "Entry")
+            return entryMethod(o, n, args, hint, out);
+        if (t == "Stdin")
+        {
+            if (m == "read_line")
+            {
+                std::string &dest = strOf(argAt(args, 0, n));
+                std::string line;
+                if (g_testMode)
+                    line = "\n";
+                else
+                    readLine(line);
+                dest += line;
+                out = mkOk(mkUint(line.size(), PR_USIZE));
+                return true;
+            }
+            if (m == "lock")
+            {
+                out = sv;
+                return true;
+            }
+            if (m == "lines")
+            {
+                out = iterV(newIter(IT_STDIN_LINES));
+                return true;
+            }
+            if (m == "read_to_string")
+            {
+                std::string &dest = strOf(argAt(args, 0, n));
+                std::string line;
+                size_t total = 0;
+                while (!g_testMode && readLine(line))
+                {
+                    dest += line;
+                    total += line.size();
+                }
+                out = mkOk(mkUint(total, PR_USIZE));
+                return true;
+            }
+        }
+        if (t == "Stdout" || t == "Stderr")
+        {
+            if (m == "flush")
+            {
+                flushOut();
+                out = mkOk(V());
+                return true;
+            }
+            if (m == "lock")
+            {
+                out = sv;
+                return true;
+            }
+            if (m == "write_all" || m == "write" || m == "write_str")
+            {
+                V data = peelAll(argAt(args, 0, n));
+                std::string text;
+                Obj *so = nullptr;
+                int64_t start = 0, len = 0;
+                if (data.k == V_STR)
+                    text = static_cast<StrObj *>(data.p)->s;
+                else if (seqOf(data, so, start, len))
+                    for (int64_t k = 0; k < len; ++k)
+                        text += (char)so->items[(size_t)(start + k)].lo;
+                if (t == "Stderr")
+                    writeErr(text);
+                else
+                    writeOut(text);
+                out = m == "write" ? mkOk(mkUint(text.size(), PR_USIZE)) : mkOk(V());
+                return true;
+            }
+        }
+        if (t == "Instant")
+        {
+            if (m == "elapsed" || m == "duration_since")
+            {
+                int64_t from = o->a;
+                int64_t to = m == "elapsed" ? nowNanos() : from;
+                if (m == "duration_since")
+                {
+                    V other = peelAll(argAt(args, 0, n));
+                    from = static_cast<NativeObj *>(other.p)->a;
+                }
+                int64_t d = to > from ? to - from : 0;
+                out = durationV(d / 1000000000, d % 1000000000);
+                return true;
+            }
+        }
+        if (t == "Duration")
+        {
+            int64_t secs = o->a, nanos = o->b;
+            if (m == "as_secs") { out = mkUint((uint64_t)secs, PR_U64); return true; }
+            if (m == "as_millis") { out = mkUint((uint64_t)(secs * 1000 + nanos / 1000000), PR_U128); return true; }
+            if (m == "as_micros") { out = mkUint((uint64_t)(secs * 1000000 + nanos / 1000), PR_U128); return true; }
+            if (m == "as_nanos") { out = mkUint((uint64_t)(secs * 1000000000 + nanos), PR_U128); return true; }
+            if (m == "as_secs_f64") { out = mkFloat((double)secs + (double)nanos / 1e9, PR_F64); return true; }
+            if (m == "as_secs_f32") { out = mkFloat((double)secs + (double)nanos / 1e9, PR_F32); return true; }
+            if (m == "subsec_millis") { out = mkUint((uint64_t)(nanos / 1000000), PR_U32); return true; }
+            if (m == "subsec_micros") { out = mkUint((uint64_t)(nanos / 1000), PR_U32); return true; }
+            if (m == "subsec_nanos") { out = mkUint((uint64_t)nanos, PR_U32); return true; }
+            if (m == "is_zero") { out = mkBool(secs == 0 && nanos == 0); return true; }
+            if (m == "add" || m == "sub" || m == "checked_add" || m == "checked_sub" || m == "saturating_sub")
+            {
+                NativeObj *b = static_cast<NativeObj *>(peelAll(argAt(args, 0, n)).p);
+                bool add = m.find("add") != std::string::npos;
+                int64_t total = secs * 1000000000 + nanos, other = b->a * 1000000000 + b->b;
+                int64_t r = add ? total + other : total - other;
+                if (r < 0)
+                {
+                    if (m == "sub")
+                        panicAt(n, "overflow when subtracting durations");
+                    if (m == "checked_sub")
+                    {
+                        out = mkNone();
+                        return true;
+                    }
+                    r = 0;
+                }
+                V d = durationV(r / 1000000000, r % 1000000000);
+                out = m[0] == 'c' ? mkSome(d) : d;
+                return true;
+            }
+            if (m == "mul" || m == "div")
+            {
+                int64_t k = (int64_t)peel(argAt(args, 0, n)).lo;
+                int64_t total = secs * 1000000000 + nanos;
+                total = m == "mul" ? total * k : total / (k ? k : 1);
+                out = durationV(total / 1000000000, total % 1000000000);
+                return true;
+            }
+        }
+        if (t == "Hasher")
+        {
+            if (m == "finish")
+            {
+                out = mkUint((uint64_t)o->a, PR_U64);
+                return true;
+            }
+            if (m.compare(0, 6, "write_") == 0 || m == "write")
+            {
+                o->a = (int64_t)((uint64_t)o->a * 1099511628211ULL ^ valueHash(argAt(args, 0, n), n));
+                out = V();
+                return true;
+            }
+        }
+        if (m == "kind" && (t == "ParseIntError" || t == "IoError"))
+        {
+            out = mkStr(o->s, false);
+            return true;
+        }
+        if (m == "source" || m == "cause")
+        {
+            out = mkNone();
+            return true;
+        }
+        if (m == "description")
+        {
+            out = mkStr(displayStr(sv, n), false);
+            return true;
+        }
+        break;
+    }
+    case V_ITER:
+        if (m == "to_string" && static_cast<IterObj *>(sv.p)->mode == 9)
+        {
+            std::string s;
+            IterObj *it = static_cast<IterObj *>(sv.p);
+            for (int64_t k = it->i; k < it->end; ++k)
+                utf8Append(s, (uint32_t)it->items[(size_t)k].lo);
+            out = mkStr(s, true);
+            return true;
+        }
+        break;
+    case V_ENUM:
+    {
+        EnumObj *e = static_cast<EnumObj *>(sv.p);
+        if (e->def != G.orderingDef)
+            break;
+        int c = e->variant - 1;
+        if (m == "then")
+        {
+            out = c != 0 ? sv : argAt(args, 0, n);
+            return true;
+        }
+        if (m == "then_with")
+        {
+            out = c != 0 ? sv : call0(argAt(args, 0, n), n);
+            return true;
+        }
+        if (m == "reverse")
+        {
+            out = mkOrdering(-c);
+            return true;
+        }
+        if (m == "is_eq" || m == "is_ne" || m == "is_lt" || m == "is_gt" || m == "is_le" || m == "is_ge")
+        {
+            bool r = m == "is_eq" ? c == 0 : m == "is_ne" ? c != 0 : m == "is_lt" ? c < 0 : m == "is_gt" ? c > 0
+                     : m == "is_le" ? c <= 0 : c >= 0;
+            out = mkBool(r);
+            return true;
+        }
+        break;
+    }
+    case V_CLOSURE:
+    case V_FN:
+        if (m == "call" || m == "call_mut" || m == "call_once")
+        {
+            V packed = peel(argAt(args, 0, n));
+            std::vector<V> unpacked;
+            if (packed.k == V_TUPLE)
+                unpacked = packed.p->items;
+            out = callValue(sv, unpacked, n);
+            return true;
+        }
+        break;
+    }
+    (void)sp;
+    return false;
+}
+
+// ─── methods of every value ────────────────────────────────────────────────
+
+bool commonMethod(Place sp, V sv, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    switch (m[0])
+    {
+    case 'a':
+        if (m == "as_ref" || m == "as_mut")
+        {
+            out = mkRef(sp.o, sp.i, m == "as_mut");
+            return true;
+        }
+        break;
+    case 'c':
+        if (m == "clone")
+        {
+            out = cloneValue(sv, n);
+            return true;
+        }
+        if (m == "cmp")
+        {
+            V a = sv, b = peelAll(argAt(args, 0, n));
+            if ((a.k == V_INT && b.k == V_INT) || (a.k == V_FLOAT && b.k == V_FLOAT))
+                unifyNum(a, b, n, "cmp");
+            int c = valueCmp(a, b, n);
+            if (c == 2)
+                errAt(n, "E0599", "the method `cmp` exists for `" + typeName(sv) + "`, but floats have no total order",
+                      "use `partial_cmp` or `total_cmp`");
+            out = mkOrdering(c);
+            return true;
+        }
+        if (m == "clamp")
+        {
+            V lo = argAt(args, 0, n), hi = argAt(args, 1, n);
+            out = valueCmp(sv, lo, n) < 0 ? lo : valueCmp(sv, hi, n) > 0 ? hi : sv;
+            return true;
+        }
+        break;
+    case 'e':
+        if (m == "eq")
+        {
+            out = mkBool(valueEq(sv, argAt(args, 0, n), n));
+            return true;
+        }
+        break;
+    case 'f':
+        if (m == "fmt")
+        {
+            // to the formatter given, the way it was asked for
+            V f = peelAll(argAt(args, 0, n));
+            if (f.k != V_NATIVE || !static_cast<NativeObj *>(f.p)->buf)
+                errAt(n, "E0308", "mismatched types: expected `&mut Formatter`, found `" + typeName(f) + "`");
+            NativeObj *fo = static_cast<NativeObj *>(f.p);
+            fmtValue(*fo->buf, sv, *fo->spec, fo->width, fo->prec, n);
+            out = mkOk(V());
+            return true;
+        }
+        break;
+    case 'g':
+    case 'l':
+        if (m == "lt" || m == "le" || m == "gt" || m == "ge")
+        {
+            int c = valueCmp(sv, argAt(args, 0, n), n);
+            out = mkBool(c == 2 ? false : m == "lt" ? c < 0 : m == "le" ? c <= 0 : m == "gt" ? c > 0 : c >= 0);
+            return true;
+        }
+        break;
+    case 'h':
+        if (m == "hash")
+        {
+            V h = peelAll(argAt(args, 0, n));
+            if (h.k == V_NATIVE)
+            {
+                NativeObj *ho = static_cast<NativeObj *>(h.p);
+                ho->a = (int64_t)((uint64_t)ho->a * 1099511628211ULL ^ valueHash(sv, n));
+            }
+            out = V();
+            return true;
+        }
+        break;
+    case 'i':
+        if (m == "into")
+        {
+            V v = isCopy(sv) ? copyShell(sv) : sv;
+            takeSelf(sp, sv);
+            out = hint ? convertInto(v, hint, n, false) : v;
+            return true;
+        }
+        break;
+    case 'm':
+        if (m == "max" || m == "min")
+        {
+            V other = argAt(args, 0, n);
+            int c = valueCmp(sv, other, n);
+            out = m == "max" ? (c > 0 ? sv : other) : (c <= 0 ? sv : other);
+            return true;
+        }
+        break;
+    case 'n':
+        if (m == "ne")
+        {
+            out = mkBool(!valueEq(sv, argAt(args, 0, n), n));
+            return true;
+        }
+        break;
+    case 'p':
+        if (m == "partial_cmp")
+        {
+            V a = sv, b = peelAll(argAt(args, 0, n));
+            if ((a.k == V_INT && b.k == V_INT) || (a.k == V_FLOAT && b.k == V_FLOAT))
+                unifyNum(a, b, n, "partial_cmp");
+            int c = valueCmp(a, b, n);
+            out = c == 2 ? mkNone() : mkSome(mkOrdering(c));
+            return true;
+        }
+        break;
+    case 't':
+        if (m == "to_string")
+        {
+            out = mkStr(displayStr(sv, n), true);
+            return true;
+        }
+        if (m == "to_owned")
+        {
+            out = cloneValue(sv, n);
+            return true;
+        }
+        if (m == "try_into")
+        {
+            Ty *h = tyResolve(hint);
+            Ty *target = h && tyHead(h) == "Result" ? tyArg(h, 0) : nullptr;
+            if (!target)
+                errAt(n, "E0282", "type annotations needed", "cannot infer what `try_into` converts to: annotate the "
+                                                               "variable, e.g. `let x: u8 = v.try_into().unwrap();`");
+            out = convertInto(sv, target, n, true);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+// ─── library functions ─────────────────────────────────────────────────────
+
+bool knownBuiltinFn(const std::string &name)
+{
+    static const char *const names[] = {
+        "drop", "mem::swap", "mem::replace", "mem::take", "mem::drop", "mem::size_of", "mem::size_of_val",
+        "cmp::max", "cmp::min", "cmp::Reverse", "iter::repeat", "iter::once", "iter::empty", "iter::from_fn",
+        "iter::successors", "iter::zip", "iter::repeat_n", "process::exit", "env::args", "env::var",
+        "env::temp_dir", "thread::spawn", "thread::sleep", "io::stdin", "io::stdout", "io::stderr",
+        "mpsc::channel", "any::type_name", "convert::identity", "hint::black_box", "ptr::eq", "array::from_fn",
+        "fs::read_to_string", "fs::write", "fs::remove_file", "str::from_utf8", "char::from_u32",
+        "char::from_digit", "char::from", "marker::PhantomData", "fmt::Error", "panic::catch_unwind"};
+    for (const char *k : names)
+        if (name == k)
+            return true;
+    return name.compare(0, 4, "fs::") == 0 || name == "thread::current" || name == "thread::yield_now" ||
+           name == "thread::park" || name == "thread::available_parallelism" || taskKnown(name) || serdeKnown(name);
+}
+
+bool builtinConst(const std::string &name, V &out)
+{
+    if (fsConst(name, out))
+        return true;
+    if (name == "Shutdown::Both" || name == "Shutdown::Read" || name == "Shutdown::Write")
+    {
+        out = mkNative("Shutdown", name.substr(10));
+        return true;
+    }
+    if (name == "time::UNIX_EPOCH" || name == "SystemTime::UNIX_EPOCH" || name == "UNIX_EPOCH")
+    {
+        out = mkNative("SystemTime", "");
+        return true;
+    }
+    // std::sync::atomic::Ordering: everything here is sequentially consistent
+    if (name == "Ordering::SeqCst" || name == "Ordering::Relaxed" || name == "Ordering::Acquire" ||
+        name == "Ordering::Release" || name == "Ordering::AcqRel")
+    {
+        out = mkNative("AtomicOrdering", name.substr(10));
+        return true;
+    }
+    size_t sep = name.rfind("::");
+    if (sep == std::string::npos)
+    {
+        if (name == "PhantomData")
+        {
+            out = V();
+            return true;
+        }
+        return false;
+    }
+    std::string head = name.substr(0, sep), tail = name.substr(sep + 2);
+    if (head.size() > 8 && head.compare(head.size() - 8, 8, "::consts") == 0)
+    {
+        uint8_t prim = head[1] == '3' ? PR_F32 : PR_F64;
+        const double pi = 3.14159265358979323846, e = 2.71828182845904523536;
+        double v = 0;
+        if (tail == "PI") v = pi;
+        else if (tail == "E") v = e;
+        else if (tail == "TAU") v = 2 * pi;
+        else if (tail == "SQRT_2") v = 1.41421356237309504880;
+        else if (tail == "LN_2") v = 0.693147180559945309417;
+        else if (tail == "LN_10") v = 2.30258509299404568402;
+        else if (tail == "LOG2_E") v = 1.44269504088896340736;
+        else if (tail == "LOG10_E") v = 0.434294481903251827651;
+        else if (tail == "FRAC_PI_2") v = pi / 2;
+        else if (tail == "FRAC_PI_3") v = pi / 3;
+        else if (tail == "FRAC_PI_4") v = pi / 4;
+        else if (tail == "FRAC_PI_6") v = pi / 6;
+        else if (tail == "FRAC_PI_8") v = pi / 8;
+        else if (tail == "FRAC_1_PI") v = 1 / pi;
+        else if (tail == "FRAC_2_PI") v = 2 / pi;
+        else if (tail == "FRAC_1_SQRT_2") v = 0.707106781186547524401;
+        else
+            return false;
+        out = mkFloat(v, prim);
+        return true;
+    }
+    uint8_t prim = primOf(head);
+    if (isIntPrim(prim))
+    {
+        if (tail == "MAX" || tail == "MIN")
+        {
+            out = intLimit(prim, tail == "MAX");
+            return true;
+        }
+        if (tail == "BITS")
+        {
+            out = mkUint((uint64_t)primBits(prim), PR_U32);
+            return true;
+        }
+        return false;
+    }
+    if (isFloatPrim(prim))
+    {
+        bool f32 = prim == PR_F32;
+        if (tail == "MAX") out = mkFloat(f32 ? 3.40282346638528859812e38 : 1.7976931348623157e308, prim);
+        else if (tail == "MIN") out = mkFloat(f32 ? -3.40282346638528859812e38 : -1.7976931348623157e308, prim);
+        else if (tail == "EPSILON") out = mkFloat(f32 ? 1.1920928955078125e-7 : 2.220446049250313e-16, prim);
+        else if (tail == "MIN_POSITIVE") out = mkFloat(f32 ? 1.17549435082228750797e-38 : 2.2250738585072014e-308, prim);
+        else if (tail == "INFINITY") out = mkFloat(HUGE_VAL, prim);
+        else if (tail == "NEG_INFINITY") out = mkFloat(-HUGE_VAL, prim);
+        else if (tail == "NAN") out = mkFloat(nanValue(), prim);
+        else
+            return false;
+        return true;
+    }
+    if (prim == PR_CHAR && tail == "MAX")
+    {
+        out = mkChar(0x10FFFF);
+        return true;
+    }
+    if (name == "Duration::ZERO")
+    {
+        out = durationV(0, 0);
+        return true;
+    }
+    if (name == "marker::PhantomData")
+    {
+        out = V();
+        return true;
+    }
+    if (name == "fmt::Error")
+    {
+        out = mkNative("Error", "an error occurred when formatting");
+        return true;
+    }
+    return false;
+}
+
+bool builtinCall(const std::string &name, std::vector<V> &args, const Node *n, Ty *hint,
+                 const std::vector<Ty *> *targs, V &out)
+{
+    size_t sep = name.rfind("::");
+    std::string head = sep == std::string::npos ? std::string() : name.substr(0, sep);
+    std::string tail = sep == std::string::npos ? name : name.substr(sep + 2);
+    auto need = [&](size_t count)
+    {
+        if (args.size() != count)
+            errAt(n, "E0061", "this function takes " + std::to_string(count) + " argument" + (count == 1 ? "" : "s") +
+                                  " but " + std::to_string(args.size()) + " argument" + (args.size() == 1 ? " was" : "s were") +
+                                  " supplied");
+    };
+    // ── numbers and char ──
+    uint8_t prim = primOf(head);
+    if (prim != PR_NONE && prim != PR_STR)
+    {
+        if (tail == "from")
+        {
+            need(1);
+            out = convertInto(args[0], primTy(prim), n, false);
+            return true;
+        }
+        if (tail == "try_from")
+        {
+            need(1);
+            out = convertInto(args[0], primTy(prim), n, true);
+            return true;
+        }
+        if (tail == "default")
+        {
+            out = defaultFor(primTy(prim), n);
+            return true;
+        }
+        if (tail == "from_str_radix")
+        {
+            need(2);
+            V v;
+            std::string kind;
+            if (parseInt(strOf(args[0]), (int)toIndex(args[1], n), prim, v, kind))
+                out = mkOk(v);
+            else
+                out = mkErr(mkNative("ParseIntError", "ParseIntError { kind: " + kind + " }"));
+            return true;
+        }
+        if (tail == "from_str")
+        {
+            need(1);
+            std::vector<V> none;
+            Node call;
+            call.k = N_MCALL;
+            call.s = "parse";
+            call.line = n->line;
+            call.col = n->col;
+            call.tys.push_back(primTy(prim));
+            Place pl;
+            pl.o = newCell(peelAll(args[0]));
+            return strMethod(pl, peelAll(args[0]), &call, none, nullptr, out);
+        }
+        if (tail == "from_be_bytes" || tail == "from_le_bytes" || tail == "from_ne_bytes")
+        {
+            need(1);
+            Obj *o = nullptr;
+            int64_t start = 0, len = 0;
+            if (!seqOf(args[0], o, start, len))
+                errAt(n, "E0308", "mismatched types: expected an array of bytes");
+            V v = mkInt(0, PR_U128);
+            for (int64_t k = 0; k < len; ++k)
+            {
+                int64_t idx = tail == "from_be_bytes" ? k : len - 1 - k;
+                v = intBinary(O_BITOR, intBinary(O_SHL, v, mkUint(8, PR_U32), n),
+                              mkUint(o->items[(size_t)(start + idx)].lo & 0xFF, PR_U128), n);
+            }
+            out = intConvert(v, prim);
+            return true;
+        }
+        if (prim == PR_CHAR)
+        {
+            if (tail == "from_u32")
+            {
+                need(1);
+                uint64_t c = peel(args[0]).lo;
+                out = c <= 0x10FFFF && !(c >= 0xD800 && c <= 0xDFFF) ? mkSome(mkChar((uint32_t)c)) : mkNone();
+                return true;
+            }
+            if (tail == "from_digit")
+            {
+                need(2);
+                uint64_t d = peel(args[0]).lo, radix = peel(args[1]).lo;
+                if (radix > 36)
+                    panicAt(n, "from_digit: invalid radix -- radix must be in the range 2 to 36 inclusive");
+                out = d < radix ? mkSome(mkChar((uint32_t)(d < 10 ? '0' + d : 'a' + d - 10))) : mkNone();
+                return true;
+            }
+        }
+        if (isFloatPrim(prim) && tail == "from_bits")
+        {
+            need(1);
+            V bits = peel(args[0]);
+            if (prim == PR_F32)
+            {
+                uint32_t b32 = (uint32_t)bits.lo;
+                float f;
+                memcpy(&f, &b32, 4);
+                out = mkFloat((double)f, prim);
+            }
+            else
+            {
+                out = mkFloat(0, prim);
+                out.lo = bits.lo;
+            }
+            return true;
+        }
+        // a method called as a function: i32::pow(2, 10): the receiver has the type named
+        if (!args.empty())
+        {
+            V &first = args[0];
+            if (first.k == V_INT && first.t == 0 && isIntPrim(prim) && intFits(first, prim))
+                first = intConvert(first, prim);
+            else if (first.k == V_FLOAT && first.t == 0 && isFloatPrim(prim))
+                first = mkFloat(fval(first), prim);
+            else if (first.k == V_INT && first.t == 0 && isFloatPrim(prim))
+                first = mkFloat((double)(int64_t)first.lo, prim);
+        }
+        return false;
+    }
+    if (name == "Reverse" || name == "cmp::Reverse")
+    {
+        need(1);
+        out = mkStruct(G.reverseDef, args);
+        return true;
+    }
+    if (fsCall(name, args, n, hint, out))
+        return true;
+    if (taskCall(name, args, n, hint, targs, out))
+        return true;
+    if (serdeCall(name, args, n, hint, targs, out))
+        return true;
+    if (netCall(name, args, n, out))
+        return true;
+    if (name == "OnceLock::new" || name == "OnceCell::new")
+    {
+        out = mkCell(mkNone(), 4);
+        return true;
+    }
+    if (name == "thread::current")
+    {
+        out = threadV();
+        return true;
+    }
+    if (name == "thread::available_parallelism")
+    {
+        out = mkOk(mkUint(4, PR_USIZE));
+        return true;
+    }
+    if (name == "Builder::new")
+    {
+        out = mkNative("ThreadBuilder", "");
+        return true;
+    }
+    switch (head.empty() ? tail[0] : head[0])
+    {
+    case 'S':
+        if (head == "String")
+        {
+            if (tail == "new" || tail == "default" || tail == "with_capacity")
+            {
+                out = mkStr("", true);
+                return true;
+            }
+            if (tail == "from" || tail == "from_str")
+            {
+                need(1);
+                V x = peelAll(args[0]);
+                if (x.k == V_CHAR)
+                    out = mkStr(charString((uint32_t)x.lo), true);
+                else
+                    out = mkStr(strOf(x), true);
+                if (tail == "from_str")
+                    out = mkOk(out);
+                return true;
+            }
+            if (tail == "from_utf8" || tail == "from_utf8_lossy")
+            {
+                need(1);
+                Obj *o = nullptr;
+                int64_t start = 0, len = 0;
+                if (!seqOf(args[0], o, start, len))
+                    errAt(n, "E0308", "mismatched types: expected bytes, found `" + typeName(args[0]) + "`");
+                std::string s;
+                for (int64_t k = 0; k < len; ++k)
+                    s += (char)o->items[(size_t)(start + k)].lo;
+                out = tail == "from_utf8" ? mkOk(mkStr(s, true)) : mkStr(s, true);
+                return true;
+            }
+            if (tail == "from_iter")
+            {
+                need(1);
+                V it = toIter(args[0], n);
+                std::vector<V> items;
+                iterDrain(static_cast<IterObj *>(it.p), items, n);
+                out = collectInto(items, tyOfValue(mkStr("", true)), n);
+                return true;
+            }
+        }
+        break;
+    case 'V':
+        if (head == "Vec" || head == "VecDeque")
+        {
+            uint8_t kind = head == "Vec" ? V_VEC : V_DEQUE;
+            if (tail == "new" || tail == "default" || tail == "with_capacity")
+            {
+                out = mkSeq(kind, std::vector<V>());
+                return true;
+            }
+            if (tail == "from" || tail == "from_iter")
+            {
+                need(1);
+                out = seqFrom(kind, args[0], n);
+                return true;
+            }
+        }
+        break;
+    case 'B':
+        if (head == "BinaryHeap")
+        {
+            if (tail == "new" || tail == "default" || tail == "with_capacity")
+            {
+                out = mkSeq(V_HEAP, std::vector<V>());
+                return true;
+            }
+            if (tail == "from" || tail == "from_iter")
+            {
+                need(1);
+                out = seqFrom(V_HEAP, args[0], n);
+                return true;
+            }
+        }
+        if (head == "BTreeMap" || head == "BTreeSet")
+        {
+            if (tail == "new" || tail == "default" || tail == "from" || tail == "from_iter")
+            {
+                out = mapFrom(true, head == "BTreeSet", args, hint, n);
+                return true;
+            }
+        }
+        if (head == "Box")
+        {
+            if (tail == "new" || tail == "from")
+            {
+                need(1);
+                V x = args[0];
+                // Box<dyn Error> from text
+                if (tail == "from" && peel(x).k == V_STR)
+                    out = mkBox(mkNative("Error", strOf(x)));
+                else
+                    out = mkBox(x);
+                return true;
+            }
+            if (tail == "default")
+            {
+                out = mkBox(defaultFor(tyArg(hint, 0), n));
+                return true;
+            }
+        }
+        break;
+    case 'H':
+        if (head == "HashMap" || head == "HashSet")
+        {
+            if (tail == "new" || tail == "default" || tail == "with_capacity" || tail == "from" || tail == "from_iter")
+            {
+                std::vector<V> src;
+                if (tail == "from" || tail == "from_iter")
+                    src = args;
+                out = mapFrom(false, head == "HashSet", src, hint, n);
+                return true;
+            }
+        }
+        break;
+    case 'R':
+    case 'A':
+        if (head == "Rc" || head == "Arc")
+        {
+            if (tail == "new" || tail == "from")
+            {
+                need(1);
+                out = mkRc(args[0]);
+                return true;
+            }
+            if (tail == "default")
+            {
+                out = mkRc(defaultFor(tyArg(hint, 0), n));
+                return true;
+            }
+            V x = args.empty() ? V() : peel(args[0]);
+            if (x.k == V_BOX || (x.k == V_REF))
+                x = peelAll(args[0]);
+            if (tail == "clone")
+            {
+                need(1);
+                V rc = peel(args[0]);
+                if (rc.k != V_RC)
+                    errAt(n, "E0308", "mismatched types: expected `&Rc<_>`, found `" + typeName(args[0]) + "`");
+                out = cloneValue(rc, n);
+                return true;
+            }
+            V rc = args.empty() ? V() : peel(args[0]);
+            if (rc.k == V_RC)
+            {
+                RcObj *r = static_cast<RcObj *>(rc.p);
+                if (tail == "strong_count")
+                {
+                    out = mkUint((uint64_t)r->strong, PR_USIZE);
+                    return true;
+                }
+                if (tail == "weak_count")
+                {
+                    out = mkUint((uint64_t)r->weak, PR_USIZE);
+                    return true;
+                }
+                if (tail == "downgrade")
+                {
+                    ++r->weak;
+                    out = rc;
+                    out.k = V_WEAK;
+                    return true;
+                }
+                if (tail == "ptr_eq")
+                {
+                    need(2);
+                    out = mkBool(peel(args[1]).p == rc.p);
+                    return true;
+                }
+                if (tail == "try_unwrap" || tail == "into_inner")
+                {
+                    if (r->strong == 1)
+                    {
+                        r->strong = 0;
+                        out = tail == "try_unwrap" ? mkOk(r->items[0]) : mkSome(r->items[0]);
+                    }
+                    else
+                        out = tail == "try_unwrap" ? mkErr(rc) : mkNone();
+                    return true;
+                }
+                if (tail == "get_mut")
+                {
+                    out = r->strong == 1 ? mkSome(mkRef(r, 0, true)) : mkNone();
+                    return true;
+                }
+                if (tail == "make_mut")
+                {
+                    if (r->strong > 1)
+                    {
+                        // shared: this one gets its own copy
+                        --r->strong;
+                        V fresh = mkRc(cloneValue(r->items[0], n));
+                        if (args[0].k == V_REF)
+                            slotAt(args[0].p, args[0].hi) = fresh;
+                        r = static_cast<RcObj *>(fresh.p);
+                    }
+                    out = mkRef(r, 0, true);
+                    return true;
+                }
+                if (tail == "as_ref")
+                {
+                    out = mkRef(r, 0, false);
+                    return true;
+                }
+            }
+        }
+        if (head == "RefCell" && tail == "new")
+        {
+            need(1);
+            out = mkCell(args[0], 0);
+            return true;
+        }
+        if (head == "RwLock" && tail == "new")
+        {
+            need(1);
+            out = mkCell(args[0], 3);
+            return true;
+        }
+        if (name == "Reverse" || name == "cmp::Reverse")
+        {
+            need(1);
+            out = mkStruct(G.reverseDef, args);
+            return true;
+        }
+        break;
+    case 'C':
+        if (head == "Cell" && tail == "new")
+        {
+            need(1);
+            out = mkCell(args[0], 1);
+            return true;
+        }
+        if (name == "Clone::clone" && args.size() == 1)
+        {
+            out = cloneValue(peel(args[0]), n);
+            return true;
+        }
+        break;
+    case 'M':
+        if (head == "Mutex" && tail == "new")
+        {
+            need(1);
+            out = mkCell(args[0], 2);
+            return true;
+        }
+        break;
+    case 'W':
+        if (name == "Weak::new")
+        {
+            RcObj *r = new RcObj();
+            r->strong = 0;
+            r->items.push_back(V());
+            out.k = V_WEAK;
+            out.p = r;
+            return true;
+        }
+        break;
+    case 'D':
+        if (name == "Default::default")
+        {
+            out = defaultFor(hint, n);
+            return true;
+        }
+        if (head == "Duration")
+        {
+            if (tail == "new")
+            {
+                need(2);
+                out = durationV((int64_t)peel(args[0]).lo, (int64_t)peel(args[1]).lo);
+                return true;
+            }
+            if (tail == "from_secs_f64" || tail == "from_secs_f32")
+            {
+                need(1);
+                double s = fval(peel(args[0]));
+                out = durationV((int64_t)s, (int64_t)((s - std::floor(s)) * 1e9));
+                return true;
+            }
+            need(1);
+            int64_t v = (int64_t)peel(args[0]).lo;
+            if (tail == "from_secs") out = durationV(v, 0);
+            else if (tail == "from_millis") out = durationV(v / 1000, (v % 1000) * 1000000);
+            else if (tail == "from_micros") out = durationV(v / 1000000, (v % 1000000) * 1000);
+            else if (tail == "from_nanos") out = durationV(v / 1000000000, v % 1000000000);
+            else
+                return false;
+            return true;
+        }
+        if (name == "DefaultHasher::new" || name == "DefaultHasher::default")
+        {
+            out = mkNative("Hasher", "");
+            static_cast<NativeObj *>(out.p)->a = (int64_t)1469598103934665603ULL;
+            return true;
+        }
+        break;
+    case 'F':
+        if (name == "From::from")
+        {
+            need(1);
+            out = convertInto(args[0], hint, n, false);
+            return true;
+        }
+        if (name == "FromStr::from_str" || name == "FromIterator::from_iter")
+        {
+            need(1);
+            if (tail == "from_str")
+            {
+                std::vector<V> none;
+                out = callMethodOn(args[0], "parse", none, n, hint);
+            }
+            else
+            {
+                V it = toIter(args[0], n);
+                std::vector<V> items;
+                iterDrain(static_cast<IterObj *>(it.p), items, n);
+                out = collectInto(items, hint, n);
+            }
+            return true;
+        }
+        break;
+    case 'I':
+        if (name == "Into::into")
+        {
+            need(1);
+            out = convertInto(args[0], hint, n, false);
+            return true;
+        }
+        if (name == "Instant::now")
+        {
+            out = mkNative("Instant", "");
+            static_cast<NativeObj *>(out.p)->a = nowNanos();
+            return true;
+        }
+        break;
+    case 'T':
+        if (name == "TryFrom::try_from")
+        {
+            need(1);
+            Ty *h = tyResolve(hint);
+            out = convertInto(args[0], h && tyHead(h) == "Result" ? tyArg(h, 0) : h, n, true);
+            return true;
+        }
+        break;
+    case 'a':
+        if (name == "any::type_name")
+        {
+            out = mkStr(targs && !targs->empty() ? tyText(tyResolve((*targs)[0])) : "_", false);
+            return true;
+        }
+        if (name == "array::from_fn")
+        {
+            need(1);
+            Ty *h = tyResolve(hint);
+            if (!h || h->k != TY_ARRAY || !h->len)
+                errAt(n, "E0282", "type annotations needed", "the array's length is not known: annotate it, e.g. `let a: [i32; 4] = ...`");
+            int64_t len = toIndex(eval(h->len, nullptr), n);
+            std::vector<V> items;
+            for (int64_t k = 0; k < len; ++k)
+                items.push_back(call1(args[0], mkUint((uint64_t)k, PR_USIZE), n));
+            out = mkSeq(V_ARRAY, items);
+            return true;
+        }
+        break;
+    case 'c':
+        if (name == "cmp::max" || name == "cmp::min")
+        {
+            need(2);
+            V a = args[0], b = args[1];
+            V x = peel(a), y = peel(b);
+            if ((x.k == V_INT && y.k == V_INT) || (x.k == V_FLOAT && y.k == V_FLOAT))
+            {
+                unifyNum(x, y, n, "max / min");
+                a = x;
+                b = y;
+            }
+            int c = valueCmp(a, b, n);
+            out = tail == "max" ? (c > 0 ? a : b) : (c <= 0 ? a : b);
+            return true;
+        }
+        if (name == "convert::identity")
+        {
+            need(1);
+            out = args[0];
+            return true;
+        }
+        break;
+    case 'd':
+        if (name == "drop")
+        {
+            need(1);
+            dropValue(args[0], n);
+            out = V();
+            return true;
+        }
+        break;
+    case 'e':
+        if (name == "env::args")
+        {
+            IterObj *it = newIter(IT_VALUES);
+            for (const std::string &a : G.args)
+                it->items.push_back(mkStr(a, true));
+            it->end = (int64_t)it->items.size();
+            out = iterV(it);
+            return true;
+        }
+        if (name == "env::var")
+        {
+            need(1);
+            const char *v = std::getenv(strOf(args[0]).c_str());
+            out = v ? mkOk(mkStr(v, true)) : mkErr(mkNative("VarError", "NotPresent"));
+            return true;
+        }
+        if (name == "env::temp_dir")
+        {
+            const char *t = std::getenv("TEMP");
+            out = mkStr(t && *t ? t : ".", true);
+            return true;
+        }
+        break;
+    case 'f':
+        if (name == "fs::read_to_string")
+        {
+            need(1);
+            std::ifstream in(strOf(args[0]), std::ios::binary);
+            if (!in)
+            {
+                out = mkErr(mkNative("IoError", "No such file or directory (os error 2)"));
+                return true;
+            }
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            out = mkOk(mkStr(ss.str(), true));
+            return true;
+        }
+        if (name == "fs::write")
+        {
+            need(2);
+            std::ofstream f(strOf(args[0]), std::ios::binary | std::ios::trunc);
+            if (!f)
+            {
+                out = mkErr(mkNative("IoError", "The system cannot find the path specified. (os error 3)"));
+                return true;
+            }
+            V data = peelAll(args[1]);
+            if (data.k == V_STR)
+                f << static_cast<StrObj *>(data.p)->s;
+            else
+            {
+                Obj *o = nullptr;
+                int64_t start = 0, len = 0;
+                if (seqOf(data, o, start, len))
+                    for (int64_t k = 0; k < len; ++k)
+                        f.put((char)o->items[(size_t)(start + k)].lo);
+            }
+            out = mkOk(V());
+            return true;
+        }
+        if (name == "fs::remove_file")
+        {
+            need(1);
+            out = std::remove(strOf(args[0]).c_str()) == 0 ? mkOk(V())
+                                                            : mkErr(mkNative("IoError", "No such file or directory (os error 2)"));
+            return true;
+        }
+        break;
+    case 'h':
+        if (name == "hint::black_box")
+        {
+            need(1);
+            out = args[0];
+            return true;
+        }
+        break;
+    case 'i':
+        if (name == "io::stdin" || name == "io::stdout" || name == "io::stderr")
+        {
+            out = mkNative(tail == "stdin" ? "Stdin" : tail == "stdout" ? "Stdout" : "Stderr", "");
+            return true;
+        }
+        if (head == "iter")
+        {
+            if (tail == "repeat" || tail == "repeat_n")
+            {
+                IterObj *it = newIter(IT_REPEAT);
+                it->a = argAt(args, 0, n);
+                it->n = tail == "repeat" ? -1 : toIndex(argAt(args, 1, n), n);
+                out = iterV(it);
+                return true;
+            }
+            if (tail == "once" || tail == "empty")
+            {
+                IterObj *it = newIter(IT_VALUES);
+                if (tail == "once")
+                    it->items.push_back(argAt(args, 0, n));
+                it->end = (int64_t)it->items.size();
+                out = iterV(it);
+                return true;
+            }
+            if (tail == "from_fn")
+            {
+                IterObj *it = newIter(IT_FROM_FN);
+                it->f = argAt(args, 0, n);
+                out = iterV(it);
+                return true;
+            }
+            if (tail == "successors")
+            {
+                need(2);
+                IterObj *it = newIter(IT_SUCCESSORS);
+                V first = peel(args[0]);
+                it->flag = isSomeV(first);
+                if (it->flag)
+                    it->a = first.p->items[0];
+                it->f = args[1];
+                out = iterV(it);
+                return true;
+            }
+            if (tail == "zip")
+            {
+                need(2);
+                IterObj *it = newIter(IT_ZIP);
+                it->src = static_cast<IterObj *>(toIter(args[0], n).p);
+                it->src2 = static_cast<IterObj *>(toIter(args[1], n).p);
+                out = iterV(it);
+                return true;
+            }
+        }
+        break;
+    case 'm':
+        if (name == "mem::swap")
+        {
+            need(2);
+            if (args[0].k != V_REF || args[1].k != V_REF)
+                errAt(n, "E0308", "mismatched types: `mem::swap` takes two `&mut` references");
+            V &a = slotAt(args[0].p, args[0].hi), &b = slotAt(args[1].p, args[1].hi);
+            V t = a;
+            a = b;
+            b = t;
+            out = V();
+            return true;
+        }
+        if (name == "mem::replace" || name == "mem::take")
+        {
+            need(tail == "replace" ? 2 : 1);
+            if (args[0].k != V_REF)
+                errAt(n, "E0308", "mismatched types: expected a `&mut` reference, found `" + typeName(args[0]) + "`");
+            V &dest = slotAt(args[0].p, args[0].hi);
+            out = dest;
+            dest = tail == "replace" ? args[1] : emptyLike(dest, n);
+            return true;
+        }
+        if (name == "mem::drop")
+        {
+            need(1);
+            dropValue(args[0], n);
+            out = V();
+            return true;
+        }
+        if (name == "mem::size_of" || name == "mem::size_of_val")
+        {
+            uint8_t p = PR_NONE;
+            Ty *t = targs && !targs->empty() ? tyResolve((*targs)[0]) : nullptr;
+            if (t)
+                p = tyPrim(t);
+            else if (!args.empty())
+            {
+                V v = peel(args[0]);
+                p = v.k == V_INT ? (v.t ? v.t : (uint8_t)PR_I32) : v.k == V_FLOAT ? (v.t ? v.t : (uint8_t)PR_F64)
+                    : v.k == V_BOOL ? (uint8_t)PR_BOOL : v.k == V_CHAR ? (uint8_t)PR_CHAR : (uint8_t)PR_NONE;
+            }
+            uint64_t size = p == PR_BOOL ? 1 : p == PR_CHAR ? 4 : p == PR_NONE ? 8 : (uint64_t)primBits(p) / 8;
+            if (t && t->k == TY_TUPLE && t->items.empty())
+                size = 0;
+            out = mkUint(size, PR_USIZE);
+            return true;
+        }
+        break;
+    case 'p':
+        if (name == "process::exit")
+        {
+            need(1);
+            ExitEx e;
+            e.code = (int)(int64_t)peel(args[0]).lo;
+            throw e;
+        }
+        if (name == "ptr::eq")
+        {
+            need(2);
+            V a = args[0], b = args[1];
+            out = mkBool(a.k == V_REF && b.k == V_REF ? (a.p == b.p && a.hi == b.hi) : peelAll(a).p == peelAll(b).p);
+            return true;
+        }
+        break;
+    case 's':
+        if (name == "str::from_utf8")
+        {
+            need(1);
+            Obj *o = nullptr;
+            int64_t start = 0, len = 0;
+            if (!seqOf(args[0], o, start, len))
+                errAt(n, "E0308", "mismatched types: expected `&[u8]`, found `" + typeName(args[0]) + "`");
+            std::string s;
+            for (int64_t k = 0; k < len; ++k)
+                s += (char)o->items[(size_t)(start + k)].lo;
+            out = mkOk(mkStr(s, false));
+            return true;
+        }
+        break;
+    case 't':
+        break;
+    }
+    return false;
+}
+
+// ─── running a program ─────────────────────────────────────────────────────
+
+std::string syntaxReport(const std::string &source, const std::string &path)
+{
+    resetRun(path, source);
+    try
+    {
+        std::vector<ModDef *> all;
+        ModDef *root = parseProgram(source, all);
+        resolveProgram(root, all);
+    }
+    catch (CompileErr &e)
+    {
+        return rustcReport(e, path, source);
+    }
+    return "";
+}
+
+int runProgram(const std::string &source, const std::string &path, RunFailure &failure)
+{
+    resetRun(path, source);
+    tasksBegin();
+    int status = 0;
+    try
+    {
+        std::vector<ModDef *> all;
+        ModDef *root = parseProgram(source, all);
+        G.root = root;
+        G.mods = all;
+        resolveProgram(root, all);
+        auto found = root->names.find("main");
+        if ((found == root->names.end() || found->second.k != S_FN) && baseName(path) == "lib.rs")
+        {
+            // a library crate: it compiles; there is nothing to run
+            writeErr("note: `" + path + "` is a library crate (it has no `main`): it compiled, and there is "
+                     "nothing to run\n");
+            tasksEnd();
+            G.fr = nullptr;
+            return 0;
+        }
+        if (found == root->names.end() || found->second.k != S_FN)
+        {
+            CompileErr e;
+            e.code = "E0601";
+            e.message = "`main` function not found in crate `" + baseName(path).substr(0, baseName(path).rfind('.')) + "`";
+            e.label = "consider adding a `main` function to `" + path + "`";
+            throw e;
+        }
+        FnDef *mainFn = found->second.fn;
+        if (mainFn->isAsync && !mainFn->runtimeMain)
+        {
+            CompileErr e;
+            e.code = "E0752";
+            e.message = "`main` function is not allowed to be `async`";
+            e.line = mainFn->line;
+            e.col = mainFn->col;
+            e.width = 4;
+            // the whole signature, `async fn main()`
+            size_t at0 = 0;
+            for (int l = 1; l < mainFn->line && at0 != std::string::npos; ++l)
+            {
+                at0 = source.find('\n', at0);
+                if (at0 != std::string::npos)
+                    ++at0;
+            }
+            if (at0 != std::string::npos)
+            {
+                std::string text = source.substr(at0, source.find('\n', at0) - at0);
+                size_t first = text.find_first_not_of(" \t");
+                size_t close = text.find(')', (size_t)mainFn->col);
+                if (first != std::string::npos && close != std::string::npos && first < (size_t)mainFn->col)
+                {
+                    e.col = (int)first + 1;
+                    e.width = (int)(close - first + 1);
+                }
+            }
+            e.label = "`main` function is not allowed to be `async`";
+            throw e;
+        }
+        Frame top;
+        top.mod = root;
+        G.fr = &top;
+        std::vector<V> none;
+        if (mainFn->isAsync)
+            enterAsync(); // #[tokio::main]: the runtime runs main's future to its end
+        V r = callFn(mainFn, none, nullptr, nullptr, nullptr);
+        if (isErrV(r))
+        {
+            flushOut();
+            writeErr("Error: " + debugStr(peel(r).p->items[0], false, nullptr) + "\n");
+            status = 1;
+        }
+    }
+    catch (CompileErr &e)
+    {
+        flushOut();
+        writeErr(rustcReport(e, path, source));
+        failure.failed = true;
+        failure.kind = e.code.empty() ? "CompileError" : "error[" + e.code + "]";
+        failure.message = e.message;
+        failure.line = e.line;
+        status = 1;
+    }
+    catch (Panic &p)
+    {
+        flushOut();
+        if (!p.msg.empty() && p.msg[0] == '\x01')
+        {
+            std::string who = p.msg.compare(0, 8, "\x01thread:") == 0 ? p.msg.substr(8) : std::string("main");
+            writeErr("\nthread '" + who + "' has overflowed its stack\nfatal runtime error: stack overflow\n");
+            failure.kind = "StackOverflow";
+            failure.message = "stack overflow";
+            status = 134;
+        }
+        else
+        {
+            writeErr("\nthread 'main' panicked at " + srcPos(p.line, p.col) + ":\n" + p.msg +
+                     "\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n");
+            failure.kind = "panic";
+            failure.message = p.msg;
+            status = 101;
+        }
+        failure.failed = true;
+        failure.line = p.line;
+    }
+    catch (ExitEx &e)
+    {
+        status = e.code;
+    }
+    catch (Deadlock &)
+    {
+        flushOut();
+        writeErr("\nfatal: deadlock: every thread is waiting for another one (a channel, a join, a lock), so this "
+                 "program would never finish\n");
+        failure.failed = true;
+        failure.kind = "deadlock";
+        failure.message = "every thread is waiting for another one";
+        status = 101;
+    }
+    tasksEnd();
+    G.fr = nullptr;
+    flushOut();
+    return status;
+}
+
+} // namespace rust

@@ -1,0 +1,2102 @@
+// quantum: cpp
+// Rust front-end: the evaluator. A walk over the tree: expressions,
+// statements, patterns and places. `break`, `continue`, `return` and `?` set
+// G.flow, which every sequence of steps checks before going on; panics and
+// errors are C++ exceptions. Calls, closures, methods and macros are in
+// RustCall.sa.
+#include "RustRt.h.sa"
+
+#include <cstdio>
+
+namespace rust
+{
+
+// ─── errors and output ─────────────────────────────────────────────────────
+
+void panicAt(const Node *at, const std::string &msg)
+{
+    Panic p;
+    p.msg = msg;
+    if (!at)
+        at = G.cur;
+    if (at)
+    {
+        p.line = at->line;
+        p.col = at->col;
+    }
+    throw p;
+}
+
+void errPos(int line, int col, int width, const char *code, const std::string &msg, const std::string &label)
+{
+    CompileErr e;
+    e.code = code ? code : "";
+    e.message = msg;
+    if (line <= 0 && G.cur)
+    {
+        line = G.cur->line;
+        col = G.cur->col;
+    }
+    e.line = line;
+    e.col = col;
+    e.width = width > 0 ? width : 1;
+    e.label = label;
+    throw e;
+}
+
+void errAt(const Node *at, const char *code, const std::string &msg, const std::string &label)
+{
+    errPos(at ? at->line : 0, at ? at->col : 0, 1, code, msg, label);
+}
+
+namespace
+{
+
+std::string *outBuf = nullptr;
+
+bool modWithin(ModDef *from, ModDef *home)
+{
+    while (home && home->isBlock)
+        home = home->parent;
+    for (ModDef *m = from; m; m = m->parent)
+        if (m == home)
+            return true;
+    return false;
+}
+
+} // namespace
+
+void flushOut()
+{
+    if (outBuf && !outBuf->empty())
+    {
+        fwrite(outBuf->data(), 1, outBuf->size(), stdout);
+        outBuf->clear();
+    }
+    fflush(stdout);
+}
+
+void writeOut(const std::string &s)
+{
+    if (!outBuf)
+        outBuf = new std::string();
+    outBuf->append(s);
+    if (outBuf->size() > (1 << 16))
+        flushOut();
+}
+
+void writeErr(const std::string &s)
+{
+    flushOut();
+    fwrite(s.data(), 1, s.size(), stderr);
+    fflush(stderr);
+}
+
+V &argAt(std::vector<V> &args, size_t k, const Node *at)
+{
+    if (k >= args.size())
+        errAt(at, "E0061", "this method takes " + std::to_string(k + 1) + " argument" + (k == 0 ? "" : "s") +
+                               " but " + std::to_string(args.size()) + (args.size() == 1 ? " was" : " were") +
+                               " supplied",
+              "argument missing");
+    return args[k];
+}
+
+// ─── types ─────────────────────────────────────────────────────────────────
+
+Ty *tyResolve(Ty *t)
+{
+    for (int guard = 0; t && guard < 8; ++guard)
+    {
+        if (t->k != TY_PATH || !t->path || t->primKnown || t->def || t->path->qself || t->path->segs.size() != 1)
+            return t;
+        const std::string &name = t->path->segs[0].name;
+        if (!G.fr)
+            return t;
+        if (name == "Self")
+        {
+            if (!G.fr->self)
+                return t;
+            // a type node for the type Self is here
+            static std::unordered_map<TypeDef *, Ty *> *selfTypes = nullptr;
+            if (!selfTypes)
+                selfTypes = new std::unordered_map<TypeDef *, Ty *>();
+            auto it = selfTypes->find(G.fr->self);
+            if (it != selfTypes->end())
+                return it->second;
+            Ty *st = new Ty();
+            st->k = TY_PATH;
+            st->path = new Path();
+            PathSeg seg;
+            seg.name = G.fr->self->name;
+            st->path->segs.push_back(seg);
+            st->defKnown = true;
+            if (G.fr->self->kind == TD_BUILTIN)
+            {
+                st->prim = primOf(seg.name);
+                st->primKnown = st->prim != PR_NONE;
+            }
+            else
+                st->def = G.fr->self;
+            (*selfTypes)[G.fr->self] = st;
+            return st;
+        }
+        Ty *bound = nullptr;
+        for (const GenBind &g : G.fr->gen)
+            if (g.name == name && g.ty && g.ty != t)
+                bound = g.ty;
+        if (!bound)
+            return t;
+        t = bound;
+    }
+    return t;
+}
+
+uint8_t tyPrim(Ty *t)
+{
+    t = tyResolve(t);
+    return t && t->k == TY_PATH ? t->prim : (uint8_t)PR_NONE;
+}
+
+std::string tyHead(Ty *t)
+{
+    t = tyResolve(t);
+    if (!t)
+        return "";
+    switch (t->k)
+    {
+    case TY_REF:
+        return "&";
+    case TY_TUPLE:
+        return "()";
+    case TY_ARRAY:
+        return "[;]";
+    case TY_SLICE:
+        return "[]";
+    case TY_FN:
+        return "fn";
+    case TY_PATH:
+    case TY_DYN:
+    case TY_IMPL:
+        return t->path ? t->path->segs.back().name : "";
+    }
+    return "";
+}
+
+Ty *tyArg(Ty *t, size_t index)
+{
+    t = tyResolve(t);
+    if (!t || !t->path || (t->k != TY_PATH && t->k != TY_DYN && t->k != TY_IMPL))
+        return nullptr;
+    const PathSeg &seg = t->path->segs.back();
+    return index < seg.args.size() ? seg.args[index] : nullptr;
+}
+
+TypeDef *tyDef(Ty *t)
+{
+    t = tyResolve(t);
+    return t && t->k == TY_PATH ? t->def : nullptr;
+}
+
+namespace
+{
+
+Ty *namedTy(const std::string &name)
+{
+    static std::unordered_map<std::string, Ty *> *made = nullptr;
+    if (!made)
+        made = new std::unordered_map<std::string, Ty *>();
+    auto it = made->find(name);
+    if (it != made->end())
+        return it->second;
+    Ty *t = new Ty();
+    t->k = TY_PATH;
+    t->path = new Path();
+    PathSeg seg;
+    seg.name = name;
+    t->path->segs.push_back(seg);
+    t->prim = primOf(name);
+    t->primKnown = t->prim != PR_NONE;
+    t->defKnown = true;
+    (*made)[name] = t;
+    return t;
+}
+
+} // namespace
+
+// the type of a value, as far as it shows
+Ty *tyOfValue(V v)
+{
+    switch (v.k)
+    {
+    case V_BOOL:
+        return namedTy("bool");
+    case V_INT:
+        return namedTy(v.t ? primName(v.t) : "i32");
+    case V_FLOAT:
+        return namedTy(v.t ? primName(v.t) : "f64");
+    case V_CHAR:
+        return namedTy("char");
+    case V_STR:
+        return namedTy(v.x ? "String" : "str");
+    case V_VEC:
+        return namedTy("Vec");
+    case V_BOX:
+        return namedTy("Box");
+    case V_RC:
+        return namedTy("Rc");
+    case V_MAP:
+        return namedTy(static_cast<MapObj *>(v.p)->sorted ? "BTreeMap" : "HashMap");
+    case V_SET:
+        return namedTy(static_cast<MapObj *>(v.p)->sorted ? "BTreeSet" : "HashSet");
+    case V_DEQUE:
+        return namedTy("VecDeque");
+    case V_REF:
+        return tyOfValue(slotAt(v.p, v.hi));
+    case V_STRUCT:
+    case V_ENUM:
+    {
+        TypeDef *def = v.k == V_STRUCT ? static_cast<StructObj *>(v.p)->def : static_cast<EnumObj *>(v.p)->def;
+        static std::unordered_map<TypeDef *, Ty *> *made = nullptr;
+        if (!made)
+            made = new std::unordered_map<TypeDef *, Ty *>();
+        auto it = made->find(def);
+        if (it != made->end())
+            return it->second;
+        Ty *t = new Ty();
+        t->k = TY_PATH;
+        t->path = new Path();
+        PathSeg seg;
+        seg.name = def->name;
+        t->path->segs.push_back(seg);
+        t->defKnown = true;
+        if (def != G.optionDef && def != G.resultDef && def != G.orderingDef)
+            t->def = def;
+        (*made)[def] = t;
+        return t;
+    }
+    }
+    return nullptr;
+}
+
+// A value entering a place whose type is declared: a number literal takes
+// the type; what cannot be that type is error E0308.
+V openDefault()
+{
+    V open = mkInt(0, 0);
+    open.n = 2; // becomes what it is first used as
+    return open;
+}
+
+V coerce(V v, Ty *ty, const Node *at)
+{
+    if (!ty)
+        return v;
+    ty = tyResolve(ty);
+    if (v.k == V_INT && v.t == 0 && v.n == 2 && ty && ty->k == TY_PATH)
+    {
+        std::string head = tyHead(ty);
+        if (ty->prim != PR_NONE || ty->def || head == "String" || head == "Vec" || head == "HashMap" ||
+            head == "HashSet" || head == "BTreeMap" || head == "BTreeSet" || head == "VecDeque" || head == "Option")
+            return defaultFor(ty, at);
+    }
+    if (ty->k == TY_PATH)
+    {
+        uint8_t prim = ty->prim;
+        if (prim != PR_NONE)
+        {
+            if (isIntPrim(prim))
+            {
+                if (v.k == V_INT)
+                {
+                    if (v.t == prim)
+                        return v;
+                    if (v.t == 0)
+                    {
+                        if (!intFits(v, prim))
+                            errAt(at, "", std::string("literal out of range for `") + primName(prim) + "`");
+                        return intConvert(v, prim);
+                    }
+                }
+            }
+            else if (isFloatPrim(prim))
+            {
+                if (v.k == V_FLOAT)
+                {
+                    if (v.t == prim)
+                        return v;
+                    if (v.t == 0)
+                        return mkFloat(fval(v), prim);
+                }
+                // a number whose type was left open (parse() with nothing to go by)
+                if (v.k == V_INT && v.t == 0 && v.n == 1)
+                    return mkFloat((double)(int64_t)v.lo, prim);
+            }
+            else if ((prim == PR_BOOL && v.k == V_BOOL) || (prim == PR_CHAR && v.k == V_CHAR) || prim == PR_STR)
+                return v;
+            errAt(at, "E0308", std::string("mismatched types: expected `") + primName(prim) + "`, found `" + typeName(v) + "`",
+                  std::string("expected `") + primName(prim) + "`, found `" + typeName(v) + "`");
+        }
+        if (ty->def)
+        {
+            TypeDef *got = v.k == V_STRUCT ? static_cast<StructObj *>(v.p)->def
+                           : v.k == V_ENUM ? static_cast<EnumObj *>(v.p)->def : nullptr;
+            if (got != ty->def)
+                errAt(at, "E0308", "mismatched types: expected `" + ty->def->name + "`, found `" + typeName(v) + "`",
+                      "expected `" + ty->def->name + "`, found `" + typeName(v) + "`" +
+                          (v.k == V_REF ? " (a reference: the value itself is wanted here)" : ""));
+            return v;
+        }
+        if (ty->path && ty->path->segs.size() == 1 && ty->path->segs[0].name == "String" && v.k == V_STR && !v.x)
+            errAt(at, "E0308", "mismatched types: expected `String`, found `&str`",
+                  "expected `String`, found `&str`: try using a conversion method: `.to_string()`");
+        return v;
+    }
+    if (ty->k == TY_REF)
+    {
+        if (v.k == V_REF)
+        {
+            V &target = slotAt(v.p, v.hi);
+            if (isOpenDefault(target))
+            {
+                Ty *e = tyResolve(ty->elem);
+                if (e && e->k == TY_PATH && e->prim == PR_STR)
+                    target = mkStr("", true);
+                else if (e && e->k == TY_PATH && (e->prim != PR_NONE || e->def || tyHead(e) == "String" ||
+                                                  tyHead(e) == "Vec" || tyHead(e) == "HashMap"))
+                    target = defaultFor(e, at);
+                else if (e && e->k == TY_SLICE)
+                    target = mkSeq(V_VEC, std::vector<V>());
+            }
+        }
+        switch (v.k)
+        {
+        case V_REF:
+        case V_SLICE:
+        case V_FN:
+        case V_CLOSURE:
+        case V_NATIVE:
+        case V_ITER:
+        case V_MOVED:
+            return v;
+        case V_STR:
+            if (!v.x)
+                return v;
+            break;
+        }
+        // an owned value where a reference is wanted
+        std::string want = tyText(ty), got = typeName(v);
+        errAt(at, "E0308", "mismatched types: expected `" + want + "`, found `" + got + "`",
+              "expected `" + want + "`, found `" + got + "`: consider borrowing here with `&`");
+    }
+    return v;
+}
+
+// ─── scopes ────────────────────────────────────────────────────────────────
+
+void scopeExit(std::vector<int> &slots, const Node *at)
+{
+    if (!G.trackDrops || slots.empty())
+        return;
+    for (size_t k = slots.size(); k-- > 0;)
+    {
+        Obj *cell = G.fr->slots[(size_t)slots[k]];
+        if (!cell)
+            continue;
+        G.fr->slots[(size_t)slots[k]] = nullptr;
+        dropSlot(cell->items[0], at);
+    }
+}
+
+// ─── places ────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+bool forWrite = false; // the place being worked out is about to be assigned
+
+[[noreturn]] void movedError(const Node *n, const V &slot)
+{
+    std::string name = n && n->k == N_PATH && n->path ? n->path->segs.back().name : "value";
+    if (slot.n == 1)
+        errAt(n, "E0381", "used binding `" + name + "` isn't initialized",
+              "`" + name + "` used here but it isn't initialized");
+    errAt(n, "E0382", "borrow of moved value: `" + name + "`", "value borrowed here after move");
+}
+
+// what a type's own Deref gives for the value at `pl`
+bool userDeref(Place &pl, const Node *at)
+{
+    V &v = slotAt(pl.o, pl.i);
+    TypeDef *def = v.k == V_STRUCT ? static_cast<StructObj *>(v.p)->def
+                   : v.k == V_ENUM ? static_cast<EnumObj *>(v.p)->def : nullptr;
+    if (!def)
+        return false;
+    FnDef *d = forWrite ? findMethod(def, "deref_mut") : nullptr;
+    if (!d)
+        d = findMethod(def, "deref");
+    if (!d)
+        return false;
+    std::vector<V> args(1, mkRef(pl.o, pl.i, true));
+    V r = callFn(d, args, def, at, nullptr);
+    if (r.k != V_REF)
+        return false;
+    pl.o = r.p;
+    pl.i = r.hi;
+    pl.ref = true;
+    return true;
+}
+
+// a[b] where b is a range: the part of a it names
+V sliceOf(V base, V range, const Node *at, bool mut)
+{
+    RangeObj *r = static_cast<RangeObj *>(range.p);
+    base = peelAll(base);
+    if (base.k == V_STR)
+    {
+        const std::string &s = static_cast<StrObj *>(base.p)->s;
+        int64_t len = (int64_t)s.size();
+        int64_t lo = r->hasLo ? toIndex(r->items[0], at) : 0;
+        int64_t hi = r->hasHi ? toIndex(r->items[1], at) + (r->inclusive ? 1 : 0) : len;
+        if (lo > hi)
+            panicAt(at, "begin <= end (" + std::to_string(lo) + " <= " + std::to_string(hi) + ") when slicing `" + s + "`");
+        if (hi > len)
+            panicAt(at, "byte index " + std::to_string(lo > len ? lo : hi) + " is out of bounds of `" + s + "`");
+        auto boundary = [&](int64_t i) { return i == len || ((unsigned char)s[(size_t)i] & 0xC0) != 0x80; };
+        if (!boundary(lo) || !boundary(hi))
+            panicAt(at, "byte index " + std::to_string(boundary(lo) ? hi : lo) + " is not a char boundary; it is inside a character of `" + s + "`");
+        return mkStr(s.substr((size_t)lo, (size_t)(hi - lo)), false);
+    }
+    Obj *o = nullptr;
+    int64_t start = 0, len = 0;
+    if (!seqOf(base, o, start, len))
+        errAt(at, "E0608", "cannot index into a value of type `" + typeName(base) + "`");
+    int64_t lo = r->hasLo ? toIndex(r->items[0], at) : 0;
+    int64_t hi = r->hasHi ? toIndex(r->items[1], at) + (r->inclusive ? 1 : 0) : len;
+    if (lo > hi)
+        panicAt(at, "slice index starts at " + std::to_string(lo) + " but ends at " + std::to_string(hi));
+    if (hi > len)
+        panicAt(at, "range end index " + std::to_string(hi) + " out of range for slice of length " + std::to_string(len));
+    return mkSlice(o, start + lo, hi - lo, mut);
+}
+
+// The place a[b] is. When b is a range there is no one place: `range` and
+// `base` are set and the result is false.
+bool indexPlace(Node *n, Place &out, V *range, V *baseOut)
+{
+    Place base;
+    if (!placeOf(n->a, base))
+    {
+        V v = eval(n->a, nullptr);
+        if (G.flow)
+            return false;
+        base.o = newCell(v);
+        base.i = 0;
+        base.ref = false;
+    }
+    bool savedWrite = forWrite;
+    forWrite = false;
+    V idx = eval(n->b, nullptr);
+    forWrite = savedWrite;
+    if (G.flow)
+        return false;
+    for (;;)
+    {
+        autoDeref(base, n);
+        V bv = slotAt(base.o, base.i);
+        V ip = peel(idx);
+        if (ip.k == V_RANGE && bv.k != V_MAP && bv.k != V_STRUCT && bv.k != V_ENUM)
+        {
+            if (range)
+            {
+                *range = ip;
+                *baseOut = bv;
+            }
+            return false;
+        }
+        switch (bv.k)
+        {
+        case V_VEC:
+        case V_ARRAY:
+        case V_DEQUE:
+        {
+            int64_t i = toIndex(ip, n), len = (int64_t)bv.p->items.size();
+            if (i >= len)
+            {
+                Panic p;
+                p.msg = "index out of bounds: the len is " + std::to_string(len) + " but the index is " + std::to_string(i);
+                // an array's check is the expression's own; a Vec's is in its Index impl, called at `[`
+                bool overloaded = bv.k != V_ARRAY && n->k == N_INDEX && n->lo;
+                p.line = overloaded ? (int)n->hi : n->line;
+                p.col = overloaded ? (int)n->lo : n->col;
+                throw p;
+            }
+            out.o = bv.p;
+            out.i = i;
+            out.ref = true;
+            return true;
+        }
+        case V_SLICE:
+        {
+            int64_t i = toIndex(ip, n), len = (int64_t)bv.lo;
+            if (i >= len)
+                panicAt(n, "index out of bounds: the len is " + std::to_string(len) + " but the index is " + std::to_string(i));
+            out.o = bv.p;
+            out.i = bv.hi + i;
+            out.ref = true;
+            return true;
+        }
+        case V_MAP:
+        {
+            MapObj *m = static_cast<MapObj *>(bv.p);
+            int e = mapFind(m, idx, n);
+            if (e < 0)
+                panicAt(n, "no entry found for key");
+            out.o = m;
+            out.i = e;
+            out.ref = true;
+            return true;
+        }
+        case V_STR:
+            errAt(n, "E0277", "the type `str` cannot be indexed by `" + typeName(ip) + "`",
+                  "string indices are ranges of `usize`");
+        case V_STRUCT:
+        case V_ENUM:
+        {
+            if (jsonIndex(bv, base, ip, forWrite, out, n))
+                return true;
+            TypeDef *def = bv.k == V_STRUCT ? static_cast<StructObj *>(bv.p)->def : static_cast<EnumObj *>(bv.p)->def;
+            FnDef *f = forWrite ? findMethod(def, "index_mut") : nullptr;
+            if (!f)
+                f = findMethod(def, "index");
+            if (f)
+            {
+                std::vector<V> args;
+                args.push_back(mkRef(base.o, base.i, true));
+                args.push_back(idx);
+                V r = callFn(f, args, def, n, nullptr);
+                if (r.k != V_REF)
+                    errAt(n, "E0308", "mismatched types: `index` has to return a reference");
+                out.o = r.p;
+                out.i = r.hi;
+                out.ref = true;
+                return true;
+            }
+            if (userDeref(base, n))
+                continue;
+            break;
+        }
+        }
+        errAt(n, "E0608", "cannot index into a value of type `" + typeName(bv) + "`");
+    }
+}
+
+} // namespace
+
+void autoDeref(Place &pl, const Node *at)
+{
+    for (;;)
+    {
+        V &v = slotAt(pl.o, pl.i);
+        if (v.k == V_REF)
+        {
+            pl.o = v.p;
+            pl.i = v.hi;
+            pl.ref = true;
+        }
+        else if (v.k == V_BOX)
+        {
+            pl.o = v.p;
+            pl.i = 0;
+        }
+        else if (v.k == V_RC)
+        {
+            pl.o = v.p;
+            pl.i = 0;
+            pl.ref = true;
+        }
+        else if (v.k == V_MOVED)
+            movedError(at && at->k != N_PATH && at->a ? at->a : at, v);
+        else
+            return;
+    }
+}
+
+bool placeOf(Node *n, Place &out)
+{
+    switch (n->k)
+    {
+    case N_PATH:
+    {
+        if (n->slot >= 0)
+        {
+            Obj *cell = G.fr->slots[(size_t)n->slot];
+            if (!cell)
+                errAt(n, "E0381", "used binding `" + n->path->segs[0].name + "` isn't initialized");
+            out.o = cell;
+            out.i = 0;
+            out.ref = false;
+            return true;
+        }
+        if (n->cacheKind == CK_CONST && static_cast<ConstDef *>(n->cache)->isStatic)
+        {
+            out.o = constCell(static_cast<ConstDef *>(n->cache), n);
+            out.i = 0;
+            out.ref = true;
+            return true;
+        }
+        return false;
+    }
+    case N_FIELD:
+    {
+        Place base;
+        if (!placeOf(n->a, base))
+        {
+            V v = eval(n->a, nullptr);
+            if (G.flow)
+                return false;
+            base.o = newCell(v);
+            base.i = 0;
+            base.ref = false;
+        }
+        for (;;)
+        {
+            autoDeref(base, n);
+            V &bv = slotAt(base.o, base.i);
+            if (bv.k == V_STRUCT)
+            {
+                StructObj *s = static_cast<StructObj *>(bv.p);
+                TypeDef *def = s->def;
+                int idx = -1;
+                if (n->cache == def)
+                    idx = n->cacheIdx;
+                else
+                {
+                    auto it = def->fieldIndex.find(n->s);
+                    if (it != def->fieldIndex.end())
+                    {
+                        idx = it->second;
+                        if (!def->fields[(size_t)idx].isPub && def->mod && !modWithin(G.fr->mod, def->mod))
+                            errAt(n, "E0616", "field `" + n->s + "` of struct `" + def->name + "` is private", "private field");
+                        n->cache = def;
+                        n->cacheIdx = idx;
+                    }
+                }
+                if (idx >= 0)
+                {
+                    out.o = s;
+                    out.i = idx;
+                    out.ref = base.ref;
+                    return true;
+                }
+            }
+            if (bv.k == V_RANGE && (n->s == "start" || n->s == "end"))
+            {
+                out.o = bv.p;
+                out.i = n->s == "start" ? 0 : 1;
+                out.ref = base.ref;
+                return true;
+            }
+            if (userDeref(base, n))
+                continue;
+            if (bv.k == V_STRUCT)
+            {
+                TypeDef *def = static_cast<StructObj *>(bv.p)->def;
+                std::string have;
+                for (const FieldDef &fd : def->fields)
+                    have += (have.empty() ? "" : ", ") + ("`" + fd.name + "`");
+                errAt(n, "E0609", "no field `" + n->s + "` on type `" + def->name + "`",
+                      have.empty() ? "unknown field" : "unknown field: available fields are: " + have);
+            }
+            errAt(n, bv.k == V_INT || bv.k == V_FLOAT || bv.k == V_BOOL || bv.k == V_CHAR ? "E0610" : "E0609",
+                  "no field `" + n->s + "` on type `" + typeName(bv) + "`");
+        }
+    }
+    case N_TFIELD:
+    {
+        Place base;
+        if (!placeOf(n->a, base))
+        {
+            V v = eval(n->a, nullptr);
+            if (G.flow)
+                return false;
+            base.o = newCell(v);
+            base.i = 0;
+            base.ref = false;
+        }
+        for (;;)
+        {
+            autoDeref(base, n);
+            V &bv = slotAt(base.o, base.i);
+            bool tupleLike = bv.k == V_TUPLE ||
+                             (bv.k == V_STRUCT && static_cast<StructObj *>(bv.p)->def->form == FORM_TUPLE);
+            if (tupleLike && n->lo < bv.p->items.size())
+            {
+                if (bv.k == V_STRUCT)
+                {
+                    TypeDef *def = static_cast<StructObj *>(bv.p)->def;
+                    if (!def->fields[(size_t)n->lo].isPub && def->mod && def != G.reverseDef &&
+                        !modWithin(G.fr->mod, def->mod))
+                        errAt(n, "E0616", "field `" + std::to_string(n->lo) + "` of struct `" + def->name + "` is private",
+                              "private field");
+                }
+                out.o = bv.p;
+                out.i = (int64_t)n->lo;
+                out.ref = base.ref;
+                return true;
+            }
+            if (userDeref(base, n))
+                continue;
+            errAt(n, "E0609", "no field `" + std::to_string(n->lo) + "` on type `" + typeName(bv) + "`", "unknown field");
+        }
+    }
+    case N_INDEX:
+        return indexPlace(n, out, nullptr, nullptr);
+    case N_UNARY:
+    {
+        if (n->op != O_DEREF)
+            return false;
+        bool savedWrite = forWrite;
+        V v = evalBorrow(n->a, nullptr);
+        forWrite = savedWrite;
+        if (G.flow)
+            return false;
+        switch (v.k)
+        {
+        case V_REF:
+            out.o = v.p;
+            out.i = v.hi;
+            out.ref = true;
+            return true;
+        case V_BOX:
+            out.o = v.p;
+            out.i = 0;
+            out.ref = false;
+            return true;
+        case V_RC:
+            out.o = v.p;
+            out.i = 0;
+            out.ref = true;
+            return true;
+        case V_STRUCT:
+        case V_ENUM:
+        {
+            Place pl;
+            pl.o = newCell(v);
+            pl.i = 0;
+            if (placeOf(n->a, pl) || true)
+            {
+                if (userDeref(pl, n))
+                {
+                    out = pl;
+                    return true;
+                }
+            }
+            break;
+        }
+        }
+        return false;
+    }
+    }
+    return false;
+}
+
+// ─── patterns ──────────────────────────────────────────────────────────────
+
+namespace
+{
+
+void bindSlot(int slot, V v) { G.fr->slots[(size_t)slot] = newCell(v); }
+
+[[noreturn]] void patMismatch(const Pat *p, const std::string &want, V got, const Node *at)
+{
+    errPos(p->line, p->col, 1, "E0308", "mismatched types: expected `" + typeName(got) + "`, found " + want,
+           "this pattern cannot match a value of type `" + typeName(got) + "`");
+    (void)at;
+}
+
+// the elements of a tuple / slice pattern against slots [first, first+count) of o
+bool matchItems(const std::vector<Pat *> &items, Obj *o, int64_t first, int64_t count, int mode, const Node *at,
+                const Pat *whole, bool slice)
+{
+    int rest = -1;
+    for (size_t k = 0; k < items.size(); ++k)
+        if (items[k]->k == P_REST || (items[k]->k == P_BIND && items[k]->sub && items[k]->sub->k == P_REST))
+            rest = (int)k;
+    int64_t fixed = (int64_t)items.size() - (rest >= 0 ? 1 : 0);
+    if (rest >= 0 ? count < fixed : count != fixed)
+    {
+        if (slice)
+            return false; // a slice of another length
+        errPos(whole->line, whole->col, 1, "E0308",
+               "mismatched types: expected a tuple with " + std::to_string(count) + " element" + (count == 1 ? "" : "s") +
+                   ", found one with " + std::to_string(fixed) + " element" + (fixed == 1 ? "" : "s"));
+    }
+    for (size_t k = 0; k < items.size(); ++k)
+    {
+        Pat *item = items[k];
+        if ((int)k == rest)
+        {
+            if (item->k == P_BIND)
+            {
+                // name @ ..: the elements in between
+                int64_t skipped = count - fixed;
+                bindSlot(item->slot, mkSlice(o, first + (int64_t)k, skipped, false));
+            }
+            continue;
+        }
+        int64_t idx = rest >= 0 && (int)k > rest ? count - ((int64_t)items.size() - (int64_t)k) : (int64_t)k;
+        Place pl;
+        pl.o = o;
+        pl.i = first + idx;
+        if (!matchPat(item, pl, mode, at))
+            return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool matchPat(Pat *p, Place pl, int mode, const Node *at)
+{
+    // through references to the value: from there on names bind references
+    if (p->k != P_BIND && p->k != P_WILD && p->k != P_REF && p->k != P_REST && p->k != P_OR)
+        for (;;)
+        {
+            V &s = slotAt(pl.o, pl.i);
+            if (s.k == V_REF)
+            {
+                pl.o = s.p;
+                pl.i = s.hi;
+                mode = M_REF;
+            }
+            else if ((s.k == V_BOX || s.k == V_RC) && p->k != P_LIT && p->k != P_RANGE)
+            {
+                if (s.k == V_RC)
+                    mode = M_REF;
+                pl.o = s.p;
+                pl.i = 0;
+            }
+            else
+                break;
+        }
+    V &v = slotAt(pl.o, pl.i);
+    switch (p->k)
+    {
+    case P_WILD:
+    case P_REST:
+        return true;
+    case P_BIND:
+    {
+        if (v.k == V_MOVED)
+            errPos(p->line, p->col, 1, v.n == 1 ? "E0381" : "E0382", "use of moved value", "value used here after move");
+        if (p->sub && !matchPat(p->sub, pl, mode == M_MOVE ? M_PEEK : mode, at))
+            return false;
+        if (p->byRef || mode == M_REF)
+            bindSlot(p->slot, mkRef(pl.o, pl.i, p->mut));
+        else if (mode == M_PEEK)
+            bindSlot(p->slot, isCopy(v) ? copyShell(v) : v);
+        else
+            bindSlot(p->slot, takeFrom(v, at, p->name.c_str()));
+        return true;
+    }
+    case P_REF:
+    {
+        if (v.k != V_REF)
+        {
+            // a string or slice is already a reference
+            return matchPat(p->sub, pl, M_PEEK, at);
+        }
+        Place inner;
+        inner.o = v.p;
+        inner.i = v.hi;
+        inner.ref = true;
+        return matchPat(p->sub, inner, M_PEEK, at);
+    }
+    case P_LIT:
+    {
+        V lit = eval(p->lo, nullptr);
+        V x = peelAll(v);
+        if (x.k == V_INT && lit.k == V_INT)
+            unifyNum(x, lit, at, "this pattern");
+        else if (x.k == V_FLOAT && lit.k == V_FLOAT)
+            unifyNum(x, lit, at, "this pattern");
+        else if (x.k != lit.k)
+            patMismatch(p, "`" + typeName(lit) + "`", x, at);
+        return valueEq(x, lit, at);
+    }
+    case P_RANGE:
+    {
+        V x = peelAll(v);
+        if (p->lo)
+        {
+            V lo = eval(p->lo, nullptr);
+            if (x.k == V_INT && lo.k == V_INT)
+                unifyNum(x, lo, at, "this pattern");
+            else if (x.k != lo.k)
+                patMismatch(p, "`" + typeName(lo) + "`", x, at);
+            if (valueCmp(x, lo, at) < 0)
+                return false;
+        }
+        if (p->hi)
+        {
+            V hi = eval(p->hi, nullptr);
+            if (x.k == V_INT && hi.k == V_INT)
+                unifyNum(x, hi, at, "this pattern");
+            else if (x.k != hi.k)
+                patMismatch(p, "`" + typeName(hi) + "`", x, at);
+            int c = valueCmp(x, hi, at);
+            if (p->inclusive ? c > 0 : c >= 0)
+                return false;
+        }
+        return true;
+    }
+    case P_TUPLE:
+    {
+        if (v.k == V_UNIT)
+            return p->items.empty() || (p->items.size() == 1 && p->items[0]->k == P_REST) ? true
+                                                                                           : (patMismatch(p, "a tuple", v, at), false);
+        if (v.k != V_TUPLE)
+            patMismatch(p, "a tuple", v, at);
+        return matchItems(p->items, v.p, 0, (int64_t)v.p->items.size(), mode, at, p, false);
+    }
+    case P_SLICE:
+    {
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        if (!seqOf(v, o, start, len))
+            patMismatch(p, "an array or slice", v, at);
+        return matchItems(p->items, o, start, len, mode, at, p, true);
+    }
+    case P_OR:
+        for (Pat *alt : p->items)
+            if (matchPat(alt, pl, mode, at))
+                return true;
+        return false;
+    case P_PATH:
+    {
+        if (p->cst)
+            return valueEq(peelAll(v), constValue(p->cst, at), at);
+        if (!p->def)
+            errPos(p->line, p->col, 1, "E0532", "this pattern's path is not one Quantum's Rust front-end can match");
+        if (p->variant >= 0)
+        {
+            if (v.k != V_ENUM || static_cast<EnumObj *>(v.p)->def != p->def)
+                patMismatch(p, "`" + p->def->name + "`", v, at);
+            return static_cast<EnumObj *>(v.p)->variant == p->variant;
+        }
+        if (v.k != V_STRUCT || static_cast<StructObj *>(v.p)->def != p->def)
+            patMismatch(p, "`" + p->def->name + "`", v, at);
+        return true;
+    }
+    case P_TSTRUCT:
+    case P_STRUCT:
+    {
+        if (!p->def)
+            errPos(p->line, p->col, 1, "E0532", "this pattern's path is not one Quantum's Rust front-end can match");
+        Obj *o = v.p;
+        const std::vector<FieldDef> *fields = &p->def->fields;
+        if (p->variant >= 0)
+        {
+            if (v.k != V_ENUM || static_cast<EnumObj *>(v.p)->def != p->def)
+                patMismatch(p, "`" + p->def->name + "`", v, at);
+            if (static_cast<EnumObj *>(v.p)->variant != p->variant)
+                return false;
+            fields = &p->def->variants[(size_t)p->variant].fields;
+        }
+        else if (v.k != V_STRUCT || static_cast<StructObj *>(v.p)->def != p->def)
+            patMismatch(p, "`" + p->def->name + "`", v, at);
+        if (p->k == P_TSTRUCT)
+            return matchItems(p->items, o, 0, (int64_t)o->items.size(), mode, at, p, false);
+        for (size_t k = 0; k < p->items.size(); ++k)
+        {
+            int idx = -1;
+            for (size_t f = 0; f < fields->size(); ++f)
+                if ((*fields)[f].name == p->fields[k])
+                    idx = (int)f;
+            if (idx < 0)
+                return false;
+            Place fp;
+            fp.o = o;
+            fp.i = idx;
+            if (!matchPat(p->items[k], fp, mode, at))
+                return false;
+        }
+        return true;
+    }
+    }
+    return false;
+}
+
+// ─── operators ─────────────────────────────────────────────────────────────
+
+namespace
+{
+
+const char *opSymbol(uint8_t op)
+{
+    static const char *const symbols[] = {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "==", "!=",
+                                          "<", "<=", ">", ">=", "&&", "||", "-", "!", "*"};
+    return op <= O_DEREF ? symbols[op] : "?";
+}
+
+const char *opMethod(uint8_t op)
+{
+    switch (op)
+    {
+    case O_ADD: return "add";
+    case O_SUB: return "sub";
+    case O_MUL: return "mul";
+    case O_DIV: return "div";
+    case O_REM: return "rem";
+    case O_BITAND: return "bitand";
+    case O_BITOR: return "bitor";
+    case O_BITXOR: return "bitxor";
+    case O_SHL: return "shl";
+    case O_SHR: return "shr";
+    case O_NEG: return "neg";
+    case O_NOT: return "not";
+    }
+    return "";
+}
+
+const char *opVerb(uint8_t op)
+{
+    switch (op)
+    {
+    case O_ADD: return "add";
+    case O_SUB: return "subtract";
+    case O_MUL: return "multiply";
+    case O_DIV: return "divide";
+    case O_REM: return "calculate the remainder of";
+    }
+    return "apply this operator to";
+}
+
+// the type name an untyped literal shows in messages
+std::string operandName(V v)
+{
+    if (v.k == V_INT && v.t == 0)
+        return "{integer}";
+    if (v.k == V_FLOAT && v.t == 0)
+        return "{float}";
+    return typeName(v);
+}
+
+} // namespace
+
+V binaryOp(uint8_t op, V a, V b, const Node *at)
+{
+    V x = peel(a), y = peel(b);
+    if (x.k == V_INT && y.k == V_INT)
+    {
+        if (op != O_SHL && op != O_SHR)
+            unifyNum(x, y, at, "this operation");
+        return intBinary(op, x, y, at);
+    }
+    if (x.k == V_FLOAT && y.k == V_FLOAT)
+    {
+        unifyNum(x, y, at, "this operation");
+        return floatBinary(op, x, y, at);
+    }
+    if (x.k == V_BOOL && y.k == V_BOOL && (op == O_BITAND || op == O_BITOR || op == O_BITXOR))
+        return mkBool(op == O_BITAND ? (x.lo & y.lo) != 0 : op == O_BITOR ? (x.lo | y.lo) != 0 : (x.lo ^ y.lo) != 0);
+    if (x.k == V_STR && op == O_ADD)
+    {
+        if (!x.x || a.k == V_REF)
+            errAt(at, "E0369", "cannot add `" + typeName(b) + "` to `" + typeName(a) + "`",
+                  "string concatenation requires an owned `String` on the left: use `.to_owned()`");
+        if (y.k != V_STR)
+            errAt(at, "E0308", "mismatched types: expected `&str`, found `" + typeName(b) + "`");
+        if (b.k == V_STR && b.x)
+            errAt(at, "E0308", "mismatched types: expected `&str`, found `String`",
+                  "expected `&str`, found `String`: consider borrowing here with `&`");
+        static_cast<StrObj *>(x.p)->s += static_cast<StrObj *>(y.p)->s;
+        return x;
+    }
+    // the operand types' own impl of the operator
+    const char *method = opMethod(op);
+    FnDef *f = findMethodFor(x, method);
+    if (f)
+    {
+        std::vector<V> args;
+        args.push_back(a);
+        args.push_back(b);
+        return callFn(f, args, typeDefOf(x), at, nullptr);
+    }
+    if ((x.k == V_SET) && y.k == V_SET && (op == O_BITAND || op == O_BITOR || op == O_SUB || op == O_BITXOR))
+    {
+        std::vector<V> args(1, b);
+        return callMethodOn(a, op == O_BITAND ? "intersection" : op == O_BITOR ? "union" : op == O_SUB ? "difference" : "symmetric_difference",
+                            args, at);
+    }
+    if ((x.k == V_INT && y.k == V_FLOAT) || (x.k == V_FLOAT && y.k == V_INT))
+        errAt(at, "E0277", std::string("cannot ") + opVerb(op) + " `" + operandName(x) + "` " +
+                               (op == O_ADD ? "to" : op == O_SUB ? "from" : "by") + " `" + operandName(y) + "`",
+              std::string("no implementation for `") + operandName(x) + " " + opSymbol(op) + " " + operandName(y) +
+                  "`: convert one of them with `as`");
+    errAt(at, "E0369", std::string("binary operation `") + opSymbol(op) + "` cannot be applied to type `" + typeName(x) + "`",
+          std::string("no implementation for `") + typeName(x) + " " + opSymbol(op) + " " + typeName(y) + "`");
+}
+
+// ─── blocks and conditions ─────────────────────────────────────────────────
+
+V evalBlock(Node *b, Ty *hint)
+{
+    V result;
+    size_t count = b->kids.size();
+    for (size_t k = 0; k < count; ++k)
+    {
+        Node *s = b->kids[k];
+        if (k + 1 == count && b->flag)
+        {
+            result = eval(s, hint);
+            break;
+        }
+        V v = eval(s, nullptr);
+        if (G.flow)
+            break;
+        if (G.trackDrops && s->k != N_LET)
+            dropValue(v, s);
+    }
+    if (G.flow == FL_BREAK && !b->s.empty() && G.flowLabel && *G.flowLabel == b->s)
+    {
+        G.flow = FL_NONE;
+        G.flowLabel = nullptr;
+        result = G.flowVal;
+    }
+    scopeExit(b->scopeSlots, b);
+    return result;
+}
+
+bool evalCond(Node *c)
+{
+    if (c->k == N_LETCOND)
+    {
+        Place pl;
+        if (!placeOf(c->a, pl))
+        {
+            V v = eval(c->a, nullptr);
+            if (G.flow)
+                return false;
+            pl.o = newCell(v);
+            pl.i = 0;
+        }
+        else if (G.flow)
+            return false;
+        return matchPat(c->pat, pl, M_MOVE, c);
+    }
+    if (c->k == N_BINARY && c->op == O_AND)
+    {
+        if (!evalCond(c->a) || G.flow)
+            return false;
+        return evalCond(c->b);
+    }
+    V v = peel(eval(c, nullptr));
+    if (G.flow)
+        return false;
+    if (v.k != V_BOOL)
+        errAt(c, "E0308", "mismatched types: expected `bool`, found `" + typeName(v) + "`", "expected `bool`");
+    return v.lo != 0;
+}
+
+V evalBorrow(Node *n, Ty *hint)
+{
+    bool place = (n->k == N_PATH && n->slot >= 0) || n->k == N_FIELD || n->k == N_TFIELD ||
+                 (n->k == N_UNARY && n->op == O_DEREF);
+    if (place)
+    {
+        Place pl;
+        if (placeOf(n, pl))
+        {
+            V &s = slotAt(pl.o, pl.i);
+            if (s.k == V_MOVED)
+                movedError(n, s);
+            return s;
+        }
+        if (G.flow)
+            return V();
+    }
+    if (n->k == N_INDEX)
+    {
+        Place pl;
+        V range, base;
+        if (indexPlace(n, pl, &range, &base))
+            return slotAt(pl.o, pl.i);
+        if (G.flow)
+            return V();
+        if (range.k == V_RANGE)
+            return sliceOf(base, range, n, false);
+    }
+    return eval(n, hint);
+}
+
+namespace
+{
+
+// what a loop does about G.flow after its body: true to leave the loop
+bool loopFlow(const Node *loop, V &result)
+{
+    if (G.flow == FL_NONE)
+        return false;
+    bool mine = !G.flowLabel || *G.flowLabel == loop->s;
+    if (G.flow == FL_BREAK && mine)
+    {
+        G.flow = FL_NONE;
+        G.flowLabel = nullptr;
+        result = G.flowVal;
+        G.flowVal = V();
+        return true;
+    }
+    if (G.flow == FL_CONTINUE && mine)
+    {
+        G.flow = FL_NONE;
+        G.flowLabel = nullptr;
+        return false;
+    }
+    return true; // for a loop further out, or a return
+}
+
+// the value assigned to a destructuring target: (a, b) = ...
+void assignInto(Node *target, V v, const Node *at)
+{
+    if (target->k == N_PATH && target->cacheKind == CK_DISCARD)
+    {
+        dropValue(v, at);
+        return;
+    }
+    if (target->k == N_TUPLE || target->k == N_ARRAY)
+    {
+        V x = peel(v);
+        Obj *o = nullptr;
+        int64_t start = 0, len = 0;
+        if (x.k == V_TUPLE)
+        {
+            o = x.p;
+            len = (int64_t)o->items.size();
+        }
+        else if (!seqOf(x, o, start, len))
+            errAt(at, "E0308", "mismatched types: expected a tuple or array, found `" + typeName(x) + "`");
+        if ((int64_t)target->kids.size() != len)
+            errAt(at, "E0308", "mismatched types: expected " + std::to_string(target->kids.size()) + " elements, found " +
+                                   std::to_string(len));
+        for (size_t k = 0; k < target->kids.size(); ++k)
+            assignInto(target->kids[k], o->items[(size_t)start + k], at);
+        return;
+    }
+    Place pl;
+    forWrite = true;
+    bool ok = placeOf(target, pl);
+    forWrite = false;
+    if (!ok)
+        errAt(target, "E0070", "invalid left-hand side of assignment", "cannot assign to this expression");
+    V &slot = slotAt(pl.o, pl.i);
+    if (v.k == V_INT && v.t == 0 && slot.k == V_INT && slot.t)
+    {
+        if (!intFits(v, slot.t))
+            errAt(at, "", std::string("literal out of range for `") + primName(slot.t) + "`");
+        v = intConvert(v, slot.t);
+    }
+    else if (v.k == V_FLOAT && v.t == 0 && slot.k == V_FLOAT && slot.t)
+        v = mkFloat(fval(v), slot.t);
+    else if (slot.k == V_INT && v.k == V_INT && slot.t && v.t && slot.t != v.t)
+        errAt(at, "E0308", std::string("mismatched types: expected `") + primName(slot.t) + "`, found `" + primName(v.t) + "`");
+    else if (slot.k == V_STR && v.k == V_STR && slot.x != v.x)
+        errAt(at, "E0308", std::string("mismatched types: expected `") + (slot.x ? "String" : "&str") + "`, found `" +
+                               (v.x ? "String" : "&str") + "`",
+              slot.x ? "try using a conversion method: `.to_string()`" : "consider borrowing here with `&`");
+    V old = slot;
+    slot = v;
+    if (G.trackDrops && old.k != V_MOVED)
+        dropValue(old, at);
+}
+
+V rangeValue(Node *n, Ty *hint)
+{
+    Ty *elem = tyArg(hint, 0);
+    V lo, hi;
+    if (n->a)
+    {
+        lo = peel(eval(n->a, elem));
+        if (G.flow)
+            return V();
+    }
+    if (n->b)
+    {
+        hi = peel(eval(n->b, elem));
+        if (G.flow)
+            return V();
+    }
+    if (n->a && n->b && lo.k == hi.k && (lo.k == V_INT || lo.k == V_FLOAT))
+        unifyNum(lo, hi, n, "a range");
+    return mkRange(lo, hi, n->a != nullptr, n->b != nullptr, n->flag);
+}
+
+} // namespace
+
+// ─── expressions ───────────────────────────────────────────────────────────
+
+V eval(Node *n, Ty *hint)
+{
+    switch (n->k)
+    {
+    case N_INT:
+    {
+        uint8_t t = n->t;
+        if (!t && hint)
+        {
+            uint8_t hp = tyPrim(hint);
+            if (isIntPrim(hp))
+                t = hp;
+            else if (isFloatPrim(hp))
+                errAt(n, "E0308", std::string("mismatched types: expected `") + primName(hp) + "`, found integer",
+                      std::string("expected `") + primName(hp) + "`, found integer: use a float literal: `" +
+                          std::to_string(n->lo) + ".0`");
+        }
+        else if (isFloatPrim(t))
+            return mkFloat(n->flag ? -(double)n->lo : (double)n->lo, t); // 1f64
+        V v;
+        v.k = V_INT;
+        v.t = 0;
+        v.lo = n->lo;
+        v.hi = n->hi;
+        if (n->flag)
+        {
+            v.lo = ~v.lo + 1;
+            v.hi = ~v.hi + (v.lo == 0 ? 1 : 0);
+        }
+        if (t)
+        {
+            if ((v.hi != 0 && v.hi != -1) || !intFits(v, t))
+                errAt(n, "", std::string("literal out of range for `") + primName(t) + "`");
+            v = intConvert(v, t);
+        }
+        return v;
+    }
+    case N_FLOAT:
+    {
+        uint8_t t = n->t;
+        if (!t && hint)
+        {
+            uint8_t hp = tyPrim(hint);
+            if (isFloatPrim(hp))
+                t = hp;
+        }
+        return mkFloat(n->flag ? -n->f : n->f, t);
+    }
+    case N_STR:
+    {
+        if (!n->cache)
+        {
+            StrObj *o = new StrObj();
+            o->s = n->s;
+            n->cache = o;
+        }
+        V v;
+        v.k = V_STR;
+        v.p = static_cast<StrObj *>(n->cache);
+        return v;
+    }
+    case N_BSTR:
+    {
+        std::vector<V> bytes;
+        for (unsigned char c : n->s)
+            bytes.push_back(mkUint(c, PR_U8));
+        return mkRefTo(mkSeq(V_ARRAY, bytes), false);
+    }
+    case N_CHAR:
+        return mkChar((uint32_t)n->lo);
+    case N_BYTE:
+        return mkUint(n->lo, PR_U8);
+    case N_BOOL:
+        return mkBool(n->lo != 0);
+    case N_PATH:
+    {
+        if (n->slot >= 0)
+        {
+            Obj *cell = G.fr->slots[(size_t)n->slot];
+            if (!cell)
+                errAt(n, "E0381", "used binding `" + n->path->segs[0].name + "` isn't initialized");
+            return takeFrom(cell->items[0], n, n->path->segs[0].name.c_str());
+        }
+        return evalPathValue(n, hint);
+    }
+    case N_BLOCK:
+        return evalBlock(n, hint);
+    case N_ITEM:
+        return V();
+    case N_SEMI:
+    {
+        V v = eval(n->a, nullptr);
+        if (!G.flow && G.trackDrops)
+            dropValue(v, n);
+        return V();
+    }
+    case N_LET:
+    {
+        Pat *pat = n->pat;
+        if (!n->a)
+        {
+            Obj *cell = newCell(V());
+            cell->items[0].k = V_MOVED;
+            cell->items[0].n = 1; // declared, no value yet
+            G.fr->slots[(size_t)pat->slot] = cell;
+            return V();
+        }
+        bool simple = pat->k == P_BIND && !pat->sub && !pat->byRef;
+        Node *src = n->a;
+        bool placeExpr = (src->k == N_PATH && src->slot >= 0) || src->k == N_FIELD || src->k == N_TFIELD ||
+                         (src->k == N_UNARY && src->op == O_DEREF);
+        if (!simple && placeExpr && !n->ty)
+        {
+            Place pl;
+            if (placeOf(src, pl))
+            {
+                V &s = slotAt(pl.o, pl.i);
+                if (s.k == V_MOVED)
+                    movedError(src, s);
+                if (pat->k == P_WILD)
+                    return V(); // `let _ = place;` moves nothing
+                if (!matchPat(pat, pl, M_MOVE, n))
+                {
+                    if (!n->b)
+                        errAt(n, "E0005", "refutable pattern in local binding",
+                              "this pattern does not match every value: use `if let` or `let ... else`");
+                    evalBlock(n->b, nullptr);
+                    if (!G.flow)
+                        errAt(n->b, "E0308", "`else` clause of `let...else` does not diverge",
+                              "it has to end in `return`, `break`, `continue` or a panic");
+                }
+                return V();
+            }
+            if (G.flow)
+                return V();
+        }
+        V v = eval(n->a, n->ty);
+        if (G.flow)
+            return V();
+        if (n->ty)
+            v = coerce(v, n->ty, n->a);
+        if (simple)
+        {
+            bindSlot(pat->slot, v);
+            return V();
+        }
+        if (pat->k == P_WILD)
+        {
+            // `let _ = value;`: not bound, dropped at once (a place is left alone)
+            if (G.trackDrops && !(n->a->k == N_PATH && n->a->slot >= 0))
+                dropValue(v, n);
+            return V();
+        }
+        Place pl;
+        pl.o = newCell(v);
+        pl.i = 0;
+        if (!matchPat(pat, pl, M_MOVE, n))
+        {
+            if (!n->b)
+                errAt(n, "E0005", "refutable pattern in local binding",
+                      "this pattern does not match every value: use `if let` or `let ... else`");
+            evalBlock(n->b, nullptr);
+            if (!G.flow)
+                errAt(n->b, "E0308", "`else` clause of `let...else` does not diverge",
+                      "it has to end in `return`, `break`, `continue` or a panic");
+        }
+        return V();
+    }
+    case N_IF:
+    {
+        bool c = evalCond(n->a);
+        if (G.flow)
+            return V();
+        V r;
+        if (c)
+            r = evalBlock(n->b, hint);
+        else if (n->c)
+            r = eval(n->c, hint);
+        scopeExit(n->scopeSlots, n);
+        return r;
+    }
+    case N_LETCOND:
+        return mkBool(evalCond(n));
+    case N_WHILE:
+    {
+        V result;
+        for (;;)
+        {
+            bool c = evalCond(n->a);
+            if (G.flow || !c)
+                break;
+            evalBlock(n->b, nullptr);
+            scopeExit(n->scopeSlots, n);
+            if (loopFlow(n, result))
+                break;
+        }
+        return V();
+    }
+    case N_LOOP:
+    {
+        V result;
+        for (;;)
+        {
+            evalBlock(n->b, nullptr);
+            if (loopFlow(n, result))
+                break;
+        }
+        return result;
+    }
+    case N_FOR:
+    {
+        V result;
+        Pat *pat = n->pat;
+        bool simple = pat->k == P_BIND && !pat->sub && !pat->byRef;
+        V iterable = eval(n->a, nullptr);
+        if (G.flow)
+            return V();
+        V source = toIter(iterable, n->a);
+        IterObj *it = static_cast<IterObj *>(source.p);
+        V item;
+        while (iterNext(it, item, n->a))
+        {
+            if (simple)
+                bindSlot(pat->slot, item);
+            else if (pat->k != P_WILD)
+            {
+                Place pl;
+                pl.o = newCell(item);
+                pl.i = 0;
+                if (!matchPat(pat, pl, M_MOVE, n))
+                    errAt(n, "E0005", "refutable pattern in `for` loop binding");
+            }
+            evalBlock(n->b, nullptr);
+            scopeExit(n->scopeSlots, n);
+            if (loopFlow(n, result))
+                break;
+        }
+        return V();
+    }
+    case N_MATCH:
+    {
+        Place pl;
+        if (!placeOf(n->a, pl))
+        {
+            V v = eval(n->a, nullptr);
+            if (G.flow)
+                return V();
+            pl.o = newCell(v);
+            pl.i = 0;
+        }
+        else if (G.flow)
+            return V();
+        {
+            V &s = slotAt(pl.o, pl.i);
+            if (s.k == V_MOVED)
+                movedError(n->a, s);
+        }
+        for (Arm &arm : n->arms)
+        {
+            if (arm.guard)
+            {
+                // the guard sees the names; nothing is moved until it says yes
+                if (!matchPat(arm.pat, pl, M_PEEK, n))
+                    continue;
+                bool ok = evalCond(arm.guard);
+                if (G.flow)
+                    return V();
+                if (!ok)
+                    continue;
+            }
+            if (!matchPat(arm.pat, pl, M_MOVE, n))
+                continue;
+            V r = eval(arm.body, hint);
+            scopeExit(n->scopeSlots, n);
+            return r;
+        }
+        errAt(n, "E0004", "non-exhaustive patterns: `" + debugStr(slotAt(pl.o, pl.i), false, n) + "` not covered",
+              "pattern `" + debugStr(slotAt(pl.o, pl.i), false, n) + "` not covered");
+    }
+    case N_BREAK:
+    {
+        V v;
+        if (n->a)
+        {
+            v = eval(n->a, nullptr);
+            if (G.flow)
+                return V();
+        }
+        G.flow = FL_BREAK;
+        G.flowVal = v;
+        G.flowLabel = n->s.empty() ? nullptr : &n->s;
+        return V();
+    }
+    case N_CONTINUE:
+        G.flow = FL_CONTINUE;
+        G.flowLabel = n->s.empty() ? nullptr : &n->s;
+        return V();
+    case N_RETURN:
+    {
+        V v;
+        if (n->a)
+        {
+            v = eval(n->a, G.fr->ret);
+            if (G.flow)
+                return V();
+        }
+        G.flow = FL_RETURN;
+        G.flowVal = v;
+        return V();
+    }
+    case N_CALL:
+        return evalCall(n, hint);
+    case N_MCALL:
+        return evalMethodCall(n, hint);
+    case N_FIELD:
+    case N_TFIELD:
+    {
+        Place pl;
+        if (!placeOf(n, pl))
+            return V();
+        V &slot = slotAt(pl.o, pl.i);
+        if (isCopy(slot))
+            return copyShell(slot);
+        if (slot.k == V_MOVED)
+            errAt(n, "E0382", "use of moved value: `" + (n->k == N_FIELD ? n->s : std::to_string(n->lo)) + "`",
+                  "value used here after move");
+        if (pl.ref)
+            errAt(n, "E0507", "cannot move out of `" + (n->k == N_FIELD ? n->s : std::to_string(n->lo)) +
+                                  "` which is behind a shared reference",
+                  "move occurs because this field has type `" + typeName(slot) +
+                      "`, which does not implement the `Copy` trait: consider cloning the value with `.clone()` "
+                      "or borrowing it with `&`");
+        V out = slot;
+        slot.k = V_MOVED;
+        slot.n = 0;
+        return out;
+    }
+    case N_INDEX:
+    {
+        Place pl;
+        V range, base;
+        if (!indexPlace(n, pl, &range, &base))
+        {
+            if (G.flow)
+                return V();
+            if (range.k == V_RANGE)
+                return sliceOf(base, range, n, true);
+            return V();
+        }
+        V &slot = slotAt(pl.o, pl.i);
+        if (isCopy(slot))
+            return copyShell(slot);
+        errAt(n, "E0507", "cannot move out of index of `" + typeName(peelAll(evalBorrow(n->a, nullptr))) + "`",
+              "move occurs because the value has type `" + typeName(slot) +
+                  "`, which does not implement the `Copy` trait: consider borrowing it with `&` or cloning it "
+                  "with `.clone()`");
+    }
+    case N_UNARY:
+    {
+        if (n->op == O_DEREF)
+        {
+            Place pl;
+            if (!placeOf(n, pl))
+            {
+                if (G.flow)
+                    return V();
+                V v = evalBorrow(n->a, nullptr);
+                if (v.k == V_STR || v.k == V_SLICE)
+                    return v; // *s of a &str is the str
+                errAt(n, "E0614", "type `" + typeName(v) + "` cannot be dereferenced", "can't be dereferenced");
+            }
+            V &slot = slotAt(pl.o, pl.i);
+            if (isCopy(slot))
+                return copyShell(slot);
+            if (slot.k == V_MOVED)
+                errAt(n, "E0382", "use of moved value", "value used here after move");
+            if (pl.ref)
+                errAt(n, "E0507", "cannot move out of a value which is behind a shared reference",
+                      "move occurs because the value has type `" + typeName(slot) +
+                          "`, which does not implement the `Copy` trait: consider cloning it with `.clone()`");
+            V out = slot;
+            slot.k = V_MOVED;
+            slot.n = 0;
+            return out;
+        }
+        V v = eval(n->a, n->op == O_NEG || n->op == O_NOT ? hint : nullptr);
+        if (G.flow)
+            return V();
+        V x = peel(v);
+        if (n->op == O_NEG)
+        {
+            if (x.k == V_INT)
+                return intNeg(x, n);
+            if (x.k == V_FLOAT)
+                return mkFloat(-fval(x), x.t);
+        }
+        else
+        {
+            if (x.k == V_BOOL)
+                return mkBool(x.lo == 0);
+            if (x.k == V_INT)
+                return intNot(x);
+        }
+        FnDef *f = findMethodFor(x, opMethod(n->op));
+        if (f)
+        {
+            std::vector<V> args(1, v);
+            return callFn(f, args, typeDefOf(x), n, nullptr);
+        }
+        errAt(n, "E0600", std::string("cannot apply unary operator `") + opSymbol(n->op) + "` to type `" + typeName(x) + "`",
+              std::string("cannot apply unary operator `") + opSymbol(n->op) + "`");
+    }
+    case N_REF:
+    {
+        Node *a = n->a;
+        if (a->k == N_INDEX)
+        {
+            Place pl;
+            V range, base;
+            forWrite = n->mut;
+            bool ok = indexPlace(a, pl, &range, &base);
+            forWrite = false;
+            if (ok)
+                return mkRef(pl.o, pl.i, n->mut);
+            if (G.flow)
+                return V();
+            if (range.k == V_RANGE)
+                return sliceOf(base, range, a, n->mut);
+            return V();
+        }
+        Place pl;
+        forWrite = n->mut;
+        bool ok = placeOf(a, pl);
+        forWrite = false;
+        if (ok)
+        {
+            V &target = slotAt(pl.o, pl.i);
+            if (target.k == V_MOVED)
+                movedError(a, target);
+            return mkRef(pl.o, pl.i, n->mut);
+        }
+        if (G.flow)
+            return V();
+        Ty *inner = nullptr;
+        if (hint)
+        {
+            Ty *h = tyResolve(hint);
+            if (h->k == TY_REF)
+                inner = h->elem;
+        }
+        V v = eval(a, inner);
+        if (G.flow)
+            return V();
+        return mkRefTo(v, n->mut);
+    }
+    case N_BINARY:
+    {
+        uint8_t op = n->op;
+        if (op == O_AND || op == O_OR)
+        {
+            if (op == O_AND)
+                return mkBool(evalCond(n));
+            V a = peel(eval(n->a, nullptr));
+            if (G.flow)
+                return V();
+            if (a.k != V_BOOL)
+                errAt(n->a, "E0308", "mismatched types: expected `bool`, found `" + typeName(a) + "`");
+            if (a.lo)
+                return a;
+            V b = peel(eval(n->b, nullptr));
+            if (G.flow)
+                return V();
+            if (b.k != V_BOOL)
+                errAt(n->b, "E0308", "mismatched types: expected `bool`, found `" + typeName(b) + "`");
+            return b;
+        }
+        if (op >= O_EQ && op <= O_GE)
+        {
+            // comparison only looks at its operands
+            V a = evalBorrow(n->a, nullptr);
+            if (G.flow)
+                return V();
+            V b = evalBorrow(n->b, nullptr);
+            if (G.flow)
+                return V();
+            V x = peelAll(a), y = peelAll(b);
+            if ((x.k == V_INT && y.k == V_INT) || (x.k == V_FLOAT && y.k == V_FLOAT))
+                unifyNum(x, y, n, "a comparison");
+            else if ((x.k == V_INT && y.k == V_FLOAT) || (x.k == V_FLOAT && y.k == V_INT))
+                errAt(n, "E0308", "mismatched types: expected `" + operandName(x) + "`, found `" + operandName(y) + "`",
+                      "an integer and a float cannot be compared: convert one of them with `as`");
+            if (op == O_EQ)
+                return mkBool(valueEq(x, y, n));
+            if (op == O_NE)
+                return mkBool(!valueEq(x, y, n));
+            int c = valueCmp(x, y, n);
+            if (c == 2)
+                return mkBool(false);
+            return mkBool(op == O_LT ? c < 0 : op == O_LE ? c <= 0 : op == O_GT ? c > 0 : c >= 0);
+        }
+        Ty *numeric = hint && tyPrim(hint) != PR_NONE ? hint : nullptr;
+        V a = eval(n->a, numeric);
+        if (G.flow)
+            return V();
+        V b = eval(n->b, op == O_SHL || op == O_SHR ? nullptr : numeric);
+        if (G.flow)
+            return V();
+        return binaryOp(op, a, b, n);
+    }
+    case N_ASSIGN:
+    {
+        V v = eval(n->b, nullptr);
+        if (G.flow)
+            return V();
+        assignInto(n->a, v, n);
+        return V();
+    }
+    case N_OPASSIGN:
+    {
+        V rhs = eval(n->b, nullptr);
+        if (G.flow)
+            return V();
+        Place pl;
+        forWrite = true;
+        bool ok = placeOf(n->a, pl);
+        forWrite = false;
+        if (!ok)
+        {
+            if (G.flow)
+                return V();
+            errAt(n->a, "E0067", "invalid left-hand side of assignment", "cannot assign to this expression");
+        }
+        V &slot = slotAt(pl.o, pl.i);
+        if (slot.k == V_MOVED)
+            movedError(n->a, slot);
+        V r = peel(rhs);
+        switch (slot.k)
+        {
+        case V_INT:
+        case V_FLOAT:
+        case V_BOOL:
+            if (slot.k == r.k)
+            {
+                slot = binaryOp(n->op, slot, r, n);
+                return V();
+            }
+            break;
+        case V_STR:
+            if (n->op == O_ADD && slot.x)
+            {
+                if (r.k != V_STR)
+                    errAt(n, "E0308", "mismatched types: expected `&str`, found `" + typeName(rhs) + "`",
+                          r.k == V_CHAR ? "a `char` is added with `.push(c)`" : "expected `&str`");
+                if (rhs.k == V_STR && rhs.x)
+                    errAt(n, "E0308", "mismatched types: expected `&str`, found `String`",
+                          "expected `&str`, found `String`: consider borrowing here with `&`");
+                static_cast<StrObj *>(slot.p)->s += static_cast<StrObj *>(r.p)->s;
+                return V();
+            }
+            break;
+        }
+        // the type's own op-assign, or its operator
+        std::string method = std::string(opMethod(n->op)) + "_assign";
+        V target = slot;
+        if (FnDef *f = findMethodFor(target, method))
+        {
+            std::vector<V> args;
+            args.push_back(mkRef(pl.o, pl.i, true));
+            args.push_back(rhs);
+            callFn(f, args, typeDefOf(target), n, nullptr);
+            return V();
+        }
+        if (target.k == V_REF)
+            errAt(n, "E0368", std::string("binary assignment operation `") + opSymbol(n->op) + "=` cannot be applied to type `" +
+                                  typeName(target) + "`",
+                  "cannot use `" + std::string(opSymbol(n->op)) + "=` on a reference: dereference it first with `*`");
+        errAt(n, "E0368", std::string("binary assignment operation `") + opSymbol(n->op) + "=` cannot be applied to type `" +
+                              typeName(target) + "`",
+              std::string("cannot use `") + opSymbol(n->op) + "=` on type `" + typeName(target) + "`");
+    }
+    case N_CAST:
+    {
+        V v = eval(n->a, nullptr);
+        if (G.flow)
+            return V();
+        return numCast(v, n->ty, n);
+    }
+    case N_RANGE:
+        return rangeValue(n, hint);
+    case N_TUPLE:
+    {
+        if (n->kids.empty())
+            return V();
+        Ty *h = tyResolve(hint);
+        std::vector<V> items;
+        items.reserve(n->kids.size());
+        for (size_t k = 0; k < n->kids.size(); ++k)
+        {
+            Ty *eh = h && h->k == TY_TUPLE && k < h->items.size() ? h->items[k] : nullptr;
+            V v = eval(n->kids[k], eh);
+            if (G.flow)
+                return V();
+            items.push_back(eh ? coerce(v, eh, n->kids[k]) : v);
+        }
+        return mkTuple(items);
+    }
+    case N_ARRAY:
+    {
+        Ty *h = tyResolve(hint);
+        while (h && h->k == TY_REF)
+            h = tyResolve(h->elem);
+        Ty *eh = h && (h->k == TY_ARRAY || h->k == TY_SLICE) ? h->elem : nullptr;
+        std::vector<V> items;
+        items.reserve(n->kids.size());
+        uint8_t firm = 0;
+        for (Node *kid : n->kids)
+        {
+            V v = eval(kid, eh);
+            if (G.flow)
+                return V();
+            if ((v.k == V_INT || v.k == V_FLOAT) && v.t)
+                firm = v.t;
+            items.push_back(v);
+        }
+        // [1u8, 2, 3]: the literals are what the typed element is
+        if (firm)
+            for (V &v : items)
+                if ((v.k == V_INT || v.k == V_FLOAT) && v.t == 0)
+                    v = v.k == V_INT ? intConvert(v, firm) : mkFloat(fval(v), firm);
+        return mkSeq(V_ARRAY, items);
+    }
+    case N_REPEAT:
+    {
+        Ty *h = tyResolve(hint);
+        while (h && h->k == TY_REF)
+            h = tyResolve(h->elem);
+        Ty *eh = h && (h->k == TY_ARRAY || h->k == TY_SLICE) ? h->elem : nullptr;
+        V v = eval(n->a, eh);
+        if (G.flow)
+            return V();
+        V count = eval(n->b, nullptr);
+        if (G.flow)
+            return V();
+        int64_t len = toIndex(count, n->b);
+        std::vector<V> items;
+        items.reserve((size_t)len);
+        for (int64_t k = 0; k < len; ++k)
+            items.push_back(k + 1 == len ? v : cloneValue(v, n));
+        return mkSeq(V_ARRAY, items);
+    }
+    case N_STRUCT:
+    {
+        TypeDef *def = static_cast<TypeDef *>(n->cache);
+        int variant = n->cacheIdx;
+        bool late = def == nullptr; // Self { .. } in a trait's own method
+        if (late)
+        {
+            def = G.fr->self;
+            variant = -1;
+            if (!def || def->kind != TD_STRUCT)
+                errAt(n, "E0071", "expected struct, variant or union type, found `Self`");
+        }
+        const std::vector<FieldDef> &fields = variant >= 0 ? def->variants[(size_t)variant].fields : def->fields;
+        if (def->mod && !modWithin(G.fr->mod, def->mod))
+            for (const FieldDef &fd : fields)
+                if (!fd.isPub && variant < 0)
+                    errAt(n, "E0451", "field `" + fd.name + "` of struct `" + def->name + "` is private", "private field");
+        std::vector<V> items(fields.size());
+        std::vector<bool> given(fields.size(), false);
+        for (size_t k = 0; k < n->kids.size(); ++k)
+        {
+            int idx = late ? -1 : n->scopeSlots[k];
+            if (late)
+            {
+                for (size_t f = 0; f < fields.size(); ++f)
+                    if (fields[f].name == n->names[k])
+                        idx = (int)f;
+                if (idx < 0)
+                    errAt(n->kids[k], "E0560", "struct `" + def->name + "` has no field named `" + n->names[k] + "`");
+            }
+            V v = eval(n->kids[k], fields[(size_t)idx].ty);
+            if (G.flow)
+                return V();
+            items[(size_t)idx] = coerce(v, fields[(size_t)idx].ty, n->kids[k]);
+            given[(size_t)idx] = true;
+        }
+        if (n->b)
+        {
+            // ..base: the fields not written come from it
+            V base = eval(n->b, tyOfValue(mkStruct(def, std::vector<V>())));
+            if (G.flow)
+                return V();
+            V bv = peel(base);
+            if (bv.k != V_STRUCT || static_cast<StructObj *>(bv.p)->def != def)
+                errAt(n->b, "E0308", "mismatched types: expected `" + def->name + "`, found `" + typeName(base) + "`");
+            for (size_t f = 0; f < fields.size(); ++f)
+                if (!given[f])
+                {
+                    V &from = bv.p->items[f];
+                    items[f] = isCopy(from) ? copyShell(from) : from;
+                }
+        }
+        else if (late)
+            for (size_t f = 0; f < fields.size(); ++f)
+                if (!given[f])
+                    errAt(n, "E0063", "missing field `" + fields[f].name + "` in initializer of `" + def->name + "`");
+        return variant >= 0 ? mkVariant(def, variant, items) : mkStruct(def, items);
+    }
+    case N_CLOSURE:
+        if (n->op == 1)
+            return asyncBlockFuture(evalClosure(n), n->flag); // async { ... }: a future
+        return evalClosure(n);
+    case N_AWAIT:
+    {
+        V f = eval(n->a, n->a->k == N_CALL || n->a->k == N_MCALL ? hint : nullptr);
+        if (G.flow)
+            return V();
+        return awaitValue(f, n, hint);
+    }
+    case N_TRY:
+    {
+        V v = eval(n->a, hint && n->a->k == N_MCALL ? resultHint(hint) : nullptr);
+        if (G.flow)
+            return V();
+        V x = peel(v);
+        if (x.k == V_ENUM)
+        {
+            EnumObj *e = static_cast<EnumObj *>(x.p);
+            if (e->def == G.optionDef)
+            {
+                if (e->variant == 1)
+                    return e->items[0];
+                G.flow = FL_RETURN;
+                G.flowVal = mkNone();
+                return V();
+            }
+            if (e->def == G.resultDef)
+            {
+                if (e->variant == 0)
+                    return e->items[0];
+                // the error becomes what the function returns: From::from(e)
+                V err = e->items[0];
+                Ty *ret = tyResolve(G.fr->ret);
+                Ty *want = ret && tyHead(ret) == "Result" ? tyArg(ret, 1) : nullptr;
+                if (want)
+                    err = convertInto(err, want, n, false);
+                else if (ret && tyHead(ret) == "Option")
+                    errAt(n, "E0277", "the `?` operator on a `Result` cannot be used in a function that returns `Option`",
+                          "use `.ok()?` if you want to discard the error");
+                G.flow = FL_RETURN;
+                G.flowVal = mkErr(err);
+                return V();
+            }
+        }
+        errAt(n, "E0277", "the `?` operator can only be applied to values that implement `Try`",
+              "the `?` operator cannot be applied to type `" + typeName(x) + "`");
+    }
+    case N_MACRO:
+        return evalMacro(n, hint);
+    }
+    errAt(n, "", "this expression is not supported by Quantum's Rust front-end");
+}
+
+} // namespace rust

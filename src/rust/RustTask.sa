@@ -1,0 +1,2585 @@
+// quantum: cpp
+// Rust front-end: threads and async tasks. Every thread a program spawns and
+// every task of its async runtime runs on a fiber of its own, one at a time:
+// a task runs until it waits (for a channel, a join, a lock-step barrier, a
+// sleep, a future), then the next one that can go on runs. Time is virtual:
+// a sleep costs nothing, the clock jumps to when the first sleeper is due. So
+// things happen in the order they would in a real run, the same every time.
+//
+//   threads  thread::spawn / Builder / scope, join, sleep, park, yield_now
+//   sync     mpsc channels (bounded too), Condvar, Barrier
+//   async    async fn / blocks / closures, .await; tokio: spawn, spawn_blocking,
+//            sleep, interval, timeout, join!, try_join!, select!, JoinSet,
+//            mpsc, oneshot, Mutex, RwLock, Notify, Semaphore, Barrier,
+//            Runtime::block_on; futures: join_all, block_on
+//
+// A spawned thread or task starts when the one that spawned it waits, as it
+// mostly does in a real run. A future is lazy: an async fn's call runs
+// nothing until it is awaited.
+#include "RustMain.h.sa"
+#include "RustRt.h.sa"
+
+#include <chrono>
+#include <deque>
+
+// A compiler older than these intrinsics (the seed, on the way to building
+// the real one) never runs this code
+#ifndef __QUANTUM_EH_TOP__
+#define __eh_top() ((int64_t)0)
+#define __eh_top_set(x) ((void)(x))
+#endif
+
+namespace __dll_kernel32
+{
+void *ConvertThreadToFiber(void *param);
+void *CreateFiberEx(size_t commit, size_t reserve, unsigned long flags, void (*start)(void *), void *param);
+void SwitchToFiber(void *fiber);
+} // namespace __dll_kernel32
+
+// The thread as a fiber: converted once, shared by every front-end that
+// switches fibers (JavaScript's generators too)
+void *g_quantumThreadFiber = nullptr;
+
+void *quantumThreadFiber()
+{
+    if (!g_quantumThreadFiber)
+        g_quantumThreadFiber = __dll_kernel32::ConvertThreadToFiber(nullptr);
+    return g_quantumThreadFiber;
+}
+
+namespace rust
+{
+
+namespace
+{
+
+const size_t kStackReserve = (size_t)64 << 20; // as much as the main thread has
+const size_t kStackCommit = (size_t)64 << 10;
+
+struct Task;
+
+// a task waiting: woken only while seq is still its wait's number
+struct Waiter
+{
+    Task *t = nullptr;
+    uint64_t seq = 0;
+};
+
+struct FiberBox
+{
+    void *fiber = nullptr;
+};
+
+enum TaskKind : uint8_t
+{
+    TK_MAIN,   // the program's main thread
+    TK_THREAD, // thread::spawn
+    TK_TASK,   // tokio::spawn: a task of the runtime
+    TK_CHILD   // a future of join! / select! / timeout, run beside the task that waits for it
+};
+
+struct Task
+{
+    int id = 0; // tokio's task id
+    uint8_t kind = TK_THREAD;
+    FiberBox *box = nullptr;
+    V body;     // the closure a thread runs, or what a task awaits
+    bool isFuture = false;
+    bool started = false, done = false, panicked = false, cancelled = false, cancelReq = false;
+    V result;
+    Panic panic;
+    std::string name; // the thread it is on
+    bool named = false;
+    int64_t threadId = 0;
+    uint64_t waitSeq = 0;
+    bool waiting = false;
+    std::vector<Waiter> joiners;
+    bool parkToken = false, isParked = false, notified = false;
+    Waiter parked;
+    Frame base; // G.fr when it starts
+};
+
+struct Sleeper
+{
+    int64_t at = 0;
+    uint64_t order = 0;
+    Task *t = nullptr;
+    uint64_t seq = 0;
+};
+
+// a task waiting for a socket
+struct IoWait
+{
+    uint64_t sock = 0;
+    int write = 0;
+    Waiter w;
+    int64_t deadline = -1;
+};
+
+std::vector<IoWait> g_io;
+Task *g_main = nullptr;
+Task *g_cur = nullptr;
+Task *g_startTask = nullptr;
+std::deque<Task *> g_ready;
+std::vector<Sleeper> g_sleepers;
+uint64_t g_sleepOrder = 0;
+std::vector<FiberBox *> g_freeBoxes;
+std::vector<Task *> g_threads; // by thread: unpark() finds them here
+int64_t g_virtual = 0;         // nanoseconds slept: the clock is the real one plus this
+int g_nextTaskId = 1;
+int64_t g_nextThreadId = 2;
+int64_t g_workerThreadId = 0;  // the thread tokio's tasks report
+bool g_enterAsync = false;
+
+enum Fatal
+{
+    FA_NONE,
+    FA_COMPILE,
+    FA_EXIT,
+    FA_OVERFLOW,
+    FA_DEADLOCK,
+    FA_OTHER
+};
+
+// what ended the program on a thread other than main: main throws it again
+int g_fatal = FA_NONE;
+CompileErr g_fatalErr;
+Panic g_fatalPanic;
+int g_fatalCode = 0;
+
+int64_t realNanos()
+{
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int64_t nowNs() { return realNanos() + g_virtual; }
+
+void fiberEntry(void *param);
+
+// ─── the scheduler ─────────────────────────────────────────────────────────
+
+void wake(Task *t, uint64_t seq, bool first)
+{
+    if (!t || t->done || !t->waiting || t->waitSeq != seq)
+        return;
+    t->waiting = false;
+    ++t->waitSeq;
+    if (first)
+        g_ready.push_front(t);
+    else
+        g_ready.push_back(t);
+}
+
+void wakeAll(std::vector<Waiter> &list, bool first)
+{
+    std::vector<Waiter> ws = list;
+    list.clear();
+    if (first)
+        for (size_t k = ws.size(); k-- > 0;)
+            wake(ws[k].t, ws[k].seq, true);
+    else
+        for (size_t k = 0; k < ws.size(); ++k)
+            wake(ws[k].t, ws[k].seq, false);
+}
+
+bool live(const Waiter &w) { return w.t && !w.t->done && w.t->waiting && w.t->waitSeq == w.seq; }
+
+// the first that still waits
+bool wakeOne(std::vector<Waiter> &list)
+{
+    while (!list.empty())
+    {
+        Waiter w = list.front();
+        list.erase(list.begin());
+        if (live(w))
+        {
+            w.t->notified = true;
+            wake(w.t, w.seq, false);
+            return true;
+        }
+    }
+    return false;
+}
+
+// the running task is about to wait: what wakes it
+Waiter waitHere()
+{
+    Waiter w;
+    w.t = g_cur;
+    g_cur->waiting = true;
+    w.seq = g_cur->waitSeq;
+    return w;
+}
+
+// it did not have to wait after all
+void unwait()
+{
+    if (g_cur->waiting)
+    {
+        g_cur->waiting = false;
+        ++g_cur->waitSeq;
+    }
+}
+
+void addSleeper(const Waiter &w, int64_t at)
+{
+    Sleeper s;
+    s.at = at;
+    s.order = g_sleepOrder++;
+    s.t = w.t;
+    s.seq = w.seq;
+    g_sleepers.push_back(s);
+}
+
+int earliestSleeper()
+{
+    size_t keep = 0;
+    for (size_t k = 0; k < g_sleepers.size(); ++k)
+    {
+        Sleeper s = g_sleepers[k];
+        if (s.t->done || !s.t->waiting || s.t->waitSeq != s.seq)
+            continue; // woken some other way
+        g_sleepers[keep++] = s;
+    }
+    g_sleepers.resize(keep);
+    int best = -1;
+    for (size_t k = 0; k < g_sleepers.size(); ++k)
+    {
+        if (best < 0)
+        {
+            best = (int)k;
+            continue;
+        }
+        const Sleeper &a = g_sleepers[k], &b = g_sleepers[(size_t)best];
+        if (a.at < b.at || (a.at == b.at && a.order < b.order))
+            best = (int)k;
+    }
+    return best;
+}
+
+// sleepers that are due go to the ready queue, in the order they are due
+void wakeDue()
+{
+    int64_t now = nowNs();
+    for (;;)
+    {
+        int best = earliestSleeper();
+        if (best < 0 || g_sleepers[(size_t)best].at > now)
+            return;
+        Sleeper s = g_sleepers[(size_t)best];
+        g_sleepers.erase(g_sleepers.begin() + best);
+        wake(s.t, s.seq, false);
+    }
+}
+
+// tasks waiting for sockets: in real time, until a socket is ready or the
+// first sleeper (or a read timeout) is due
+void pollSockets()
+{
+    size_t keep = 0;
+    for (size_t k = 0; k < g_io.size(); ++k)
+    {
+        IoWait io = g_io[k];
+        if (!live(io.w))
+            continue;
+        g_io[keep++] = io;
+    }
+    g_io.resize(keep);
+    if (g_io.empty())
+        return;
+    int64_t now = nowNs(), timeout = -1;
+    int best = earliestSleeper();
+    if (best >= 0)
+        timeout = g_sleepers[(size_t)best].at > now ? g_sleepers[(size_t)best].at - now : 0;
+    for (const IoWait &io : g_io)
+        if (io.deadline >= 0)
+        {
+            int64_t left = io.deadline > now ? io.deadline - now : 0;
+            timeout = timeout < 0 || left < timeout ? left : timeout;
+        }
+    std::vector<uint64_t> socks;
+    std::vector<int> writes, ready;
+    for (const IoWait &io : g_io)
+    {
+        socks.push_back(io.sock);
+        writes.push_back(io.write);
+    }
+    netPoll(socks, writes, timeout, ready);
+    now = nowNs();
+    std::vector<IoWait> waiting = g_io;
+    g_io.clear();
+    for (size_t k = 0; k < waiting.size(); ++k)
+    {
+        if (ready[k] || (waiting[k].deadline >= 0 && now >= waiting[k].deadline))
+            wake(waiting[k].w.t, waiting[k].w.seq, false);
+        else
+            g_io.push_back(waiting[k]);
+    }
+    wakeDue();
+}
+
+// the next task to run: a ready one, else the first sleeper (the clock moves
+// to when it is due); null: every task waits for another
+Task *pickNext()
+{
+    for (;;)
+    {
+        while (!g_ready.empty())
+        {
+            Task *t = g_ready.front();
+            g_ready.pop_front();
+            if (!t->done)
+                return t;
+        }
+        if (!g_io.empty())
+        {
+            pollSockets();
+            if (!g_io.empty() || !g_ready.empty())
+                continue;
+        }
+        int best = earliestSleeper();
+        if (best < 0)
+            return nullptr;
+        Sleeper s = g_sleepers[(size_t)best];
+        g_sleepers.erase(g_sleepers.begin() + best);
+        int64_t now = nowNs();
+        if (s.at > now)
+            g_virtual += s.at - now;
+        wake(s.t, s.seq, false);
+    }
+}
+
+FiberBox *takeBox()
+{
+    if (!g_freeBoxes.empty())
+    {
+        FiberBox *b = g_freeBoxes.back();
+        g_freeBoxes.pop_back();
+        return b;
+    }
+    FiberBox *b = new FiberBox();
+    b->fiber = __dll_kernel32::CreateFiberEx(kStackCommit, kStackReserve, 0, fiberEntry, b);
+    if (!b->fiber)
+        panicAt(nullptr, "failed to spawn thread: the system has no memory left for another stack");
+    return b;
+}
+
+[[noreturn]] void rethrowFatal()
+{
+    int f = g_fatal;
+    g_fatal = FA_NONE;
+    if (f == FA_COMPILE)
+        throw g_fatalErr;
+    if (f == FA_EXIT)
+    {
+        ExitEx e;
+        e.code = g_fatalCode;
+        throw e;
+    }
+    if (f == FA_OVERFLOW || f == FA_OTHER)
+        throw g_fatalPanic;
+    Deadlock d;
+    throw d;
+}
+
+// to t's fiber, from whichever is running
+void enter(Task *t)
+{
+    g_cur = t;
+    void *target;
+    if (t == g_main)
+        target = quantumThreadFiber();
+    else
+    {
+        if (!t->started)
+        {
+            FiberBox *box = takeBox();
+            t->started = true;
+            t->box = box;
+            g_startTask = t;
+        }
+        target = t->box->fiber;
+    }
+    __dll_kernel32::SwitchToFiber(target);
+}
+
+// the running task hands over to next; returns when it runs again
+void switchTo(Task *next)
+{
+    quantumThreadFiber(); // the thread is a fiber before anything switches
+    Task *me = g_cur;
+    Frame *fr = G.fr;
+    int depth = G.depth;
+    int flow = G.flow;
+    V flowVal = G.flowVal;
+    const std::string *label = G.flowLabel;
+    const Node *cur = G.cur;
+    int64_t eh = __eh_top();
+    enter(next);
+    // running again
+    __eh_top_set(eh);
+    G.fr = fr;
+    G.depth = depth;
+    G.flow = flow;
+    G.flowVal = flowVal;
+    G.flowLabel = label;
+    G.cur = cur;
+    g_cur = me;
+    if (me == g_main && g_fatal != FA_NONE)
+        rethrowFatal();
+    if (me->cancelReq && !me->cancelled && me != g_main)
+    {
+        me->cancelled = true;
+        TaskCancel c;
+        throw c;
+    }
+}
+
+// the running task waits: it is registered where it will be woken
+void suspend()
+{
+    Task *next = pickNext();
+    if (!next)
+    {
+        Deadlock d;
+        throw d;
+    }
+    if (next != g_cur)
+        switchTo(next);
+}
+
+void sleepUntil(int64_t at)
+{
+    Waiter w = waitHere();
+    addSleeper(w, at);
+    suspend();
+}
+
+void yieldNow()
+{
+    Waiter w = waitHere();
+    wakeDue();
+    wake(w.t, w.seq, false);
+    suspend();
+}
+
+void waitFor(Task *t)
+{
+    while (!t->done)
+    {
+        Waiter w = waitHere();
+        t->joiners.push_back(w);
+        suspend();
+    }
+}
+
+// until one of them ends
+void waitAny(std::vector<Task *> &tasks)
+{
+    Waiter w = waitHere();
+    bool any = false;
+    for (Task *t : tasks)
+        if (!t->done)
+        {
+            t->joiners.push_back(w);
+            any = true;
+        }
+    if (!any)
+    {
+        unwait();
+        return;
+    }
+    suspend();
+}
+
+void reportPanic(Task *t, const Panic &p)
+{
+    writeErr("\nthread '" + (t->named ? t->name : std::string("<unnamed>")) + "' panicked at " + srcPos(p.line, p.col) +
+             ":\n" + p.msg +
+             "\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n");
+}
+
+V runFuture(V fv, const Node *at, Ty *hint);
+
+void runTask(Task *t)
+{
+    G.fr = &t->base;
+    G.depth = 0;
+    G.flow = FL_NONE;
+    G.flowVal = V();
+    G.flowLabel = nullptr;
+    G.cur = nullptr;
+    try
+    {
+        if (t->cancelReq)
+        {
+            TaskCancel c;
+            throw c;
+        }
+        if (t->isFuture)
+            t->result = awaitValue(t->body, nullptr, nullptr);
+        else
+        {
+            t->result = call0(t->body, nullptr);
+            dropValue(t->body, nullptr); // the thread is over: what its closure captured is dropped
+        }
+    }
+    catch (TaskCancel &)
+    {
+        t->cancelled = true;
+    }
+    catch (Panic &p)
+    {
+        if (!p.msg.empty() && p.msg[0] == '\x01')
+        {
+            g_fatal = FA_OVERFLOW;
+            g_fatalPanic = p;
+            g_fatalPanic.msg = std::string("\x01thread:") + (t->named ? t->name : std::string("<unknown>"));
+        }
+        else
+        {
+            t->panicked = true;
+            t->panic = p;
+            if (t->kind != TK_CHILD)
+                reportPanic(t, p);
+        }
+    }
+    catch (CompileErr &e)
+    {
+        g_fatal = FA_COMPILE;
+        g_fatalErr = e;
+    }
+    catch (ExitEx &e)
+    {
+        g_fatal = FA_EXIT;
+        g_fatalCode = e.code;
+    }
+    catch (Deadlock &)
+    {
+        g_fatal = FA_DEADLOCK;
+    }
+    catch (...)
+    {
+        g_fatal = FA_OTHER;
+        g_fatalPanic = Panic();
+        g_fatalPanic.msg = "internal error in a thread";
+    }
+    t->done = true;
+    wakeAll(t->joiners, t->kind == TK_CHILD);
+}
+
+void fiberEntry(void *param)
+{
+    FiberBox *box = static_cast<FiberBox *>(param);
+    Task *t = g_startTask;
+    for (;;)
+    {
+        __eh_top_set(0);
+        g_cur = t;
+        runTask(t);
+        Task *next = g_fatal == FA_NONE ? pickNext() : nullptr;
+        if (!next)
+        {
+            if (g_fatal == FA_NONE)
+                g_fatal = FA_DEADLOCK;
+            next = g_main;
+        }
+        if (next != g_main && !next->started)
+        {
+            // it runs on this fiber
+            next->started = true;
+            next->box = box;
+            t = next;
+            continue;
+        }
+        g_freeBoxes.push_back(box);
+        enter(next);
+        // this fiber was taken for a new task
+        t = g_startTask;
+    }
+}
+
+// cancels t: if it is waiting somewhere it runs now, unwinds and ends
+void cancelTask(Task *t)
+{
+    if (t->done)
+        return;
+    t->cancelReq = true;
+    if (!t->started)
+    {
+        t->done = true;
+        t->cancelled = true;
+        wakeAll(t->joiners, false);
+        return;
+    }
+    t->waiting = false;
+    ++t->waitSeq;
+    Waiter w = waitHere();
+    wake(w.t, w.seq, true); // back here as soon as it is gone
+    switchTo(t);
+}
+
+void cancelAll(std::vector<Task *> &tasks)
+{
+    for (Task *t : tasks)
+        if (t)
+            cancelTask(t);
+}
+
+Task *newTask(uint8_t kind, V body, bool isFuture)
+{
+    Task *t = new Task();
+    t->kind = kind;
+    t->body = body;
+    t->isFuture = isFuture;
+    t->base.mod = G.root;
+    if (kind == TK_TASK)
+    {
+        t->id = g_nextTaskId++;
+        t->name = "tokio-runtime-worker";
+        t->named = true;
+        if (!g_workerThreadId)
+            g_workerThreadId = g_nextThreadId++;
+        t->threadId = g_workerThreadId;
+    }
+    else if (kind == TK_CHILD && g_cur)
+    {
+        t->name = g_cur->name;
+        t->named = g_cur->named;
+        t->threadId = g_cur->threadId;
+    }
+    return t;
+}
+
+// children run before anything else that is ready, in order
+std::vector<Task *> startChildren(std::vector<V> &futs)
+{
+    std::vector<Task *> kids;
+    for (size_t k = 0; k < futs.size(); ++k)
+        kids.push_back(newTask(TK_CHILD, futs[k], true));
+    for (size_t k = kids.size(); k-- > 0;)
+        g_ready.push_front(kids[k]);
+    return kids;
+}
+
+V handleFor(Task *t)
+{
+    V h = mkNative("JoinHandle", "");
+    static_cast<NativeObj *>(h.p)->ext = t;
+    static_cast<NativeObj *>(h.p)->a = t->kind == TK_TASK ? 1 : 0;
+    return h;
+}
+
+Task *taskOf(NativeObj *o)
+{
+    Task *t = static_cast<Task *>(o->ext);
+    if (!t)
+        panicAt(nullptr, "a JoinHandle without a thread");
+    return t;
+}
+
+V durationOf(int64_t ns)
+{
+    V v = mkNative("Duration", "");
+    NativeObj *d = static_cast<NativeObj *>(v.p);
+    d->a = ns / 1000000000;
+    d->b = ns % 1000000000;
+    return v;
+}
+
+int64_t nanosOf(V d, const Node *at)
+{
+    V x = peelAll(d);
+    if (x.k != V_NATIVE || static_cast<NativeObj *>(x.p)->type != "Duration")
+        errAt(at, "E0308", "mismatched types: expected `Duration`, found `" + typeName(x) + "`");
+    NativeObj *o = static_cast<NativeObj *>(x.p);
+    return o->a * 1000000000 + o->b;
+}
+
+V instantAt(int64_t ns)
+{
+    V v = mkNative("Instant", "");
+    static_cast<NativeObj *>(v.p)->a = ns;
+    return v;
+}
+
+// ─── futures ───────────────────────────────────────────────────────────────
+
+enum FutK : uint8_t
+{
+    FU_FN,       // an async fn's call
+    FU_CLOSURE,  // an async block, or an async closure's call
+    FU_READY,    // a: the value
+    FU_PENDING,  // never ready
+    FU_SLEEP,    // until `when`
+    FU_YIELD,
+    FU_TIMEOUT,  // a: the future; when: the deadline
+    FU_JOIN_ALL, // items: the futures
+    FU_RECV,     // a: the receiver
+    FU_SEND,     // a: the sender, b: the value
+    FU_TICK,     // a: the interval
+    FU_NOTIFIED, // a: the Notify
+    FU_ACQUIRE,  // a: the semaphore; n: permits; owned
+    FU_BARRIER,  // a: the barrier
+    FU_BLOCKING, // a: a closure (spawn_blocking)
+    FU_DEFER     // a: a library object, args: a method's arguments, at: the call (tokio's sockets)
+};
+
+struct FutState
+{
+    uint8_t k = FU_READY;
+    bool used = false, owned = false, tryForm = false;
+    FnDef *fn = nullptr;
+    TypeDef *self = nullptr;
+    const Node *at = nullptr;
+    Ty *hint = nullptr;
+    std::vector<V> args;
+    std::vector<Ty *> targs;
+    bool hasTargs = false;
+    V a, b;
+    int64_t when = 0;
+    int64_t n = 0;
+};
+
+V mkFuture(uint8_t k, FutState *&st)
+{
+    V v = mkNative("Future", "");
+    st = new FutState();
+    st->k = k;
+    static_cast<NativeObj *>(v.p)->ext = st;
+    return v;
+}
+
+V futureOf(uint8_t k, V a)
+{
+    FutState *st = nullptr;
+    V v = mkFuture(k, st);
+    st->a = a;
+    return v;
+}
+
+// ─── channels ──────────────────────────────────────────────────────────────
+
+enum ChanKind : uint8_t
+{
+    CH_STD,     // std::sync::mpsc
+    CH_TOKIO,   // tokio::sync::mpsc
+    CH_ONESHOT  // tokio::sync::oneshot
+};
+
+struct Chan
+{
+    uint8_t kind = CH_STD;
+    std::deque<V> q;
+    int senders = 1, receivers = 1;
+    int64_t cap = -1; // bounded: how many it holds
+    bool closed = false;
+    std::vector<Waiter> recvWait, sendWait;
+};
+
+Chan *chanOf(NativeObj *o) { return static_cast<Chan *>(o->ext); }
+
+V chanEnd(const char *type, Chan *c)
+{
+    V v = mkNative(type, "");
+    static_cast<NativeObj *>(v.p)->ext = c;
+    return v;
+}
+
+V pairOf(V a, V b)
+{
+    std::vector<V> items;
+    items.push_back(a);
+    items.push_back(b);
+    return mkTuple(items);
+}
+
+V newChannel(uint8_t kind, int64_t cap)
+{
+    Chan *c = new Chan();
+    c->kind = kind;
+    c->cap = cap;
+    G.trackDrops = true; // a channel ends when every sender is dropped
+    return pairOf(chanEnd(kind == CH_STD && cap >= 0 ? "SyncSender" : "Sender", c), chanEnd("Receiver", c));
+}
+
+// 0: a value; 1: none yet (not blocking); 2: every sender is gone; 3: timed out
+int chanTake(Chan *c, V &out, bool block, bool timed, int64_t deadline)
+{
+    for (;;)
+    {
+        if (!c->q.empty())
+        {
+            out = c->q.front();
+            c->q.pop_front();
+            wakeOne(c->sendWait);
+            return 0;
+        }
+        if (c->senders <= 0 || c->closed)
+            return 2;
+        if (!block)
+            return 1;
+        if (timed && nowNs() >= deadline)
+            return 3;
+        Waiter w = waitHere();
+        c->recvWait.push_back(w);
+        if (timed)
+            addSleeper(w, deadline);
+        suspend();
+    }
+}
+
+// false: the receiver is gone
+bool chanPut(Chan *c, V v)
+{
+    for (;;)
+    {
+        if (c->receivers <= 0 || c->closed)
+            return false;
+        if (c->cap < 0 || (int64_t)c->q.size() < (c->cap > 0 ? c->cap : 1))
+            break;
+        Waiter w = waitHere();
+        c->sendWait.push_back(w);
+        suspend();
+    }
+    c->q.push_back(v);
+    wakeOne(c->recvWait);
+    return true;
+}
+
+V libVariant(TypeDef *def, int variant)
+{
+    std::vector<V> none;
+    return mkVariant(def, variant, none);
+}
+
+// ─── Condvar, Barrier, Notify, Semaphore, JoinSet, Scope ───────────────────
+
+struct WaitList
+{
+    std::vector<Waiter> waiters;
+    int64_t count = 0, size = 0; // Barrier: arrived, needed; Semaphore: permits
+    uint64_t gen = 0;
+    bool permit = false;         // Notify: a notify_one nobody waited for
+};
+
+WaitList *listOf(NativeObj *o)
+{
+    if (!o->ext)
+        o->ext = new WaitList();
+    return static_cast<WaitList *>(o->ext);
+}
+
+V barrierWait(WaitList *b)
+{
+    bool leader = false;
+    if (++b->count >= b->size)
+    {
+        b->count = 0;
+        ++b->gen;
+        wakeAll(b->waiters, false);
+        leader = true;
+    }
+    else
+    {
+        uint64_t gen = b->gen;
+        while (b->gen == gen)
+        {
+            Waiter w = waitHere();
+            b->waiters.push_back(w);
+            suspend();
+        }
+    }
+    V r = mkNative("BarrierWaitResult", "");
+    static_cast<NativeObj *>(r.p)->a = leader ? 1 : 0;
+    return r;
+}
+
+V acquirePermits(WaitList *s, int64_t n, bool owned)
+{
+    while (s->count < n)
+    {
+        Waiter w = waitHere();
+        s->waiters.push_back(w);
+        suspend();
+    }
+    s->count -= n;
+    V p = mkNative(owned ? "OwnedSemaphorePermit" : "SemaphorePermit", "");
+    static_cast<NativeObj *>(p.p)->ext = s;
+    static_cast<NativeObj *>(p.p)->b = n;
+    G.trackDrops = true;
+    return mkOk(p);
+}
+
+void notifiedWait(WaitList *nl)
+{
+    if (nl->permit)
+    {
+        nl->permit = false;
+        return;
+    }
+    g_cur->notified = false;
+    while (!g_cur->notified)
+    {
+        Waiter w = waitHere();
+        nl->waiters.push_back(w);
+        suspend();
+    }
+}
+
+struct TaskSet
+{
+    std::vector<Task *> tasks;
+};
+
+TaskSet *setOf(NativeObj *o)
+{
+    if (!o->ext)
+        o->ext = new TaskSet();
+    return static_cast<TaskSet *>(o->ext);
+}
+
+V joinErrorOf(Task *t)
+{
+    V e = mkNative("JoinError", "");
+    NativeObj *o = static_cast<NativeObj *>(e.p);
+    o->a = t->id;
+    o->b = t->cancelled ? 1 : 0;
+    o->s = t->panic.msg;
+    return e;
+}
+
+// what awaiting a tokio JoinHandle gives
+V taskOutcome(Task *t)
+{
+    if (t->panicked || t->cancelled)
+        return mkErr(joinErrorOf(t));
+    return mkOk(t->result);
+}
+
+V spawnFuture(V fut)
+{
+    Task *t = newTask(TK_TASK, fut, true);
+    g_ready.push_back(t);
+    return handleFor(t);
+}
+
+V spawnBlocking(V f)
+{
+    FutState *st = nullptr;
+    V fut = mkFuture(FU_BLOCKING, st);
+    st->a = f;
+    return spawnFuture(fut);
+}
+
+// ─── join!, try_join!, select!, timeout ────────────────────────────────────
+
+// runs the futures together; their results in order. try_join: the first
+// Err ends it (err is set)
+std::vector<V> joinFutures(std::vector<V> &futs, bool tryJoin, V *err)
+{
+    std::vector<Task *> kids = startChildren(futs);
+    std::vector<V> results;
+    try
+    {
+        for (;;)
+        {
+            bool all = true;
+            for (Task *t : kids)
+            {
+                if (t->done && t->panicked)
+                {
+                    Panic p = t->panic;
+                    cancelAll(kids);
+                    throw p;
+                }
+                if (tryJoin && t->done && !t->cancelled && isErrV(t->result))
+                {
+                    *err = t->result;
+                    cancelAll(kids);
+                    return results;
+                }
+                if (!t->done)
+                    all = false;
+            }
+            if (all)
+                break;
+            waitAny(kids);
+        }
+    }
+    catch (TaskCancel &)
+    {
+        cancelAll(kids);
+        TaskCancel c;
+        throw c;
+    }
+    for (Task *t : kids)
+        results.push_back(tryJoin ? peel(t->result).p->items[0] : t->result);
+    return results;
+}
+
+V selectMacro(Node *n, Ty *hint)
+{
+    size_t count = n->arms.size();
+    std::vector<bool> enabled(count, true);
+    for (size_t k = 0; k < count; ++k)
+        if (n->arms[k].guard)
+        {
+            enabled[k] = evalCond(n->arms[k].guard);
+            if (G.flow)
+                return V();
+        }
+    std::vector<V> futs;
+    for (size_t k = 0; k < count; ++k)
+    {
+        futs.push_back(eval(n->kids[k], nullptr));
+        if (G.flow)
+            return V();
+    }
+    std::vector<Task *> kids(count, nullptr);
+    std::vector<Task *> running;
+    for (size_t k = 0; k < count; ++k)
+        if (enabled[k])
+        {
+            kids[k] = newTask(TK_CHILD, futs[k], true);
+            running.push_back(kids[k]);
+        }
+    for (size_t k = running.size(); k-- > 0;)
+        g_ready.push_front(running[k]);
+    try
+    {
+        for (;;)
+        {
+            bool pending = false;
+            for (size_t k = 0; k < count; ++k)
+            {
+                Task *t = kids[k];
+                if (!t || !enabled[k])
+                    continue;
+                if (!t->done)
+                {
+                    pending = true;
+                    continue;
+                }
+                enabled[k] = false;
+                if (t->panicked)
+                {
+                    Panic p = t->panic;
+                    cancelAll(running);
+                    throw p;
+                }
+                if (t->cancelled)
+                    continue;
+                Place pl;
+                pl.o = newCell(t->result);
+                pl.i = 0;
+                if (!matchPat(n->arms[k].pat, pl, M_MOVE, n))
+                    continue; // the branch is disabled; the others go on
+                cancelAll(running);
+                V r = eval(n->arms[k].body, hint);
+                scopeExit(n->scopeSlots, n);
+                return r;
+            }
+            if (!pending)
+                break;
+            waitAny(running);
+        }
+    }
+    catch (TaskCancel &)
+    {
+        cancelAll(running);
+        TaskCancel c;
+        throw c;
+    }
+    if (n->b)
+        return eval(n->b, hint);
+    panicAt(n, "all branches are disabled and there is no else branch");
+}
+
+V timeoutRun(FutState *f)
+{
+    std::vector<V> one(1, f->a);
+    std::vector<Task *> kids = startChildren(one);
+    Task *child = kids[0];
+    bool lastChance = false;
+    try
+    {
+        for (;;)
+        {
+            if (child->done)
+            {
+                if (child->panicked)
+                    throw child->panic;
+                return mkOk(child->result);
+            }
+            if (nowNs() >= f->when)
+            {
+                // what is due at the deadline itself still gets to finish: the
+                // inner future is polled before the timer
+                if (!lastChance)
+                {
+                    lastChance = true;
+                    yieldNow();
+                    continue;
+                }
+                cancelTask(child);
+                return mkErr(mkNative("Elapsed", ""));
+            }
+            Waiter w = waitHere();
+            child->joiners.push_back(w);
+            addSleeper(w, f->when);
+            suspend();
+        }
+    }
+    catch (TaskCancel &)
+    {
+        cancelTask(child);
+        TaskCancel c;
+        throw c;
+    }
+}
+
+V runFuture(V fv, const Node *at, Ty *hint)
+{
+    NativeObj *o = static_cast<NativeObj *>(fv.p);
+    FutState *f = static_cast<FutState *>(o->ext);
+    if (f->used && f->k != FU_SLEEP && f->k != FU_PENDING)
+        panicAt(at, "`async fn` resumed after completion");
+    f->used = true;
+    switch (f->k)
+    {
+    case FU_FN:
+    {
+        std::vector<V> args = f->args;
+        g_enterAsync = true;
+        return callFn(f->fn, args, f->self, f->at ? f->at : at, hint ? hint : f->hint,
+                      f->hasTargs ? &f->targs : nullptr);
+    }
+    case FU_CLOSURE:
+    {
+        std::vector<V> args = f->args;
+        g_enterAsync = true;
+        V r = callValue(f->a, args, at);
+        if (f->owned)
+            dropValue(f->a, at); // an async move block: what it captured goes with it
+        return r;
+    }
+    case FU_READY:
+        return f->a;
+    case FU_PENDING:
+        for (;;)
+        {
+            waitHere();
+            suspend();
+        }
+    case FU_SLEEP:
+        sleepUntil(f->when);
+        return V();
+    case FU_YIELD:
+        yieldNow();
+        return V();
+    case FU_TIMEOUT:
+        return timeoutRun(f);
+    case FU_JOIN_ALL:
+    {
+        V err;
+        err.k = V_MOVED;
+        std::vector<V> results = joinFutures(f->args, f->tryForm, &err);
+        if (err.k != V_MOVED)
+            return err;
+        V vec = mkSeq(V_VEC, results);
+        return f->tryForm ? mkOk(vec) : vec;
+    }
+    case FU_RECV:
+    {
+        Chan *c = chanOf(static_cast<NativeObj *>(peelAll(f->a).p));
+        V v;
+        int got = chanTake(c, v, true, false, 0);
+        return got == 0 ? mkSome(v) : mkNone();
+    }
+    case FU_SEND:
+    {
+        Chan *c = chanOf(static_cast<NativeObj *>(peelAll(f->a).p));
+        if (chanPut(c, f->b))
+            return mkOk(V());
+        V e = mkNative("SendError", "");
+        e.p->items.push_back(f->b);
+        return mkErr(e);
+    }
+    case FU_TICK:
+    {
+        NativeObj *iv = static_cast<NativeObj *>(peelAll(f->a).p);
+        int64_t due = iv->a;
+        if (nowNs() < due)
+            sleepUntil(due);
+        iv->a = due + iv->b;
+        return instantAt(due);
+    }
+    case FU_NOTIFIED:
+        notifiedWait(listOf(static_cast<NativeObj *>(peelAll(f->a).p)));
+        return V();
+    case FU_ACQUIRE:
+        return acquirePermits(listOf(static_cast<NativeObj *>(peelAll(f->a).p)), f->n, f->owned);
+    case FU_BARRIER:
+        return barrierWait(listOf(static_cast<NativeObj *>(peelAll(f->a).p)));
+    case FU_BLOCKING:
+        return call0(f->a, at);
+    case FU_DEFER:
+    {
+        V out;
+        std::vector<V> args = f->args;
+        NativeObj *o = static_cast<NativeObj *>(peelAll(f->a).p);
+        if (!netMethodNow(o, f->a, f->at, args, out))
+            errAt(f->at, "E0599", "no method named `" + f->at->s + "` found for `" + o->type + "`");
+        return out;
+    }
+    }
+    return V();
+}
+
+V recvError(const char *type, TypeDef *def, int variant)
+{
+    if (def)
+        return libVariant(def, variant);
+    return mkNative(type, type);
+}
+
+} // namespace
+
+// ─── what the rest of the front-end calls ──────────────────────────────────
+
+void tasksBegin()
+{
+    g_main = new Task();
+    g_main->kind = TK_MAIN;
+    g_main->started = true;
+    g_main->name = "main";
+    g_main->named = true;
+    g_main->threadId = 1;
+    g_cur = g_main;
+    g_ready.clear();
+    g_sleepers.clear();
+    g_io.clear();
+    g_threads.clear();
+    g_threads.push_back(g_main);
+    g_virtual = 0;
+    g_nextTaskId = 1;
+    g_nextThreadId = 2;
+    g_workerThreadId = 0;
+    g_enterAsync = false;
+    g_fatal = FA_NONE;
+}
+
+void tasksEnd()
+{
+    // what is still waiting never runs: the program is over
+    g_ready.clear();
+    g_sleepers.clear();
+    g_io.clear();
+    g_threads.clear();
+    g_cur = nullptr;
+    g_fatal = FA_NONE;
+    g_enterAsync = false;
+}
+
+int64_t virtualNanos() { return g_virtual; }
+
+void currentThreadInfo(std::string &name, bool &named, int64_t &id)
+{
+    Task *t = g_cur ? g_cur : g_main;
+    if (!t)
+    {
+        name = "main";
+        named = true;
+        id = 1;
+        return;
+    }
+    name = t->name;
+    named = t->named;
+    id = t->threadId;
+}
+
+V spawnThread(V f, const std::string &name, bool named, const Node *n)
+{
+    (void)n;
+    Task *t = newTask(TK_THREAD, f, false);
+    t->name = name;
+    t->named = named;
+    t->threadId = g_nextThreadId++;
+    g_threads.push_back(t);
+    g_ready.push_back(t);
+    return handleFor(t);
+}
+
+void sleepNanos(int64_t ns) { sleepUntil(nowNs() + (ns > 0 ? ns : 0)); }
+
+bool waitSocket(uint64_t s, bool write, int64_t timeoutNs)
+{
+    std::vector<uint64_t> one(1, s);
+    std::vector<int> wr(1, write ? 1 : 0), ready;
+    netPoll(one, wr, 0, ready);
+    if (ready[0])
+        return true;
+    int64_t deadline = timeoutNs >= 0 ? nowNs() + timeoutNs : -1;
+    for (;;)
+    {
+        IoWait io;
+        io.sock = s;
+        io.write = write ? 1 : 0;
+        io.w = waitHere();
+        io.deadline = deadline;
+        g_io.push_back(io);
+        suspend();
+        netPoll(one, wr, 0, ready);
+        if (ready[0])
+            return true;
+        if (deadline >= 0 && nowNs() >= deadline)
+            return false;
+    }
+}
+
+bool takeAsyncEntry()
+{
+    bool e = g_enterAsync;
+    g_enterAsync = false;
+    return e;
+}
+
+void enterAsync() { g_enterAsync = true; }
+
+V asyncFnFuture(FnDef *f, std::vector<V> &args, TypeDef *self, const Node *at, Ty *hint,
+                const std::vector<Ty *> *targs)
+{
+    FutState *st = nullptr;
+    V v = mkFuture(FU_FN, st);
+    st->fn = f;
+    st->args = args;
+    st->self = self;
+    st->at = at;
+    Ty *h = tyResolve(hint);
+    st->hint = h && h->k != TY_IMPL && h->k != TY_DYN && tyHead(h) != "Pin" && tyHead(h) != "Box" ? hint : nullptr;
+    if (targs)
+    {
+        st->targs = *targs;
+        st->hasTargs = true;
+    }
+    return v;
+}
+
+V asyncClosureFuture(V closure, std::vector<V> &args)
+{
+    FutState *st = nullptr;
+    V v = mkFuture(FU_CLOSURE, st);
+    st->a = closure;
+    st->args = args;
+    return v;
+}
+
+V asyncBlockFuture(V closure, bool owned)
+{
+    FutState *st = nullptr;
+    V v = mkFuture(FU_CLOSURE, st);
+    st->a = closure;
+    st->owned = owned;
+    return v;
+}
+
+V readyFuture(V v) { return futureOf(FU_READY, v); }
+
+V deferredCall(V self, const Node *n, std::vector<V> &args)
+{
+    FutState *st = nullptr;
+    V v = mkFuture(FU_DEFER, st);
+    st->a = self;
+    st->args = args;
+    st->at = n;
+    return v;
+}
+
+V awaitValue(V v, const Node *at, Ty *hint)
+{
+    V x = peelAll(v);
+    if (x.k == V_NATIVE)
+    {
+        NativeObj *o = static_cast<NativeObj *>(x.p);
+        if (o->type == "Future")
+            return runFuture(x, at, hint);
+        if (o->type == "JoinHandle")
+        {
+            Task *t = taskOf(o);
+            waitFor(t);
+            return taskOutcome(t);
+        }
+        if (o->type == "Receiver" && o->ext && chanOf(o)->kind == CH_ONESHOT)
+        {
+            V got;
+            if (chanTake(chanOf(o), got, true, false, 0) == 0)
+                return mkOk(got);
+            return mkErr(mkNative("RecvError", "RecvError"));
+        }
+    }
+    errAt(at, "E0277", "`" + typeName(x) + "` is not a future",
+          "`" + typeName(x) + "` is not a future: only async functions, async blocks and the futures of the "
+                              "library can be awaited here");
+}
+
+bool taskMacro(Node *n, Ty *hint, V &out)
+{
+    const std::string &m = n->s;
+    if (m == "join" || m == "try_join")
+    {
+        std::vector<V> futs;
+        for (Node *k : n->kids)
+        {
+            futs.push_back(eval(k, nullptr));
+            if (G.flow)
+            {
+                out = V();
+                return true;
+            }
+        }
+        V err;
+        err.k = V_MOVED;
+        std::vector<V> results = joinFutures(futs, m == "try_join", &err);
+        if (err.k != V_MOVED)
+            out = err;
+        else
+        {
+            V tuple = results.empty() ? V() : mkTuple(results);
+            out = m == "try_join" ? mkOk(tuple) : tuple;
+        }
+        return true;
+    }
+    if (m == "select")
+    {
+        out = selectMacro(n, hint);
+        return true;
+    }
+    if (m == "pin")
+    {
+        // tokio::pin!(fut) leaves the future where it is; std::pin::pin!(fut) is the future, pinned
+        out = n->kids.size() == 1 ? evalBorrow(n->kids[0], nullptr) : V();
+        return true;
+    }
+    return false;
+}
+
+bool taskKnown(const std::string &name)
+{
+    if (name.compare(0, 7, "tokio::") == 0 || name.compare(0, 9, "futures::") == 0 ||
+        name.compare(0, 11, "async_std::") == 0)
+        return true;
+    static const char *const names[] = {"mpsc::sync_channel", "thread::scope", "thread::park_timeout",
+                                        "future::ready", "future::pending", "thread::sleep_ms"};
+    for (const char *k : names)
+        if (name == k)
+            return true;
+    return false;
+}
+
+void taskDropped(NativeObj *o)
+{
+    if (o->type == "TcpStream" || o->type == "TcpListener")
+    {
+        if (!o->dropped)
+        {
+            o->dropped = true;
+            netDropped(o);
+        }
+        return;
+    }
+    if (!o->ext || o->dropped)
+        return;
+    const std::string &t = o->type;
+    if (t == "Sender" || t == "SyncSender")
+    {
+        o->dropped = true;
+        Chan *c = chanOf(o);
+        if (--c->senders <= 0)
+            wakeAll(c->recvWait, false);
+    }
+    else if (t == "Receiver")
+    {
+        o->dropped = true;
+        Chan *c = chanOf(o);
+        if (--c->receivers <= 0)
+            wakeAll(c->sendWait, false);
+    }
+    else if (t == "SemaphorePermit" || t == "OwnedSemaphorePermit")
+    {
+        o->dropped = true;
+        WaitList *s = static_cast<WaitList *>(o->ext);
+        s->count += o->b;
+        for (int64_t k = 0; k < o->b; ++k)
+            wakeOne(s->waiters);
+    }
+}
+
+void taskCloned(NativeObj *o)
+{
+    if (!o->ext)
+        return;
+    if (o->type == "Sender" || o->type == "SyncSender")
+    {
+        o->dropped = false;
+        ++chanOf(o)->senders;
+    }
+    else if (o->type == "Receiver")
+    {
+        o->dropped = false;
+        ++chanOf(o)->receivers;
+    }
+}
+
+bool recvIterNext(IterObj *it, V &out, const Node *at)
+{
+    (void)at;
+    NativeObj *o = static_cast<NativeObj *>(peelAll(it->a).p);
+    return chanTake(chanOf(o), out, it->mode == 0, false, 0) == 0;
+}
+
+bool taskFormat(NativeObj *o, bool debug, std::string &out)
+{
+    const std::string &t = o->type;
+    if (t == "JoinError")
+    {
+        if (debug)
+            out = o->b ? "JoinError::Cancelled(Id(" + std::to_string(o->a) + "))"
+                       : "JoinError::Panic(Id(" + std::to_string(o->a) + "), \"" + o->s + "\", ..)";
+        else if (o->b)
+            out = "task " + std::to_string(o->a) + " was cancelled";
+        else
+            out = "task " + std::to_string(o->a) + " panicked with message \"" + o->s + "\"";
+        return true;
+    }
+    if (t == "SystemTime")
+    {
+        // as Windows' SystemTime prints itself: 100 ns intervals since 1601
+        out = "SystemTime { intervals: " + std::to_string(o->a / 100 + 116444736000000000LL) + " }";
+        return true;
+    }
+    if (t == "SystemTimeError")
+    {
+        out = debug ? "SystemTimeError(" + debugStr(durationOf(o->a), false, nullptr) + ")" : o->s;
+        return true;
+    }
+    if (t == "Elapsed")
+    {
+        out = debug ? "Elapsed(())" : "deadline has elapsed";
+        return true;
+    }
+    if (t == "SendError")
+    {
+        bool tokio = false;
+        out = debug ? "SendError { .. }" : tokio ? "channel closed" : "sending on a closed channel";
+        return true;
+    }
+    if (t == "RecvError")
+    {
+        out = debug ? "RecvError" : "receiving on a closed channel";
+        return true;
+    }
+    if (t == "Sender" || t == "SyncSender" || t == "Receiver" || t == "JoinHandle" || t == "Condvar" ||
+        t == "Barrier" || t == "Notify" || t == "Semaphore" || t == "JoinSet" || t == "Interval" ||
+        t == "Runtime" || t == "Future")
+    {
+        out = t + " { .. }";
+        return true;
+    }
+    if (t == "BarrierWaitResult")
+    {
+        out = std::string("BarrierWaitResult { is_leader: ") + (o->a ? "true" : "false") + " }";
+        return true;
+    }
+    if (t == "WaitTimeoutResult")
+    {
+        out = std::string("WaitTimeoutResult(") + (o->a ? "true" : "false") + ")";
+        return true;
+    }
+    return false;
+}
+
+// tokio::*, futures::*, mpsc::sync_channel, thread::scope ...
+bool taskCall(const std::string &name, std::vector<V> &args, const Node *n, Ty *hint,
+              const std::vector<Ty *> *targs, V &out)
+{
+    auto need = [&](size_t count)
+    {
+        if (args.size() != count)
+            errAt(n, "E0061", "this function takes " + std::to_string(count) + " argument" + (count == 1 ? "" : "s") +
+                                  " but " + std::to_string(args.size()) + " argument" +
+                                  (args.size() == 1 ? " was" : "s were") + " supplied");
+    };
+    (void)targs;
+    bool tokio = name.compare(0, 7, "tokio::") == 0;
+    bool futures = name.compare(0, 9, "futures::") == 0 || name.compare(0, 11, "async_std::") == 0;
+    std::string key = name;
+    if (tokio)
+        key = name.substr(7);
+    else if (futures)
+        key = name.substr(name.find("::") + 2);
+    if (!tokio && !futures)
+    {
+        if (name == "mpsc::sync_channel")
+        {
+            need(1);
+            out = newChannel(CH_STD, (int64_t)peel(args[0]).lo);
+            return true;
+        }
+        if (name == "mpsc::channel")
+        {
+            need(0);
+            out = newChannel(CH_STD, -1);
+            return true;
+        }
+        if (name == "thread::spawn")
+        {
+            need(1);
+            out = spawnThread(args[0], "", false, n);
+            return true;
+        }
+        if (name == "thread::sleep")
+        {
+            need(1);
+            sleepNanos(nanosOf(args[0], n));
+            out = V();
+            return true;
+        }
+        if (name == "thread::sleep_ms")
+        {
+            need(1);
+            sleepNanos((int64_t)peel(args[0]).lo * 1000000);
+            out = V();
+            return true;
+        }
+        if (name == "thread::yield_now")
+        {
+            yieldNow();
+            out = V();
+            return true;
+        }
+        if (name == "thread::park" || name == "thread::park_timeout")
+        {
+            Task *me = g_cur;
+            if (me->parkToken)
+                me->parkToken = false;
+            else
+            {
+                Waiter w = waitHere();
+                me->parked = w;
+                me->isParked = true;
+                if (name == "thread::park_timeout")
+                {
+                    need(1);
+                    addSleeper(w, nowNs() + nanosOf(args[0], n));
+                }
+                suspend();
+                me->isParked = false;
+                me->parkToken = false;
+            }
+            out = V();
+            return true;
+        }
+        if (name == "thread::scope")
+        {
+            need(1);
+            V scope = mkNative("Scope", "");
+            TaskSet *set = setOf(static_cast<NativeObj *>(scope.p));
+            V r = call1(args[0], mkRefTo(scope, false), n);
+            bool panicked = false;
+            for (Task *t : set->tasks)
+            {
+                waitFor(t);
+                if (t->panicked)
+                    panicked = true;
+            }
+            if (panicked)
+                panicAt(n, "a scoped thread panicked");
+            out = r;
+            return true;
+        }
+        if (name.compare(0, 6, "Atomic") == 0 && name.size() > 5 && name.compare(name.size() - 5, 5, "::new") == 0)
+        {
+            need(1);
+            std::string ty = name.substr(6, name.size() - 11); // Usize, Bool, I32 ...
+            V v = peel(args[0]);
+            if (ty == "Bool")
+                out = mkCell(mkBool(v.lo != 0), 7);
+            else
+            {
+                std::string prim = ty;
+                for (char &c : prim)
+                    if (c >= 'A' && c <= 'Z')
+                        c = (char)(c - 'A' + 'a');
+                uint8_t p = primOf(prim);
+                if (p == PR_NONE)
+                    p = PR_USIZE;
+                out = mkCell(v.k == V_INT ? intConvert(v, p) : mkUint(v.lo, p), 7);
+            }
+            return true;
+        }
+        if (name == "Box::pin" || name == "Box::into_pin" || name == "Pin::new" || name == "Pin::new_unchecked" ||
+            name == "Pin::into_inner")
+        {
+            need(1);
+            out = name == "Box::pin" ? mkBox(args[0]) : args[0];
+            return true;
+        }
+        if (name == "SystemTime::now")
+        {
+            out = mkNative("SystemTime", "");
+            static_cast<NativeObj *>(out.p)->a =
+                (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count() +
+                g_virtual;
+            return true;
+        }
+        if (name == "Condvar::new")
+        {
+            out = mkNative("Condvar", "");
+            listOf(static_cast<NativeObj *>(out.p));
+            return true;
+        }
+        if (name == "Barrier::new")
+        {
+            need(1);
+            out = mkNative("Barrier", "");
+            listOf(static_cast<NativeObj *>(out.p))->size = (int64_t)peel(args[0]).lo;
+            return true;
+        }
+        if (name == "future::ready")
+        {
+            need(1);
+            out = futureOf(FU_READY, args[0]);
+            return true;
+        }
+        if (name == "future::pending")
+        {
+            out = futureOf(FU_PENDING, V());
+            return true;
+        }
+        return false;
+    }
+    // tokio and futures
+    if (key == "spawn" || key == "task::spawn" || key == "task::spawn_local")
+    {
+        need(1);
+        out = spawnFuture(args[0]);
+        return true;
+    }
+    if (key == "task::spawn_blocking")
+    {
+        need(1);
+        out = spawnBlocking(args[0]);
+        return true;
+    }
+    if (key == "task::yield_now")
+    {
+        out = futureOf(FU_YIELD, V());
+        return true;
+    }
+    if (key == "time::sleep")
+    {
+        need(1);
+        FutState *st = nullptr;
+        out = mkFuture(FU_SLEEP, st);
+        st->when = nowNs() + nanosOf(args[0], n);
+        return true;
+    }
+    if (key == "time::sleep_until")
+    {
+        need(1);
+        FutState *st = nullptr;
+        out = mkFuture(FU_SLEEP, st);
+        st->when = static_cast<NativeObj *>(peelAll(args[0]).p)->a;
+        return true;
+    }
+    if (key == "time::timeout")
+    {
+        need(2);
+        FutState *st = nullptr;
+        out = mkFuture(FU_TIMEOUT, st);
+        st->when = nowNs() + nanosOf(args[0], n);
+        st->a = args[1];
+        return true;
+    }
+    if (key == "time::interval" || key == "time::interval_at")
+    {
+        V iv = mkNative("Interval", "");
+        NativeObj *o = static_cast<NativeObj *>(iv.p);
+        if (key == "time::interval")
+        {
+            need(1);
+            o->a = nowNs();
+            o->b = nanosOf(args[0], n);
+        }
+        else
+        {
+            need(2);
+            o->a = static_cast<NativeObj *>(peelAll(args[0]).p)->a;
+            o->b = nanosOf(args[1], n);
+        }
+        if (o->b <= 0)
+            panicAt(n, "`period` must be non-zero.");
+        out = iv;
+        return true;
+    }
+    if (key == "Instant::now")
+    {
+        out = instantAt(nowNs());
+        return true;
+    }
+    if (key == "mpsc::channel")
+    {
+        need(1);
+        int64_t cap = (int64_t)peel(args[0]).lo;
+        if (cap <= 0)
+            panicAt(n, "mpsc bounded channel requires buffer > 0");
+        out = newChannel(CH_TOKIO, cap);
+        return true;
+    }
+    if (key == "mpsc::unbounded_channel")
+    {
+        out = newChannel(CH_TOKIO, -1);
+        return true;
+    }
+    if (key == "oneshot::channel")
+    {
+        out = newChannel(CH_ONESHOT, 1);
+        return true;
+    }
+    if (key == "Mutex::new" || key == "RwLock::new")
+    {
+        need(1);
+        out = mkCell(args[0], key[0] == 'M' ? 5 : 6);
+        return true;
+    }
+    if (key == "Notify::new")
+    {
+        out = mkNative("Notify", "");
+        listOf(static_cast<NativeObj *>(out.p));
+        return true;
+    }
+    if (key == "Semaphore::new")
+    {
+        need(1);
+        out = mkNative("Semaphore", "");
+        listOf(static_cast<NativeObj *>(out.p))->count = (int64_t)peel(args[0]).lo;
+        return true;
+    }
+    if (key == "Barrier::new")
+    {
+        need(1);
+        out = mkNative("TokioBarrier", "");
+        listOf(static_cast<NativeObj *>(out.p))->size = (int64_t)peel(args[0]).lo;
+        return true;
+    }
+    if (key == "JoinSet::new")
+    {
+        out = mkNative("JoinSet", "");
+        setOf(static_cast<NativeObj *>(out.p));
+        return true;
+    }
+    if (key == "Runtime::new" || key == "Builder::new_multi_thread" || key == "Builder::new_current_thread")
+    {
+        V rt = mkNative(key[0] == 'R' ? "Runtime" : "RuntimeBuilder", "");
+        out = key[0] == 'R' ? mkOk(rt) : rt;
+        return true;
+    }
+    if (key == "future::join_all" || key == "future::try_join_all")
+    {
+        need(1);
+        FutState *st = nullptr;
+        out = mkFuture(FU_JOIN_ALL, st);
+        st->tryForm = key == "future::try_join_all";
+        V it = toIter(args[0], n);
+        iterDrain(static_cast<IterObj *>(it.p), st->args, n);
+        return true;
+    }
+    if (key == "future::ready" || key == "future::ok" || key == "future::err")
+    {
+        need(1);
+        out = futureOf(FU_READY, key == "future::ok" ? mkOk(args[0]) : key == "future::err" ? mkErr(args[0]) : args[0]);
+        return true;
+    }
+    if (key == "future::pending")
+    {
+        out = futureOf(FU_PENDING, V());
+        return true;
+    }
+    if (key == "executor::block_on" || key == "task::block_on")
+    {
+        need(1);
+        out = awaitValue(args[0], n, hint);
+        return true;
+    }
+    if (key == "TcpListener::bind" || key == "TcpStream::connect")
+    {
+        // tokio's sockets: their own reads and writes are futures
+        if (!netCall(key, args, n, out))
+            return false;
+        if (isOkV(out))
+            static_cast<NativeObj *>(peel(out).p->items[0].p)->d = 1;
+        out = futureOf(FU_READY, out);
+        return true;
+    }
+    // the rest of tokio::time / tokio::sync / tokio::fs that is std's: Duration, Arc, fs::read ...
+    if (tokio && builtinCall(key, args, n, hint, targs, out))
+    {
+        if (key.compare(0, 4, "fs::") == 0)
+            out = futureOf(FU_READY, out); // tokio::fs::read(..).await
+        return true;
+    }
+    return false;
+}
+
+bool atomicMethod(V sv, const Node *n, std::vector<V> &args, V &out)
+{
+    V &cell = sv.p->items[0];
+    const std::string &m = n->s;
+    if (m == "load" || m == "into_inner")
+    {
+        out = cell;
+        return true;
+    }
+    if (m == "get_mut")
+    {
+        out = mkRef(sv.p, 0, true);
+        return true;
+    }
+    if (m == "store")
+    {
+        V v = peel(argAt(args, 0, n));
+        cell = cell.k == V_INT ? intConvert(v, cell.t) : v;
+        out = V();
+        return true;
+    }
+    if (m == "swap")
+    {
+        V v = peel(argAt(args, 0, n));
+        out = cell;
+        cell = cell.k == V_INT ? intConvert(v, cell.t) : v;
+        return true;
+    }
+    if (m == "compare_exchange" || m == "compare_exchange_weak" || m == "compare_and_swap")
+    {
+        V want = peel(argAt(args, 0, n)), next = peel(argAt(args, 1, n));
+        V old = cell;
+        bool same = valueEq(old, cell.k == V_INT ? intConvert(want, cell.t) : want, n);
+        if (same)
+            cell = cell.k == V_INT ? intConvert(next, cell.t) : next;
+        out = m == "compare_and_swap" ? old : same ? mkOk(old) : mkErr(old);
+        return true;
+    }
+    if (m == "fetch_update")
+    {
+        V f = argAt(args, 2, n);
+        V old = cell;
+        V r = call1(f, old, n);
+        if (isSomeV(r))
+        {
+            V next = peel(r).p->items[0];
+            cell = cell.k == V_INT ? intConvert(peel(next), cell.t) : peel(next);
+            out = mkOk(old);
+        }
+        else
+            out = mkErr(old);
+        return true;
+    }
+    if (m.compare(0, 6, "fetch_") == 0)
+    {
+        std::string op = m.substr(6);
+        V old = cell;
+        if (cell.k == V_BOOL)
+        {
+            bool a = cell.lo != 0;
+            bool b = op == "not" ? true : peel(argAt(args, 0, n)).lo != 0;
+            bool r = op == "and" ? (a && b) : op == "or" ? (a || b) : op == "xor" ? (a != b) : op == "nand" ? !(a && b) : !a;
+            cell = mkBool(r);
+            out = old;
+            return true;
+        }
+        V b = intConvert(peel(argAt(args, 0, n)), cell.t);
+        if (op == "add")
+            cell = intWrapping(O_ADD, cell, b);
+        else if (op == "sub")
+            cell = intWrapping(O_SUB, cell, b);
+        else if (op == "and")
+            cell = intWrapping(O_BITAND, cell, b);
+        else if (op == "or")
+            cell = intWrapping(O_BITOR, cell, b);
+        else if (op == "xor")
+            cell = intWrapping(O_BITXOR, cell, b);
+        else if (op == "nand")
+            cell = intNot(intWrapping(O_BITAND, cell, b));
+        else if (op == "max")
+            cell = intCmp(b, cell) > 0 ? b : cell;
+        else if (op == "min")
+            cell = intCmp(b, cell) < 0 ? b : cell;
+        else
+            return false;
+        out = old;
+        return true;
+    }
+    return false;
+}
+
+bool taskMethod(NativeObj *o, V self, const Node *n, std::vector<V> &args, Ty *hint, V &out)
+{
+    (void)self;
+    const std::string &t = o->type;
+    const std::string &m = n->s;
+    if (t == "JoinHandle" && o->ext)
+    {
+        Task *task = taskOf(o);
+        if (m == "join")
+        {
+            waitFor(task);
+            if (task->panicked)
+                out = mkErr(mkStr(task->panic.msg, true));
+            else
+                out = mkOk(task->result);
+            return true;
+        }
+        if (m == "is_finished")
+        {
+            out = mkBool(task->done);
+            return true;
+        }
+        if (m == "abort")
+        {
+            cancelTask(task);
+            out = V();
+            return true;
+        }
+        if (m == "thread")
+        {
+            out = mkNative("Thread", task->name);
+            static_cast<NativeObj *>(out.p)->a = task->named ? 1 : 0;
+            static_cast<NativeObj *>(out.p)->b = task->threadId;
+            return true;
+        }
+        if (m == "id")
+        {
+            out = mkUint((uint64_t)task->id, PR_U64);
+            return true;
+        }
+    }
+    if (t == "Thread" && m == "unpark")
+    {
+        for (Task *th : g_threads)
+            if (th->threadId == o->b && !th->done)
+            {
+                if (th->isParked && live(th->parked))
+                    wake(th->parked.t, th->parked.seq, false);
+                else
+                    th->parkToken = true;
+            }
+        out = V();
+        return true;
+    }
+    if (t == "Scope" && m == "spawn")
+    {
+        V h = spawnThread(argAt(args, 0, n), "", false, n);
+        setOf(o)->tasks.push_back(taskOf(static_cast<NativeObj *>(h.p)));
+        out = h;
+        return true;
+    }
+    if ((t == "Sender" || t == "SyncSender" || t == "Receiver") && o->ext)
+    {
+        Chan *c = chanOf(o);
+        if (t != "Receiver")
+        {
+            if (m == "send" || m == "try_send" || m == "blocking_send")
+            {
+                V v = argAt(args, 0, n);
+                if (c->kind == CH_ONESHOT)
+                {
+                    // send(self): the sender is used up
+                    bool ok = c->receivers > 0;
+                    if (ok)
+                        c->q.push_back(v);
+                    o->dropped = true;
+                    --c->senders;
+                    wakeAll(c->recvWait, false);
+                    out = ok ? mkOk(V()) : mkErr(v);
+                    return true;
+                }
+                if (c->kind == CH_TOKIO && m == "send" && c->cap >= 0)
+                {
+                    FutState *st = nullptr;
+                    out = mkFuture(FU_SEND, st);
+                    st->a = self;
+                    st->b = v;
+                    return true;
+                }
+                if (m == "try_send" && c->cap >= 0 && (int64_t)c->q.size() >= (c->cap > 0 ? c->cap : 1))
+                {
+                    V e = mkNative("TrySendError", "Full");
+                    e.p->items.push_back(v);
+                    out = mkErr(e);
+                    return true;
+                }
+                if (chanPut(c, v))
+                    out = mkOk(V());
+                else
+                {
+                    V e = mkNative("SendError", "");
+                    e.p->items.push_back(v);
+                    out = mkErr(e);
+                }
+                return true;
+            }
+            if (m == "is_closed")
+            {
+                out = mkBool(c->receivers <= 0 || c->closed);
+                return true;
+            }
+            if (m == "capacity" || m == "max_capacity")
+            {
+                int64_t cap = c->cap < 0 ? 0 : c->cap;
+                out = mkUint((uint64_t)(m == "capacity" ? cap - (int64_t)c->q.size() : cap), PR_USIZE);
+                return true;
+            }
+            if (m == "closed")
+            {
+                out = futureOf(FU_READY, V());
+                return true;
+            }
+            return false;
+        }
+        // a receiver
+        if (c->kind == CH_STD)
+        {
+            if (m == "recv" || m == "try_recv" || m == "recv_timeout")
+            {
+                V v;
+                int64_t deadline = m == "recv_timeout" ? nowNs() + nanosOf(argAt(args, 0, n), n) : 0;
+                int got = chanTake(c, v, m != "try_recv", m == "recv_timeout", deadline);
+                if (got == 0)
+                    out = mkOk(v);
+                else if (m == "recv")
+                    out = mkErr(mkNative("RecvError", "RecvError"));
+                else if (m == "try_recv")
+                    out = mkErr(libVariant(G.tryRecvErrorDef, got == 1 ? 0 : 1));
+                else
+                    out = mkErr(libVariant(G.recvTimeoutErrorDef, got == 3 ? 0 : 1));
+                return true;
+            }
+            if (m == "iter" || m == "try_iter" || m == "into_iter")
+            {
+                IterObj *it = newIter(IT_RECV);
+                it->a = self;
+                it->mode = m == "try_iter" ? 1 : 0;
+                out = iterV(it);
+                return true;
+            }
+            return false;
+        }
+        // tokio
+        if (m == "recv")
+        {
+            out = futureOf(FU_RECV, self);
+            return true;
+        }
+        if (m == "blocking_recv")
+        {
+            V v;
+            out = chanTake(c, v, true, false, 0) == 0 ? mkSome(v) : mkNone();
+            return true;
+        }
+        if (m == "try_recv")
+        {
+            V v;
+            int got = chanTake(c, v, false, false, 0);
+            out = got == 0 ? mkOk(v) : mkErr(libVariant(G.tryRecvErrorDef, got == 1 ? 0 : 1));
+            return true;
+        }
+        if (m == "close")
+        {
+            c->closed = true;
+            wakeAll(c->sendWait, false);
+            out = V();
+            return true;
+        }
+        if (m == "len")
+        {
+            out = mkUint(c->q.size(), PR_USIZE);
+            return true;
+        }
+        if (m == "is_empty")
+        {
+            out = mkBool(c->q.empty());
+            return true;
+        }
+        return false;
+    }
+    if (t == "Condvar")
+    {
+        WaitList *cv = listOf(o);
+        if (m == "notify_one")
+        {
+            wakeOne(cv->waiters);
+            out = V();
+            return true;
+        }
+        if (m == "notify_all")
+        {
+            for (Waiter &w : cv->waiters)
+                if (live(w))
+                    w.t->notified = true;
+            wakeAll(cv->waiters, false);
+            out = V();
+            return true;
+        }
+        if (m == "wait" || m == "wait_while" || m == "wait_timeout" || m == "wait_timeout_while" ||
+            m == "wait_timeout_ms")
+        {
+            V guard = argAt(args, 0, n);
+            bool timed = m.find("timeout") != std::string::npos;
+            bool loop = m.find("while") != std::string::npos;
+            int64_t deadline = 0;
+            if (timed)
+            {
+                V d = argAt(args, 1, n);
+                deadline = nowNs() + (m == "wait_timeout_ms" ? (int64_t)peel(d).lo * 1000000 : nanosOf(d, n));
+            }
+            bool timedOut = false;
+            for (;;)
+            {
+                if (loop)
+                {
+                    V pred = argAt(args, timed ? 2 : 1, n);
+                    if (!isTrue(call1(pred, guard, n), n))
+                        break;
+                }
+                if (timed && nowNs() >= deadline)
+                {
+                    timedOut = true;
+                    break;
+                }
+                g_cur->notified = false;
+                Waiter w = waitHere();
+                cv->waiters.push_back(w);
+                if (timed)
+                    addSleeper(w, deadline);
+                suspend();
+                if (!loop)
+                {
+                    timedOut = timed && !g_cur->notified;
+                    break;
+                }
+            }
+            if (!timed)
+                out = mkOk(guard);
+            else
+            {
+                V res = mkNative("WaitTimeoutResult", "");
+                static_cast<NativeObj *>(res.p)->a = timedOut ? 1 : 0;
+                out = mkOk(pairOf(guard, res));
+            }
+            return true;
+        }
+        return false;
+    }
+    if (t == "SystemTime")
+    {
+        if (m == "duration_since" || m == "elapsed")
+        {
+            int64_t from = o->a, to = 0;
+            if (m == "elapsed")
+            {
+                to = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count() +
+                     g_virtual;
+            }
+            else
+            {
+                to = from;
+                from = static_cast<NativeObj *>(peelAll(argAt(args, 0, n)).p)->a;
+            }
+            if (to >= from)
+                out = mkOk(durationOf(to - from));
+            else
+            {
+                V e = mkNative("SystemTimeError", "second time provided was later than self");
+                static_cast<NativeObj *>(e.p)->a = from - to;
+                out = mkErr(e);
+            }
+            return true;
+        }
+        if (m == "checked_add" || m == "checked_sub" || m == "add" || m == "sub")
+        {
+            int64_t d = nanosOf(argAt(args, 0, n), n);
+            V r = mkNative("SystemTime", "");
+            static_cast<NativeObj *>(r.p)->a = o->a + (m.find("add") != std::string::npos ? d : -d);
+            out = m[0] == 'c' ? mkSome(r) : r;
+            return true;
+        }
+    }
+    if (t == "SystemTimeError" && m == "duration")
+    {
+        out = durationOf(o->a);
+        return true;
+    }
+    if (t == "WaitTimeoutResult" && m == "timed_out")
+    {
+        out = mkBool(o->a != 0);
+        return true;
+    }
+    if (t == "Barrier" && m == "wait")
+    {
+        out = barrierWait(listOf(o));
+        return true;
+    }
+    if (t == "TokioBarrier" && m == "wait")
+    {
+        out = futureOf(FU_BARRIER, self);
+        return true;
+    }
+    if (t == "BarrierWaitResult" && m == "is_leader")
+    {
+        out = mkBool(o->a != 0);
+        return true;
+    }
+    if (t == "Notify")
+    {
+        WaitList *nl = listOf(o);
+        if (m == "notified")
+        {
+            out = futureOf(FU_NOTIFIED, self);
+            return true;
+        }
+        if (m == "notify_one")
+        {
+            if (!wakeOne(nl->waiters))
+                nl->permit = true;
+            out = V();
+            return true;
+        }
+        if (m == "notify_waiters")
+        {
+            for (Waiter &w : nl->waiters)
+                if (live(w))
+                    w.t->notified = true;
+            wakeAll(nl->waiters, false);
+            out = V();
+            return true;
+        }
+        return false;
+    }
+    if (t == "Semaphore")
+    {
+        WaitList *s = listOf(o);
+        if (m == "acquire" || m == "acquire_owned" || m == "acquire_many" || m == "acquire_many_owned")
+        {
+            FutState *st = nullptr;
+            out = mkFuture(FU_ACQUIRE, st);
+            st->a = self;
+            st->n = m.find("many") != std::string::npos ? (int64_t)peel(argAt(args, 0, n)).lo : 1;
+            st->owned = m.find("owned") != std::string::npos;
+            return true;
+        }
+        if (m == "try_acquire" || m == "try_acquire_owned")
+        {
+            if (s->count > 0)
+                out = acquirePermits(s, 1, m == "try_acquire_owned");
+            else
+                out = mkErr(mkNative("TryAcquireError", "NoPermits"));
+            return true;
+        }
+        if (m == "available_permits")
+        {
+            out = mkUint((uint64_t)s->count, PR_USIZE);
+            return true;
+        }
+        if (m == "add_permits")
+        {
+            int64_t k = (int64_t)peel(argAt(args, 0, n)).lo;
+            s->count += k;
+            for (int64_t j = 0; j < k; ++j)
+                wakeOne(s->waiters);
+            out = V();
+            return true;
+        }
+        if (m == "close")
+        {
+            out = V();
+            return true;
+        }
+        return false;
+    }
+    if ((t == "SemaphorePermit" || t == "OwnedSemaphorePermit") && m == "forget")
+    {
+        o->dropped = true;
+        out = V();
+        return true;
+    }
+    if (t == "Interval")
+    {
+        if (m == "tick")
+        {
+            out = futureOf(FU_TICK, self);
+            return true;
+        }
+        if (m == "reset")
+        {
+            o->a = nowNs() + o->b;
+            out = V();
+            return true;
+        }
+        if (m == "period")
+        {
+            out = durationOf(o->b);
+            return true;
+        }
+        if (m == "set_missed_tick_behavior")
+        {
+            out = V();
+            return true;
+        }
+        return false;
+    }
+    if (t == "JoinSet")
+    {
+        TaskSet *set = setOf(o);
+        if (m == "spawn" || m == "spawn_blocking")
+        {
+            V h = m == "spawn" ? spawnFuture(argAt(args, 0, n)) : spawnBlocking(argAt(args, 0, n));
+            set->tasks.push_back(taskOf(static_cast<NativeObj *>(h.p)));
+            out = V();
+            return true;
+        }
+        if (m == "join_next" || m == "try_join_next")
+        {
+            // the first to end
+            if (set->tasks.empty())
+            {
+                out = m == "join_next" ? futureOf(FU_READY, mkNone()) : mkNone();
+                return true;
+            }
+            for (;;)
+            {
+                for (size_t k = 0; k < set->tasks.size(); ++k)
+                    if (set->tasks[k]->done)
+                    {
+                        Task *done = set->tasks[k];
+                        set->tasks.erase(set->tasks.begin() + (int64_t)k);
+                        V r = mkSome(taskOutcome(done));
+                        out = m == "join_next" ? futureOf(FU_READY, r) : r;
+                        return true;
+                    }
+                if (m == "try_join_next")
+                {
+                    out = mkNone();
+                    return true;
+                }
+                waitAny(set->tasks);
+            }
+        }
+        if (m == "join_all")
+        {
+            std::vector<V> results;
+            for (Task *task : set->tasks)
+            {
+                waitFor(task);
+                if (task->panicked)
+                    throw task->panic;
+                results.push_back(task->result);
+            }
+            set->tasks.clear();
+            out = futureOf(FU_READY, mkSeq(V_VEC, results));
+            return true;
+        }
+        if (m == "len")
+        {
+            out = mkUint(set->tasks.size(), PR_USIZE);
+            return true;
+        }
+        if (m == "is_empty")
+        {
+            out = mkBool(set->tasks.empty());
+            return true;
+        }
+        if (m == "abort_all" || m == "shutdown")
+        {
+            cancelAll(set->tasks);
+            out = m == "shutdown" ? futureOf(FU_READY, V()) : V();
+            return true;
+        }
+        return false;
+    }
+    if (t == "JoinError")
+    {
+        if (m == "is_panic")
+        {
+            out = mkBool(o->b == 0);
+            return true;
+        }
+        if (m == "is_cancelled")
+        {
+            out = mkBool(o->b != 0);
+            return true;
+        }
+        if (m == "into_panic")
+        {
+            out = mkStr(o->s, true);
+            return true;
+        }
+        return false;
+    }
+    if (t == "SendError" && (m == "into_inner" || m == "0"))
+    {
+        out = o->items.empty() ? V() : o->items[0];
+        return true;
+    }
+    if (t == "RuntimeBuilder")
+    {
+        if (m == "build")
+            out = mkOk(mkNative("Runtime", ""));
+        else
+            out = self; // enable_all, worker_threads, thread_name ...
+        return true;
+    }
+    if (t == "Runtime")
+    {
+        if (m == "block_on")
+        {
+            out = awaitValue(argAt(args, 0, n), n, hint);
+            return true;
+        }
+        if (m == "spawn")
+        {
+            out = spawnFuture(argAt(args, 0, n));
+            return true;
+        }
+        if (m == "spawn_blocking")
+        {
+            out = spawnBlocking(argAt(args, 0, n));
+            return true;
+        }
+        if (m == "handle" || m == "enter")
+        {
+            out = self;
+            return true;
+        }
+        if (m == "shutdown_timeout" || m == "shutdown_background")
+        {
+            out = V();
+            return true;
+        }
+        return false;
+    }
+    if (t == "Future" && (m == "await"))
+    {
+        out = runFuture(self, n, hint);
+        return true;
+    }
+    return false;
+}
+
+} // namespace rust

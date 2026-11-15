@@ -2,6 +2,7 @@
 #include "../js/JsMain.h.sa"
 #include "../ruby/RubyMain.h.sa"
 #include "../python/PyMain.h.sa"
+#include "../rust/RustMain.h.sa"
 #include "../html/HtmlMain.h.sa"
 #include "Vm.h.sa"
 #include "Error.h.sa"
@@ -277,6 +278,21 @@ void VM::registerNatives()
             std::cerr << failure.report;
             std::cerr.flush();
         }
+        if (status != 0)
+            std::exit(status);
+        return QuantumValue(); });
+
+    // A Rust program (applyDialect): the Rust front-end runs it to its end. A
+    // panic is reported the way a program rustc built reports it (exit status
+    // 101); the test runner is handed it instead, for its own report.
+    reg("__rust_run__", [](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        rust::setArgs(g_scriptArgv);
+        rust::setTestMode(g_testMode);
+        rust::RunFailure failure;
+        int status = rust::runProgram(args[0].asString(), args[1].asString(), failure);
+        if (failure.failed && g_testMode)
+            throw QuantumError(failure.kind, failure.message, failure.line);
         if (status != 0)
             std::exit(status);
         return QuantumValue(); });

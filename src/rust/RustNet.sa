@@ -1,0 +1,769 @@
+// quantum: cpp
+// Rust front-end: std::net. TcpListener and TcpStream are real Windows
+// sockets (winsock). A thread that waits for a connection or for data does
+// not stop the others: it waits in the scheduler (RustTask.sa), which
+// select()s over every socket that is waited for, up to the next sleeper.
+//
+// While a test run (quantum --test) is going, no client ever connects: a
+// listener's incoming() ends at once and accept() is an error, so a server
+// program ends instead of waiting for ever.
+#include "RustRt.h.sa"
+
+#include <cstring>
+
+namespace __dll_ws2_32
+{
+int WSAStartup(unsigned short version, void *data);
+int WSAGetLastError();
+uint64_t socket(int af, int type, int protocol);
+int bind(uint64_t s, const void *addr, int len);
+int listen(uint64_t s, int backlog);
+uint64_t accept(uint64_t s, void *addr, int *len);
+int connect(uint64_t s, const void *addr, int len);
+int recv(uint64_t s, char *buf, int len, int flags);
+int send(uint64_t s, const char *buf, int len, int flags);
+int closesocket(uint64_t s);
+int shutdown(uint64_t s, int how);
+int setsockopt(uint64_t s, int level, int name, const char *val, int len);
+int getsockname(uint64_t s, void *addr, int *len);
+int getpeername(uint64_t s, void *addr, int *len);
+int select(int nfds, void *readfds, void *writefds, void *exceptfds, const void *timeout);
+int getaddrinfo(const char *node, const char *service, const void *hints, void **res);
+void freeaddrinfo(void *ai);
+} // namespace __dll_ws2_32
+
+namespace rust
+{
+
+namespace
+{
+
+const uint64_t kBadSocket = ~(uint64_t)0;
+bool g_wsaReady = false;
+
+void wsaInit()
+{
+    if (g_wsaReady)
+        return;
+    char data[512];
+    std::memset(data, 0, sizeof data);
+    __dll_ws2_32::WSAStartup(0x0202, data);
+    g_wsaReady = true;
+}
+
+NativeObj *nobj(V v) { return static_cast<NativeObj *>(v.p); }
+
+V ioErr(int code)
+{
+    V v = mkNative("IoError", "");
+    NativeObj *e = nobj(v);
+    e->a = code;
+    switch (code)
+    {
+    case 10013:
+        e->s = "An attempt was made to access a socket in a way forbidden by its access permissions.";
+        e->data = "PermissionDenied";
+        break;
+    case 10048:
+        e->s = "Only one usage of each socket address (protocol/network address/port) is normally permitted.";
+        e->data = "AddrInUse";
+        break;
+    case 10049:
+        e->s = "The requested address is not valid in its context.";
+        e->data = "AddrNotAvailable";
+        break;
+    case 10053:
+        e->s = "An established connection was aborted by the software in your host machine.";
+        e->data = "ConnectionAborted";
+        break;
+    case 10054:
+        e->s = "An existing connection was forcibly closed by the remote host.";
+        e->data = "ConnectionReset";
+        break;
+    case 10057:
+        e->s = "A request to send or receive data was disallowed because the socket is not connected and (when sending on "
+               "a datagram socket using a sendto call) no address was supplied.";
+        e->data = "NotConnected";
+        break;
+    case 10060:
+        e->s = "A connection attempt failed because the connected party did not properly respond after a period of "
+               "time, or established connection failed because connected host has failed to respond.";
+        e->data = "TimedOut";
+        break;
+    case 10061:
+        e->s = "No connection could be made because the target machine actively refused it.";
+        e->data = "ConnectionRefused";
+        break;
+    case 11001:
+        e->s = "No such host is known.";
+        e->data = "Uncategorized";
+        break;
+    default:
+        e->s = "An unexpected network error occurred.";
+        e->data = "Other";
+    }
+    return mkErr(v);
+}
+
+V customErr(const std::string &kind, const std::string &message)
+{
+    V v = mkNative("IoError", message);
+    nobj(v)->data = kind;
+    return mkErr(v);
+}
+
+void putPort(unsigned char *sa, int port)
+{
+    sa[2] = (unsigned char)((port >> 8) & 255);
+    sa[3] = (unsigned char)(port & 255);
+}
+
+std::string addrText(const unsigned char *sa)
+{
+    int port = (sa[2] << 8) | sa[3];
+    return std::to_string(sa[4]) + "." + std::to_string(sa[5]) + "." + std::to_string(sa[6]) + "." +
+           std::to_string(sa[7]) + ":" + std::to_string(port);
+}
+
+bool dotted(const std::string &host, unsigned char *out4)
+{
+    int part = 0, value = 0, digits = 0;
+    for (size_t k = 0; k <= host.size(); ++k)
+    {
+        char c = k < host.size() ? host[k] : '.';
+        if (c >= '0' && c <= '9')
+        {
+            value = value * 10 + (c - '0');
+            if (++digits > 3 || value > 255)
+                return false;
+        }
+        else if (c == '.')
+        {
+            if (!digits || part > 3)
+                return false;
+            out4[part++] = (unsigned char)value;
+            value = 0;
+            digits = 0;
+        }
+        else
+            return false;
+    }
+    return part == 4;
+}
+
+// "host:port", (host, port) or a SocketAddr: a sockaddr_in; false and err set when it is not one
+bool socketAddr(V a, unsigned char *sa, V &err, const Node *n)
+{
+    std::memset(sa, 0, 16);
+    sa[0] = 2; // AF_INET
+    V x = peelAll(a);
+    std::string host;
+    int port = -1;
+    if (x.k == V_TUPLE && x.p->items.size() == 2)
+    {
+        V h = peelAll(x.p->items[0]);
+        host = h.k == V_STR ? static_cast<StrObj *>(h.p)->s : displayStr(h, n);
+        port = (int)(int64_t)peel(x.p->items[1]).lo;
+    }
+    else
+    {
+        std::string text = x.k == V_STR ? static_cast<StrObj *>(x.p)->s : displayStr(x, n);
+        size_t colon = text.rfind(':');
+        if (colon == std::string::npos || text.find('[') != std::string::npos)
+        {
+            err = customErr("InvalidInput", "invalid socket address");
+            return false;
+        }
+        host = text.substr(0, colon);
+        std::string ps = text.substr(colon + 1);
+        if (ps.empty() || ps.size() > 5 || ps.find_first_not_of("0123456789") != std::string::npos)
+        {
+            err = customErr("InvalidInput", "invalid port value");
+            return false;
+        }
+        port = std::atoi(ps.c_str());
+    }
+    if (port < 0 || port > 65535)
+    {
+        err = customErr("InvalidInput", "invalid port value");
+        return false;
+    }
+    putPort(sa, port);
+    if (dotted(host, sa + 4))
+        return true;
+    if (host == "localhost")
+    {
+        sa[4] = 127;
+        sa[7] = 1;
+        return true;
+    }
+    // a name: ask the resolver for an IPv4 address
+    wsaInit();
+    unsigned char hints[48];
+    std::memset(hints, 0, sizeof hints);
+    hints[4] = 2; // ai_family = AF_INET
+    hints[8] = 1; // ai_socktype = SOCK_STREAM
+    void *res = nullptr;
+    if (__dll_ws2_32::getaddrinfo(host.c_str(), nullptr, hints, &res) != 0 || !res)
+    {
+        err = ioErr(11001);
+        return false;
+    }
+    // addrinfo: ai_addr at offset 32
+    unsigned char *info = static_cast<unsigned char *>(res);
+    unsigned char *addr = nullptr;
+    std::memcpy(&addr, info + 32, sizeof addr);
+    if (addr)
+        std::memcpy(sa + 4, addr + 4, 4);
+    __dll_ws2_32::freeaddrinfo(res);
+    return addr != nullptr;
+}
+
+V socketAddrV(const std::string &text)
+{
+    return mkNative("SocketAddr", text);
+}
+
+uint64_t sockOf(NativeObj *o) { return (uint64_t)o->a; }
+
+V streamV(uint64_t s, const std::string &peer)
+{
+    V v = mkNative("TcpStream", peer);
+    nobj(v)->a = (int64_t)s;
+    G.trackDrops = true; // the socket closes when the stream is dropped
+    return v;
+}
+
+// waits (letting other threads run) until the socket can be read or written; false: timed out
+bool waitReady(uint64_t s, bool write, int64_t timeoutMs)
+{
+    return waitSocket(s, write, timeoutMs > 0 ? timeoutMs * 1000000 : -1);
+}
+
+void closeSocket(NativeObj *o)
+{
+    if (o->b & 1)
+        return;
+    o->b |= 1;
+    __dll_ws2_32::closesocket(sockOf(o));
+}
+
+// more bytes into the stream's buffer; 0: the other end closed, -1: an error (code), -2: timed out
+int fill(NativeObj *o, int &code)
+{
+    if (!waitReady(sockOf(o), false, o->pos))
+        return -2;
+    char buf[8192];
+    int got = __dll_ws2_32::recv(sockOf(o), buf, (int)sizeof buf, 0);
+    if (got < 0)
+    {
+        code = __dll_ws2_32::WSAGetLastError();
+        return -1;
+    }
+    o->data.append(buf, (size_t)got);
+    return got;
+}
+
+// a line (with its \n) from the stream; false at the end
+bool readLine(NativeObj *o, std::string &line, V &err)
+{
+    for (;;)
+    {
+        size_t nl = o->data.find('\n');
+        if (nl != std::string::npos)
+        {
+            line = o->data.substr(0, nl + 1);
+            o->data.erase(0, nl + 1);
+            return true;
+        }
+        int code = 0;
+        int got = fill(o, code);
+        if (got == 0)
+        {
+            line = o->data;
+            o->data.clear();
+            return !line.empty();
+        }
+        if (got < 0)
+        {
+            err = got == -2 ? ioErr(10060) : ioErr(code);
+            return false;
+        }
+    }
+}
+
+std::string bytesText(V v, const Node *n)
+{
+    V x = peelAll(v);
+    if (x.k == V_STR)
+        return static_cast<StrObj *>(x.p)->s;
+    Obj *o = nullptr;
+    int64_t start = 0, len = 0;
+    if (!seqOf(x, o, start, len))
+        errAt(n, "E0308", "mismatched types: expected `&[u8]`, found `" + typeName(x) + "`");
+    std::string s;
+    s.reserve((size_t)len);
+    for (int64_t k = 0; k < len; ++k)
+        s += (char)o->items[(size_t)(start + k)].lo;
+    return s;
+}
+
+bool sendAll(NativeObj *o, const std::string &text, int &code)
+{
+    size_t done = 0;
+    while (done < text.size())
+    {
+        int sent = __dll_ws2_32::send(sockOf(o), text.data() + done, (int)(text.size() - done), 0);
+        if (sent < 0)
+        {
+            code = __dll_ws2_32::WSAGetLastError();
+            return false;
+        }
+        done += (size_t)sent;
+    }
+    return true;
+}
+
+V acceptOne(NativeObj *l)
+{
+    if (testMode())
+        return customErr("WouldBlock", "no client connects while the program is being tested");
+    waitReady(sockOf(l), false, 0);
+    unsigned char peer[16];
+    int len = 16;
+    uint64_t s = __dll_ws2_32::accept(sockOf(l), peer, &len);
+    if (s == kBadSocket)
+        return ioErr(__dll_ws2_32::WSAGetLastError());
+    return mkOk(streamV(s, addrText(peer)));
+}
+
+} // namespace
+
+bool netCall(const std::string &name, std::vector<V> &args, const Node *n, V &out)
+{
+    if (name == "TcpListener::bind" || name == "TcpStream::connect" || name == "TcpStream::connect_timeout")
+    {
+        V a = argAt(args, 0, n);
+        unsigned char sa[16];
+        V err;
+        if (!socketAddr(a, sa, err, n))
+        {
+            out = err;
+            return true;
+        }
+        wsaInit();
+        uint64_t s = __dll_ws2_32::socket(2, 1, 6);
+        if (s == kBadSocket)
+        {
+            out = ioErr(__dll_ws2_32::WSAGetLastError());
+            return true;
+        }
+        if (name == "TcpListener::bind")
+        {
+            if (__dll_ws2_32::bind(s, sa, 16) != 0 || __dll_ws2_32::listen(s, 128) != 0)
+            {
+                int code = __dll_ws2_32::WSAGetLastError();
+                __dll_ws2_32::closesocket(s);
+                out = ioErr(code);
+                return true;
+            }
+            unsigned char local[16];
+            int len = 16;
+            __dll_ws2_32::getsockname(s, local, &len);
+            V l = mkNative("TcpListener", addrText(local));
+            nobj(l)->a = (int64_t)s;
+            G.trackDrops = true;
+            out = mkOk(l);
+            return true;
+        }
+        if (__dll_ws2_32::connect(s, sa, 16) != 0)
+        {
+            int code = __dll_ws2_32::WSAGetLastError();
+            __dll_ws2_32::closesocket(s);
+            out = ioErr(code);
+            return true;
+        }
+        out = mkOk(streamV(s, addrText(sa)));
+        return true;
+    }
+    if (name == "UdpSocket::bind")
+    {
+        out = customErr("Unsupported", "UDP sockets are not supported by Quantum's Rust front-end");
+        return true;
+    }
+    if (name == "Shutdown::Both" || name == "Shutdown::Read" || name == "Shutdown::Write")
+    {
+        out = mkNative("Shutdown", name.substr(10));
+        return true;
+    }
+    return false;
+}
+
+// tokio's sockets (d == 1): their reads, writes and accept are futures, run when awaited
+bool netMethod(NativeObj *o, V self, const Node *n, std::vector<V> &args, V &out)
+{
+    if (o->d == 1 && (o->type == "TcpStream" || o->type == "TcpListener"))
+    {
+        const std::string &m = n->s;
+        if (m == "accept" || m == "read" || m == "read_exact" || m == "read_to_end" || m == "read_to_string" ||
+            m == "write" || m == "write_all" || m == "flush" || m == "shutdown" || m == "readable" ||
+            m == "writable")
+        {
+            out = deferredCall(self, n, args);
+            return true;
+        }
+    }
+    return netMethodNow(o, self, n, args, out);
+}
+
+bool netMethodNow(NativeObj *o, V self, const Node *n, std::vector<V> &args, V &out)
+{
+    const std::string &t = o->type;
+    const std::string &m = n->s;
+    if (t == "SocketAddr")
+    {
+        size_t colon = o->s.rfind(':');
+        if (m == "port")
+        {
+            out = mkUint((uint64_t)std::atoi(o->s.c_str() + colon + 1), PR_U16);
+            return true;
+        }
+        if (m == "ip")
+        {
+            out = mkNative("IpAddr", o->s.substr(0, colon));
+            return true;
+        }
+        if (m == "is_ipv4")
+        {
+            out = mkBool(true);
+            return true;
+        }
+        return false;
+    }
+    if (t == "TcpListener")
+    {
+        if (m == "incoming")
+        {
+            IterObj *it = newIter(IT_NET);
+            it->a = self;
+            out = iterV(it);
+            return true;
+        }
+        if (m == "accept")
+        {
+            V r = acceptOne(o);
+            if (isOkV(r))
+            {
+                V st = peel(r).p->items[0];
+                nobj(st)->d = o->d; // tokio's listener gives tokio's streams
+                std::vector<V> pair;
+                pair.push_back(st);
+                pair.push_back(socketAddrV(nobj(st)->s));
+                r = mkOk(mkTuple(pair));
+            }
+            out = r;
+            return true;
+        }
+        if (m == "local_addr")
+        {
+            out = mkOk(socketAddrV(o->s));
+            return true;
+        }
+        if (m == "set_nonblocking" || m == "set_ttl")
+        {
+            out = mkOk(V());
+            return true;
+        }
+        if (m == "try_clone")
+        {
+            out = mkOk(self);
+            return true;
+        }
+        return false;
+    }
+    if (t != "TcpStream")
+        return false;
+    if (m == "read")
+    {
+        V dest = argAt(args, 0, n);
+        V x = peel(dest);
+        Obj *so = nullptr;
+        int64_t start = 0, len = 0;
+        if (!seqOf(x, so, start, len))
+            errAt(n, "E0308", "mismatched types: expected `&mut [u8]`, found `" + typeName(x) + "`");
+        if (o->data.empty() && len > 0)
+        {
+            int code = 0;
+            int got = fill(o, code);
+            if (got < 0)
+            {
+                out = got == -2 ? ioErr(10060) : ioErr(code);
+                return true;
+            }
+        }
+        int64_t count = (int64_t)o->data.size() < len ? (int64_t)o->data.size() : len;
+        for (int64_t k = 0; k < count; ++k)
+            so->items[(size_t)(start + k)] = mkUint((unsigned char)o->data[(size_t)k], PR_U8);
+        o->data.erase(0, (size_t)count);
+        out = mkOk(mkUint((uint64_t)count, PR_USIZE));
+        return true;
+    }
+    if (m == "read_exact")
+    {
+        V x = peel(argAt(args, 0, n));
+        Obj *so = nullptr;
+        int64_t start = 0, len = 0;
+        if (!seqOf(x, so, start, len))
+            errAt(n, "E0308", "mismatched types: expected `&mut [u8]`, found `" + typeName(x) + "`");
+        while ((int64_t)o->data.size() < len)
+        {
+            int code = 0;
+            int got = fill(o, code);
+            if (got == 0)
+            {
+                out = customErr("UnexpectedEof", "failed to fill whole buffer");
+                return true;
+            }
+            if (got < 0)
+            {
+                out = got == -2 ? ioErr(10060) : ioErr(code);
+                return true;
+            }
+        }
+        for (int64_t k = 0; k < len; ++k)
+            so->items[(size_t)(start + k)] = mkUint((unsigned char)o->data[(size_t)k], PR_U8);
+        o->data.erase(0, (size_t)len);
+        out = mkOk(o->d == 1 ? mkUint((uint64_t)len, PR_USIZE) : V());
+        return true;
+    }
+    if (m == "readable" || m == "writable")
+    {
+        waitReady(sockOf(o), m == "writable", 0);
+        out = mkOk(V());
+        return true;
+    }
+    if (m == "read_line")
+    {
+        std::string line;
+        V err;
+        err.k = V_MOVED;
+        bool any = readLine(o, line, err);
+        if (!any && err.k != V_MOVED)
+        {
+            out = err;
+            return true;
+        }
+        strOf(argAt(args, 0, n)) += line;
+        out = mkOk(mkUint(line.size(), PR_USIZE));
+        return true;
+    }
+    if (m == "lines")
+    {
+        IterObj *it = newIter(IT_NET);
+        it->a = self;
+        it->mode = 1;
+        out = iterV(it);
+        return true;
+    }
+    if (m == "read_to_string" || m == "read_to_end")
+    {
+        for (;;)
+        {
+            int code = 0;
+            int got = fill(o, code);
+            if (got == 0)
+                break;
+            if (got < 0)
+            {
+                out = got == -2 ? ioErr(10060) : ioErr(code);
+                return true;
+            }
+        }
+        std::string text = o->data;
+        o->data.clear();
+        V dest = argAt(args, 0, n);
+        if (m == "read_to_string")
+            strOf(dest) += text;
+        else
+            for (unsigned char c : text)
+                peelAll(dest).p->items.push_back(mkUint(c, PR_U8));
+        out = mkOk(mkUint(text.size(), PR_USIZE));
+        return true;
+    }
+    if (m == "write" || m == "write_all" || m == "write_str" || m == "write_fmt")
+    {
+        std::string text = m == "write_fmt" ? bytesText(argAt(args, 0, n), n) : bytesText(argAt(args, 0, n), n);
+        int code = 0;
+        if (!sendAll(o, text, code))
+            out = ioErr(code);
+        else
+            out = m == "write" ? mkOk(mkUint(text.size(), PR_USIZE)) : mkOk(V());
+        return true;
+    }
+    if (m == "flush")
+    {
+        out = mkOk(V());
+        return true;
+    }
+    if (m == "set_read_timeout" || m == "set_write_timeout")
+    {
+        V d = peelAll(argAt(args, 0, n));
+        if (m == "set_read_timeout")
+        {
+            o->pos = 0;
+            if (isSomeV(d))
+            {
+                NativeObj *dur = nobj(peelAll(peel(d).p->items[0]));
+                o->pos = dur->a * 1000 + dur->b / 1000000;
+                if (o->pos <= 0)
+                    o->pos = 1;
+            }
+        }
+        out = mkOk(V());
+        return true;
+    }
+    if (m == "set_nodelay" || m == "set_nonblocking" || m == "set_ttl")
+    {
+        out = mkOk(V());
+        return true;
+    }
+    if (m == "peer_addr")
+    {
+        out = mkOk(socketAddrV(o->s));
+        return true;
+    }
+    if (m == "local_addr")
+    {
+        unsigned char local[16];
+        int len = 16;
+        __dll_ws2_32::getsockname(sockOf(o), local, &len);
+        out = mkOk(socketAddrV(addrText(local)));
+        return true;
+    }
+    if (m == "shutdown")
+    {
+        // std's shutdown(how); tokio's shutdown() closes the writing side
+        V how = args.empty() ? V() : peelAll(args[0]);
+        std::string h = how.k == V_NATIVE ? nobj(how)->s : args.empty() ? "Write" : "Both";
+        __dll_ws2_32::shutdown(sockOf(o), h == "Read" ? 0 : h == "Write" ? 1 : 2);
+        out = mkOk(V());
+        return true;
+    }
+    if (m == "try_clone")
+    {
+        // the same socket: closing waits for the last handle
+        V c = mkNative("TcpStream", o->s);
+        nobj(c)->a = o->a;
+        nobj(c)->b = 2; // a clone: dropping it does not close
+        out = mkOk(c);
+        return true;
+    }
+    if (m == "by_ref" || m == "get_ref" || m == "get_mut")
+    {
+        out = self;
+        return true;
+    }
+    return false;
+}
+
+bool netFormat(NativeObj *o, bool debug, std::string &out)
+{
+    const std::string &t = o->type;
+    if (t == "SocketAddr" || t == "IpAddr")
+    {
+        out = o->s;
+        return true;
+    }
+    if (t == "TcpListener")
+    {
+        out = "TcpListener { addr: " + o->s + ", socket: " + std::to_string(o->a) + " }";
+        return debug;
+    }
+    if (t == "TcpStream")
+    {
+        out = "TcpStream { peer: " + o->s + ", socket: " + std::to_string(o->a) + " }";
+        return debug;
+    }
+    return false;
+}
+
+bool netNext(IterObj *it, V &out, const Node *at)
+{
+    (void)at;
+    NativeObj *o = nobj(peelAll(it->a));
+    if (it->mode == 0)
+    {
+        // incoming(): the next connection; none while testing
+        if (testMode())
+            return false;
+        out = acceptOne(o);
+        return true;
+    }
+    std::string line;
+    V err;
+    err.k = V_MOVED;
+    if (!readLine(o, line, err))
+    {
+        if (err.k == V_MOVED)
+            return false;
+        out = err;
+        return true;
+    }
+    if (!line.empty() && line.back() == '\n')
+        line.pop_back();
+    if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+    out = mkOk(mkStr(line, true));
+    return true;
+}
+
+void netDropped(NativeObj *o)
+{
+    if (o->type == "TcpStream" && !(o->b & 2))
+        closeSocket(o);
+    else if (o->type == "TcpListener")
+        closeSocket(o);
+}
+
+// which of the sockets can be read (or written) within timeoutNs (-1: as long as it takes)
+void netPoll(const std::vector<uint64_t> &socks, const std::vector<int> &writes, int64_t timeoutNs,
+             std::vector<int> &ready)
+{
+    ready.assign(socks.size(), 0);
+    if (timeoutNs != 0)
+        flushOut(); // what was printed shows while the program waits (Rust's stdout goes out line by line)
+    uint64_t rset[65], wset[65];
+    std::memset(rset, 0, sizeof rset);
+    std::memset(wset, 0, sizeof wset);
+    for (size_t k = 0; k < socks.size() && k < 64; ++k)
+    {
+        uint64_t *set = writes[k] ? wset : rset;
+        set[1 + set[0]] = socks[k];
+        ++set[0];
+    }
+    int32_t tv[2];
+    if (timeoutNs >= 0)
+    {
+        tv[0] = (int32_t)(timeoutNs / 1000000000);
+        tv[1] = (int32_t)((timeoutNs % 1000000000) / 1000);
+    }
+    int r = __dll_ws2_32::select(0, rset[0] ? rset : nullptr, wset[0] ? wset : nullptr, nullptr,
+                                 timeoutNs >= 0 ? tv : nullptr);
+    if (r < 0)
+    {
+        // a socket that went bad: let its waiter find out
+        ready.assign(socks.size(), 1);
+        return;
+    }
+    if (r == 0)
+        return;
+    for (size_t k = 0; k < socks.size(); ++k)
+    {
+        uint64_t *set = writes[k] ? wset : rset;
+        for (uint64_t j = 0; j < set[0]; ++j)
+            if (set[1 + j] == socks[k])
+                ready[k] = 1;
+    }
+}
+
+} // namespace rust

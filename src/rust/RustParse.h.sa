@@ -1,0 +1,118 @@
+// quantum: cpp
+#pragma once
+// Rust front-end: the parser (recursive descent; binary operators by
+// precedence). RustParse.sa has items, types and patterns; RustExpr.sa has
+// expressions, statements, macro calls and format strings.
+#include "RustAst.h.sa"
+
+namespace rust
+{
+
+struct Parser
+{
+    std::vector<Tok> toks; // ends with T_EOF
+    size_t p = 0;
+    ModDef *mod = nullptr;            // where items being parsed go
+    std::vector<ModDef *> *all = nullptr;
+    std::vector<MacroDef *> *macros = nullptr; // macro_rules! seen so far
+    int expandDepth = 0;
+    // what the last parseAttributes() saw besides derives
+    std::string attrSerde;          // #[serde(...)]: "rename=x;default;"
+    bool attrRuntimeMain = false;   // #[tokio::main]
+    std::string itemSerde;          // ... on the item being parsed
+    bool itemRuntimeMain = false;
+    bool inAsync = false;           // in an async fn or block: `.await` is allowed
+    bool asyncClosure = false;      // the closure parseClosure() is about to read is `async |..|`
+    std::string modDir;             // where `mod name;` of the module being parsed finds name.rs
+
+    // ── tokens ──
+    const Tok &cur() const { return toks[p]; }
+    const Tok &peekTok(size_t n) const { return toks[p + n < toks.size() ? p + n : toks.size() - 1]; }
+    const Tok &prevTok() const { return toks[p > 0 ? p - 1 : 0]; }
+    bool isP(const char *s) const { return toks[p].k == T_PUNCT && toks[p].s == s; }
+    bool isPAt(size_t n, const char *s) const { return peekTok(n).k == T_PUNCT && peekTok(n).s == s; }
+    bool isKw(const char *s) const { return toks[p].k == T_IDENT && !toks[p].raw && toks[p].s == s; }
+    bool isKwAt(size_t n, const char *s) const
+    {
+        return peekTok(n).k == T_IDENT && !peekTok(n).raw && peekTok(n).s == s;
+    }
+    bool isIdent() const;             // an identifier that is not a keyword
+    bool isIdentAt(size_t n) const;
+    bool eatP(const char *s);
+    bool eatKw(const char *s);
+    void expectP(const char *s);
+    void expectKw(const char *s);
+    std::string expectIdent(const char *what);
+    bool eatGt();                     // `>`, splitting >> >= >>=
+    void splitAmp();                  // `&&` becomes `&` `&`
+    std::string describe(const Tok &t) const;
+    [[noreturn]] void fail(const std::string &msg, const Tok &at);
+    [[noreturn]] void failHere(const std::string &msg) { fail(msg, cur()); }
+    [[noreturn]] void failExpected(const std::string &what);
+    [[noreturn]] void failAfterPrev(const std::string &what); // expected `;` right after the last token
+
+    Node *mk(uint8_t k, const Tok &at) const;
+
+    // ── items (RustParse.sa) ──
+    void parseItems(ModDef *m, bool untilBrace);
+    bool atItemStart() const;
+    void parseItem(ModDef *m);
+    void parseItemInto(ModDef *m, ModDef *target, bool isDefault, unsigned derives);
+    unsigned parseAttributes(bool &skipItem, bool &isDefault);
+    void skipBalanced();              // the bracketed group cur() opens
+    bool parseVisibility();
+    FnDef *parseFn(bool isPub, bool inTrait);
+    void parseFnParams(FnDef *f);
+    void parseStruct(ModDef *m, bool isPub, unsigned derives);
+    void parseEnum(ModDef *m, bool isPub, unsigned derives);
+    void parseTrait(ModDef *m, bool isPub);
+    void parseImpl(ModDef *m);
+    void parseUse(ModDef *m, bool isPub);
+    void parseUseTree(ModDef *m, std::vector<std::string> prefix, bool isPub);
+    ConstDef *parseConst(bool isPub, bool isStatic);
+    void parseMacroRules(ModDef *m);
+    void parseGenerics(std::vector<GenericParam> &out);
+    void parseWhere(std::vector<GenericParam> &generics);
+    void parseBounds(std::vector<Ty *> &out);
+    void parseFields(std::vector<FieldDef> &out, bool tuple);
+    void addName(ModDef *m, const std::string &name, const Sym &sym, const Tok &at);
+
+    // ── types, paths and patterns (RustParse.sa) ──
+    Ty *parseType();
+    Path *parsePath(bool exprMode);
+    void parseGenericArgs(PathSeg &seg);
+    Pat *parsePattern();              // with alternatives: a | b
+    Pat *parsePatNoOr();
+    Node *parsePatLiteral();
+    bool atPatLiteral() const;
+
+    // ── expressions and statements (RustExpr.sa) ──
+    Node *parseBlock();
+    Node *parseBlockBody(const Tok &open);
+    void parseStmt(Node *block);
+    Node *parseExpr(bool noStruct = false);
+    Node *parseRange(bool noStruct);
+    Node *parseBinary(int minPrec, bool noStruct);
+    Node *parseUnary(bool noStruct);
+    Node *parsePostfix(Node *e, bool noStruct);
+    Node *parsePrimary(bool noStruct);
+    Node *parseIf();
+    Node *parseMatch();
+    Node *parseClosure();
+    Node *parseStructLit(Path *path, const Tok &at);
+    Node *parseMacro(Path *path, const Tok &at, bool stmt);
+    Node *parseUserMacro(MacroDef *def, const Tok &at, int context);
+    Node *parseJsonValue();           // inside json!(...)
+    void parseItemMacro(ModDef *m);   // name!(...) where items are expected
+    MacroDef *findMacro(const std::string &name) const;
+    void parseArgs(std::vector<Node *> &out, const char *close);
+    void parseFormatArgs(Node *m, const char *close, bool required);
+    Fmt *parseFormat(const Tok &str, Node *m, size_t firstArg, std::vector<std::string> &names);
+    bool exprStarts() const;          // can an expression start at cur()?
+    // a string literal, or concat!(..) / stringify!(..) of literals: its text
+    bool literalText(std::string &out);
+    static bool blockLike(const Node *e);
+    std::vector<Tok> takeGroup();     // the tokens inside the group cur() opens
+};
+
+} // namespace rust
